@@ -1,0 +1,4 @@
+fastapi==0.111.0
+uvicorn[standard]==0.40.0
+nba_api
+pandas==2.2.3
