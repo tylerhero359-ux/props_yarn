@@ -24,6 +24,9 @@ const seasonValue = document.getElementById('seasonValue');
 const streakValue = document.getElementById('streakValue');
 const lastGameValue = document.getElementById('lastGameValue');
 const gamesTableBody = document.getElementById('gamesTableBody');
+const gameLogMeta = document.getElementById('gameLogMeta');
+const recentLogTab = document.getElementById('recentLogTab');
+const h2hLogTab = document.getElementById('h2hLogTab');
 const propButtonsWrap = document.getElementById('propButtons');
 const themeToggle = document.getElementById('themeToggle');
 const matchupPanel = document.getElementById('matchupPanel');
@@ -31,15 +34,39 @@ const betFinderMeta = document.getElementById('betFinderMeta');
 const betFinderResults = document.getElementById('betFinderResults');
 const matchupLeanBadge = document.getElementById('matchupLeanBadge');
 const matchupBody = document.getElementById('matchupBody');
+const analyzerMatchupLeanBadge = document.getElementById('analyzerMatchupLeanBadge');
+const analyzerMatchupBody = document.getElementById('analyzerMatchupBody');
 const marketTextarea = document.getElementById('marketTextarea');
 const marketTemplateBtn = document.getElementById('marketTemplateBtn');
 const marketClearBtn = document.getElementById('marketClearBtn');
 const marketScanBtn = document.getElementById('marketScanBtn');
 const marketResults = document.getElementById('marketResults');
 const marketMeta = document.getElementById('marketMeta');
+const workspaceTitle = document.getElementById('workspaceTitle');
+const workspaceSubtitle = document.getElementById('workspaceSubtitle');
+const workspaceEyebrow = document.getElementById('workspaceEyebrow');
+const navItems = document.querySelectorAll('.nav-item');
+const dashboardViews = document.querySelectorAll('.dashboard-view');
+const quickViewButtons = document.querySelectorAll('[data-go-view]');
+const betFinderViewRunBtn = document.getElementById('betFinderViewRunBtn');
+const overviewCurrentCard = document.getElementById('overviewCurrentCard');
+const sidebarMiniPlayer = document.getElementById('sidebarMiniPlayer');
+const sidebarToggle = document.getElementById('sidebarToggle');
+const todayGamesBoard = document.getElementById('todayGamesBoard');
+const todayGamesMeta = document.getElementById('todayGamesMeta');
+const overviewTodayGames = document.getElementById('overviewTodayGames');
+const overviewTodayMeta = document.getElementById('overviewTodayMeta');
+const overviewBestBets = document.getElementById('overviewBestBets');
+const overviewBestBetsMeta = document.getElementById('overviewBestBetsMeta');
+const interpretationTone = document.getElementById('interpretationTone');
+const interpretationBody = document.getElementById('interpretationBody');
+const opportunityTone = document.getElementById('opportunityTone');
+const opportunityBody = document.getElementById('opportunityBody');
 
 const RECENT_PLAYERS_KEY = 'nba-props-recent-players';
 const THEME_KEY = 'nba-props-theme';
+const SIDEBAR_COLLAPSED_KEY = 'nba-props-sidebar-collapsed';
+const MARKET_RESULTS_KEY = 'nba-props-latest-market-results';
 const FALLBACK_HEADSHOT = encodeURIComponent(`
   <svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240">
     <defs>
@@ -94,6 +121,152 @@ let searchTimeout = null;
 let rosterPlayers = [];
 let selectedTeam = null;
 let lastPayload = null;
+let activeView = 'overview';
+let latestTodayGamesPayload = null;
+let currentGameLogPayload = null;
+let activeGameLogView = 'recent';
+
+const VIEW_META = {
+  overview: {
+    eyebrow: 'Dashboard workspace',
+    title: 'Overview',
+    subtitle: 'A structured view of the selected player, current matchup, and key prop indicators.'
+  },
+  today: {
+    eyebrow: 'Daily slate',
+    title: `Today's Games`,
+    subtitle: 'Review the current slate, game status, and team-level injury report context in one place.'
+  },
+  analyzer: {
+    eyebrow: 'Player lab',
+    title: 'Player Analyzer',
+    subtitle: 'Control the inputs, browse rosters, and inspect trend charts plus recent game logs.'
+  },
+  betfinder: {
+    eyebrow: 'Team rankings',
+    title: 'Bet Finder',
+    subtitle: 'Use your current team, prop, and line to rank the strongest recent overs on that roster.'
+  },
+  market: {
+    eyebrow: 'Board analysis',
+    title: 'Market Scanner',
+    subtitle: 'Paste a prop board, compare value, and jump straight into the best candidate.'
+  }
+};
+
+function switchView(view) {
+  if (!VIEW_META[view]) return;
+
+  activeView = view;
+
+  dashboardViews.forEach(section => {
+    section.classList.toggle('active', section.dataset.view === view);
+  });
+
+  navItems.forEach(item => {
+    item.classList.toggle('active', item.dataset.view === view);
+  });
+
+  const meta = VIEW_META[view];
+  if (workspaceEyebrow) workspaceEyebrow.textContent = meta.eyebrow;
+  if (workspaceTitle) workspaceTitle.textContent = meta.title;
+  if (workspaceSubtitle) workspaceSubtitle.textContent = meta.subtitle;
+
+  document.body.dataset.activeView = view;
+  if (view === 'today') {
+    loadTodayGames();
+  }
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function setSidebarCollapsed(collapsed) {
+  document.body.classList.toggle('sidebar-collapsed', collapsed);
+  localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? '1' : '0');
+  if (sidebarToggle) {
+    sidebarToggle.querySelector('.sidebar-toggle-icon').textContent = collapsed ? '⟩' : '⟨';
+    sidebarToggle.setAttribute('aria-label', collapsed ? 'Expand sidebar' : 'Collapse sidebar');
+  }
+}
+
+function applySavedSidebarState() {
+  const collapsed = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1';
+  setSidebarCollapsed(collapsed);
+}
+
+function loadStoredMarketResults() {
+  try {
+    return JSON.parse(localStorage.getItem(MARKET_RESULTS_KEY) || 'null');
+  } catch {
+    return null;
+  }
+}
+
+function saveLatestMarketResults(payload) {
+  const snapshot = {
+    updated_at: new Date().toISOString(),
+    results: (payload.results || []).slice(0, 8)
+  };
+  localStorage.setItem(MARKET_RESULTS_KEY, JSON.stringify(snapshot));
+}
+
+function formatStoredTime(value) {
+  if (!value) return 'Latest saved board unavailable.';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 'Latest saved board available.';
+  return `Updated ${date.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
+}
+
+function renderOverviewSelection() {
+  if (!overviewCurrentCard || !sidebarMiniPlayer) return;
+
+  if (!selectedPlayer) {
+    overviewCurrentCard.innerHTML = `
+      <div class="overview-current-avatar placeholder-avatar">NBA</div>
+      <div class="overview-current-copy">
+        <span class="selected-player-label">Waiting for a selection</span>
+        <strong>No player selected</strong>
+        <small>Choose a team and player in the analyzer to fill this card.</small>
+      </div>
+    `;
+
+    sidebarMiniPlayer.innerHTML = `
+      <div class="sidebar-mini-avatar placeholder-avatar">NBA</div>
+      <div>
+        <strong>No player selected</strong>
+        <small>Pick a team and player to begin.</small>
+      </div>
+    `;
+    return;
+  }
+
+  const subLine = [
+    selectedPlayer.team_name || selectedPlayer.team_abbreviation || '',
+    selectedPlayer.position || '',
+    selectedPlayer.jersey ? `#${selectedPlayer.jersey}` : ''
+  ].filter(Boolean).join(' • ');
+
+  const availabilityHtml = selectedPlayer.availability
+    ? `<div class="selected-player-meta-row">${renderAvailabilityBadge(selectedPlayer.availability)}<small>${escapeHtml(selectedPlayer.availability.reason || selectedPlayer.availability.note || '')}</small></div>`
+    : '';
+
+  overviewCurrentCard.innerHTML = `
+    <img class="overview-current-avatar-img" src="${getPlayerImage(selectedPlayer.id)}" alt="${escapeHtml(selectedPlayer.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
+    <div class="overview-current-copy">
+      <span class="selected-player-label">Current focus</span>
+      <strong>${escapeHtml(selectedPlayer.full_name)}</strong>
+      <small>${escapeHtml(subLine || (selectedPlayer.is_active ? 'Active player' : 'Player'))}</small>
+      ${availabilityHtml}
+    </div>
+  `;
+
+  sidebarMiniPlayer.innerHTML = `
+    <img class="sidebar-mini-avatar-img" src="${getPlayerImage(selectedPlayer.id)}" alt="${escapeHtml(selectedPlayer.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
+    <div>
+      <strong>${escapeHtml(selectedPlayer.full_name)}</strong>
+      <small>${escapeHtml(subLine || 'Selected player')}</small>
+    </div>
+  `;
+}
 
 function getFallbackHeadshot() {
   return `data:image/svg+xml;charset=UTF-8,${FALLBACK_HEADSHOT}`;
@@ -208,6 +381,7 @@ function clearRecentPlayersState({ resetCurrent = true } = {}) {
     renderSelectedPlayer();
     updateSelectedCardStyles();
     resetDashboardForNoSelection();
+    renderGameLogTab('recent');
   }
 }
 
@@ -231,6 +405,7 @@ function renderRecentPlayers() {
 
   recentPlayersContainer.querySelectorAll('.mini-player-card').forEach(card => {
     card.addEventListener('click', () => {
+      switchView('analyzer');
       setSelectedPlayer({
         id: Number(card.dataset.id),
         full_name: card.dataset.name,
@@ -263,6 +438,7 @@ function renderSelectedPlayer() {
         <small>Choose a team, then click a player card to start.</small>
       </div>
     `;
+    renderOverviewSelection();
     return;
   }
 
@@ -271,6 +447,9 @@ function renderSelectedPlayer() {
     selectedPlayer.position || '',
     selectedPlayer.jersey ? `#${selectedPlayer.jersey}` : ''
   ].filter(Boolean).join(' • ');
+  const availabilityHtml = selectedPlayer.availability
+    ? `<div class="selected-player-meta-row">${renderAvailabilityBadge(selectedPlayer.availability)}<small>${escapeHtml(selectedPlayer.availability.reason || selectedPlayer.availability.note || '')}</small></div>`
+    : '';
 
   selectedPlayerBadge.className = 'selected-player';
   selectedPlayerBadge.innerHTML = `
@@ -279,12 +458,91 @@ function renderSelectedPlayer() {
       <span class="selected-player-label">Selected player</span>
       <strong>${escapeHtml(selectedPlayer.full_name)}</strong>
       <small>${escapeHtml(subLine || (selectedPlayer.is_active ? 'Active player' : 'Player'))}</small>
+      ${availabilityHtml}
     </div>
   `;
+  renderOverviewSelection();
+}
+
+function clearAnalysisForNewSelection() {
+  resetDashboardForNoSelection();
+
+  if (interpretationTone) {
+    interpretationTone.className = 'spotlight-pill neutral';
+    interpretationTone.textContent = 'Waiting for analysis';
+  }
+
+  if (opportunityTone) {
+    opportunityTone.className = 'spotlight-pill neutral';
+    opportunityTone.textContent = 'Waiting for analysis';
+  }
+
+  if (interpretationBody) {
+    interpretationBody.className = 'interpretation-body';
+    interpretationBody.innerHTML = `
+      <div class="insight-summary neutral">
+        <span class="insight-summary-label">Quick read</span>
+        <strong>Waiting for analysis</strong>
+        <p>Select a player and run the analyzer to generate a simple interpretation.</p>
+      </div>
+      <ul class="insight-bullet-list compact-bullets">
+        <li>Recent trend, matchup, and opportunity notes will appear here.</li>
+      </ul>
+    `;
+  }
+
+  if (opportunityBody) {
+    opportunityBody.className = 'opportunity-body';
+    opportunityBody.innerHTML = `
+      <div class="opportunity-chip-grid refined-opportunity-grid">
+        <div class="opportunity-chip">
+          <span class="small-label">Minutes</span>
+          <strong>—</strong>
+          <small>Waiting for analysis</small>
+        </div>
+        <div class="opportunity-chip">
+          <span class="small-label">FGA</span>
+          <strong>—</strong>
+          <small>Waiting for analysis</small>
+        </div>
+        <div class="opportunity-chip">
+          <span class="small-label">3PA</span>
+          <strong>—</strong>
+          <small>Waiting for analysis</small>
+        </div>
+        <div class="opportunity-chip">
+          <span class="small-label">FTA</span>
+          <strong>—</strong>
+          <small>Waiting for analysis</small>
+        </div>
+      </div>
+      <div class="opportunity-summary-wrap refined-opportunity-wrap">
+        <div class="insight-summary neutral compact-summary">
+          <span class="insight-summary-label">Opportunity read</span>
+          <p class="opportunity-summary">Analyze a player prop to load minutes, attempts, and team context.</p>
+        </div>
+        <div class="team-context-box neutral">
+          <strong>Team context</strong>
+          <p>No team-availability context yet.</p>
+          <small>Latest same-team absences will appear here after analysis.</small>
+        </div>
+      </div>
+    `;
+  }
 }
 
 function setSelectedPlayer(player) {
+  const previousId = selectedPlayer?.id ?? null;
+  const nextId = player?.id ?? null;
+  const changedPlayer = previousId !== nextId;
+
   selectedPlayer = player;
+
+  if (changedPlayer) {
+    clearAnalysisForNewSelection();
+    setStatus('Player selected');
+  }
+
   renderSelectedPlayer();
   playerSearchInput.value = player.full_name;
   searchResults.classList.add('hidden');
@@ -363,7 +621,6 @@ function renderRoster(team, season, players) {
 
   if (!players.length) {
     playerGrid.classList.remove('has-scroll');
-    playerGrid.classList.remove('has-scroll');
     playerGrid.classList.add('empty-grid');
     playerGrid.innerHTML = `
       <div class="empty-roster-state empty-state-panel compact">
@@ -437,6 +694,179 @@ function renderSearchResults(results) {
       });
     });
   });
+}
+
+function renderOverviewBestBets() {
+  if (!overviewBestBets || !overviewBestBetsMeta) return;
+
+  const stored = loadStoredMarketResults();
+  const results = stored?.results || [];
+  overviewBestBetsMeta.textContent = results.length ? formatStoredTime(stored.updated_at) : 'Populated by your latest Market Scanner run.';
+
+  if (!results.length) {
+    overviewBestBets.className = 'overview-best-bets-list empty-state-panel compact';
+    overviewBestBets.innerHTML = `
+      <div class="empty-icon">⭐</div>
+      <strong>No best bets saved yet.</strong>
+      <span>Run Market Scanner to pin the strongest current board edges here.</span>
+    `;
+    return;
+  }
+
+  overviewBestBets.className = 'overview-best-bets-list';
+  overviewBestBets.innerHTML = results.slice(0, 4).map((item, index) => `
+    <button class="overview-best-bet-card ${item.best_bet.confidence_tone || ''}" data-index="${index}" type="button">
+      <div class="overview-best-bet-head">
+        <span class="overview-rank">#${index + 1}</span>
+        <span class="finder-badge ${item.best_bet.confidence_tone || ''}">${item.best_bet.display_side || item.best_bet.side} • ${item.best_bet.confidence}${item.best_bet.confidence_score ? ` ${item.best_bet.confidence_score}` : ''}</span>
+      </div>
+      <strong>${escapeHtml(item.player.full_name)}</strong>
+      <small>${escapeHtml(item.market.stat)} ${item.market.line} • ${escapeHtml(item.player.team || '')}${item.player.opponent ? ` vs ${escapeHtml(item.player.opponent)}` : ''}</small>
+      <div class="overview-best-bet-metrics">
+        <span>Edge ${item.best_bet.edge ?? '—'}%</span>
+        <span>EV ${item.best_bet.ev ?? '—'}%</span>
+        <span>${item.analysis.hit_rate}% hit</span>
+      </div>
+      <p>${escapeHtml(item.best_bet.confidence_summary || 'Latest scanner leader.')}</p>
+    </button>
+  `).join('');
+
+  overviewBestBets.querySelectorAll('.overview-best-bet-card').forEach(card => {
+    card.addEventListener('click', async () => {
+      const item = results[Number(card.dataset.index)];
+      if (!item) return;
+      await focusMarketPlayer(item);
+    });
+  });
+}
+
+function buildTodayGameCard(game, compact = false) {
+  const statusClass = game.status_category || 'scheduled';
+  const homeSummary = game.home.availability?.headline || 'Clean report';
+  const awaySummary = game.away.availability?.headline || 'Clean report';
+  const scoreLine = game.status_category === 'scheduled'
+    ? `<div class="today-game-time">${escapeHtml(game.status_text)}</div>`
+    : `<div class="today-game-scoreline"><span>${game.away.score}</span><small>-</small><span>${game.home.score}</span></div>`;
+  return `
+    <article class="today-game-card ${compact ? 'compact' : ''} ${statusClass}">
+      <div class="today-game-head">
+        <span class="small-badge ${statusClass}">${escapeHtml(game.status_text)}</span>
+        <span class="small-meta">${escapeHtml(game.game_label)}</span>
+      </div>
+      <div class="today-game-main">
+        <div class="today-team-row">
+          <div>
+            <strong>${escapeHtml(game.away.abbreviation)}</strong>
+            <small>${escapeHtml(awaySummary)}</small>
+          </div>
+          ${scoreLine}
+          <div class="today-team-home">
+            <strong>${escapeHtml(game.home.abbreviation)}</strong>
+            <small>${escapeHtml(homeSummary)}</small>
+          </div>
+        </div>
+        ${compact ? '' : `
+        <div class="today-game-actions">
+          <button class="mini-team-btn" type="button" data-team-id="${game.away.team_id}">Open ${escapeHtml(game.away.abbreviation)}</button>
+          <button class="mini-team-btn" type="button" data-team-id="${game.home.team_id}">Open ${escapeHtml(game.home.abbreviation)}</button>
+        </div>`}
+      </div>
+    </article>
+  `;
+}
+
+async function openTeamFromSlate(teamId) {
+  if (!teamId) return;
+  teamSelect.value = String(teamId);
+  await loadRoster(Number(teamId));
+  switchView('analyzer');
+}
+
+function bindSlateTeamButtons(root) {
+  root.querySelectorAll('.mini-team-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      try {
+        await openTeamFromSlate(btn.dataset.teamId);
+      } catch (error) {
+        console.error(error);
+        alert(error.message || 'Failed to open team roster.');
+      }
+    });
+  });
+}
+
+function renderTodayGames(payload) {
+  latestTodayGamesPayload = payload;
+  const games = payload.games || [];
+  if (todayGamesMeta) {
+    todayGamesMeta.textContent = payload.fallback_used
+      ? `No games on ${payload.requested_date}. Showing next slate on ${payload.resolved_date}. ${payload.report_label ? `• Report ${payload.report_label}` : ''}`
+      : `${games.length} game${games.length === 1 ? '' : 's'} on ${payload.resolved_date}${payload.report_label ? ` • Report ${payload.report_label}` : ''}`;
+  }
+  if (overviewTodayMeta) {
+    overviewTodayMeta.textContent = payload.fallback_used
+      ? `Next slate: ${payload.resolved_date}`
+      : `${games.length} game${games.length === 1 ? '' : 's'} on ${payload.resolved_date}`;
+  }
+
+  if (!games.length) {
+    const emptyHtml = `
+      <div class="empty-state-panel compact today-game-empty">
+        <div class="empty-icon">🗓️</div>
+        <strong>No games on the active slate.</strong>
+        <span>When the NBA schedule posts games, they will appear here with report context.</span>
+      </div>`;
+    if (todayGamesBoard) todayGamesBoard.innerHTML = emptyHtml;
+    if (overviewTodayGames) overviewTodayGames.innerHTML = emptyHtml;
+    return;
+  }
+
+  if (todayGamesBoard) {
+    todayGamesBoard.innerHTML = games.map(game => buildTodayGameCard(game, false)).join('');
+    bindSlateTeamButtons(todayGamesBoard);
+  }
+
+  if (overviewTodayGames) {
+    overviewTodayGames.className = 'today-overview-list';
+    overviewTodayGames.innerHTML = games.slice(0, 4).map(game => buildTodayGameCard(game, true)).join('');
+  }
+}
+
+async function loadTodayGames(force = false) {
+  if (latestTodayGamesPayload && !force) {
+    renderTodayGames(latestTodayGamesPayload);
+    return;
+  }
+
+  if (todayGamesMeta) todayGamesMeta.textContent = "Loading today's NBA slate...";
+  if (overviewTodayMeta) overviewTodayMeta.textContent = "Fetching today's slate...";
+  try {
+    const response = await fetch('/api/todays-games');
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || "Failed to load today's games.");
+    }
+    renderTodayGames(payload);
+  } catch (error) {
+    console.error(error);
+    const fallbackMessage = error.message || "Failed to load today's slate.";
+    if (todayGamesBoard) {
+      todayGamesBoard.innerHTML = `
+        <div class="empty-state-panel compact today-game-empty">
+          <div class="empty-icon">⚠️</div>
+          <strong>Could not load today&#39;s games.</strong>
+          <span>${escapeHtml(fallbackMessage)}</span>
+        </div>`;
+    }
+    if (overviewTodayGames) {
+      overviewTodayGames.innerHTML = `
+        <div class="empty-state-panel compact today-game-empty">
+          <div class="empty-icon">⚠️</div>
+          <strong>Could not load the slate.</strong>
+          <span>${escapeHtml(fallbackMessage)}</span>
+        </div>`;
+    }
+  }
 }
 
 function renderBetFinderEmpty(message = 'Choose a team, set your prop line, then click Bet Finder.') {
@@ -523,6 +953,7 @@ function renderBetFinderResults(payload) {
 }
 
 async function runBetFinder() {
+  switchView('betfinder');
   const teamId = teamSelect.value;
   if (!teamId) {
     alert('Please choose a team first.');
@@ -530,6 +961,7 @@ async function runBetFinder() {
   }
 
   betFinderBtn.disabled = true;
+  if (betFinderViewRunBtn) betFinderViewRunBtn.disabled = true;
   setStatus('Finding bets');
   betFinderMeta.textContent = 'Scanning the selected roster using your current prop settings...';
   betFinderResults.className = 'bet-finder-state empty-state-panel compact';
@@ -565,6 +997,7 @@ async function runBetFinder() {
     setStatus('Error');
   } finally {
     betFinderBtn.disabled = false;
+    if (betFinderViewRunBtn) betFinderViewRunBtn.disabled = false;
   }
 }
 
@@ -595,6 +1028,29 @@ function getLeanClass(tone) {
   return 'neutral';
 }
 
+function getAvailabilityToneClass(tone) {
+  if (tone === 'good') return 'good';
+  if (tone === 'bad') return 'bad';
+  if (tone === 'warning') return 'warning';
+  return 'neutral';
+}
+
+function renderAvailabilityBadge(availability, compact = false) {
+  if (!availability) return '';
+  const toneClass = getAvailabilityToneClass(availability.tone);
+  const tagClass = compact ? 'availability-tag compact' : 'availability-tag';
+  const reason = escapeHtml(availability.reason || availability.note || 'No official note');
+  const reportLabel = escapeHtml(availability.report_label || 'Latest report time unavailable');
+  return `<span class="${tagClass} ${toneClass}" title="${reason} • ${reportLabel}">${escapeHtml(availability.status || 'Unknown')}</span>`;
+}
+
+function getMatchupTargets() {
+  return [
+    { badge: matchupLeanBadge, body: matchupBody },
+    { badge: analyzerMatchupLeanBadge, body: analyzerMatchupBody }
+  ].filter(target => target.badge && target.body);
+}
+
 function formatDelta(value) {
   return value > 0 ? `+${value}` : `${value}`;
 }
@@ -602,22 +1058,25 @@ function formatDelta(value) {
 function renderMatchup(payload) {
   const nextGame = payload?.matchup?.next_game;
   const vsPosition = payload?.matchup?.vs_position;
+  const availability = payload?.availability;
+  const targets = getMatchupTargets();
 
-  if (!nextGame && !vsPosition) {
-    matchupLeanBadge.className = 'spotlight-pill neutral';
-    matchupLeanBadge.textContent = 'No matchup data';
-    matchupBody.className = 'empty-state-panel compact matchup-empty';
-    matchupBody.innerHTML = `
-      <div class="empty-icon">🛡️</div>
-      <strong>Matchup context unavailable.</strong>
-      <span>We could not resolve the next opponent or position split for this player.</span>
-    `;
+  if (!nextGame && !vsPosition && !availability) {
+    targets.forEach(({ badge, body }) => {
+      badge.className = 'spotlight-pill neutral';
+      badge.textContent = 'No matchup data';
+      body.className = 'empty-state-panel compact matchup-empty';
+      body.innerHTML = `
+        <div class="empty-icon">🛡️</div>
+        <strong>Matchup context unavailable.</strong>
+        <span>We could not resolve the next opponent or position split for this player.</span>
+      `;
+    });
     return;
   }
 
   const leanTone = getLeanClass(vsPosition?.lean_tone);
-  matchupLeanBadge.className = `spotlight-pill ${leanTone}`;
-  matchupLeanBadge.textContent = vsPosition?.lean || (nextGame ? 'Upcoming game found' : 'Partial matchup');
+  const leanText = vsPosition?.lean || (nextGame ? 'Upcoming game found' : 'Partial matchup');
 
   const nextGameLabel = nextGame
     ? `${nextGame.matchup_label} • ${nextGame.game_date || 'Date TBA'}${nextGame.game_time ? ` • ${nextGame.game_time}` : ''}`
@@ -632,8 +1091,7 @@ function renderMatchup(payload) {
     summaryText = `${nextGame?.opponent_name || 'This opponent'} allows ${vsPosition.opponent_value.toFixed(2)} ${getStatLabel(vsPosition.stat).toLowerCase()} per player-game to ${vsPosition.position_label.toLowerCase()}, versus a league baseline of ${vsPosition.league_average.toFixed(2)} (${formatDelta(vsPosition.delta_pct)}%).`;
   }
 
-  matchupBody.className = 'matchup-body';
-  matchupBody.innerHTML = `
+  const bodyHtml = `
     <div class="matchup-grid">
       <article class="matchup-tile">
         <span class="small-label">Next game</span>
@@ -644,6 +1102,11 @@ function renderMatchup(payload) {
         <span class="small-label">Venue</span>
         <strong>${escapeHtml(venueLabel)}</strong>
         <small>${escapeHtml(nextGame?.player_team_abbreviation || 'NBA')}</small>
+      </article>
+      <article class="matchup-tile">
+        <span class="small-label">Availability</span>
+        <strong>${renderAvailabilityBadge(availability, true) || '—'}</strong>
+        <small>${escapeHtml(availability?.reason || availability?.note || 'Official status unavailable')}</small>
       </article>
       <article class="matchup-tile">
         <span class="small-label">Vs position</span>
@@ -667,7 +1130,90 @@ function renderMatchup(payload) {
       </article>
     </div>
     <p class="matchup-summary">${escapeHtml(summaryText)}</p>
+    ${availability ? `<p class="availability-footnote">${renderAvailabilityBadge(availability, true)} ${escapeHtml(availability.report_label || 'Latest report time unavailable')} • ${escapeHtml(availability.source || 'Official NBA injury report')}</p>` : ''}
   `;
+
+  targets.forEach(({ badge, body }) => {
+    badge.className = `spotlight-pill ${leanTone}`;
+    badge.textContent = leanText;
+    body.className = 'matchup-body';
+    body.innerHTML = bodyHtml;
+  });
+}
+
+function renderInterpretationPanels(payload) {
+  const interpretation = payload?.interpretation || {};
+  const opportunity = payload?.opportunity || {};
+  const teamContext = payload?.team_context || {};
+  const toneMap = { good: 'good', warning: 'warning', bad: 'bad', neutral: 'neutral' };
+  const interpretationToneClass = toneMap[interpretation.tone] || 'neutral';
+  const opportunityToneClass = opportunity.minutes_trend === 'up' || opportunity.volume_trend === 'up'
+    ? 'good'
+    : (teamContext.impact_count ? 'warning' : 'neutral');
+
+  if (interpretationTone) {
+    interpretationTone.className = `spotlight-pill ${interpretationToneClass}`;
+    interpretationTone.textContent = interpretation.headline || 'Quick read';
+  }
+  if (opportunityTone) {
+    opportunityTone.className = `spotlight-pill ${opportunityToneClass}`;
+    opportunityTone.textContent = opportunity.minutes_label || 'Opportunity';
+  }
+
+  if (interpretationBody) {
+    const bullets = Array.isArray(interpretation.bullets) ? interpretation.bullets : [];
+    interpretationBody.className = 'interpretation-body';
+    interpretationBody.innerHTML = `
+      <div class="insight-summary ${interpretationToneClass}">
+        <span class="insight-summary-label">Quick read</span>
+        <strong>${escapeHtml(interpretation.headline || 'Quick read unavailable')}</strong>
+        <p>${escapeHtml(interpretation.summary || 'Analyze a player prop to generate a simple read.')}</p>
+      </div>
+      <ul class="insight-bullet-list compact-bullets">
+        ${bullets.length ? bullets.map(item => `<li>${escapeHtml(item)}</li>`).join('') : '<li>Analyze a player prop to fill this section.</li>'}
+      </ul>
+    `;
+  }
+
+  if (opportunityBody) {
+    const listedPlayers = (teamContext.players || []).map(item => `${item.name} (${item.status})`);
+    opportunityBody.className = 'opportunity-body';
+    opportunityBody.innerHTML = `
+      <div class="opportunity-chip-grid refined-opportunity-grid">
+        <div class="opportunity-chip">
+          <span class="small-label">Minutes</span>
+          <strong>${Number(opportunity.minutes_last5 || 0).toFixed(1)}</strong>
+          <small>${escapeHtml(opportunity.minutes_label || 'Minutes trend')}</small>
+        </div>
+        <div class="opportunity-chip">
+          <span class="small-label">FGA</span>
+          <strong>${Number(opportunity.fga_last5 || 0).toFixed(1)}</strong>
+          <small>${escapeHtml(opportunity.volume_label || 'Shot volume trend')}</small>
+        </div>
+        <div class="opportunity-chip">
+          <span class="small-label">3PA</span>
+          <strong>${Number(opportunity.fg3a_last5 || 0).toFixed(1)}</strong>
+          <small>Three-point volume</small>
+        </div>
+        <div class="opportunity-chip">
+          <span class="small-label">FTA</span>
+          <strong>${Number(opportunity.fta_last5 || 0).toFixed(1)}</strong>
+          <small>Free-throw trips</small>
+        </div>
+      </div>
+      <div class="opportunity-summary-wrap refined-opportunity-wrap">
+        <div class="insight-summary neutral compact-summary">
+          <span class="insight-summary-label">Opportunity read</span>
+          <p class="opportunity-summary">${escapeHtml(opportunity.summary || 'Opportunity trends will appear after analysis.')}</p>
+        </div>
+        <div class="team-context-box ${teamContext.impact_count ? 'warning' : 'neutral'}">
+          <strong>${escapeHtml(teamContext.headline || 'Team context')}</strong>
+          <p>${escapeHtml(teamContext.summary || 'No team-availability context yet.')}</p>
+          ${listedPlayers.length ? `<small>${escapeHtml(listedPlayers.join(' • '))}</small>` : '<small>No major same-team absences flagged on the latest report.</small>'}
+        </div>
+      </div>
+    `;
+  }
 }
 
 function createLinePlugin(lineValue) {
@@ -731,10 +1277,17 @@ function renderChart(payload) {
       responsive: true,
       maintainAspectRatio: false,
       animation: { duration: 700 },
+      layout: {
+        padding: {
+          bottom: 12
+        }
+      },
       plugins: {
         legend: { display: false },
         tooltip: {
-          backgroundColor: document.body.classList.contains('light-theme') ? 'rgba(255,255,255,0.96)' : 'rgba(10,16,31,0.95)',
+          backgroundColor: document.body.classList.contains('light-theme')
+            ? 'rgba(255,255,255,0.96)'
+            : 'rgba(10,16,31,0.95)',
           titleColor: text,
           bodyColor: text,
           borderColor: `${accent}55`,
@@ -754,8 +1307,10 @@ function renderChart(payload) {
         x: {
           ticks: {
             color: muted,
-            maxRotation: 0,
             autoSkip: false,
+            minRotation: 35,
+            maxRotation: 35,
+            padding: 8,
             callback(value, index) {
               return labels[index].replace(/\s+vs\.|\s+@/g, ' ');
             }
@@ -767,7 +1322,9 @@ function renderChart(payload) {
           beginAtZero: true,
           ticks: { color: muted },
           grid: {
-            color: document.body.classList.contains('light-theme') ? 'rgba(17,33,63,0.08)' : 'rgba(255,255,255,0.08)'
+            color: document.body.classList.contains('light-theme')
+              ? 'rgba(17,33,63,0.08)'
+              : 'rgba(255,255,255,0.08)'
           },
           border: { display: false }
         }
@@ -790,6 +1347,7 @@ function renderSummary(payload) {
 
   const nextGame = payload.matchup?.next_game;
   const vsPosition = payload.matchup?.vs_position;
+  const h2h = payload.h2h || {};
   chartTitle.textContent = `${payload.player.full_name} • ${getStatLabel(payload.stat)}`;
   chartSubtitle.textContent = nextGame
     ? `Line ${payload.line} across the last ${payload.last_n} games • Next ${nextGame.matchup_label}`
@@ -802,35 +1360,105 @@ function renderSummary(payload) {
     <span class="chart-chip">Season ${payload.season}</span>
     <span class="chart-chip">Current streak ${streak}</span>
     <span class="chart-chip">Stat ${payload.stat}</span>
+    ${payload.availability ? `<span class="chart-chip">Status ${escapeHtml(payload.availability.status)}</span>` : ''}
     ${nextGame ? `<span class="chart-chip">Next ${escapeHtml(nextGame.matchup_label)}</span>` : ''}
     ${vsPosition ? `<span class="chart-chip">Vs ${escapeHtml(vsPosition.position_label)} ${formatDelta(vsPosition.delta_pct)}%</span>` : ''}
+    ${h2h.games_count ? `<span class="chart-chip">H2H ${h2h.hit_count}/${h2h.games_count} vs ${escapeHtml(h2h.opponent_abbreviation || h2h.opponent_name || 'opponent')}</span>` : ''}
   `;
 
   renderMatchup(payload);
+  renderInterpretationPanels(payload);
 }
 
-function renderTable(payload) {
-  gamesTableBody.innerHTML = payload.games.slice().reverse().map(game => `
+function buildGameLogRowsMarkup(games, emptyTitle, emptySubtitle) {
+  if (!games || !games.length) {
+    return `
+      <tr>
+        <td colspan="8">
+          <div class="empty-state-panel compact">
+            <div class="empty-icon">📊</div>
+            <strong>${escapeHtml(emptyTitle)}</strong>
+            <span>${escapeHtml(emptySubtitle)}</span>
+          </div>
+        </td>
+      </tr>
+    `;
+  }
+
+  return games.slice().reverse().map(game => `
     <tr>
       <td>${game.game_date}</td>
       <td>${game.matchup}</td>
       <td class="${game.hit ? 'hit-value' : 'miss-value'}">${game.value}</td>
+      <td>${Number(game.minutes || 0).toFixed(1)}</td>
+      <td>${Number(game.fga || 0).toFixed(1)}</td>
+      <td>${Number(game.fg3a || 0).toFixed(1)}</td>
+      <td>${Number(game.fta || 0).toFixed(1)}</td>
       <td><span class="result-badge ${game.hit ? 'hit' : 'miss'}">${game.hit ? 'Hit' : 'Miss'}</span></td>
     </tr>
   `).join('');
 }
 
+function setActiveGameLogTab(view) {
+  activeGameLogView = view;
+  recentLogTab?.classList.toggle('active', view === 'recent');
+  h2hLogTab?.classList.toggle('active', view === 'h2h');
+}
+
+function renderGameLogTab(view = activeGameLogView) {
+  currentGameLogPayload = currentGameLogPayload || null;
+  const h2h = currentGameLogPayload?.h2h || {};
+  if (h2hLogTab) {
+    const hasOpponent = Boolean(h2h.opponent_abbreviation || h2h.opponent_name);
+    h2hLogTab.disabled = !hasOpponent;
+    h2hLogTab.title = hasOpponent ? 'Show current-season results vs the next opponent' : 'Next opponent not available yet';
+  }
+  if (view === 'h2h' && !(h2h.opponent_abbreviation || h2h.opponent_name)) {
+    view = 'recent';
+  }
+  setActiveGameLogTab(view);
+
+  if (!currentGameLogPayload) {
+    gameLogMeta.textContent = 'Hit / miss tags included';
+    gamesTableBody.innerHTML = buildGameLogRowsMarkup([], 'No data yet.', 'Analyze a player prop to fill the game log.');
+    return;
+  }
+
+  if (view === 'h2h') {
+    const h2h = currentGameLogPayload.h2h || {};
+    const oppLabel = h2h.opponent_abbreviation || h2h.opponent_name || 'opponent';
+    const games = h2h.games || [];
+    if (games.length) {
+      gameLogMeta.textContent = `${h2h.hit_count}/${h2h.games_count} overs • Avg ${Number(h2h.average || 0).toFixed(1)} vs ${oppLabel} • Minutes and attempts included`;
+      gamesTableBody.innerHTML = buildGameLogRowsMarkup(games, `No H2H games vs ${oppLabel} yet.`, 'No current-season meetings found for this next opponent.');
+    } else {
+      gameLogMeta.textContent = `H2H vs ${oppLabel}`;
+      gamesTableBody.innerHTML = buildGameLogRowsMarkup([], `No H2H games vs ${oppLabel} yet.`, 'No current-season meetings found for this next opponent.');
+    }
+    return;
+  }
+
+  gameLogMeta.textContent = `Last ${currentGameLogPayload.last_n} games • Value, minutes, and attempts`;
+  gamesTableBody.innerHTML = buildGameLogRowsMarkup(currentGameLogPayload.games || [], 'No data yet.', 'Analyze a player prop to fill the game log.');
+}
+
+function renderTable(payload) {
+  currentGameLogPayload = payload;
+  renderGameLogTab(activeGameLogView);
+}
 
 function getMarketTemplate() {
   return [
-    'player_name,stat,line,over_odds,under_odds,team,opponent',
-    'Nikola Jokic,REB,12.5,2.00,1.73,DEN,POR',
-    'Aaron Gordon,REB,5.5,1.90,1.80,DEN,POR',
-    'Jamal Murray,REB,4.5,1.95,1.75,DEN,POR',
-    'Christian Braun,REB,4.5,1.85,1.85,DEN,POR',
-    'Deni Avdija,REB,6.5,1.75,1.95,POR,DEN',
-    'Toumani Camara,REB,4.5,2.05,1.68,POR,DEN',
-    'Donovan Clingan,REB,11.5,1.85,1.85,POR,DEN'
+    'player_name,stat,line,over_odds,under_odds',
+    'Nikola Jokic,REB,12.5,2.00,1.73',
+    'Aaron Gordon,REB,5.5,1.90,1.80',
+    'Jamal Murray,REB,4.5,1.95,1.75',
+    'Christian Braun,REB,4.5,1.85,1.85',
+    'Deni Avdija,REB,6.5,1.75,1.95',
+    'Toumani Camara,REB,4.5,2.05,1.68',
+    'Donovan Clingan,REB,11.5,1.85,1.85',
+    '',
+    'Correct the spelling of the names, you can use the internet to double check it.'
   ].join('\n');
 }
 
@@ -853,11 +1481,11 @@ function parseMarketText(rawText) {
 
   const rows = dataLines.map((line, index) => {
     const parts = line.split(',').map(part => part.trim());
-    if (parts.length < 7) {
-      throw new Error(`Row ${index + 1} is incomplete. Use: player_name,stat,line,over_odds,under_odds,team,opponent`);
+    if (parts.length < 5) {
+      throw new Error(`Row ${index + 1} is incomplete. Use: player_name,stat,line,over_odds,under_odds`);
     }
 
-    const [player_name, stat, lineValue, overOdds, underOdds, team, opponent] = parts;
+    const [player_name, stat, lineValue, overOdds, underOdds, team = '', opponent = ''] = parts;
     if (!player_name || !stat || !lineValue || !overOdds || !underOdds) {
       throw new Error(`Row ${index + 1} has missing required values.`);
     }
@@ -886,11 +1514,12 @@ function getConfidenceTone(confidence) {
   if (confidence === 'A') return 'elite';
   if (confidence === 'B') return 'good';
   if (confidence === 'C') return 'warm';
+  if (confidence === 'X') return 'out';
   return '';
 }
 
 function renderMarketEmpty(message = 'Paste your board using the template, then click Analyze Board.') {
-  marketMeta.textContent = 'Paste rows using the template below. The scanner compares hit rate, implied odds, EV, and matchup context.';
+  marketMeta.textContent = 'Paste rows using the template below. Team and opponent are detected automatically from the player.';
   marketResults.className = 'bet-finder-state empty-state-panel compact';
   marketResults.innerHTML = `
     <div class="empty-icon">🧾</div>
@@ -905,79 +1534,63 @@ async function focusMarketPlayer(item) {
   const teamId = item.player.team_id;
   if (teamId && String(teamSelect.value) !== String(teamId)) {
     teamSelect.value = String(teamId);
-    const selectedOption = teamSelect.options[teamSelect.selectedIndex];
-    if (selectedOption) {
-      applyTeamAccent(selectedOption.dataset.abbreviation);
-    }
     await loadRoster(teamId);
   }
 
-  const rosterMatch = rosterPlayers.find(player => Number(player.id) === Number(item.player.id));
-  setSelectedPlayer(rosterMatch || {
-    id: Number(item.player.id),
+  setSelectedPlayer({
+    id: item.player.id,
     full_name: item.player.full_name,
     is_active: true,
-    team_id: item.player.team_id,
-    team_abbreviation: item.player.team,
-    team_name: selectedTeam?.full_name || item.player.team,
+    team_abbreviation: item.player.team_abbreviation || '',
+    team_name: item.player.team_name || '',
+    team_id: item.player.team_id || null,
     position: item.player.position || '',
-    jersey: ''
+    jersey: item.player.jersey || ''
   });
 
   setActiveProp(item.market.stat);
   lineInput.value = item.market.line;
+  switchView('analyzer');
   await analyzePlayerProp();
-  document.getElementById('marketScannerPanel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 function renderMarketResults(payload) {
   const results = payload.results || [];
-  const errors = payload.errors || [];
 
   if (!results.length) {
-    renderMarketEmpty(errors.length ? `No valid results. ${errors.length} row(s) failed to parse or analyze.` : 'No valid results for that board.');
+    renderMarketEmpty('No rows produced a usable result. Check names and try again.');
     return;
   }
 
-  marketMeta.textContent = `${results.length} props ranked • Last ${payload.last_n} • Season ${payload.season}${errors.length ? ` • ${errors.length} issue(s)` : ''}`;
-
-  const errorHtml = errors.length ? `
-    <div class="market-errors">
-      <strong>Rows skipped:</strong>
-      <ul>
-        ${errors.slice(0, 6).map(error => `<li>Row ${error.row}: ${escapeHtml(error.player_name || '')} ${escapeHtml(error.reason || 'Unknown issue')}</li>`).join('')}
-      </ul>
-    </div>
-  ` : '';
-
-  marketResults.className = 'market-results-wrap';
+  marketMeta.textContent = `${results.length} props scanned • Sorted by best edge and EV`;
+  marketResults.className = 'market-results-shell';
   marketResults.innerHTML = `
-    ${errorHtml}
-    <div class="table-wrap market-table-wrap">
-      <table class="market-table">
+    <div class="market-results-table-wrap">
+      <table class="market-results-table">
         <thead>
           <tr>
-            <th>Rank</th>
             <th>Player</th>
+            <th>Availability</th>
             <th>Prop</th>
-            <th>Best Side</th>
+            <th>Best side</th>
             <th>Edge</th>
             <th>EV</th>
             <th>Model %</th>
             <th>Implied %</th>
             <th>Last ${payload.last_n}</th>
-            <th>Avg</th>
+            <th>Average</th>
             <th>Matchup</th>
           </tr>
         </thead>
         <tbody>
           ${results.map((item, index) => {
-            const tone = getConfidenceTone(item.best_bet.confidence);
-            const matchupLean = item.matchup?.vs_position?.lean || 'No read';
-            const matchupDetail = item.matchup?.next_game?.matchup_label || `${item.player.team} vs ${item.player.opponent}`;
-            return `
+    const tone = getConfidenceTone(item.best_bet.confidence);
+    const availability = item.analysis?.availability || item.availability || { status: 'Unknown', tone: 'neutral', reason: 'No report found', note: '' };
+    const matchupData = item.analysis?.matchup || item.matchup || {};
+    const matchupLean = matchupData?.vs_position?.lean || 'No matchup';
+    const matchupDetail = matchupData?.next_game?.matchup_label || 'No next opponent';
+    return `
               <tr class="market-row" data-index="${index}">
-                <td><span class="finder-rank small-rank">#${index + 1}</span></td>
                 <td>
                   <div class="market-player-cell">
                     <img src="${getPlayerImage(item.player.id)}" alt="${escapeHtml(item.player.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
@@ -987,8 +1600,14 @@ function renderMarketResults(payload) {
                     </div>
                   </div>
                 </td>
+                <td><div class="market-availability-cell">${renderAvailabilityBadge(availability, true)}<small>${escapeHtml(availability.reason || availability.note || 'No official note')}</small></div></td>
                 <td>${escapeHtml(item.market.stat)} ${item.market.line}</td>
-                <td><span class="finder-badge ${tone}">${item.best_bet.side} • ${item.best_bet.confidence}</span></td>
+                <td>
+                  <div class="market-confidence-cell">
+                    <span class="finder-badge ${tone}">${item.best_bet.display_side || item.best_bet.side} • ${item.best_bet.confidence}${item.best_bet.confidence_score ? ` ${item.best_bet.confidence_score}` : ''}</span>
+                    <small>${escapeHtml(item.best_bet.user_read || item.best_bet.confidence_summary || 'Confidence summary unavailable.')}</small>
+                  </div>
+                </td>
                 <td class="${(item.best_bet.edge || 0) >= 0 ? 'hit-value' : 'miss-value'}">${item.best_bet.edge ?? '—'}%</td>
                 <td class="${(item.best_bet.ev || 0) >= 0 ? 'hit-value' : 'miss-value'}">${item.best_bet.ev ?? '—'}%</td>
                 <td>${item.best_bet.model_probability ?? '—'}%</td>
@@ -1003,7 +1622,7 @@ function renderMarketResults(payload) {
                 </td>
               </tr>
             `;
-          }).join('')}
+  }).join('')}
         </tbody>
       </table>
     </div>
@@ -1027,6 +1646,7 @@ function renderMarketResults(payload) {
 }
 
 async function runMarketScan() {
+  switchView('market');
   let rows;
   try {
     rows = parseMarketText(marketTextarea.value);
@@ -1059,6 +1679,8 @@ async function runMarketScan() {
       throw new Error(payload.detail || 'Market scan failed.');
     }
     renderMarketResults(payload);
+    saveLatestMarketResults(payload);
+    renderOverviewBestBets();
     setStatus('Ready');
   } catch (error) {
     console.error(error);
@@ -1068,7 +1690,6 @@ async function runMarketScan() {
     marketScanBtn.disabled = false;
   }
 }
-
 
 function resetDashboardForNoSelection() {
   avgValue.textContent = '—';
@@ -1080,25 +1701,20 @@ function resetDashboardForNoSelection() {
   chartTitle.textContent = 'Waiting for a player selection';
   chartSubtitle.textContent = 'Choose a player and analyze a prop to populate the chart.';
   chartChips.innerHTML = '<span class="chart-chip">Waiting for data</span>';
-  gamesTableBody.innerHTML = `
-    <tr>
-      <td colspan="4">
-        <div class="empty-state-panel compact">
-          <div class="empty-icon">📊</div>
-          <strong>No data yet.</strong>
-          <span>Analyze a player prop to fill the game log.</span>
-        </div>
-      </td>
-    </tr>
-  `;
-  matchupLeanBadge.className = 'spotlight-pill neutral';
-  matchupLeanBadge.textContent = 'Waiting for analysis';
-  matchupBody.className = 'empty-state-panel compact matchup-empty';
-  matchupBody.innerHTML = `
-    <div class="empty-icon">🛡️</div>
-    <strong>No matchup loaded yet.</strong>
-    <span>Analyze a player prop to load the next opponent and defense-vs-position read.</span>
-  `;
+  currentGameLogPayload = null;
+  activeGameLogView = 'recent';
+  if (gameLogMeta) gameLogMeta.textContent = 'Hit / miss tags included';
+  renderGameLogTab('recent');
+  getMatchupTargets().forEach(({ badge, body }) => {
+    badge.className = 'spotlight-pill neutral';
+    badge.textContent = 'Waiting for analysis';
+    body.className = 'empty-state-panel compact matchup-empty';
+    body.innerHTML = `
+      <div class="empty-icon">🛡️</div>
+      <strong>No matchup loaded yet.</strong>
+      <span>Analyze a player prop to load the next opponent and defense-vs-position read.</span>
+    `;
+  });
 
   if (chart) {
     chart.destroy();
@@ -1108,6 +1724,7 @@ function resetDashboardForNoSelection() {
 }
 
 async function analyzePlayerProp() {
+  switchView('analyzer');
   if (!selectedPlayer) {
     alert('Please select a player first.');
     return;
@@ -1137,6 +1754,13 @@ async function analyzePlayerProp() {
       throw new Error(payload.detail || 'Failed to analyze player prop.');
     }
 
+    selectedPlayer = {
+      ...selectedPlayer,
+      team_id: payload.player.team_id || selectedPlayer.team_id,
+      position: payload.player.position || selectedPlayer.position,
+      availability: payload.availability || null
+    };
+    renderSelectedPlayer();
     renderSummary(payload);
     renderChart(payload);
     renderTable(payload);
@@ -1157,7 +1781,12 @@ teamSelect.addEventListener('change', async () => {
   if (!teamId) {
     rosterPlayers = [];
     selectedTeam = null;
+    selectedPlayer = null;
+    playerSearchInput.value = '';
     applyTeamAccent();
+    renderSelectedPlayer();
+    updateSelectedCardStyles();
+    clearAnalysisForNewSelection();
     rosterTitle.textContent = 'Team roster';
     rosterMeta.textContent = 'Choose a team to load players.';
     playerGrid.classList.add('empty-grid');
@@ -1170,13 +1799,23 @@ teamSelect.addEventListener('change', async () => {
     `;
     betFinderMeta.textContent = 'Uses your current team, prop, line, and recent-game sample.';
     renderBetFinderEmpty();
-  renderMarketEmpty();
+    renderMarketEmpty();
+    setStatus('Ready');
     return;
   }
 
+  const teamChanged = String(selectedPlayer?.team_id || '') !== String(teamId);
   applyTeamAccent(selectedOption.dataset.abbreviation);
   setStatus('Loading roster');
   renderRosterSkeleton();
+
+  if (teamChanged && selectedPlayer) {
+    selectedPlayer = null;
+    playerSearchInput.value = '';
+    renderSelectedPlayer();
+    updateSelectedCardStyles();
+    clearAnalysisForNewSelection();
+  }
 
   try {
     await loadRoster(teamId);
@@ -1215,17 +1854,38 @@ propButtonsWrap.querySelectorAll('.prop-chip').forEach(chip => {
   chip.addEventListener('click', () => setActiveProp(chip.dataset.stat));
 });
 
+navItems.forEach(item => {
+  item.addEventListener('click', () => switchView(item.dataset.view));
+});
+
+quickViewButtons.forEach(button => {
+  button.addEventListener('click', () => switchView(button.dataset.goView));
+});
+
+if (betFinderViewRunBtn) {
+  betFinderViewRunBtn.addEventListener('click', runBetFinder);
+}
+
 analyzeBtn.addEventListener('click', analyzePlayerProp);
 betFinderBtn.addEventListener('click', runBetFinder);
 clearRecentBtn.addEventListener('click', () => clearRecentPlayersState({ resetCurrent: true }));
 marketTemplateBtn.addEventListener('click', () => { marketTextarea.value = getMarketTemplate(); });
 marketClearBtn.addEventListener('click', () => { marketTextarea.value = ''; renderMarketEmpty(); });
 marketScanBtn.addEventListener('click', runMarketScan);
+recentLogTab?.addEventListener('click', () => renderGameLogTab('recent'));
+h2hLogTab?.addEventListener('click', () => renderGameLogTab('h2h'));
 
 themeToggle.addEventListener('click', () => {
   const nextTheme = document.body.classList.contains('light-theme') ? 'dark' : 'light';
   setTheme(nextTheme);
 });
+
+if (sidebarToggle) {
+  sidebarToggle.addEventListener('click', () => {
+    const collapsed = !document.body.classList.contains('sidebar-collapsed');
+    setSidebarCollapsed(collapsed);
+  });
+}
 
 document.addEventListener('click', (event) => {
   if (!playerSearchInput.contains(event.target) && !searchResults.contains(event.target)) {
@@ -1243,9 +1903,12 @@ window.addEventListener('keydown', (event) => {
   applySavedTheme();
   renderRecentPlayers();
   renderSelectedPlayer();
+  renderOverviewSelection();
   resetDashboardForNoSelection();
   renderBetFinderEmpty();
+  renderMarketEmpty();
   setActiveProp(selectedStat);
+  switchView(activeView);
   setStatus('Loading teams');
 
   try {

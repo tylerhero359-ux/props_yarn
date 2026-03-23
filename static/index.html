@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>NBA Props Tracker</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -14,341 +15,559 @@
   <div class="bg-orb bg-orb-one"></div>
   <div class="bg-orb bg-orb-two"></div>
 
-  <div class="page-shell">
-    <header class="hero-card card glass">
-      <div class="hero-copy">
-        <div class="eyebrow-row">
-          <span class="eyebrow">NBA Props Dashboard</span>
-          <span class="live-dot-pill"><span class="live-dot"></span>Visualize recent form</span>
+  <div class="dashboard-layout">
+    <aside class="dashboard-sidebar card glass">
+      <div class="sidebar-brand-shell">
+        <div class="sidebar-brand">
+          <div class="brand-mark brand-mark-icon">
+            <img src="/static/favicon.svg" alt="NBA Props Tracker icon" class="brand-icon" />
+          </div>
+          <div class="brand-copy">
+            <p class="sidebar-kicker">Props Platform</p>
+            <h1>NBA Props Tracker</h1>
+          </div>
         </div>
-        <h1>Track player props with cleaner charts, faster picks, and team-based styling.</h1>
-        <p class="hero-subtext">
-          Pick a team, click a player card, choose a prop, then instantly see recent game bars, hit rate,
-          streaks, upcoming opponent context, and defense-vs-position matchup notes.
-        </p>
-        <div class="hero-meta-row">
-          <div class="hero-stat-pill">
-            <strong>30 Teams</strong>
-            <span>Browse rosters</span>
-          </div>
-          <div class="hero-stat-pill">
-            <strong>10 Props</strong>
-            <span>Quick select</span>
-          </div>
-          <div class="hero-stat-pill">
-            <strong>Live Theme</strong>
-            <span>Adapts by team</span>
+        <button id="sidebarToggle" class="sidebar-toggle" type="button" aria-label="Collapse sidebar">
+          <span class="sidebar-toggle-icon">⟨</span>
+        </button>
+      </div>
+
+      <nav class="sidebar-nav" aria-label="Dashboard sections">
+        <button class="nav-item active" type="button" data-view="overview">
+          <span class="nav-icon">⌂</span>
+          <span>
+            <strong>Overview</strong>
+            <small>Snapshot and shortcuts</small>
+          </span>
+        </button>
+        <button class="nav-item" type="button" data-view="today">
+          <span class="nav-icon">🗓️</span>
+          <span>
+            <strong>Today's Games</strong>
+            <small>Slate, status, team notes</small>
+          </span>
+        </button>
+        <button class="nav-item" type="button" data-view="analyzer">
+          <span class="nav-icon">📊</span>
+          <span>
+            <strong>Player Analyzer</strong>
+            <small>Charts, roster, trends</small>
+          </span>
+        </button>
+        <button class="nav-item" type="button" data-view="betfinder">
+          <span class="nav-icon">🎯</span>
+          <span>
+            <strong>Bet Finder</strong>
+            <small>Rank team props fast</small>
+          </span>
+        </button>
+        <button class="nav-item" type="button" data-view="market">
+          <span class="nav-icon">🧾</span>
+          <span>
+            <strong>Market Scanner</strong>
+            <small>Paste and rank a full board</small>
+          </span>
+        </button>
+      </nav>
+
+      <div class="sidebar-summary card">
+        <div class="sidebar-summary-head">
+          <span class="section-kicker">Current focus</span>
+          <span id="statusPill" class="status-pill">Idle</span>
+        </div>
+        <div class="sidebar-mini-player" id="sidebarMiniPlayer">
+          <div class="sidebar-mini-avatar placeholder-avatar">NBA</div>
+          <div>
+            <strong>No player selected</strong>
+            <small>Pick a team and player to begin.</small>
           </div>
         </div>
       </div>
 
-      <div class="hero-side">
-        <div class="hero-badge-stack">
-          <div class="hero-badge">Powered by nba_api</div>
-          <div class="hero-badge subtle">Rendered with Chart.js</div>
-        </div>
+      <div class="sidebar-footer">
         <button id="themeToggle" class="theme-toggle" type="button" aria-label="Toggle theme">
           <span class="theme-icon">☀</span>
           <span class="theme-text">Light</span>
         </button>
+        <p class="sidebar-footnote">Professional workflow for player props, matchup analysis, availability, and market scanning.</p>
       </div>
-    </header>
+    </aside>
 
-    <section class="controls-panel card glass">
-      <div class="controls-top">
+    <main class="workspace-main">
+      <header class="workspace-header card glass">
         <div>
-          <p class="section-kicker">Control Center</p>
-          <h2>Choose a team, pick a player, and set the line.</h2>
+          <p class="section-kicker" id="workspaceEyebrow">Dashboard workspace</p>
+          <h2 id="workspaceTitle">Overview</h2>
+          <p id="workspaceSubtitle" class="workspace-subtitle">A structured view of the selected player, current matchup, and key prop indicators.</p>
         </div>
-        <div id="statusPill" class="status-pill">Idle</div>
-      </div>
+      </header>
 
-      <div class="controls-grid">
-        <div class="control-group">
-          <label for="teamSelect">Team</label>
-          <div class="input-shell">
-            <select id="teamSelect">
-              <option value="">Choose a team</option>
-            </select>
-          </div>
-        </div>
-
-        <div class="control-group control-group-wide search-group">
-          <label for="playerSearch">Search fallback</label>
-          <div class="input-shell">
-            <input id="playerSearch" type="text" placeholder="Search any NBA player" autocomplete="off" />
-          </div>
-          <div id="searchResults" class="search-results hidden"></div>
-        </div>
-
-        <div class="control-group">
-          <label for="lineInput">Prop line</label>
-          <div class="input-shell">
-            <input id="lineInput" type="number" step="0.5" min="0" value="25.5" />
-          </div>
-        </div>
-
-        <div class="control-group">
-          <label for="gamesSelect">Recent games</label>
-          <div class="input-shell">
-            <select id="gamesSelect">
-              <option value="5">Last 5</option>
-              <option value="10" selected>Last 10</option>
-              <option value="15">Last 15</option>
-              <option value="20">Last 20</option>
-            </select>
-          </div>
-        </div>
-
-        <div class="control-group">
-          <label for="seasonInput">Season</label>
-          <div class="input-shell">
-            <input id="seasonInput" type="text" placeholder="2025-26" />
-          </div>
-        </div>
-
-        <div class="control-group actions-group">
-          <label>&nbsp;</label>
-          <div class="action-stack">
-            <button id="analyzeBtn" class="primary-btn" type="button">Analyze Prop</button>
-            <button id="betFinderBtn" class="secondary-btn" type="button">Bet Finder</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="prop-picker-wrap">
-        <div class="prop-picker-copy">
-          <span class="small-label">Prop quick select</span>
-          <p>Use sportsbook-style buttons instead of a dropdown.</p>
-        </div>
-        <div id="propButtons" class="prop-button-row" role="tablist" aria-label="Prop types">
-          <button class="prop-chip active" data-stat="PTS" type="button">PTS</button>
-          <button class="prop-chip" data-stat="REB" type="button">REB</button>
-          <button class="prop-chip" data-stat="AST" type="button">AST</button>
-          <button class="prop-chip" data-stat="3PM" type="button">3PM</button>
-          <button class="prop-chip" data-stat="STL" type="button">STL</button>
-          <button class="prop-chip" data-stat="BLK" type="button">BLK</button>
-          <button class="prop-chip" data-stat="PRA" type="button">PRA</button>
-          <button class="prop-chip" data-stat="PR" type="button">PR</button>
-          <button class="prop-chip" data-stat="PA" type="button">PA</button>
-          <button class="prop-chip" data-stat="RA" type="button">RA</button>
-        </div>
-      </div>
-    </section>
-
-    <section class="explorer-grid">
-      <article class="card glass spotlight-card">
-        <div class="section-head">
-          <div>
-            <p class="section-kicker">Spotlight</p>
-            <h2>Selected player</h2>
-          </div>
-          <span class="spotlight-pill">Ready for analysis</span>
-        </div>
-
-        <div id="selectedPlayer" class="selected-player selected-player-empty">
-          <div class="selected-player-avatar placeholder-avatar">NBA</div>
-          <div class="selected-player-copy">
-            <span class="selected-player-label">Waiting for a selection</span>
-            <strong>No player selected</strong>
-            <small>Choose a team, then click a player card to start.</small>
-          </div>
-        </div>
-
-        <div id="recentPlayersSection" class="recent-players hidden">
-          <div class="mini-section-head">
-            <h3>Recent players</h3>
-            <div class="mini-section-head-actions">
-              <span>Quick re-open</span>
-              <button id="clearRecentBtn" class="text-btn" type="button">Clear</button>
+      <section class="dashboard-view active" data-view="overview">
+        <header class="hero-card card glass overview-hero-refined">
+          <div class="hero-copy">
+            <div class="eyebrow-row">
+              <span class="eyebrow">NBA Props Dashboard</span>
+              <span class="live-dot-pill"><span class="live-dot"></span>Structured research workspace</span>
+            </div>
+            <h1>Centralize player prop research in one structured dashboard.</h1>
+            <p class="hero-subtext">
+              Review the active player, scan the current slate, surface the strongest board edges, and move into deeper matchup analysis without losing context.
+            </p>
+            <div class="hero-meta-row hero-meta-row-compact">
+              <div class="hero-stat-pill">
+                <strong>Today’s Slate</strong>
+                <span>Quick view of scheduled games and report notes</span>
+              </div>
+              <div class="hero-stat-pill">
+                <strong>Best Bets</strong>
+                <span>Latest scanner leaders with confidence scoring</span>
+              </div>
+              <div class="hero-stat-pill">
+                <strong>Confidence Engine</strong>
+                <span>Balances edge, EV, matchup, sample, and risk</span>
+              </div>
             </div>
           </div>
-          <div id="recentPlayers" class="mini-player-row"></div>
-        </div>
-      </article>
+        </header>
 
-      <article class="card glass roster-panel">
-        <div class="section-head">
+        <section class="overview-grid">
+          <article class="card glass overview-current-card">
+            <div class="section-head">
+              <div>
+                <p class="section-kicker">Current Selection</p>
+                <h2>Player snapshot</h2>
+              </div>
+              <span class="spotlight-pill">Live summary</span>
+            </div>
+            <div id="overviewCurrentCard" class="overview-current-body">
+              <div class="overview-current-avatar placeholder-avatar">NBA</div>
+              <div class="overview-current-copy">
+                <span class="selected-player-label">Waiting for a selection</span>
+                <strong>No player selected</strong>
+                <small>Choose a team and player in the analyzer to fill this card.</small>
+              </div>
+            </div>
+          </article>
+
+          <article class="card glass overview-actions-card overview-best-bets-card">
+            <div class="section-head">
+              <div>
+                <p class="section-kicker">Best Bets</p>
+                <h2>Latest board leaders</h2>
+              </div>
+              <span id="overviewBestBetsMeta" class="small-meta">Populated by your latest Market Scanner run.</span>
+            </div>
+            <div id="overviewBestBets" class="overview-best-bets-list empty-state-panel compact">
+              <div class="empty-icon">⭐</div>
+              <strong>No best bets saved yet.</strong>
+              <span>Run Market Scanner to pin the strongest current board edges here.</span>
+            </div>
+          </article>
+        </section>
+
+        <section class="insight-strip">
+          <article class="metric-card card glass">
+            <span class="metric-label">Average</span>
+            <strong id="avgValue">—</strong>
+            <small>Across selected sample</small>
+          </article>
+          <article class="metric-card card glass">
+            <span class="metric-label">Hit Rate</span>
+            <strong id="hitRateValue">—</strong>
+            <small>Overs at current line</small>
+          </article>
+          <article class="metric-card card glass">
+            <span class="metric-label">Hits</span>
+            <strong id="hitCountValue">—</strong>
+            <small>Games above the line</small>
+          </article>
+          <article class="metric-card card glass">
+            <span class="metric-label">Season</span>
+            <strong id="seasonValue">—</strong>
+            <small>Current data source</small>
+          </article>
+          <article class="metric-card card glass">
+            <span class="metric-label">Over Streak</span>
+            <strong id="streakValue">—</strong>
+            <small>Current consecutive overs</small>
+          </article>
+          <article class="metric-card card glass">
+            <span class="metric-label">Last Game</span>
+            <strong id="lastGameValue">—</strong>
+            <small>Most recent performance</small>
+          </article>
+        </section>
+
+        <section class="overview-lower-grid">
+          <article class="card glass today-overview-card">
+            <div class="section-head">
+              <div>
+                <p class="section-kicker">Today's Games</p>
+                <h2>Slate snapshot</h2>
+              </div>
+              <span id="overviewTodayMeta" class="small-meta">Fetching today’s slate...</span>
+            </div>
+            <div id="overviewTodayGames" class="today-overview-list empty-state-panel compact">
+              <div class="empty-icon">🗓️</div>
+              <strong>No slate loaded yet.</strong>
+              <span>The dashboard will show today’s games and injury-report context here.</span>
+            </div>
+          </article>
+        </section>
+
+        <section id="matchupPanel" class="card glass matchup-panel">
+          <div class="section-head">
+            <div>
+              <p class="section-kicker">Next Matchup</p>
+              <h2>Opponent context</h2>
+            </div>
+            <span id="matchupLeanBadge" class="spotlight-pill neutral">Waiting for analysis</span>
+          </div>
+          <div id="matchupBody" class="empty-state-panel compact matchup-empty">
+            <div class="empty-icon">🛡️</div>
+            <strong>No matchup loaded yet.</strong>
+            <span>Analyze a player prop to load the next opponent and defense-vs-position read.</span>
+          </div>
+        </section>
+      </section>
+
+      <section class="dashboard-view" data-view="analyzer">
+        <section class="controls-panel card glass">
+          <div class="controls-top">
+            <div>
+              <p class="section-kicker">Control Center</p>
+              <h2>Choose a team, pick a player, and set the line.</h2>
+            </div>
+          </div>
+
+          <div class="controls-grid">
+            <div class="control-group">
+              <label for="teamSelect">Team</label>
+              <div class="input-shell">
+                <select id="teamSelect">
+                  <option value="">Choose a team</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="control-group control-group-wide search-group">
+              <label for="playerSearch">Search fallback</label>
+              <div class="input-shell">
+                <input id="playerSearch" type="text" placeholder="Search any NBA player" autocomplete="off" />
+              </div>
+              <div id="searchResults" class="search-results hidden"></div>
+            </div>
+
+            <div class="control-group">
+              <label for="lineInput">Prop line</label>
+              <div class="input-shell">
+                <input id="lineInput" type="number" step="0.5" min="0" value="25.5" />
+              </div>
+            </div>
+
+            <div class="control-group">
+              <label for="gamesSelect">Recent games</label>
+              <div class="input-shell">
+                <select id="gamesSelect">
+                  <option value="5">Last 5</option>
+                  <option value="10" selected>Last 10</option>
+                  <option value="15">Last 15</option>
+                  <option value="20">Last 20</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="control-group">
+              <label for="seasonInput">Season</label>
+              <div class="input-shell">
+                <input id="seasonInput" type="text" placeholder="2025-26" />
+              </div>
+            </div>
+
+            <div class="control-group actions-group">
+              <label>&nbsp;</label>
+              <div class="action-stack">
+                <button id="analyzeBtn" class="primary-btn" type="button">Analyze Prop</button>
+                <button id="betFinderBtn" class="secondary-btn" type="button">Bet Finder</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="prop-picker-wrap">
+            <div class="prop-picker-copy">
+              <span class="small-label">Prop quick select</span>
+              <p>Use sportsbook-style buttons instead of a dropdown.</p>
+            </div>
+            <div id="propButtons" class="prop-button-row" role="tablist" aria-label="Prop types">
+              <button class="prop-chip active" data-stat="PTS" type="button">PTS</button>
+              <button class="prop-chip" data-stat="REB" type="button">REB</button>
+              <button class="prop-chip" data-stat="AST" type="button">AST</button>
+              <button class="prop-chip" data-stat="3PM" type="button">3PM</button>
+              <button class="prop-chip" data-stat="STL" type="button">STL</button>
+              <button class="prop-chip" data-stat="BLK" type="button">BLK</button>
+              <button class="prop-chip" data-stat="PRA" type="button">PRA</button>
+              <button class="prop-chip" data-stat="PR" type="button">PR</button>
+              <button class="prop-chip" data-stat="PA" type="button">PA</button>
+              <button class="prop-chip" data-stat="RA" type="button">RA</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="explorer-grid analyzer-explorer-grid">
+          <article class="card glass spotlight-card">
+            <div class="section-head">
+              <div>
+                <p class="section-kicker">Spotlight</p>
+                <h2>Selected player</h2>
+              </div>
+              <span class="spotlight-pill">Ready for analysis</span>
+            </div>
+
+            <div id="selectedPlayer" class="selected-player selected-player-empty">
+              <div class="selected-player-avatar placeholder-avatar">NBA</div>
+              <div class="selected-player-copy">
+                <span class="selected-player-label">Waiting for a selection</span>
+                <strong>No player selected</strong>
+                <small>Choose a team, then click a player card to start.</small>
+              </div>
+            </div>
+
+            <div id="recentPlayersSection" class="recent-players hidden">
+              <div class="mini-section-head">
+                <h3>Recent players</h3>
+                <div class="mini-section-head-actions">
+                  <span>Quick re-open</span>
+                  <button id="clearRecentBtn" class="text-btn" type="button">Clear</button>
+                </div>
+              </div>
+              <div id="recentPlayers" class="mini-player-row"></div>
+            </div>
+          </article>
+
+          <article class="card glass roster-panel">
+            <div class="section-head">
+              <div>
+                <p class="section-kicker">Roster Explorer</p>
+                <h2 id="rosterTitle">Team roster</h2>
+              </div>
+              <span id="rosterMeta" class="small-meta">Choose a team to load players.</span>
+            </div>
+            <div id="playerGrid" class="player-grid empty-grid">
+              <div class="empty-roster-state empty-state-panel">
+                <div class="empty-icon">🏀</div>
+                <strong>Choose a team to load player cards.</strong>
+                <span>You’ll get clickable headshots, jersey numbers, and positions.</span>
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <section class="card glass matchup-panel analyzer-matchup-panel">
+          <div class="section-head">
+            <div>
+              <p class="section-kicker">Next Matchup</p>
+              <h2>Opponent context</h2>
+            </div>
+            <span id="analyzerMatchupLeanBadge" class="spotlight-pill neutral">Waiting for analysis</span>
+          </div>
+          <div id="analyzerMatchupBody" class="empty-state-panel compact matchup-empty">
+            <div class="empty-icon">🛡️</div>
+            <strong>No matchup loaded yet.</strong>
+            <span>Analyze a player prop to load the next opponent and defense-vs-position read.</span>
+          </div>
+        </section>
+
+        <section class="dashboard-grid analyzer-insight-grid">
+          <article class="card glass insight-card">
+            <div class="section-head">
+              <div>
+                <p class="section-kicker">Interpretation</p>
+                <h2>Quick read</h2>
+              </div>
+              <span id="interpretationTone" class="spotlight-pill neutral">Waiting for analysis</span>
+            </div>
+            <div id="interpretationBody" class="empty-state-panel compact matchup-empty">
+              <div class="empty-icon">🧠</div>
+              <strong>No interpretation yet.</strong>
+              <span>Analyze a player prop to get a simple read on whether the line looks supportive, mixed, or risky.</span>
+            </div>
+          </article>
+
+          <article class="card glass insight-card">
+            <div class="section-head">
+              <div>
+                <p class="section-kicker">Opportunity</p>
+                <h2>Opportunity profile</h2>
+              </div>
+              <span id="opportunityTone" class="spotlight-pill neutral">Waiting for analysis</span>
+            </div>
+            <div id="opportunityBody" class="empty-state-panel compact matchup-empty">
+              <div class="empty-icon">⏱️</div>
+              <strong>No opportunity profile yet.</strong>
+              <span>Analyze a player prop to see minutes, shot attempts, and teammate absence context.</span>
+            </div>
+          </article>
+        </section>
+
+        <section class="dashboard-grid">
+          <article class="chart-card card glass">
+            <div class="chart-topbar">
+              <div>
+                <p class="section-kicker">Trend View</p>
+                <h2 id="chartTitle">Waiting for a player selection</h2>
+                <p id="chartSubtitle">Choose a player and analyze a prop to populate the chart.</p>
+              </div>
+              <div class="chart-legend">
+                <span><i class="legend-dot legend-over"></i> Over</span>
+                <span><i class="legend-dot legend-under"></i> Under</span>
+                <span><i class="legend-line"></i> Prop line</span>
+              </div>
+            </div>
+            <div class="chart-chip-row" id="chartChips">
+              <span class="chart-chip">Waiting for data</span>
+            </div>
+            <div class="chart-wrap">
+              <canvas id="propsChart"></canvas>
+            </div>
+          </article>
+
+          <article class="table-card card glass">
+            <div class="section-head table-head game-log-head">
+              <div>
+                <p class="section-kicker">Game Log</p>
+                <h2>Recent results and H2H</h2>
+              </div>
+              <div class="game-log-head-right">
+                <span id="gameLogMeta" class="small-meta">Hit / miss tags included</span>
+                <div class="segmented-toggle" role="tablist" aria-label="Game log views">
+                  <button id="recentLogTab" class="segmented-toggle-btn active" type="button">Last N</button>
+                  <button id="h2hLogTab" class="segmented-toggle-btn" type="button">H2H</button>
+                </div>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Matchup</th>
+                    <th>Value</th>
+                    <th>MIN</th>
+                    <th>FGA</th>
+                    <th>3PA</th>
+                    <th>FTA</th>
+                    <th>Result</th>
+                  </tr>
+                </thead>
+                <tbody id="gamesTableBody">
+                  <tr>
+                    <td colspan="4">
+                      <div class="empty-state-panel compact">
+                        <div class="empty-icon">📊</div>
+                        <strong>No data yet.</strong>
+                        <span>Analyze a player prop to fill the game log.</span>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+      </section>
+
+      <section class="dashboard-view" data-view="today">
+        <section class="tool-intro-card card glass">
           <div>
-            <p class="section-kicker">Roster Explorer</p>
-            <h2 id="rosterTitle">Team roster</h2>
+            <p class="section-kicker">Today's Games</p>
+            <h2>Track the active slate, injury-report notes, and fast team entry points.</h2>
+            <p id="todayGamesMeta" class="small-meta">Loading today’s NBA slate...</p>
           </div>
-          <span id="rosterMeta" class="small-meta">Choose a team to load players.</span>
-        </div>
-        <div id="playerGrid" class="player-grid empty-grid">
-          <div class="empty-roster-state empty-state-panel">
-            <div class="empty-icon">🏀</div>
-            <strong>Choose a team to load player cards.</strong>
-            <span>You’ll get clickable headshots, jersey numbers, and positions.</span>
-          </div>
-        </div>
-      </article>
-    </section>
+        </section>
 
-    <section class="insight-strip">
-      <article class="metric-card card glass">
-        <span class="metric-label">Average</span>
-        <strong id="avgValue">—</strong>
-        <small>Across selected sample</small>
-      </article>
-      <article class="metric-card card glass">
-        <span class="metric-label">Hit Rate</span>
-        <strong id="hitRateValue">—</strong>
-        <small>Overs at current line</small>
-      </article>
-      <article class="metric-card card glass">
-        <span class="metric-label">Hits</span>
-        <strong id="hitCountValue">—</strong>
-        <small>Games above the line</small>
-      </article>
-      <article class="metric-card card glass">
-        <span class="metric-label">Season</span>
-        <strong id="seasonValue">—</strong>
-        <small>Current data source</small>
-      </article>
-      <article class="metric-card card glass">
-        <span class="metric-label">Over Streak</span>
-        <strong id="streakValue">—</strong>
-        <small>Current consecutive overs</small>
-      </article>
-      <article class="metric-card card glass">
-        <span class="metric-label">Last Game</span>
-        <strong id="lastGameValue">—</strong>
-        <small>Most recent performance</small>
-      </article>
-    </section>
+        <section id="todayGamesBoard" class="today-games-grid">
+          <article class="card glass empty-state-panel compact today-game-empty">
+            <div class="empty-icon">🗓️</div>
+            <strong>Loading games...</strong>
+            <span>Schedule, team context, and injury report notes will appear here.</span>
+          </article>
+        </section>
+      </section>
 
-    <section id="betFinderPanel" class="card glass bet-finder-panel">
-      <div class="bet-finder-topbar">
-        <div>
-          <p class="section-kicker">Bet Finder</p>
-          <h2>Find the best recent overs on the selected team.</h2>
-          <p id="betFinderMeta" class="small-meta">Uses your current team, prop, line, and recent-game sample.</p>
-        </div>
-        <span class="small-badge">Team-scoped for speed</span>
-      </div>
-      <div id="betFinderResults" class="bet-finder-state empty-state-panel compact">
-        <div class="empty-icon">🎯</div>
-        <strong>No bet finder results yet.</strong>
-        <span>Choose a team, set your prop line, then click Bet Finder.</span>
-      </div>
-    </section>
-
-
-
-    <section id="marketScannerPanel" class="card glass market-panel">
-      <div class="bet-finder-topbar market-topbar">
-        <div>
-          <p class="section-kicker">Market Scanner</p>
-          <h2>Paste your prop board and rank the best bets automatically.</h2>
-          <p id="marketMeta" class="small-meta">Paste rows using the template below. The scanner compares hit rate, implied odds, EV, and matchup context.</p>
-        </div>
-        <span class="small-badge">Manual paste template</span>
-      </div>
-
-      <div class="market-input-grid">
-        <div class="market-form">
-          <label for="marketTextarea" class="small-label">Paste market rows</label>
-          <textarea id="marketTextarea" class="market-textarea" spellcheck="false" placeholder="player_name,stat,line,over_odds,under_odds,team,opponent
-Nikola Jokic,REB,12.5,2.00,1.73,DEN,POR"></textarea>
-          <div class="market-template-note">
-            Template: <code>player_name,stat,line,over_odds,under_odds,team,opponent</code>
-          </div>
-          <div class="market-action-row">
-            <button id="marketTemplateBtn" class="secondary-btn" type="button">Load Template</button>
-            <button id="marketClearBtn" class="text-btn" type="button">Clear</button>
-            <button id="marketScanBtn" class="primary-btn" type="button">Analyze Board</button>
-          </div>
-        </div>
-        <div class="market-guide card">
-          <p class="section-kicker">How to fill it</p>
-          <h3>One prop per line.</h3>
-          <ul class="market-guide-list">
-            <li>Use decimal odds only.</li>
-            <li>Use stat codes like <strong>PTS</strong>, <strong>REB</strong>, <strong>AST</strong>, <strong>3PM</strong>, <strong>PRA</strong>.</li>
-            <li>Team and opponent can be abbreviations like <strong>DEN</strong> and <strong>POR</strong>.</li>
-            <li>The scanner ranks by EV first, then edge, then recent hit rate.</li>
-          </ul>
-        </div>
-      </div>
-
-      <div id="marketResults" class="bet-finder-state empty-state-panel compact">
-        <div class="empty-icon">🧾</div>
-        <strong>No market scan yet.</strong>
-        <span>Paste your board using the template, then click Analyze Board.</span>
-      </div>
-    </section>
-
-    <section id="matchupPanel" class="card glass matchup-panel">
-      <div class="section-head">
-        <div>
-          <p class="section-kicker">Next Matchup</p>
-          <h2>Opponent context</h2>
-        </div>
-        <span id="matchupLeanBadge" class="spotlight-pill neutral">Waiting for analysis</span>
-      </div>
-      <div id="matchupBody" class="empty-state-panel compact matchup-empty">
-        <div class="empty-icon">🛡️</div>
-        <strong>No matchup loaded yet.</strong>
-        <span>Analyze a player prop to load the next opponent and defense-vs-position read.</span>
-      </div>
-    </section>
-
-    <section class="dashboard-grid">
-      <article class="chart-card card glass">
-        <div class="chart-topbar">
+      <section class="dashboard-view" data-view="betfinder">
+        <section class="tool-intro-card card glass">
           <div>
-            <p class="section-kicker">Trend View</p>
-            <h2 id="chartTitle">Waiting for a player selection</h2>
-            <p id="chartSubtitle">Choose a player and analyze a prop to populate the chart.</p>
+            <p class="section-kicker">Bet Finder Workspace</p>
+            <h2>Scan the selected roster using your current line and sample size.</h2>
+            <p class="small-meta">Use the Player Analyzer to choose the team, stat, line, and recent-game sample. Then run Bet Finder here or from the analyzer controls.</p>
           </div>
-          <div class="chart-legend">
-            <span><i class="legend-dot legend-over"></i> Over</span>
-            <span><i class="legend-dot legend-under"></i> Under</span>
-            <span><i class="legend-line"></i> Prop line</span>
+          <div class="tool-intro-actions">
+            <button id="betFinderViewRunBtn" class="primary-btn" type="button">Run Bet Finder</button>
+            <button class="secondary-btn" type="button" data-go-view="analyzer">Adjust Inputs</button>
           </div>
-        </div>
-        <div class="chart-chip-row" id="chartChips">
-          <span class="chart-chip">Waiting for data</span>
-        </div>
-        <div class="chart-wrap">
-          <canvas id="propsChart"></canvas>
-        </div>
-      </article>
+        </section>
 
-      <article class="table-card card glass">
-        <div class="section-head table-head">
-          <div>
-            <p class="section-kicker">Game Log</p>
-            <h2>Recent results</h2>
+        <section id="betFinderPanel" class="card glass bet-finder-panel standalone-panel">
+          <div class="bet-finder-topbar">
+            <div>
+              <p class="section-kicker">Bet Finder</p>
+              <h2>Find the best recent overs on the selected team.</h2>
+              <p id="betFinderMeta" class="small-meta">Uses your current team, prop, line, and recent-game sample.</p>
+            </div>
+            <span class="small-badge">Team-scoped for speed</span>
           </div>
-          <span class="small-meta">Hit / miss tags included</span>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Date</th>
-                <th>Matchup</th>
-                <th>Value</th>
-                <th>Result</th>
-              </tr>
-            </thead>
-            <tbody id="gamesTableBody">
-              <tr>
-                <td colspan="4">
-                  <div class="empty-state-panel compact">
-                    <div class="empty-icon">📊</div>
-                    <strong>No data yet.</strong>
-                    <span>Analyze a player prop to fill the game log.</span>
-                  </div>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </article>
-    </section>
+          <div id="betFinderResults" class="bet-finder-state empty-state-panel compact">
+            <div class="empty-icon">🎯</div>
+            <strong>No bet finder results yet.</strong>
+            <span>Choose a team, set your prop line, then click Bet Finder.</span>
+          </div>
+        </section>
+      </section>
+
+      <section class="dashboard-view" data-view="market">
+        <section id="marketScannerPanel" class="card glass market-panel standalone-panel">
+          <div class="bet-finder-topbar market-topbar">
+            <div>
+              <p class="section-kicker">Market Scanner</p>
+              <h2>Paste your prop board and rank the best bets automatically.</h2>
+              <p id="marketMeta" class="small-meta">Paste rows using the template below. Team and opponent are detected automatically from the player.</p>
+            </div>
+            <span class="small-badge">Manual paste template</span>
+          </div>
+
+          <div class="market-input-grid">
+            <div class="market-form">
+              <label for="marketTextarea" class="small-label">Paste market rows</label>
+              <textarea id="marketTextarea" class="market-textarea" spellcheck="false" placeholder="player_name,stat,line,over_odds,under_odds&#10;Nikola Jokic,REB,12.5,2.00,1.73"></textarea>
+              <div class="market-template-note">
+                Template: <code>player_name,stat,line,over_odds,under_odds</code>
+              </div>
+              <div class="market-action-row">
+                <button id="marketTemplateBtn" class="secondary-btn" type="button">Load Template</button>
+                <button id="marketClearBtn" class="text-btn" type="button">Clear</button>
+                <button id="marketScanBtn" class="primary-btn" type="button">Analyze Board</button>
+              </div>
+            </div>
+            <div class="market-guide card">
+              <p class="section-kicker">How to fill it</p>
+              <h3>One prop per line.</h3>
+              <ul class="market-guide-list">
+                <li>Use decimal odds only.</li>
+                <li>Use stat codes like <strong>PTS</strong>, <strong>REB</strong>, <strong>AST</strong>, <strong>3PM</strong>, <strong>PRA</strong>.</li>
+                <li>Teams and opponents are auto-detected from the player.</li>
+                <li>The scanner ranks by EV first, then edge, then recent hit rate.</li>
+              </ul>
+            </div>
+          </div>
+
+          <div id="marketResults" class="bet-finder-state empty-state-panel compact">
+            <div class="empty-icon">🧾</div>
+            <strong>No market scan yet.</strong>
+            <span>Paste your board using the template, then click Analyze Board.</span>
+          </div>
+        </section>
+      </section>
+    </main>
   </div>
 
   <script src="/static/app.js"></script>
