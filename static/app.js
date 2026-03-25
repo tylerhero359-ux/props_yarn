@@ -17,6 +17,10 @@ const chartTitle = document.getElementById('chartTitle');
 const chartSubtitle = document.getElementById('chartSubtitle');
 const chartChips = document.getElementById('chartChips');
 const statusPill = document.getElementById('statusPill');
+const actionBanner = document.getElementById('actionBanner');
+const actionBannerTitle = document.getElementById('actionBannerTitle');
+const actionBannerDetail = document.getElementById('actionBannerDetail');
+const actionBannerState = document.getElementById('actionBannerState');
 const avgValue = document.getElementById('avgValue');
 const hitRateValue = document.getElementById('hitRateValue');
 const hitCountValue = document.getElementById('hitCountValue');
@@ -62,6 +66,8 @@ const interpretationTone = document.getElementById('interpretationTone');
 const interpretationBody = document.getElementById('interpretationBody');
 const opportunityTone = document.getElementById('opportunityTone');
 const opportunityBody = document.getElementById('opportunityBody');
+const environmentTone = document.getElementById('environmentTone');
+const environmentBody = document.getElementById('environmentBody');
 
 const RECENT_PLAYERS_KEY = 'nba-props-recent-players';
 const THEME_KEY = 'nba-props-theme';
@@ -122,6 +128,8 @@ let rosterPlayers = [];
 let selectedTeam = null;
 let lastPayload = null;
 let activeView = 'overview';
+let statusBannerTimer = null;
+let activeWorkCount = 0;
 let latestTodayGamesPayload = null;
 let currentGameLogPayload = null;
 let activeGameLogView = 'recent';
@@ -154,9 +162,11 @@ const VIEW_META = {
   }
 };
 
-function switchView(view) {
+function switchView(view, options = {}) {
   if (!VIEW_META[view]) return;
 
+  const previousView = activeView;
+  const shouldScroll = options.scroll ?? (view !== previousView);
   activeView = view;
 
   dashboardViews.forEach(section => {
@@ -176,7 +186,12 @@ function switchView(view) {
   if (view === 'today') {
     loadTodayGames();
   }
-  window.scrollTo({ top: 0, behavior: 'smooth' });
+  if (view === 'analyzer') {
+    ensureTeamsLoaded();
+  }
+  if (shouldScroll) {
+    window.scrollTo({ top: 0, behavior: options.instant ? 'auto' : 'smooth' });
+  }
 }
 
 function setSidebarCollapsed(collapsed) {
@@ -285,9 +300,98 @@ function escapeHtml(text) {
     .replaceAll("'", '&#039;');
 }
 
-function setStatus(text) {
-  statusPill.textContent = text;
+function getStatusMeta(text) {
+  const raw = String(text || 'Idle');
+  const normalized = raw.toLowerCase();
+
+  if (normalized.includes('loading market pick')) {
+    return { phase: 'working', state: 'Working', title: 'Opening this market pick', detail: 'Loading the player, line, and current trend view into the analyzer.', pill: 'working' };
+  }
+  if (normalized.includes('scanning market')) {
+    return { phase: 'working', state: 'Scanning', title: 'Scanning the market board', detail: 'Comparing edge, EV, availability, and matchup context across every pasted prop.', pill: 'working' };
+  }
+  if (normalized.includes('finding bets')) {
+    return { phase: 'working', state: 'Working', title: 'Finding the best team props', detail: 'Ranking the current roster using hit rate, opportunity, and recent form.', pill: 'working' };
+  }
+  if (normalized.includes('loading roster')) {
+    return { phase: 'working', state: 'Loading', title: 'Loading team roster', detail: 'Pulling player cards, headshots, and current season roster information.', pill: 'working' };
+  }
+  if (normalized.includes('loading teams')) {
+    return { phase: 'working', state: 'Loading', title: 'Preparing the dashboard', detail: 'Fetching the active NBA teams so the analyzer is ready to use.', pill: 'working' };
+  }
+  if (normalized.includes('loading')) {
+    return { phase: 'working', state: 'Working', title: 'Running player analysis', detail: 'Checking recent form, matchup, availability, and opportunity trends for this prop.', pill: 'working' };
+  }
+  if (normalized.includes('ready')) {
+    return { phase: 'success', state: 'Ready', title: 'Update complete', detail: 'The dashboard finished processing your latest request.', pill: 'ready' };
+  }
+  if (normalized.includes('roster ready')) {
+    return { phase: 'success', state: 'Ready', title: 'Roster loaded', detail: 'The analyzer is ready for player selection.', pill: 'ready' };
+  }
+  if (normalized.includes('player selected')) {
+    return { phase: 'success', state: 'Ready', title: 'Player selected', detail: 'Choose a prop and line when you are ready to run the analysis.', pill: 'ready' };
+  }
+  if (normalized.includes('error')) {
+    return { phase: 'error', state: 'Issue', title: 'Something needs attention', detail: 'The request could not finish. Please try again or adjust the input.', pill: 'error' };
+  }
+  return { phase: 'idle', state: 'Idle', title: 'Standing by', detail: 'Select a player, scan a board, or open today\'s games to begin.', pill: 'idle' };
 }
+
+function showActionBanner(meta) {
+  if (!actionBanner || !actionBannerTitle || !actionBannerDetail || !actionBannerState) return;
+  actionBannerTitle.textContent = meta.title;
+  actionBannerDetail.textContent = meta.detail;
+  actionBannerState.textContent = meta.state;
+  actionBanner.dataset.phase = meta.phase;
+  actionBanner.classList.add('is-visible');
+}
+
+function hideActionBanner() {
+  if (!actionBanner) return;
+  actionBanner.classList.remove('is-visible');
+  actionBanner.dataset.phase = 'idle';
+}
+
+function setStatus(text) {
+  const meta = getStatusMeta(text);
+  if (statusPill) {
+    statusPill.textContent = text;
+    statusPill.dataset.state = meta.pill;
+  }
+
+  if (statusBannerTimer) {
+    clearTimeout(statusBannerTimer);
+    statusBannerTimer = null;
+  }
+
+  if (meta.phase === 'working') {
+    activeWorkCount += 1;
+    showActionBanner(meta);
+    return;
+  }
+
+  if (meta.phase === 'success') {
+    activeWorkCount = Math.max(0, activeWorkCount - 1);
+    showActionBanner(meta);
+    statusBannerTimer = window.setTimeout(() => {
+      if (activeWorkCount === 0) hideActionBanner();
+    }, 1400);
+    return;
+  }
+
+  if (meta.phase === 'error') {
+    activeWorkCount = Math.max(0, activeWorkCount - 1);
+    showActionBanner(meta);
+    statusBannerTimer = window.setTimeout(() => {
+      if (activeWorkCount === 0) hideActionBanner();
+    }, 2600);
+    return;
+  }
+
+  activeWorkCount = 0;
+  hideActionBanner();
+}
+
 
 function setTheme(theme) {
   document.body.classList.toggle('light-theme', theme === 'light');
@@ -477,6 +581,11 @@ function clearAnalysisForNewSelection() {
     opportunityTone.textContent = 'Waiting for analysis';
   }
 
+  if (environmentTone) {
+    environmentTone.className = 'spotlight-pill neutral';
+    environmentTone.textContent = 'Waiting for analysis';
+  }
+
   if (interpretationBody) {
     interpretationBody.className = 'interpretation-body';
     interpretationBody.innerHTML = `
@@ -529,6 +638,38 @@ function clearAnalysisForNewSelection() {
       </div>
     `;
   }
+
+  if (environmentBody) {
+    environmentBody.className = 'environment-body';
+    environmentBody.innerHTML = `
+      <div class="environment-chip-grid">
+        <div class="environment-chip">
+          <span class="small-label">Venue</span>
+          <strong>—</strong>
+          <small>Waiting for analysis</small>
+        </div>
+        <div class="environment-chip">
+          <span class="small-label">Rest</span>
+          <strong>—</strong>
+          <small>Waiting for analysis</small>
+        </div>
+        <div class="environment-chip">
+          <span class="small-label">Back-to-back</span>
+          <strong>—</strong>
+          <small>Waiting for analysis</small>
+        </div>
+        <div class="environment-chip">
+          <span class="small-label">Games in 7</span>
+          <strong>—</strong>
+          <small>Waiting for analysis</small>
+        </div>
+      </div>
+      <div class="insight-summary neutral compact-summary">
+        <span class="insight-summary-label">Schedule read</span>
+        <p class="opportunity-summary">Analyze a player prop to see rest, back-to-back risk, and the upcoming spot.</p>
+      </div>
+    `;
+  }
 }
 
 function setSelectedPlayer(player) {
@@ -571,7 +712,11 @@ function updateRosterScrollState(players, season) {
   });
 }
 
-async function loadTeams() {
+async function loadTeams(force = false) {
+  if (!force && teamSelect && teamSelect.options.length > 1) {
+    return;
+  }
+
   const response = await fetch('/api/teams');
   const data = await response.json().catch(() => ({}));
 
@@ -580,20 +725,32 @@ async function loadTeams() {
     throw new Error(data.detail || 'Failed to load teams.');
   }
 
+  const teams = Array.isArray(data) ? data : (Array.isArray(data.results) ? data.results : (Array.isArray(data.teams) ? data.teams : []));
+
   teamSelect.innerHTML = '';
   const placeholder = document.createElement('option');
   placeholder.value = '';
   placeholder.textContent = 'Choose a team';
   teamSelect.appendChild(placeholder);
 
-  (data.results || []).forEach(team => {
+  teams.forEach(team => {
     const option = document.createElement('option');
     option.value = String(team.id);
-    option.textContent = team.full_name;
-    option.dataset.abbreviation = team.abbreviation;
-    option.dataset.name = team.full_name;
+    option.textContent = team.full_name || `${team.city || ''} ${team.nickname || ''}`.trim() || String(team.id);
+    option.dataset.abbreviation = team.abbreviation || '';
+    option.dataset.name = team.full_name || option.textContent;
     teamSelect.appendChild(option);
   });
+}
+
+async function ensureTeamsLoaded(force = false) {
+  if (!teamSelect) return;
+  if (!force && teamSelect.options.length > 1) return;
+  try {
+    await loadTeams(force);
+  } catch (error) {
+    console.error(error);
+  }
 }
 
 async function loadRoster(teamId) {
@@ -1145,11 +1302,13 @@ function renderInterpretationPanels(payload) {
   const interpretation = payload?.interpretation || {};
   const opportunity = payload?.opportunity || {};
   const teamContext = payload?.team_context || {};
+  const environment = payload?.environment || {};
   const toneMap = { good: 'good', warning: 'warning', bad: 'bad', neutral: 'neutral' };
   const interpretationToneClass = toneMap[interpretation.tone] || 'neutral';
   const opportunityToneClass = opportunity.minutes_trend === 'up' || opportunity.volume_trend === 'up'
     ? 'good'
     : (teamContext.impact_count ? 'warning' : 'neutral');
+  const environmentToneClass = toneMap[environment.tone] || 'neutral';
 
   if (interpretationTone) {
     interpretationTone.className = `spotlight-pill ${interpretationToneClass}`;
@@ -1158,6 +1317,10 @@ function renderInterpretationPanels(payload) {
   if (opportunityTone) {
     opportunityTone.className = `spotlight-pill ${opportunityToneClass}`;
     opportunityTone.textContent = opportunity.minutes_label || 'Opportunity';
+  }
+  if (environmentTone) {
+    environmentTone.className = `spotlight-pill ${environmentToneClass}`;
+    environmentTone.textContent = environment.headline || 'Schedule spot';
   }
 
   if (interpretationBody) {
@@ -1211,6 +1374,40 @@ function renderInterpretationPanels(payload) {
           <p>${escapeHtml(teamContext.summary || 'No team-availability context yet.')}</p>
           ${listedPlayers.length ? `<small>${escapeHtml(listedPlayers.join(' • '))}</small>` : '<small>No major same-team absences flagged on the latest report.</small>'}
         </div>
+      </div>
+    `;
+  }
+
+  if (environmentBody) {
+    const restValue = Number.isInteger(environment.rest_days) ? `${environment.rest_days} day${environment.rest_days === 1 ? '' : 's'}` : 'Unknown';
+    environmentBody.className = 'environment-body';
+    environmentBody.innerHTML = `
+      <div class="environment-chip-grid">
+        <div class="environment-chip">
+          <span class="small-label">Venue</span>
+          <strong>${escapeHtml(environment.venue_label || 'TBD')}</strong>
+          <small>${escapeHtml(environment.next_opponent ? `Next ${environment.next_opponent}` : 'Upcoming game')}</small>
+        </div>
+        <div class="environment-chip">
+          <span class="small-label">Rest</span>
+          <strong>${escapeHtml(restValue)}</strong>
+          <small>${escapeHtml(environment.headline || 'Schedule spot')}</small>
+        </div>
+        <div class="environment-chip ${environment.is_back_to_back ? 'warning' : ''}">
+          <span class="small-label">Back-to-back</span>
+          <strong>${environment.is_back_to_back ? 'Yes' : 'No'}</strong>
+          <small>${environment.is_back_to_back ? 'More fatigue risk' : 'No immediate fatigue flag'}</small>
+        </div>
+        <div class="environment-chip">
+          <span class="small-label">Games in 7</span>
+          <strong>${Number(environment.games_last7 || 0)}</strong>
+          <small>${Number(environment.games_last7 || 0) >= 4 ? 'Busy recent schedule' : 'Normal recent load'}</small>
+        </div>
+      </div>
+      <div class="insight-summary ${environmentToneClass} compact-summary">
+        <span class="insight-summary-label">Schedule read</span>
+        <strong>${escapeHtml(environment.headline || 'Schedule spot')}</strong>
+        <p class="opportunity-summary">${escapeHtml(environment.summary || 'Schedule context will appear after analysis.')}</p>
       </div>
     `;
   }
@@ -1347,6 +1544,7 @@ function renderSummary(payload) {
 
   const nextGame = payload.matchup?.next_game;
   const vsPosition = payload.matchup?.vs_position;
+  const environment = payload.environment || {};
   const h2h = payload.h2h || {};
   chartTitle.textContent = `${payload.player.full_name} • ${getStatLabel(payload.stat)}`;
   chartSubtitle.textContent = nextGame
@@ -1716,6 +1914,26 @@ function resetDashboardForNoSelection() {
     `;
   });
 
+  if (environmentTone) {
+    environmentTone.className = 'spotlight-pill neutral';
+    environmentTone.textContent = 'Waiting for analysis';
+  }
+  if (environmentBody) {
+    environmentBody.className = 'environment-body';
+    environmentBody.innerHTML = `
+      <div class="environment-chip-grid">
+        <div class="environment-chip"><span class="small-label">Venue</span><strong>—</strong><small>Waiting for analysis</small></div>
+        <div class="environment-chip"><span class="small-label">Rest</span><strong>—</strong><small>Waiting for analysis</small></div>
+        <div class="environment-chip"><span class="small-label">Back-to-back</span><strong>—</strong><small>Waiting for analysis</small></div>
+        <div class="environment-chip"><span class="small-label">Games in 7</span><strong>—</strong><small>Waiting for analysis</small></div>
+      </div>
+      <div class="insight-summary neutral compact-summary">
+        <span class="insight-summary-label">Schedule read</span>
+        <p class="opportunity-summary">Analyze a player prop to see rest, back-to-back risk, and the upcoming spot.</p>
+      </div>
+    `;
+  }
+
   if (chart) {
     chart.destroy();
     chart = null;
@@ -1723,8 +1941,8 @@ function resetDashboardForNoSelection() {
   lastPayload = null;
 }
 
-async function analyzePlayerProp() {
-  switchView('analyzer');
+async function analyzePlayerProp(options = {}) {
+  switchView('analyzer', { scroll: !options.preserveScroll });
   if (!selectedPlayer) {
     alert('Please select a player first.');
     return;
@@ -1829,6 +2047,13 @@ teamSelect.addEventListener('change', async () => {
   }
 });
 
+
+['focus', 'mousedown', 'touchstart'].forEach(evt => {
+  teamSelect?.addEventListener(evt, () => {
+    ensureTeamsLoaded();
+  }, { passive: true });
+});
+
 playerSearchInput.addEventListener('input', () => {
   const query = playerSearchInput.value.trim();
   if (searchTimeout) clearTimeout(searchTimeout);
@@ -1920,3 +2145,1014 @@ window.addEventListener('keydown', (event) => {
     setStatus('Error');
   }
 })();
+
+/* === Premium UX / prediction upgrade overrides === */
+const recommendationToneEl = document.getElementById('recommendationTone');
+const recommendationBodyEl = document.getElementById('recommendationBody');
+const overviewCautionBoardEl = document.getElementById('overviewCautionBoard');
+const overviewBoostBoardEl = document.getElementById('overviewBoostBoard');
+const favoritesListEl = document.getElementById('favoritesList');
+const simpleViewBtnEl = document.getElementById('simpleViewBtn');
+const advancedViewBtnEl = document.getElementById('advancedViewBtn');
+const stickyPlayerNameEl = document.getElementById('stickyPlayerName');
+const stickyPropLabelEl = document.getElementById('stickyPropLabel');
+const favoritePlayerBtnEl = document.getElementById('favoritePlayerBtn');
+const savePropBtnEl = document.getElementById('savePropBtn');
+const chartModeBarsBtnEl = document.getElementById('chartModeBarsBtn');
+const chartModeComboBtnEl = document.getElementById('chartModeComboBtn');
+const chartHighlightBtnEl = document.getElementById('chartHighlightBtn');
+const chartSampleBtnsEl = document.querySelectorAll('.chart-sample-btn');
+const collapseButtonsEl = document.querySelectorAll('.collapse-btn');
+const FAVORITES_KEY = 'nba-props-favorites';
+const DENSITY_MODE_KEY = 'nba-props-density-mode';
+const CHART_PREFS_KEY = 'nba-props-chart-prefs';
+let analyzerDensityMode = localStorage.getItem(DENSITY_MODE_KEY) || 'simple';
+let upgradedChartPrefs = (() => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(CHART_PREFS_KEY) || '{}');
+    return { mode: parsed.mode === 'combo' ? 'combo' : 'bars', highlight: parsed.highlight !== false };
+  } catch {
+    return { mode: 'bars', highlight: true };
+  }
+})();
+
+function getTeamLogo(teamId) {
+  return teamId ? `https://cdn.nba.com/logos/nba/${teamId}/global/L/logo.svg` : '';
+}
+
+function loadFavoritesUpgrade() {
+  try {
+    return JSON.parse(localStorage.getItem(FAVORITES_KEY) || '[]');
+  } catch {
+    return [];
+  }
+}
+
+function saveFavoritesUpgrade(items) {
+  localStorage.setItem(FAVORITES_KEY, JSON.stringify(items.slice(0, 12)));
+}
+
+function updateStickyAnalyzerSummary() {
+  if (stickyPlayerNameEl) stickyPlayerNameEl.textContent = selectedPlayer?.full_name || 'No player selected';
+  if (stickyPropLabelEl) stickyPropLabelEl.textContent = `${selectedStat} ${lineInput?.value || '—'}`;
+  if (favoritePlayerBtnEl) {
+    const favorites = loadFavoritesUpgrade();
+    const isFavorite = !!selectedPlayer && favorites.some(item => item.type === 'player' && item.key === String(selectedPlayer.id));
+    favoritePlayerBtnEl.classList.toggle('active', isFavorite);
+  }
+}
+
+function toggleFavoriteUpgrade(item) {
+  const favorites = loadFavoritesUpgrade();
+  const key = `${item.type}:${item.key}`;
+  const existingIndex = favorites.findIndex(entry => `${entry.type}:${entry.key}` === key);
+  if (existingIndex >= 0) favorites.splice(existingIndex, 1);
+  else favorites.unshift(item);
+  saveFavoritesUpgrade(favorites);
+  renderFavoritesUpgrade();
+  updateStickyAnalyzerSummary();
+}
+
+function renderFavoritesUpgrade() {
+  if (!favoritesListEl) return;
+  const favorites = loadFavoritesUpgrade();
+  if (!favorites.length) {
+    favoritesListEl.className = 'favorites-list empty-state-panel compact';
+    favoritesListEl.innerHTML = `
+      <div class="empty-icon">💾</div>
+      <strong>No favorites yet.</strong>
+      <span>Star a player or save a prop from the analyzer to keep it here.</span>
+    `;
+    return;
+  }
+
+  favoritesListEl.className = 'favorites-list favorites-grid';
+  favoritesListEl.innerHTML = favorites.map((item, index) => {
+    const player = item.player || null;
+    const teamId = item.team_id || player?.team_id || null;
+    const teamAbbr = item.team_abbreviation || player?.team_abbreviation || '';
+    const playerName = player?.full_name || item.title || 'Saved favorite';
+    const isProp = item.type === 'prop';
+    const eyebrow = isProp ? 'Saved prop' : 'Saved player';
+    const subtitle = item.subtitle || (isProp ? 'Reusable prop setup' : (player?.position || 'Saved player'));
+    const kicker = isProp
+      ? `${item.stat || ''} ${item.line ?? ''}`.trim()
+      : [teamAbbr, player?.position].filter(Boolean).join(' • ');
+    const logo = teamId ? getTeamLogo(teamId) : '';
+    const headshot = player?.id ? getPlayerImage(player.id) : getFallbackHeadshot();
+    return `
+      <button class="favorite-card favorite-card-rich" type="button" data-index="${index}">
+        <div class="favorite-card-top">
+          <span class="favorite-type ${item.type}">${eyebrow}</span>
+          ${kicker ? `<span class="favorite-chip">${escapeHtml(kicker)}</span>` : ''}
+        </div>
+        <div class="favorite-card-body">
+          <div class="favorite-visual-shell">
+            <img class="favorite-player-shot" src="${headshot}" alt="${escapeHtml(playerName)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
+            ${logo ? `<img class="favorite-team-logo" src="${logo}" alt="${escapeHtml(teamAbbr || 'Team')}" onerror="this.style.display='none'">` : ''}
+          </div>
+          <div class="favorite-copy">
+            <strong>${escapeHtml(item.title)}</strong>
+            <small>${escapeHtml(subtitle)}</small>
+          </div>
+        </div>
+      </button>
+    `;
+  }).join('');
+
+  favoritesListEl.querySelectorAll('.favorite-card').forEach(card => {
+    card.addEventListener('click', async () => {
+      const item = favorites[Number(card.dataset.index)];
+      if (!item) return;
+      if (item.type === 'player') {
+        if (item.team_id && String(teamSelect.value) !== String(item.team_id)) {
+          teamSelect.value = String(item.team_id);
+          await loadRoster(Number(item.team_id));
+        }
+        setSelectedPlayer(item.player);
+        switchView('analyzer');
+        return;
+      }
+      if (item.type === 'prop') {
+        if (item.player?.team_id && String(teamSelect.value) !== String(item.player.team_id)) {
+          teamSelect.value = String(item.player.team_id);
+          await loadRoster(Number(item.player.team_id));
+        }
+        setSelectedPlayer(item.player);
+        setActiveProp(item.stat);
+        lineInput.value = item.line;
+        switchView('analyzer');
+        await analyzePlayerProp();
+      }
+    });
+  });
+}
+
+function applyDensityModeUpgrade(mode) {
+  analyzerDensityMode = mode === 'advanced' ? 'advanced' : 'simple';
+  document.body.classList.toggle('density-simple', analyzerDensityMode === 'simple');
+  document.body.classList.toggle('density-advanced', analyzerDensityMode === 'advanced');
+  localStorage.setItem(DENSITY_MODE_KEY, analyzerDensityMode);
+  simpleViewBtnEl?.classList.toggle('active', analyzerDensityMode === 'simple');
+  advancedViewBtnEl?.classList.toggle('active', analyzerDensityMode === 'advanced');
+}
+
+function saveChartPrefsUpgrade() {
+  localStorage.setItem(CHART_PREFS_KEY, JSON.stringify(upgradedChartPrefs));
+  chartModeBarsBtnEl?.classList.toggle('active', upgradedChartPrefs.mode === 'bars');
+  chartModeComboBtnEl?.classList.toggle('active', upgradedChartPrefs.mode === 'combo');
+  chartHighlightBtnEl?.classList.toggle('active', !!upgradedChartPrefs.highlight);
+  if (chartHighlightBtnEl) chartHighlightBtnEl.textContent = upgradedChartPrefs.highlight ? 'Highlight O/U' : 'Neutral bars';
+}
+
+function updateChartSampleButtonsUpgrade() {
+  chartSampleBtnsEl.forEach(btn => btn.classList.toggle('active', btn.dataset.sample === String(gamesSelect?.value || '10')));
+}
+
+function renderPanelSkeletonUpgrade(body, icon = '⏳', title = 'Loading...', subtitle = 'Pulling current data...') {
+  if (!body) return;
+  body.className = 'empty-state-panel compact skeleton-panel';
+  body.innerHTML = `
+    <div class="empty-icon">${icon}</div>
+    <strong>${title}</strong>
+    <span>${subtitle}</span>
+    <div class="skeleton-line"></div>
+    <div class="skeleton-line short"></div>
+  `;
+}
+
+function toggleSectionByIdUpgrade(id) {
+  const body = document.getElementById(id);
+  if (!body) return;
+  const collapsed = !body.classList.contains('collapsed');
+  body.classList.toggle('collapsed', collapsed);
+  body.closest('.card')?.classList.toggle('section-collapsed', collapsed);
+  const btn = document.querySelector(`.collapse-btn[data-collapse-target="${id}"]`);
+  if (btn) btn.textContent = collapsed ? '+' : '−';
+}
+
+function renderOverviewBestBets() {
+  if (!overviewBestBets || !overviewBestBetsMeta) return;
+  const stored = loadStoredMarketResults();
+  const results = stored?.results || [];
+  overviewBestBetsMeta.textContent = results.length ? formatStoredTime(stored.updated_at) : 'Populated by your latest Market Scanner run.';
+
+  const renderBoard = (node, items, icon, title, subtitle) => {
+    if (!node) return;
+    if (!items.length) {
+      node.className = 'overview-best-bets-list empty-state-panel compact board-empty-state';
+      node.innerHTML = `<div class="board-empty-head"><div class="empty-icon">${icon}</div><strong>${title}</strong></div><span>${subtitle}</span>`;
+      return;
+    }
+    node.className = 'overview-best-bets-list';
+    node.innerHTML = items.map((item, index) => `
+      <button class="overview-best-bet-card ${item.best_bet.confidence_tone || ''}" data-index="${index}" type="button">
+        <div class="overview-best-bet-head">
+          <span class="overview-rank">#${index + 1}</span>
+          <span class="finder-badge ${(item.best_bet.traffic_light?.tone || item.best_bet.confidence_tone || '')}">${escapeHtml(item.best_bet.display_side || item.best_bet.side)} • ${escapeHtml(item.best_bet.traffic_light?.label || item.best_bet.confidence || '')}</span>
+        </div>
+        <strong>${escapeHtml(item.player.full_name)}</strong>
+        <small>${escapeHtml(item.market.stat)} ${item.market.line} • ${escapeHtml(item.player.team || '')}${item.player.opponent ? ` vs ${escapeHtml(item.player.opponent)}` : ''}</small>
+        <div class="overview-best-bet-metrics"><span>Edge ${item.best_bet.edge ?? '—'}%</span><span>EV ${item.best_bet.ev ?? '—'}%</span></div>
+        <p>${escapeHtml(item.best_bet.explanation || item.best_bet.user_read || 'Latest board note.')}</p>
+      </button>
+    `).join('');
+    node.querySelectorAll('.overview-best-bet-card').forEach((card, idx) => card.addEventListener('click', async () => focusMarketPlayer(items[idx])));
+  };
+
+  const strongest = results.slice(0, 5);
+  const caution = results.filter(item => ['yellow', 'red'].includes(item.best_bet.traffic_light?.tone || '') || item.analysis?.availability?.is_risky || item.availability?.is_risky || (item.analysis?.matchup?.vs_position?.lean_tone === 'bad')).slice(0, 3);
+  const boosts = results.filter(item => Number(item.analysis?.team_context?.impact_count || item.team_context?.impact_count || 0) > 0 || /boost|expanded|thin|rise/i.test(String(item.analysis?.team_context?.headline || item.team_context?.headline || ''))).slice(0, 3);
+  renderBoard(overviewBestBets, strongest, '⭐', 'No best bets saved yet.', 'Run Market Scanner to pin the strongest current board edges here.');
+  renderBoard(overviewCautionBoardEl, caution, '⚠️', 'No caution spots yet.', 'Risky plays will appear here after a board scan.');
+  renderBoard(overviewBoostBoardEl, boosts, '📈', 'No injury boosts yet.', 'Plays with teammate-absence boosts will appear here.');
+}
+
+function buildTodayGameCard(game, compact = false) {
+  const statusClass = game.status_category || 'scheduled';
+  const homeSummary = game.home.availability?.headline || 'Clean report';
+  const awaySummary = game.away.availability?.headline || 'Clean report';
+  const scoreLine = game.status_category === 'scheduled'
+    ? `<div class="today-game-time">${escapeHtml(game.status_text)}</div>`
+    : `<div class="today-game-scoreline"><span>${game.away.score}</span><small>-</small><span>${game.home.score}</span></div>`;
+  return `
+    <article class="today-game-card ${compact ? 'compact' : ''} ${statusClass}">
+      <div class="today-game-head">
+        <span class="small-badge ${statusClass}">${escapeHtml(game.status_text)}</span>
+        <span class="small-meta">${escapeHtml(game.game_label)}</span>
+      </div>
+      <div class="today-game-main">
+        <div class="today-team-row with-logos">
+          <div class="today-team-side">
+            <img class="today-team-logo" src="${escapeHtml(game.away.logo || getTeamLogo(game.away.team_id))}" alt="${escapeHtml(game.away.abbreviation)} logo" onerror="this.style.display='none'">
+            <div>
+              <strong>${escapeHtml(game.away.abbreviation)}</strong>
+              <small>${escapeHtml(awaySummary)}</small>
+            </div>
+          </div>
+          ${scoreLine}
+          <div class="today-team-side today-team-home">
+            <div>
+              <strong>${escapeHtml(game.home.abbreviation)}</strong>
+              <small>${escapeHtml(homeSummary)}</small>
+            </div>
+            <img class="today-team-logo" src="${escapeHtml(game.home.logo || getTeamLogo(game.home.team_id))}" alt="${escapeHtml(game.home.abbreviation)} logo" onerror="this.style.display='none'">
+          </div>
+        </div>
+        ${compact ? '' : `
+        <div class="today-game-actions">
+          <button class="mini-team-btn" type="button" data-team-id="${game.away.team_id}">Open ${escapeHtml(game.away.abbreviation)}</button>
+          <button class="mini-team-btn" type="button" data-team-id="${game.home.team_id}">Open ${escapeHtml(game.home.abbreviation)}</button>
+        </div>`}
+      </div>
+    </article>
+  `;
+}
+
+function renderTodayGames(payload) {
+  latestTodayGamesPayload = payload;
+  const rawGames = payload.games || [];
+  const seenGameIds = new Set();
+  const games = rawGames.filter(game => {
+    const key = game.game_id || `${game.away?.team_id}-${game.home?.team_id}-${game.game_label}`;
+    if (seenGameIds.has(key)) return false;
+    seenGameIds.add(key);
+    return true;
+  });
+  if (todayGamesMeta) {
+    todayGamesMeta.textContent = payload.fallback_used
+      ? `No games on ${payload.requested_date}. Showing next slate on ${payload.resolved_date}. ${payload.report_label ? `• Report ${payload.report_label}` : ''}`
+      : `${games.length} game${games.length === 1 ? '' : 's'} on ${payload.resolved_date}${payload.report_label ? ` • Report ${payload.report_label}` : ''}`;
+  }
+  if (overviewTodayMeta) {
+    overviewTodayMeta.textContent = payload.fallback_used ? `Next slate: ${payload.resolved_date}` : `${games.length} game${games.length === 1 ? '' : 's'} on ${payload.resolved_date}`;
+  }
+  if (!games.length) {
+    const emptyHtml = `<div class="empty-state-panel compact today-game-empty"><div class="empty-icon">🗓️</div><strong>No games on the active slate.</strong><span>When the NBA schedule posts games, they will appear here with report context.</span></div>`;
+    if (todayGamesBoard) todayGamesBoard.innerHTML = emptyHtml;
+    if (overviewTodayGames) overviewTodayGames.innerHTML = emptyHtml;
+    return;
+  }
+  if (todayGamesBoard) {
+    todayGamesBoard.innerHTML = games.map(game => buildTodayGameCard(game, false)).join('');
+    bindSlateTeamButtons(todayGamesBoard);
+  }
+  if (overviewTodayGames) {
+    overviewTodayGames.className = 'today-overview-list';
+    overviewTodayGames.innerHTML = games.slice(0, 4).map(game => buildTodayGameCard(game, true)).join('');
+    bindSlateTeamButtons(overviewTodayGames);
+  }
+}
+
+function renderInterpretationPanels(payload) {
+  const interpretation = payload?.interpretation || {};
+  const opportunity = payload?.opportunity || {};
+  const teamContext = payload?.team_context || {};
+  const environment = payload?.environment || {};
+  const recommendation = payload?.traffic_light || { label: 'Caution', tone: 'yellow', summary: 'Analyze a prop to generate a clearer read.' };
+  const confidence = payload?.confidence || {};
+  const toneMap = { good: 'good', warning: 'warning', bad: 'bad', neutral: 'neutral' };
+  const interpretationToneClass = toneMap[interpretation.tone] || 'neutral';
+  const opportunityToneClass = opportunity.minutes_trend === 'up' || opportunity.volume_trend === 'up' ? 'good' : (teamContext.impact_count ? 'warning' : 'neutral');
+  const environmentToneClass = toneMap[environment.tone] || 'neutral';
+  const trafficToneClass = recommendation.tone === 'green' ? 'good' : recommendation.tone === 'red' ? 'bad' : 'warning';
+
+  if (recommendationToneEl) {
+    recommendationToneEl.className = `spotlight-pill ${trafficToneClass}`;
+    recommendationToneEl.textContent = recommendation.label || 'Recommendation';
+  }
+  if (recommendationBodyEl) {
+    recommendationBodyEl.className = 'interpretation-body';
+    recommendationBodyEl.innerHTML = `
+      <div class="insight-summary ${trafficToneClass}">
+        <span class="insight-summary-label">Traffic light</span>
+        <strong>${escapeHtml(recommendation.label || 'Caution')}</strong>
+        <p>${escapeHtml(recommendation.summary || 'Analyze a player prop to generate a clearer read.')}</p>
+      </div>
+      <div class="traffic-light-row">
+        <span class="traffic-pill ${trafficToneClass}">${escapeHtml(payload?.recommended_side || 'LEAN')}</span>
+        <span class="traffic-meta">${escapeHtml(confidence.grade || '—')} ${escapeHtml(String(confidence.score || ''))} • ${escapeHtml(confidence.summary || '')}</span>
+      </div>`;
+  }
+  if (interpretationTone) {
+    interpretationTone.className = `spotlight-pill ${interpretationToneClass}`;
+    interpretationTone.textContent = interpretation.headline || 'Quick read';
+  }
+  if (opportunityTone) {
+    opportunityTone.className = `spotlight-pill ${opportunityToneClass}`;
+    opportunityTone.textContent = opportunity.minutes_label || 'Opportunity';
+  }
+  if (environmentTone) {
+    environmentTone.className = `spotlight-pill ${environmentToneClass}`;
+    environmentTone.textContent = environment.headline || 'Schedule spot';
+  }
+  if (interpretationBody) {
+    const bullets = Array.isArray(interpretation.bullets) ? interpretation.bullets : [];
+    interpretationBody.className = 'interpretation-body';
+    interpretationBody.innerHTML = `
+      <div class="insight-summary ${interpretationToneClass}">
+        <span class="insight-summary-label">Quick read</span>
+        <strong>${escapeHtml(interpretation.headline || 'Quick read unavailable')}</strong>
+        <p>${escapeHtml(interpretation.summary || 'Analyze a player prop to generate a simple read.')}</p>
+      </div>
+      <ul class="insight-bullet-list compact-bullets">${bullets.length ? bullets.map(item => `<li>${escapeHtml(item)}</li>`).join('') : '<li>Analyze a player prop to fill this section.</li>'}</ul>`;
+  }
+  if (opportunityBody) {
+    const listedPlayers = (teamContext.players || []).map(item => `${item.name} (${item.status})`);
+    const focusMetrics = Array.isArray(opportunity.focus_metrics) ? opportunity.focus_metrics : [];
+    opportunityBody.className = 'opportunity-body';
+    opportunityBody.innerHTML = `
+      <div class="opportunity-chip-grid refined-opportunity-grid">
+        <div class="opportunity-chip"><span class="small-label">Minutes</span><strong>${Number(opportunity.minutes_last5 || 0).toFixed(1)}</strong><small>${escapeHtml(opportunity.minutes_label || 'Minutes trend')}</small></div>
+        <div class="opportunity-chip"><span class="small-label">FGA</span><strong>${Number(opportunity.fga_last5 || 0).toFixed(1)}</strong><small>${escapeHtml(opportunity.volume_label || 'Shot volume trend')}</small></div>
+        <div class="opportunity-chip"><span class="small-label">3PA</span><strong>${Number(opportunity.fg3a_last5 || 0).toFixed(1)}</strong><small>Three-point volume</small></div>
+        <div class="opportunity-chip"><span class="small-label">FTA</span><strong>${Number(opportunity.fta_last5 || 0).toFixed(1)}</strong><small>Free-throw trips</small></div>
+      </div>
+      <div class="opportunity-focus-card ${opportunityToneClass}">
+        <span class="insight-summary-label">${escapeHtml(opportunity.focus_title || 'Prop focus')}</span>
+        <strong>${escapeHtml(opportunity.focus_summary || 'Prop-specific context appears here after analysis.')}</strong>
+        <div class="opportunity-focus-grid">${focusMetrics.length ? focusMetrics.map(metric => `<div class="focus-metric"><span>${escapeHtml(metric.label)}</span><strong>${escapeHtml(String(metric.value))}</strong><small>${escapeHtml(metric.note || '')}</small></div>`).join('') : '<div class="focus-metric"><span>Stat</span><strong>—</strong><small>Analyze a prop first</small></div>'}</div>
+      </div>
+      <div class="opportunity-summary-wrap refined-opportunity-wrap">
+        <div class="insight-summary neutral compact-summary"><span class="insight-summary-label">Opportunity read</span><p class="opportunity-summary">${escapeHtml(opportunity.summary || 'Opportunity trends will appear after analysis.')}</p></div>
+        <div class="team-context-box ${teamContext.impact_count ? 'warning' : 'neutral'}"><strong>${escapeHtml(teamContext.headline || 'Team context')}</strong><p>${escapeHtml(teamContext.impact_summary || teamContext.summary || 'No team-availability context yet.')}</p>${listedPlayers.length ? `<small>${escapeHtml(listedPlayers.join(' • '))}</small>` : '<small>No major same-team absences flagged on the latest report.</small>'}</div>
+      </div>`;
+  }
+  if (environmentBody) {
+    const restValue = Number.isInteger(environment.rest_days) ? `${environment.rest_days} day${environment.rest_days === 1 ? '' : 's'}` : 'Unknown';
+    environmentBody.className = 'environment-body';
+    environmentBody.innerHTML = `
+      <div class="environment-chip-grid">
+        <div class="environment-chip"><span class="small-label">Venue</span><strong>${escapeHtml(environment.venue_label || 'TBD')}</strong><small>${escapeHtml(environment.next_opponent ? `Next ${environment.next_opponent}` : 'Upcoming game')}</small></div>
+        <div class="environment-chip"><span class="small-label">Rest</span><strong>${escapeHtml(restValue)}</strong><small>${escapeHtml(environment.headline || 'Schedule spot')}</small></div>
+        <div class="environment-chip ${environment.is_back_to_back ? 'warning' : ''}"><span class="small-label">Back-to-back</span><strong>${environment.is_back_to_back ? 'Yes' : 'No'}</strong><small>${environment.is_back_to_back ? 'More fatigue risk' : 'No immediate fatigue flag'}</small></div>
+        <div class="environment-chip"><span class="small-label">Games in 7</span><strong>${Number(environment.games_last7 || 0)}</strong><small>${Number(environment.games_last7 || 0) >= 4 ? 'Busy recent schedule' : 'Normal recent load'}</small></div>
+      </div>
+      <div class="insight-summary ${environmentToneClass} compact-summary"><span class="insight-summary-label">Schedule read</span><strong>${escapeHtml(environment.headline || 'Schedule spot')}</strong><p class="opportunity-summary">${escapeHtml(environment.summary || 'Schedule context will appear after analysis.')}</p></div>`;
+  }
+}
+
+function renderChart(payload) {
+  lastPayload = payload;
+  const labels = payload.games.map(game => game.matchup);
+  const values = payload.games.map(game => game.value);
+  const hits = payload.games.map(game => game.hit);
+  const accent = getCssVar('--accent');
+  const good = getCssVar('--good');
+  const bad = getCssVar('--bad');
+  const textColor = getChartTextColor();
+  const muted = getMutedColor();
+  const linePlugin = createLinePlugin(payload.line);
+
+  if (chart) chart.destroy();
+  const baseColors = upgradedChartPrefs.highlight ? hits.map(hit => hit ? `${good}CC` : `${bad}CC`) : values.map(() => `${accent}CC`);
+  const baseBorders = upgradedChartPrefs.highlight ? hits.map(hit => hit ? good : bad) : values.map(() => accent);
+  const datasets = [{
+    type: 'bar', label: getStatLabel(payload.stat), data: values, backgroundColor: baseColors, borderColor: baseBorders, borderWidth: 1.4, borderRadius: 12, borderSkipped: false, maxBarThickness: 42,
+  }];
+  if (upgradedChartPrefs.mode === 'combo') {
+    datasets.push({ type: 'line', label: 'Trend', data: values, borderColor: accent, pointBackgroundColor: accent, pointRadius: 3, pointHoverRadius: 4, borderWidth: 2, tension: 0.28, fill: false });
+  }
+  chart = new Chart(document.getElementById('propsChart'), {
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 520 },
+      layout: { padding: { bottom: 12 } },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: document.body.classList.contains('light-theme') ? 'rgba(255,255,255,0.96)' : 'rgba(10,16,31,0.95)',
+          titleColor: textColor,
+          bodyColor: textColor,
+          borderColor: `${accent}55`,
+          borderWidth: 1,
+          padding: 12,
+          displayColors: false,
+          callbacks: {
+            label(context) {
+              const value = context.raw;
+              const verdict = value >= payload.line ? 'Over' : 'Under';
+              return `${getStatLabel(payload.stat)}: ${value} (${verdict})`;
+            }
+          }
+        }
+      },
+      scales: {
+        x: { ticks: { color: muted, autoSkip: false, minRotation: 35, maxRotation: 35, padding: 8, callback(value, index) { return labels[index].replace(/\s+vs\.|\s+@/g, ' '); } }, grid: { display: false }, border: { display: false } },
+        y: { beginAtZero: true, ticks: { color: muted }, grid: { color: document.body.classList.contains('light-theme') ? 'rgba(17,33,63,0.08)' : 'rgba(255,255,255,0.08)' }, border: { display: false } }
+      }
+    },
+    plugins: [linePlugin]
+  });
+}
+
+if (lineInput) lineInput.addEventListener('input', updateStickyAnalyzerSummary);
+if (gamesSelect) gamesSelect.addEventListener('change', updateChartSampleButtonsUpgrade);
+simpleViewBtnEl?.addEventListener('click', () => applyDensityModeUpgrade('simple'));
+advancedViewBtnEl?.addEventListener('click', () => applyDensityModeUpgrade('advanced'));
+chartModeBarsBtnEl?.addEventListener('click', () => { upgradedChartPrefs.mode = 'bars'; saveChartPrefsUpgrade(); if (lastPayload) renderChart(lastPayload); });
+chartModeComboBtnEl?.addEventListener('click', () => { upgradedChartPrefs.mode = 'combo'; saveChartPrefsUpgrade(); if (lastPayload) renderChart(lastPayload); });
+chartHighlightBtnEl?.addEventListener('click', () => { upgradedChartPrefs.highlight = !upgradedChartPrefs.highlight; saveChartPrefsUpgrade(); if (lastPayload) renderChart(lastPayload); });
+chartSampleBtnsEl.forEach(btn => btn.addEventListener('click', async () => {
+  gamesSelect.value = btn.dataset.sample;
+  updateChartSampleButtonsUpgrade();
+  if (selectedPlayer) await analyzePlayerProp({ preserveScroll: true });
+}));
+collapseButtonsEl.forEach(btn => btn.addEventListener('click', () => toggleSectionByIdUpgrade(btn.dataset.collapseTarget)));
+favoritePlayerBtnEl?.addEventListener('click', () => {
+  if (!selectedPlayer) return;
+  toggleFavoriteUpgrade({ type: 'player', key: String(selectedPlayer.id), title: selectedPlayer.full_name, subtitle: `${selectedPlayer.team_abbreviation || ''} ${selectedPlayer.position || ''}`.trim(), team_id: selectedPlayer.team_id || null, player: selectedPlayer });
+});
+savePropBtnEl?.addEventListener('click', () => {
+  if (!selectedPlayer) return;
+  toggleFavoriteUpgrade({ type: 'prop', key: `${selectedPlayer.id}:${selectedStat}:${lineInput.value}`, title: `${selectedPlayer.full_name} • ${selectedStat} ${lineInput.value}`, subtitle: lastPayload?.traffic_light?.summary || lastPayload?.interpretation?.summary || 'Saved from analyzer', stat: selectedStat, line: Number(lineInput.value || 0), player: selectedPlayer });
+});
+analyzeBtn?.addEventListener('click', () => {
+  getMatchupTargets().forEach(target => renderPanelSkeletonUpgrade(target.body, '🛡️', 'Loading matchup...', 'Fetching the next opponent context.'));
+  renderPanelSkeletonUpgrade(recommendationBodyEl, '🚦', 'Loading recommendation...', 'Building the traffic-light read.');
+  renderPanelSkeletonUpgrade(interpretationBody, '🧠', 'Loading quick read...', 'Summarizing the latest signals.');
+  renderPanelSkeletonUpgrade(opportunityBody, '⏱️', 'Loading opportunity...', 'Pulling minutes, attempts, and team context.');
+  renderPanelSkeletonUpgrade(environmentBody, '📅', 'Loading schedule...', 'Checking the current rest and schedule spot.');
+}, true);
+marketScanBtn?.addEventListener('click', () => {
+  if (marketResults) marketResults.innerHTML = `<div class="empty-state-panel compact skeleton-panel"><div class="empty-icon">⏳</div><strong>Scanning your board...</strong><span>Comparing hit rate, implied odds, EV, and matchup context.</span><div class="skeleton-line"></div><div class="skeleton-line short"></div></div>`;
+}, true);
+applyDensityModeUpgrade(analyzerDensityMode);
+saveChartPrefsUpgrade();
+renderFavoritesUpgrade();
+renderOverviewBestBets();
+updateStickyAnalyzerSummary();
+updateChartSampleButtonsUpgrade();
+
+
+function setActiveProp(stat) {
+  selectedStat = stat;
+  propButtonsWrap.querySelectorAll('.prop-chip').forEach(chip => {
+    chip.classList.toggle('active', chip.dataset.stat === stat);
+  });
+  updateStickyAnalyzerSummary();
+}
+
+function renderSelectedPlayer() {
+  if (!selectedPlayer) {
+    selectedPlayerBadge.className = 'selected-player selected-player-empty';
+    selectedPlayerBadge.innerHTML = `
+      <div class="selected-player-avatar placeholder-avatar">NBA</div>
+      <div class="selected-player-copy">
+        <span class="selected-player-label">Waiting for a selection</span>
+        <strong>No player selected</strong>
+        <small>Choose a team, then click a player card to start.</small>
+      </div>
+    `;
+    renderOverviewSelection();
+    updateStickyAnalyzerSummary();
+    return;
+  }
+
+  const subLine = [
+    selectedPlayer.team_name || selectedPlayer.team_abbreviation || '',
+    selectedPlayer.position || '',
+    selectedPlayer.jersey ? `#${selectedPlayer.jersey}` : ''
+  ].filter(Boolean).join(' • ');
+  const availabilityHtml = selectedPlayer.availability
+    ? `<div class="selected-player-meta-row">${renderAvailabilityBadge(selectedPlayer.availability)}<small>${escapeHtml(selectedPlayer.availability.reason || selectedPlayer.availability.note || '')}</small></div>`
+    : '';
+
+  selectedPlayerBadge.className = 'selected-player';
+  selectedPlayerBadge.innerHTML = `
+    <img src="${getPlayerImage(selectedPlayer.id)}" alt="${escapeHtml(selectedPlayer.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
+    <div class="selected-player-copy">
+      <span class="selected-player-label">Selected player</span>
+      <strong>${escapeHtml(selectedPlayer.full_name)}</strong>
+      <small>${escapeHtml(subLine || (selectedPlayer.is_active ? 'Active player' : 'Player'))}</small>
+      ${availabilityHtml}
+    </div>
+  `;
+  renderOverviewSelection();
+  updateStickyAnalyzerSummary();
+}
+
+function clearAnalysisForNewSelection() {
+  resetDashboardForNoSelection();
+
+  if (recommendationToneEl) {
+    recommendationToneEl.className = 'spotlight-pill neutral';
+    recommendationToneEl.textContent = 'Waiting for analysis';
+  }
+  if (recommendationBodyEl) {
+    recommendationBodyEl.className = 'empty-state-panel compact matchup-empty';
+    recommendationBodyEl.innerHTML = `
+      <div class="empty-icon">🚦</div>
+      <strong>No recommendation yet.</strong>
+      <span>Analyze a player prop to generate a green / yellow / red read.</span>
+    `;
+  }
+  if (interpretationTone) {
+    interpretationTone.className = 'spotlight-pill neutral';
+    interpretationTone.textContent = 'Waiting for analysis';
+  }
+  if (opportunityTone) {
+    opportunityTone.className = 'spotlight-pill neutral';
+    opportunityTone.textContent = 'Waiting for analysis';
+  }
+  if (environmentTone) {
+    environmentTone.className = 'spotlight-pill neutral';
+    environmentTone.textContent = 'Waiting for analysis';
+  }
+  if (interpretationBody) {
+    interpretationBody.className = 'interpretation-body';
+    interpretationBody.innerHTML = `
+      <div class="insight-summary neutral">
+        <span class="insight-summary-label">Quick read</span>
+        <strong>Waiting for analysis</strong>
+        <p>Select a player and run the analyzer to generate a simple interpretation.</p>
+      </div>
+      <ul class="insight-bullet-list compact-bullets"><li>Recent trend, matchup, and opportunity notes will appear here.</li></ul>
+    `;
+  }
+  if (opportunityBody) {
+    opportunityBody.className = 'opportunity-body';
+    opportunityBody.innerHTML = `
+      <div class="opportunity-chip-grid refined-opportunity-grid">
+        <div class="opportunity-chip"><span class="small-label">Minutes</span><strong>—</strong><small>Waiting for analysis</small></div>
+        <div class="opportunity-chip"><span class="small-label">FGA</span><strong>—</strong><small>Waiting for analysis</small></div>
+        <div class="opportunity-chip"><span class="small-label">3PA</span><strong>—</strong><small>Waiting for analysis</small></div>
+        <div class="opportunity-chip"><span class="small-label">FTA</span><strong>—</strong><small>Waiting for analysis</small></div>
+      </div>
+      <div class="opportunity-focus-card neutral"><span class="insight-summary-label">Prop focus</span><strong>Prop-specific context will appear here after analysis.</strong></div>
+      <div class="opportunity-summary-wrap refined-opportunity-wrap">
+        <div class="insight-summary neutral compact-summary"><span class="insight-summary-label">Opportunity read</span><p class="opportunity-summary">Analyze a player prop to load minutes, attempts, and team context.</p></div>
+        <div class="team-context-box neutral"><strong>Team context</strong><p>No team-availability context yet.</p><small>Latest same-team absences will appear here after analysis.</small></div>
+      </div>
+    `;
+  }
+  if (environmentBody) {
+    environmentBody.className = 'environment-body';
+    environmentBody.innerHTML = `
+      <div class="environment-chip-grid">
+        <div class="environment-chip"><span class="small-label">Venue</span><strong>—</strong><small>Waiting for analysis</small></div>
+        <div class="environment-chip"><span class="small-label">Rest</span><strong>—</strong><small>Waiting for analysis</small></div>
+        <div class="environment-chip"><span class="small-label">Back-to-back</span><strong>—</strong><small>Waiting for analysis</small></div>
+        <div class="environment-chip"><span class="small-label">Games in 7</span><strong>—</strong><small>Waiting for analysis</small></div>
+      </div>
+      <div class="insight-summary neutral compact-summary"><span class="insight-summary-label">Schedule read</span><p class="opportunity-summary">Analyze a player prop to see rest, back-to-back risk, and the upcoming spot.</p></div>
+    `;
+  }
+  updateStickyAnalyzerSummary();
+}
+
+
+function saveLatestMarketResults(payload) {
+  const snapshot = {
+    updated_at: new Date().toISOString(),
+    results: (payload.results || []).slice(0, 12)
+  };
+  localStorage.setItem(MARKET_RESULTS_KEY, JSON.stringify(snapshot));
+}
+
+function renderMarketResults(payload) {
+  const results = payload.results || [];
+
+  if (!results.length) {
+    renderMarketEmpty('No rows produced a usable result. Check names and try again.');
+    return;
+  }
+
+  marketMeta.textContent = `${results.length} props scanned • Sorted by best edge and EV`;
+  marketResults.className = 'market-results-shell';
+  marketResults.innerHTML = `
+    <div class="market-results-table-wrap">
+      <table class="market-results-table">
+        <thead>
+          <tr>
+            <th>Player</th>
+            <th>Availability</th>
+            <th>Prop</th>
+            <th>Best side</th>
+            <th>Edge</th>
+            <th>EV</th>
+            <th>Model %</th>
+            <th>Implied %</th>
+            <th>Last ${payload.last_n}</th>
+            <th>Average</th>
+            <th>Matchup</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${results.map((item, index) => {
+    const availability = item.analysis.availability || item.availability || { status: 'Unknown', tone: 'neutral', reason: 'No report found', note: '' };
+    const matchup = item.analysis.matchup || item.matchup || {};
+    const matchupLean = matchup?.vs_position?.lean || 'No matchup';
+    const matchupDetail = matchup?.next_game?.matchup_label || 'No next opponent';
+    const trafficTone = item.best_bet.traffic_light?.tone || item.best_bet.confidence_tone || '';
+    return `
+              <tr class="market-row" data-index="${index}">
+                <td>
+                  <div class="market-player-cell">
+                    <img src="${getPlayerImage(item.player.id)}" alt="${escapeHtml(item.player.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
+                    <div>
+                      <strong>${escapeHtml(item.player.full_name)}</strong>
+                      <small>${escapeHtml(item.player.team)} vs ${escapeHtml(item.player.opponent || '')}</small>
+                      <p class="market-explainer">${escapeHtml(item.best_bet.explanation || item.best_bet.user_read || '')}</p>
+                    </div>
+                  </div>
+                </td>
+                <td><div class="market-availability-cell">${renderAvailabilityBadge(availability, true)}<small>${escapeHtml(availability.reason || availability.note || 'No official note')}</small></div></td>
+                <td>${escapeHtml(item.market.stat)} ${item.market.line}</td>
+                <td><span class="finder-badge ${trafficTone}">${item.best_bet.display_side || item.best_bet.side} • ${item.best_bet.traffic_light?.label || item.best_bet.confidence}</span></td>
+                <td class="${(item.best_bet.edge || 0) >= 0 ? 'hit-value' : 'miss-value'}">${item.best_bet.edge ?? '—'}%</td>
+                <td class="${(item.best_bet.ev || 0) >= 0 ? 'hit-value' : 'miss-value'}">${item.best_bet.ev ?? '—'}%</td>
+                <td>${item.best_bet.model_probability ?? '—'}%</td>
+                <td>${item.best_bet.implied_probability ?? '—'}%</td>
+                <td>${item.analysis.hit_count}/${item.analysis.games_count} (${item.analysis.hit_rate}%)</td>
+                <td>${item.analysis.average}</td>
+                <td><div class="market-matchup-cell"><strong>${escapeHtml(matchupLean)}</strong><small>${escapeHtml(matchupDetail)}</small></div></td>
+              </tr>`;
+  }).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+
+  marketResults.querySelectorAll('.market-row').forEach(row => {
+    row.addEventListener('click', async () => {
+      const item = results[Number(row.dataset.index)];
+      if (!item) return;
+      try {
+        setStatus('Loading market pick');
+        await focusMarketPlayer(item);
+        setStatus('Ready');
+      } catch (error) {
+        console.error(error);
+        alert(error.message || 'Failed to open that market pick.');
+        setStatus('Error');
+      }
+    });
+  });
+}
+
+async function loadTodayGames(force = false) {
+  if (latestTodayGamesPayload && !force) {
+    renderTodayGames(latestTodayGamesPayload);
+    return;
+  }
+
+  if (todayGamesMeta) todayGamesMeta.textContent = "Loading today's NBA slate...";
+  if (overviewTodayMeta) overviewTodayMeta.textContent = "Fetching today's slate...";
+  if (todayGamesBoard) todayGamesBoard.innerHTML = `<div class="empty-state-panel compact skeleton-panel today-game-empty"><div class="empty-icon">🗓️</div><strong>Loading games...</strong><span>Pulling the current slate and report context.</span><div class="skeleton-line"></div><div class="skeleton-line short"></div></div>`;
+  if (overviewTodayGames) overviewTodayGames.innerHTML = `<div class="empty-state-panel compact skeleton-panel today-game-empty"><div class="empty-icon">🗓️</div><strong>Loading games...</strong><span>Pulling the current slate and report context.</span></div>`;
+  try {
+    const response = await fetch('/api/todays-games');
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.detail || "Failed to load today's games.");
+    }
+    renderTodayGames(payload);
+  } catch (error) {
+    console.error(error);
+    const fallbackMessage = error.message || "Failed to load today's slate.";
+    if (todayGamesBoard) {
+      todayGamesBoard.innerHTML = `<div class="empty-state-panel compact today-game-empty"><div class="empty-icon">⚠️</div><strong>Could not load today&#39;s games.</strong><span>${escapeHtml(fallbackMessage)}</span></div>`;
+    }
+    if (overviewTodayGames) {
+      overviewTodayGames.innerHTML = `<div class="empty-state-panel compact today-game-empty"><div class="empty-icon">⚠️</div><strong>Could not load the slate.</strong><span>${escapeHtml(fallbackMessage)}</span></div>`;
+    }
+  }
+}
+
+
+/* === Analyzer filter upgrade === */
+const filtersBadgeEl = document.getElementById('filtersBadge');
+const activeFiltersSummaryEl = document.getElementById('activeFiltersSummary');
+const toggleAdvancedFiltersBtnEl = document.getElementById('toggleAdvancedFiltersBtn');
+const advancedFiltersPanelEl = document.getElementById('advancedFiltersPanel');
+const quickFilterChipButtonsEl = document.querySelectorAll('#quickFilterChips .filter-chip');
+const filterLocationSelectEl = document.getElementById('filterLocationSelect');
+const filterResultSelectEl = document.getElementById('filterResultSelect');
+const filterMarginMinEl = document.getElementById('filterMarginMin');
+const filterMarginMaxEl = document.getElementById('filterMarginMax');
+const filterMinMinutesEl = document.getElementById('filterMinMinutes');
+const filterMaxMinutesEl = document.getElementById('filterMaxMinutes');
+const filterMinFgaEl = document.getElementById('filterMinFga');
+const filterMaxFgaEl = document.getElementById('filterMaxFga');
+const filterH2HOnlyEl = document.getElementById('filterH2HOnly');
+const applyFiltersBtnEl = document.getElementById('applyFiltersBtn');
+const resetFiltersBtnEl = document.getElementById('resetFiltersBtn');
+
+function parseNullableNumber(value) {
+  if (value === null || value === undefined) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  const number = Number(raw);
+  return Number.isFinite(number) ? number : null;
+}
+
+function getAnalyzerFiltersState() {
+  return {
+    location: filterLocationSelectEl?.value || 'all',
+    result: filterResultSelectEl?.value || 'all',
+    margin_min: parseNullableNumber(filterMarginMinEl?.value),
+    margin_max: parseNullableNumber(filterMarginMaxEl?.value),
+    min_minutes: parseNullableNumber(filterMinMinutesEl?.value),
+    max_minutes: parseNullableNumber(filterMaxMinutesEl?.value),
+    min_fga: parseNullableNumber(filterMinFgaEl?.value),
+    max_fga: parseNullableNumber(filterMaxFgaEl?.value),
+    h2h_only: !!filterH2HOnlyEl?.checked,
+  };
+}
+
+function setAnalyzerFiltersState(state = {}) {
+  if (filterLocationSelectEl) filterLocationSelectEl.value = state.location || 'all';
+  if (filterResultSelectEl) filterResultSelectEl.value = state.result || 'all';
+  if (filterMarginMinEl) filterMarginMinEl.value = state.margin_min ?? '';
+  if (filterMarginMaxEl) filterMarginMaxEl.value = state.margin_max ?? '';
+  if (filterMinMinutesEl) filterMinMinutesEl.value = state.min_minutes ?? '';
+  if (filterMaxMinutesEl) filterMaxMinutesEl.value = state.max_minutes ?? '';
+  if (filterMinFgaEl) filterMinFgaEl.value = state.min_fga ?? '';
+  if (filterMaxFgaEl) filterMaxFgaEl.value = state.max_fga ?? '';
+  if (filterH2HOnlyEl) filterH2HOnlyEl.checked = !!state.h2h_only;
+  refreshFilterChipStates();
+  updateFilterSummaryUpgrade();
+}
+
+function resetAnalyzerFiltersState() {
+  [filterLocationSelectEl, filterResultSelectEl, filterMarginMinEl, filterMarginMaxEl, filterMinMinutesEl, filterMaxMinutesEl, filterMinFgaEl, filterMaxFgaEl, filterH2HOnlyEl].forEach(el => {
+    el?.addEventListener('input', () => { refreshFilterChipStates(); updateFilterSummaryUpgrade(); });
+    el?.addEventListener('change', () => { refreshFilterChipStates(); updateFilterSummaryUpgrade(); });
+  });
+
+  setAnalyzerFiltersState({ location: 'all', result: 'all', h2h_only: false });
+}
+
+function buildFilterSummaryCopy(filters) {
+  const chips = [];
+  if (filters.location === 'home') chips.push('Home');
+  else if (filters.location === 'away') chips.push('Away');
+  if (filters.result === 'win') chips.push('Wins');
+  else if (filters.result === 'loss') chips.push('Losses');
+  if (filters.margin_min !== null || filters.margin_max !== null) {
+    if (filters.margin_min !== null && filters.margin_max !== null) chips.push(`Margin ${filters.margin_min}-${filters.margin_max}`);
+    else if (filters.margin_min !== null) chips.push(`Margin ≥ ${filters.margin_min}`);
+    else chips.push(`Margin ≤ ${filters.margin_max}`);
+  }
+  if (filters.min_minutes !== null || filters.max_minutes !== null) {
+    if (filters.min_minutes !== null && filters.max_minutes !== null) chips.push(`MIN ${filters.min_minutes}-${filters.max_minutes}`);
+    else if (filters.min_minutes !== null) chips.push(`MIN ≥ ${filters.min_minutes}`);
+    else chips.push(`MIN ≤ ${filters.max_minutes}`);
+  }
+  if (filters.min_fga !== null || filters.max_fga !== null) {
+    if (filters.min_fga !== null && filters.max_fga !== null) chips.push(`FGA ${filters.min_fga}-${filters.max_fga}`);
+    else if (filters.min_fga !== null) chips.push(`FGA ≥ ${filters.min_fga}`);
+    else chips.push(`FGA ≤ ${filters.max_fga}`);
+  }
+  if (filters.h2h_only) chips.push('H2H only');
+  return { label: chips.length ? chips.join(' • ') : 'All games', hasFilters: chips.length > 0, chips };
+}
+
+function updateFilterSummaryUpgrade(payload = null) {
+  const filterSummary = payload?.active_filters || buildFilterSummaryCopy(getAnalyzerFiltersState());
+  if (filtersBadgeEl) {
+    filtersBadgeEl.textContent = filterSummary.label || 'All games';
+    filtersBadgeEl.className = `spotlight-pill ${filterSummary.has_filters ? 'good' : 'neutral'}`;
+  }
+  if (activeFiltersSummaryEl) {
+    if (payload?.filtered_pool_count !== undefined && payload?.season_pool_count !== undefined) {
+      activeFiltersSummaryEl.textContent = `${filterSummary.label || 'All games'} • Using ${payload.filtered_pool_count} of ${payload.season_pool_count} season games.`;
+    } else {
+      activeFiltersSummaryEl.textContent = filterSummary.hasFilters
+        ? `${filterSummary.label} • Applied to the analyzer, chart, and game log.`
+        : 'No active filters. Using all games in the selected season.';
+    }
+  }
+}
+
+function detectPresetMatch(filters) {
+  const checks = {
+    all: !buildFilterSummaryCopy(filters).hasFilters,
+    home: filters.location === 'home' && !filters.result && false,
+  };
+  if (filters.location === 'home' && filters.result === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && !filters.h2h_only) return 'home';
+  if (filters.location === 'away' && filters.result === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && !filters.h2h_only) return 'away';
+  if (filters.result === 'win' && filters.location === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && !filters.h2h_only) return 'wins';
+  if (filters.result === 'loss' && filters.location === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && !filters.h2h_only) return 'losses';
+  if (filters.h2h_only && filters.location === 'all' && filters.result === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null) return 'h2h';
+  if (filters.min_minutes === 30 && filters.max_minutes === null && filters.location === 'all' && filters.result === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_fga === null && filters.max_fga === null && !filters.h2h_only) return 'min30';
+  if (filters.margin_min === 0 && filters.margin_max === 5 && filters.location === 'all' && filters.result === 'all' && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && !filters.h2h_only) return 'close';
+  if (filters.margin_min === 11 && filters.margin_max === null && filters.location === 'all' && filters.result === 'all' && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && !filters.h2h_only) return 'blowout';
+  return buildFilterSummaryCopy(filters).hasFilters ? '' : 'all';
+}
+
+function refreshFilterChipStates() {
+  const preset = detectPresetMatch(getAnalyzerFiltersState());
+  quickFilterChipButtonsEl.forEach(btn => btn.classList.toggle('active', btn.dataset.filterPreset === preset));
+}
+
+function applyFilterPresetUpgrade(preset) {
+  const state = { location: 'all', result: 'all', h2h_only: false };
+  if (preset === 'home') state.location = 'home';
+  else if (preset === 'away') state.location = 'away';
+  else if (preset === 'wins') state.result = 'win';
+  else if (preset === 'losses') state.result = 'loss';
+  else if (preset === 'h2h') state.h2h_only = true;
+  else if (preset === 'min30') state.min_minutes = 30;
+  else if (preset === 'close') { state.margin_min = 0; state.margin_max = 5; }
+  else if (preset === 'blowout') { state.margin_min = 11; }
+  setAnalyzerFiltersState(state);
+  if (selectedPlayer) analyzePlayerProp({ preserveScroll: true, preserveSection: true });
+}
+
+function getAnalyzerFocusScrollTarget() {
+  return document.querySelector('.chart-card') || document.querySelector('.analyzer-filter-card') || document.querySelector('[data-view="analyzer"]');
+}
+
+function scrollAnalyzerFocusIntoView() {
+  const target = getAnalyzerFocusScrollTarget();
+  if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function renderEmptyFilterStatesUpgrade() {
+  if (!gameLogMeta) return;
+  gameLogMeta.textContent = 'No games matched the active filters';
+  gamesTableBody.innerHTML = `
+    <tr>
+      <td colspan="8">
+        <div class="empty-state-panel compact">
+          <div class="empty-icon">🧪</div>
+          <strong>No games matched the filters.</strong>
+          <span>Relax the current split or reset the filters to repopulate the trend view and game log.</span>
+        </div>
+      </td>
+    </tr>
+  `;
+  if (chartTitle) chartTitle.textContent = 'No games matched the active filters';
+  if (chartSubtitle) chartSubtitle.textContent = 'Adjust or reset the analyzer filters to rebuild the trend view.';
+  if (chartChips) chartChips.innerHTML = '<span class="chart-chip">No filtered sample</span>';
+  if (chart) { chart.destroy(); chart = null; }
+}
+
+function renderSummary(payload) {
+  const streak = computeOverStreak(payload.games || []);
+  const lastGame = payload.games?.[payload.games.length - 1];
+  avgValue.textContent = Number(payload.average || 0).toFixed(1);
+  hitRateValue.textContent = `${Number(payload.hit_rate || 0).toFixed(1)}%`;
+  hitCountValue.textContent = `${payload.hit_count || 0}/${payload.games_count || 0}`;
+  seasonValue.textContent = payload.season;
+  streakValue.textContent = streak ? `${streak} straight` : '0';
+  lastGameValue.textContent = lastGame ? `${lastGame.value}` : '—';
+
+  const nextGame = payload.matchup?.next_game;
+  const vsPosition = payload.matchup?.vs_position;
+  const h2h = payload.h2h || {};
+  chartTitle.textContent = `${payload.player.full_name} • ${getStatLabel(payload.stat)}`;
+  chartSubtitle.textContent = nextGame
+    ? `Line ${payload.line} across the last ${payload.last_n} filtered games • Next ${nextGame.matchup_label}`
+    : `Line ${payload.line} across the last ${payload.last_n} filtered games.`;
+
+  chartChips.innerHTML = `
+    <span class="chart-chip">Avg ${Number(payload.average || 0).toFixed(1)}</span>
+    <span class="chart-chip">${payload.hit_count || 0}/${payload.games_count || 0} overs</span>
+    <span class="chart-chip">${Number(payload.hit_rate || 0).toFixed(1)}% hit rate</span>
+    <span class="chart-chip">Season ${escapeHtml(payload.season || '')}</span>
+    <span class="chart-chip">Current streak ${streak}</span>
+    ${payload.active_filters?.label ? `<span class="chart-chip">${escapeHtml(payload.active_filters.label)}</span>` : ''}
+    ${payload.filtered_pool_count !== undefined ? `<span class="chart-chip">Pool ${payload.filtered_pool_count}/${payload.season_pool_count}</span>` : ''}
+    ${payload.availability ? `<span class="chart-chip">Status ${escapeHtml(payload.availability.status)}</span>` : ''}
+    ${nextGame ? `<span class="chart-chip">Next ${escapeHtml(nextGame.matchup_label)}</span>` : ''}
+    ${vsPosition ? `<span class="chart-chip">Vs ${escapeHtml(vsPosition.position_label)} ${formatDelta(vsPosition.delta_pct)}%</span>` : ''}
+    ${h2h.games_count ? `<span class="chart-chip">H2H ${h2h.hit_count}/${h2h.games_count} vs ${escapeHtml(h2h.opponent_abbreviation || h2h.opponent_name || 'opponent')}</span>` : ''}
+  `;
+
+  renderMatchup(payload);
+  renderInterpretationPanels(payload);
+  updateFilterSummaryUpgrade(payload);
+}
+
+async function analyzePlayerProp(options = {}) {
+  switchView('analyzer', { scroll: !options.preserveScroll });
+  if (!selectedPlayer) {
+    alert('Please select a player first.');
+    return;
+  }
+
+  setStatus('Loading');
+  analyzeBtn.disabled = true;
+
+  try {
+    const params = new URLSearchParams({
+      player_id: selectedPlayer.id,
+      stat: selectedStat,
+      line: lineInput.value,
+      last_n: gamesSelect.value
+    });
+    if (selectedPlayer.team_id) params.set('team_id', selectedPlayer.team_id);
+    if (selectedPlayer.position) params.set('player_position', selectedPlayer.position);
+    const season = seasonInput.value.trim();
+    if (season) params.set('season', season);
+
+    const filters = getAnalyzerFiltersState();
+    if (filters.location && filters.location !== 'all') params.set('location', filters.location);
+    if (filters.result && filters.result !== 'all') params.set('result', filters.result);
+    if (filters.margin_min !== null) params.set('margin_min', String(filters.margin_min));
+    if (filters.margin_max !== null) params.set('margin_max', String(filters.margin_max));
+    if (filters.min_minutes !== null) params.set('min_minutes', String(filters.min_minutes));
+    if (filters.max_minutes !== null) params.set('max_minutes', String(filters.max_minutes));
+    if (filters.min_fga !== null) params.set('min_fga', String(filters.min_fga));
+    if (filters.max_fga !== null) params.set('max_fga', String(filters.max_fga));
+    if (filters.h2h_only) params.set('h2h_only', 'true');
+
+    const response = await fetch(`/api/player-prop?${params.toString()}`);
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || 'Failed to analyze player prop.');
+
+    selectedPlayer = {
+      ...selectedPlayer,
+      team_id: payload.player.team_id || selectedPlayer.team_id,
+      position: payload.player.position || selectedPlayer.position,
+      availability: payload.availability || null
+    };
+    renderSelectedPlayer();
+    renderSummary(payload);
+    if (payload.games && payload.games.length) {
+      renderChart(payload);
+      renderTable(payload);
+    } else {
+      renderEmptyFilterStatesUpgrade();
+      renderInterpretationPanels(payload);
+      updateFilterSummaryUpgrade(payload);
+    }
+    setStatus('Ready');
+    if (options.preserveSection) {
+      requestAnimationFrame(() => scrollAnalyzerFocusIntoView());
+    }
+  } catch (error) {
+    console.error(error);
+    alert(error.message);
+    setStatus('Error');
+  } finally {
+    analyzeBtn.disabled = false;
+  }
+}
+
+toggleAdvancedFiltersBtnEl?.addEventListener('click', () => {
+  advancedFiltersPanelEl?.classList.toggle('hidden');
+  if (toggleAdvancedFiltersBtnEl) toggleAdvancedFiltersBtnEl.textContent = advancedFiltersPanelEl?.classList.contains('hidden') ? 'Advanced' : 'Hide';
+});
+
+quickFilterChipButtonsEl.forEach(btn => btn.addEventListener('click', () => applyFilterPresetUpgrade(btn.dataset.filterPreset || 'all')));
+applyFiltersBtnEl?.addEventListener('click', async () => {
+  updateFilterSummaryUpgrade();
+  if (selectedPlayer) await analyzePlayerProp({ preserveScroll: true, preserveSection: true });
+});
+resetFiltersBtnEl?.addEventListener('click', async () => {
+  resetAnalyzerFiltersState();
+  if (selectedPlayer) await analyzePlayerProp({ preserveScroll: true, preserveSection: true });
+});
+
+[filterLocationSelectEl, filterResultSelectEl, filterMarginMinEl, filterMarginMaxEl, filterMinMinutesEl, filterMaxMinutesEl, filterMinFgaEl, filterMaxFgaEl, filterH2HOnlyEl].forEach(el => {
+  el?.addEventListener('input', () => { refreshFilterChipStates(); updateFilterSummaryUpgrade(); });
+  el?.addEventListener('change', () => { refreshFilterChipStates(); updateFilterSummaryUpgrade(); });
+});
+
+setAnalyzerFiltersState({ location: 'all', result: 'all', h2h_only: false });

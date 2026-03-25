@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import copy
-import math
-
 import re
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from io import BytesIO
@@ -87,7 +85,10 @@ TEAM_ALIAS_LOOKUP = build_team_alias_lookup()
 CACHE_TTL_SECONDS = 1800
 PROFILE_TTL_SECONDS = 86400
 POSITION_TTL_SECONDS = 43200
-NEXT_GAME_TTL_SECONDS = 3600
+NEXT_GAME_TTL_SECONDS = 900
+PLAYER_BASE_CONTEXT_TTL_SECONDS = 1800
+PROP_ANALYSIS_CACHE_TTL_SECONDS = 180
+REQUEST_MIN_INTERVAL_SECONDS = 0.15
 GAME_LOG_CACHE: dict[tuple[int, str, str], dict[str, Any]] = {}
 ROSTER_CACHE: dict[tuple[int, str], dict[str, Any]] = {}
 PLAYER_INFO_CACHE: dict[int, dict[str, Any]] = {}
@@ -95,9 +96,8 @@ NEXT_GAME_CACHE: dict[tuple[int, str, str], dict[str, Any]] = {}
 TEAM_NEXT_GAME_CACHE: dict[tuple[int, str, str], dict[str, Any]] = {}
 POSITION_DASH_CACHE: dict[tuple[str, str, str, int], dict[str, Any]] = {}
 SCOREBOARD_CACHE: dict[str, dict[str, Any]] = {}
-ENRICHED_LOG_CACHE: dict[tuple[int, str, str, int | None], dict[str, Any]] = {}
-ANALYSIS_CACHE_TTL_SECONDS = 300
-ANALYSIS_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+PLAYER_BASE_CONTEXT_CACHE: dict[tuple[int, str, str, int, str], dict[str, Any]] = {}
+PROP_ANALYSIS_CACHE: dict[tuple[int, str, float, int, str, str, int, str], dict[str, Any]] = {}
 INJURY_REPORT_PAGE_URL = "https://official.nba.com/nba-injury-report-2025-26-season/"
 INJURY_REPORT_TTL_SECONDS = 600
 INJURY_REPORT_CACHE: dict[str, Any] = {"timestamp": 0.0, "payload": None}
@@ -791,14 +791,7 @@ def build_confidence_engine(
     ev: float,
     matchup_delta_pct: float | None,
     availability: dict[str, Any],
-    opportunity: dict[str, Any] | None = None,
-    team_context: dict[str, Any] | None = None,
-    environment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    opportunity = opportunity or {}
-    team_context = team_context or {}
-    environment = environment or {}
-
     if availability.get("is_unavailable"):
         return {
             "grade": "X",
@@ -812,53 +805,25 @@ def build_confidence_engine(
     if side == "UNDER":
         matchup_value *= -1
 
-    score = 42.0
-    score += max(-16.0, min(18.0, ev * 105.0))
-    score += max(-14.0, min(16.0, edge_value * 1.0))
-    score += max(-10.0, min(13.0, (hit_rate - 50.0) * 0.44))
-    score += max(-5.0, min(6.0, (games_count - 5) * 0.65))
+    score = 44.0
+    score += max(-14.0, min(20.0, ev * 110.0))
+    score += max(-12.0, min(18.0, edge_value * 1.1))
+    score += max(-9.0, min(15.0, (hit_rate - 50.0) * 0.48))
+    score += max(-5.0, min(7.0, (games_count - 5) * 0.7))
 
     matchup_penalty_applied = False
     matchup_bonus_applied = False
     if matchup_delta_pct is not None:
         if matchup_value >= 0:
-            score += max(0.0, min(8.0, matchup_value * 0.28))
+            score += max(0.0, min(8.0, matchup_value * 0.32))
             matchup_bonus_applied = matchup_value >= 5
         else:
-            score -= max(0.0, min(24.0, abs(matchup_value) * 0.95))
+            score -= max(0.0, min(22.0, abs(matchup_value) * 0.9))
             matchup_penalty_applied = abs(matchup_value) >= 5
             if abs(matchup_value) >= 12:
-                score = min(score, 72.0)
+                score = min(score, 74.0)
             elif abs(matchup_value) >= 5:
-                score = min(score, 81.0)
-
-    minutes_trend = str(opportunity.get("minutes_trend") or "steady")
-    volume_trend = str(opportunity.get("volume_trend") or "steady")
-    if minutes_trend == "up":
-        score += 4.0
-    elif minutes_trend == "down":
-        score -= 5.0
-
-    if volume_trend == "up":
-        score += 4.0 if side == "OVER" else -2.0
-    elif volume_trend == "down":
-        score -= 4.0 if side == "OVER" else 2.0
-
-    impact_count = int(team_context.get("impact_count") or 0)
-    if impact_count:
-        score += min(4.0, impact_count * 1.5) if side == "OVER" else max(-2.0, -impact_count * 0.8)
-
-    rest_days = environment.get("rest_days")
-    if isinstance(rest_days, int):
-        if rest_days >= 2:
-            score += 3.0
-        elif rest_days == 0:
-            score -= 4.0
-
-    if environment.get("is_back_to_back"):
-        score -= 6.0
-    elif environment.get("schedule_density") == "light":
-        score += 2.0
+                score = min(score, 83.0)
 
     if availability.get("is_risky"):
         score -= 14.0
@@ -896,20 +861,10 @@ def build_confidence_engine(
     else:
         summary_parts.append("limited EV")
 
-    if minutes_trend == "up" or volume_trend == "up":
-        summary_parts.append("role trending up")
-    elif minutes_trend == "down" or volume_trend == "down":
-        summary_parts.append("role cooling off")
-
     if matchup_bonus_applied:
         summary_parts.append("supportive matchup")
     elif matchup_penalty_applied:
         summary_parts.append("tough matchup penalty")
-
-    if environment.get("is_back_to_back"):
-        summary_parts.append("back-to-back spot")
-    elif isinstance(rest_days, int) and rest_days >= 2:
-        summary_parts.append("extra rest")
 
     if availability.get("is_risky"):
         summary_parts.append("watch availability")
@@ -921,13 +876,14 @@ def build_confidence_engine(
         "summary": " • ".join(summary_parts).capitalize(),
     }
 
+
 def throttle_request() -> None:
     global LAST_REQUEST_TIME
 
     with REQUEST_LOCK:
         elapsed = time.time() - LAST_REQUEST_TIME
-        if elapsed < 0.35:
-            time.sleep(0.35 - elapsed)
+        if elapsed < REQUEST_MIN_INTERVAL_SECONDS:
+            time.sleep(REQUEST_MIN_INTERVAL_SECONDS - elapsed)
         LAST_REQUEST_TIME = time.time()
 
 
@@ -970,101 +926,8 @@ def safe_stat_number(row: dict[str, Any], key: str) -> float:
         return 0.0
 
 
-def safe_int_score(*values: Any) -> int:
-    for value in values:
-        if value is None:
-            continue
-        if isinstance(value, str) and not value.strip():
-            continue
-        try:
-            number = float(value)
-            if math.isnan(number):
-                continue
-            return int(number)
-        except Exception:
-            continue
-    return 0
-
-
 def average_or_zero(values: list[float], digits: int = 1) -> float:
     return round(sum(values) / len(values), digits) if values else 0.0
-
-
-def parse_game_date_any(raw_value: Any) -> datetime | None:
-    raw = str(raw_value or "").strip()
-    if not raw:
-        return None
-
-    for fmt in ("%b %d, %Y", "%Y-%m-%d", "%m/%d/%Y"):
-        try:
-            return datetime.strptime(raw, fmt)
-        except Exception:
-            pass
-
-    iso_candidate = raw.replace("Z", "+00:00")
-    try:
-        return datetime.fromisoformat(iso_candidate)
-    except Exception:
-        pass
-
-    match = re.search(r"(\d{4}-\d{2}-\d{2})", raw)
-    if match:
-        try:
-            return datetime.strptime(match.group(1), "%Y-%m-%d")
-        except Exception:
-            pass
-
-    return None
-
-
-def build_game_environment_context(season_rows: list[dict[str, Any]], next_game: dict[str, Any] | None) -> dict[str, Any]:
-    last_game_dt = parse_game_date_any(season_rows[0].get("GAME_DATE")) if season_rows else None
-    next_game_dt = parse_game_date_any((next_game or {}).get("game_date"))
-
-    rest_days: int | None = None
-    is_back_to_back = False
-    if last_game_dt and next_game_dt:
-        rest_days = max(0, (next_game_dt.date() - last_game_dt.date()).days - 1)
-        is_back_to_back = rest_days == 0
-
-    games_last7 = 0
-    if next_game_dt:
-        for row in season_rows:
-            row_dt = parse_game_date_any(row.get("GAME_DATE"))
-            if not row_dt:
-                continue
-            gap = (next_game_dt.date() - row_dt.date()).days
-            if 0 < gap <= 7:
-                games_last7 += 1
-
-    if is_back_to_back:
-        headline = "Back-to-back spot"
-        tone = "warning"
-        summary = "No rest between games can trim ceiling and add volatility."
-    elif isinstance(rest_days, int) and rest_days >= 2:
-        headline = "Rest edge"
-        tone = "good"
-        summary = "Extra rest can support workload and late-game legs."
-    else:
-        headline = "Normal rest"
-        tone = "neutral"
-        summary = "Nothing unusual from the schedule spot right now."
-
-    if games_last7 >= 4 and not is_back_to_back:
-        summary = "Heavy recent schedule can still create fatigue even without a true back-to-back."
-        tone = "warning"
-        headline = "Busy schedule"
-
-    return {
-        "headline": headline,
-        "tone": tone,
-        "summary": summary,
-        "rest_days": rest_days,
-        "is_back_to_back": is_back_to_back,
-        "games_last7": games_last7,
-        "venue_label": "Home" if (next_game or {}).get("is_home") else ("Away" if next_game else "TBD"),
-        "next_opponent": (next_game or {}).get("opponent_abbreviation") or "",
-    }
 
 
 def build_game_log_entry(row: dict[str, Any], stat: str, line: float) -> dict[str, Any]:
@@ -1078,194 +941,6 @@ def build_game_log_entry(row: dict[str, Any], stat: str, line: float) -> dict[st
         "fga": round(safe_stat_number(row, "FGA"), 1),
         "fg3a": round(safe_stat_number(row, "FG3A"), 1),
         "fta": round(safe_stat_number(row, "FTA"), 1),
-    }
-
-def parse_matchup_descriptor(matchup: str) -> dict[str, Any]:
-    raw = str(matchup or '').strip()
-    location = 'neutral'
-    team_abbreviation = ''
-    opponent_abbreviation = ''
-    if ' vs. ' in raw:
-        parts = raw.split(' vs. ', 1)
-        location = 'home'
-    elif ' @ ' in raw:
-        parts = raw.split(' @ ', 1)
-        location = 'away'
-    else:
-        parts = [raw, '']
-    if parts:
-        team_abbreviation = str(parts[0] or '').strip().upper()
-    if len(parts) > 1:
-        opponent_abbreviation = str(parts[1] or '').strip().upper()
-    return {
-        'location': location,
-        'team_abbreviation': team_abbreviation,
-        'opponent_abbreviation': opponent_abbreviation,
-    }
-
-
-def enrich_game_logs_with_context(season_rows: list[dict[str, Any]], team_id: int | None, season: str, season_type: str, player_id: int) -> list[dict[str, Any]]:
-    cache_key = (player_id, season, season_type, team_id)
-    cached = ENRICHED_LOG_CACHE.get(cache_key)
-    now_ts = time.time()
-    if cached and now_ts - cached['timestamp'] < CACHE_TTL_SECONDS:
-        return [dict(row) for row in cached['rows']]
-
-    scoreboards_by_date: dict[str, list[dict[str, Any]]] = {}
-    enriched: list[dict[str, Any]] = []
-    for row in season_rows:
-        row_copy = dict(row)
-        matchup_info = parse_matchup_descriptor(row_copy.get('MATCHUP', ''))
-        row_copy['_location'] = matchup_info['location']
-        row_copy['_opponent_abbreviation'] = matchup_info['opponent_abbreviation']
-        row_copy['_minutes'] = parse_minutes_to_decimal(row_copy.get('MIN'))
-        row_copy['_fga'] = round(safe_stat_number(row_copy, 'FGA'), 1)
-        row_copy['_fg3a'] = round(safe_stat_number(row_copy, 'FG3A'), 1)
-        row_copy['_fta'] = round(safe_stat_number(row_copy, 'FTA'), 1)
-        wl = str(row_copy.get('WL') or '').strip().upper()
-        row_copy['_result'] = 'win' if wl == 'W' else ('loss' if wl == 'L' else 'all')
-        row_copy['_margin'] = None
-
-        game_id = str(row_copy.get('Game_ID') or row_copy.get('GAME_ID') or '').strip()
-        game_date = parse_game_date_any(row_copy.get('GAME_DATE'))
-        if game_id and game_date:
-            date_key = game_date.strftime('%Y-%m-%d')
-            if date_key not in scoreboards_by_date:
-                scoreboards_by_date[date_key] = fetch_scoreboard_games(date_key)
-            game_row = next((item for item in scoreboards_by_date[date_key] if str(item.get('GAME_ID') or '').strip() == game_id), None)
-            if game_row:
-                home_team_id = int(game_row.get('HOME_TEAM_ID') or 0)
-                away_team_id = int(game_row.get('VISITOR_TEAM_ID') or 0)
-                home_score = safe_int_score(game_row.get('PTS_HOME'), 0)
-                away_score = safe_int_score(game_row.get('PTS_AWAY'), 0)
-                if team_id and team_id == home_team_id:
-                    row_copy['_margin'] = home_score - away_score
-                elif team_id and team_id == away_team_id:
-                    row_copy['_margin'] = away_score - home_score
-                elif matchup_info['location'] == 'home':
-                    row_copy['_margin'] = home_score - away_score
-                elif matchup_info['location'] == 'away':
-                    row_copy['_margin'] = away_score - home_score
-
-        enriched.append(row_copy)
-
-    ENRICHED_LOG_CACHE[cache_key] = {'timestamp': now_ts, 'rows': [dict(row) for row in enriched]}
-    return enriched
-
-
-def enrich_game_logs_light(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    enriched: list[dict[str, Any]] = []
-    for row in rows:
-        row_copy = dict(row)
-        matchup_info = parse_matchup_descriptor(row_copy.get('MATCHUP', ''))
-        row_copy['_location'] = matchup_info['location']
-        row_copy['_opponent_abbreviation'] = matchup_info['opponent_abbreviation']
-        row_copy['_minutes'] = parse_minutes_to_decimal(row_copy.get('MIN'))
-        row_copy['_fga'] = round(safe_stat_number(row_copy, 'FGA'), 1)
-        row_copy['_fg3a'] = round(safe_stat_number(row_copy, 'FG3A'), 1)
-        row_copy['_fta'] = round(safe_stat_number(row_copy, 'FTA'), 1)
-        wl = str(row_copy.get('WL') or '').strip().upper()
-        row_copy['_result'] = 'win' if wl == 'W' else ('loss' if wl == 'L' else 'all')
-        row_copy['_margin'] = None
-        enriched.append(row_copy)
-    return enriched
-
-
-def apply_game_log_filters(
-    rows: list[dict[str, Any]],
-    *,
-    location: str = 'all',
-    result: str = 'all',
-    margin_min: float | None = None,
-    margin_max: float | None = None,
-    min_minutes: float | None = None,
-    max_minutes: float | None = None,
-    min_fga: float | None = None,
-    max_fga: float | None = None,
-    h2h_only: bool = False,
-    opponent_abbreviation: str | None = None,
-) -> list[dict[str, Any]]:
-    location = str(location or 'all').lower()
-    result = str(result or 'all').lower()
-    opponent_abbreviation = str(opponent_abbreviation or '').upper().strip()
-
-    filtered: list[dict[str, Any]] = []
-    for row in rows:
-        if location in {'home', 'away'} and str(row.get('_location') or '').lower() != location:
-            continue
-        if result in {'win', 'loss'} and str(row.get('_result') or '').lower() != result:
-            continue
-        margin = row.get('_margin')
-        abs_margin = abs(float(margin)) if isinstance(margin, (int, float)) else None
-        if margin_min is not None and (abs_margin is None or abs_margin < margin_min):
-            continue
-        if margin_max is not None and (abs_margin is None or abs_margin > margin_max):
-            continue
-        minutes_value = float(row.get('_minutes') or 0)
-        fga_value = float(row.get('_fga') or 0)
-        if min_minutes is not None and minutes_value < min_minutes:
-            continue
-        if max_minutes is not None and minutes_value > max_minutes:
-            continue
-        if min_fga is not None and fga_value < min_fga:
-            continue
-        if max_fga is not None and fga_value > max_fga:
-            continue
-        if h2h_only:
-            if not opponent_abbreviation or opponent_abbreviation not in str(row.get('MATCHUP') or '').upper():
-                continue
-        filtered.append(row)
-    return filtered
-
-
-def build_filter_summary(
-    *,
-    location: str = 'all',
-    result: str = 'all',
-    margin_min: float | None = None,
-    margin_max: float | None = None,
-    min_minutes: float | None = None,
-    max_minutes: float | None = None,
-    min_fga: float | None = None,
-    max_fga: float | None = None,
-    h2h_only: bool = False,
-) -> dict[str, Any]:
-    chips: list[str] = []
-    if location == 'home':
-        chips.append('Home')
-    elif location == 'away':
-        chips.append('Away')
-    if result == 'win':
-        chips.append('Wins')
-    elif result == 'loss':
-        chips.append('Losses')
-    if margin_min is not None or margin_max is not None:
-        if margin_min is not None and margin_max is not None:
-            chips.append(f'Margin {margin_min:g}-{margin_max:g}')
-        elif margin_min is not None:
-            chips.append(f'Margin ≥ {margin_min:g}')
-        else:
-            chips.append(f'Margin ≤ {margin_max:g}')
-    if min_minutes is not None or max_minutes is not None:
-        if min_minutes is not None and max_minutes is not None:
-            chips.append(f'MIN {min_minutes:g}-{max_minutes:g}')
-        elif min_minutes is not None:
-            chips.append(f'MIN ≥ {min_minutes:g}')
-        else:
-            chips.append(f'MIN ≤ {max_minutes:g}')
-    if min_fga is not None or max_fga is not None:
-        if min_fga is not None and max_fga is not None:
-            chips.append(f'FGA {min_fga:g}-{max_fga:g}')
-        elif min_fga is not None:
-            chips.append(f'FGA ≥ {min_fga:g}')
-        else:
-            chips.append(f'FGA ≤ {max_fga:g}')
-    if h2h_only:
-        chips.append('H2H only')
-    return {
-        'chips': chips,
-        'label': ' • '.join(chips) if chips else 'All games',
-        'has_filters': bool(chips),
     }
 
 
@@ -1416,7 +1091,6 @@ def build_analyzer_interpretation(
     opportunity: dict[str, Any],
     team_context: dict[str, Any],
     h2h: dict[str, Any],
-    environment: dict[str, Any],
 ) -> dict[str, Any]:
     avg_edge = round(average - line, 1)
     matchup = matchup or {}
@@ -1441,15 +1115,15 @@ def build_analyzer_interpretation(
         headline = 'Status check first'
         summary = 'There is injury risk on the player, so wait for a final status check before treating this as a live play.'
         bullets.append(f"{availability.get('status')}: {availability.get('reason') or availability.get('note')}")
-    elif hit_rate >= 75 and avg_edge >= 1.0 and lean.lower() in {'good matchup', 'favorable', 'very favorable'} and not environment.get('is_back_to_back'):
+    elif hit_rate >= 75 and avg_edge >= 1.0 and lean.lower() in {'good matchup', 'favorable', 'strong over environment'}:
         tone = 'good'
         headline = 'Strong over case'
         summary = f'Recent form, line clearance, and matchup support all point in the same direction for this {get_stat_label_for_copy(stat).lower()} over.'
-    elif hit_rate >= 65 and avg_edge >= 0.5 and opportunity.get('minutes_trend') == 'up':
+    elif hit_rate >= 65 and avg_edge >= 0.5:
         tone = 'good'
         headline = 'Over lean'
-        summary = f'The recent sample leans over this {get_stat_label_for_copy(stat).lower()} line, and the player is trending into enough minutes to keep the over live.'
-    elif hit_rate <= 35 and avg_edge <= -1.0 and lean.lower() in {'tough', 'very tough', 'bad matchup'}:
+        summary = f'The recent sample leans over this {get_stat_label_for_copy(stat).lower()} line, but it still looks more like a lean than a lock.'
+    elif hit_rate <= 35 and avg_edge <= -1.0 and lean.lower() in {'tough environment', 'tough matchup', 'bad matchup'}:
         tone = 'bad'
         headline = 'Strong under case'
         summary = f'The trend and matchup both lean against this {get_stat_label_for_copy(stat).lower()} line, which makes the under look cleaner.'
@@ -1457,11 +1131,7 @@ def build_analyzer_interpretation(
         tone = 'bad'
         headline = 'Under lean'
         summary = f'The player has been finishing below this {get_stat_label_for_copy(stat).lower()} line often enough to keep the under in front.'
-    elif environment.get('is_back_to_back'):
-        tone = 'warning'
-        headline = 'Schedule caution'
-        summary = 'The player is in a back-to-back spot, so the line becomes harder to trust as a plug-and-play over.'
-    elif lean.lower() in {'very tough', 'tough'}:
+    elif lean.lower() in {'tough environment', 'tough matchup', 'bad matchup'}:
         tone = 'warning'
         headline = 'Caution spot'
         summary = 'The recent numbers are playable, but the matchup is working against the prop enough to keep this in the caution tier.'
@@ -1484,19 +1154,16 @@ def build_analyzer_interpretation(
         bullets.append(f"Matchup read: {lean} versus the next opponent.")
     if team_context.get('impact_count'):
         bullets.append(f"Team context: {team_context.get('headline')}. {team_context.get('summary')}")
-    if environment.get('headline'):
-        env_summary = environment.get('summary') or ''
-        bullets.append(f"Schedule spot: {environment.get('headline')}. {env_summary}")
-    elif h2h and h2h.get('games_count'):
+    if h2h and h2h.get('games_count'):
         bullets.append(f"H2H: {h2h.get('hit_count')}/{h2h.get('games_count')} over this line versus {h2h.get('opponent_abbreviation') or h2h.get('opponent_name')}.")
 
     market_takeaway = summary
     if tone == 'good' and 'over' in headline.lower():
-        market_takeaway = 'Lean: the over has enough support to stay in the shortlist.'
+        market_takeaway = 'Plug-and-play lean: the over has enough support to stay in the shortlist.'
     elif tone == 'bad' and 'under' in headline.lower():
-        market_takeaway = 'Lean: the under reads cleaner than the over here.'
+        market_takeaway = 'Plug-and-play lean: the under reads cleaner than the over here.'
     elif tone == 'warning':
-        market_takeaway = 'Lean: usable, but not clean enough to force.'
+        market_takeaway = 'Plug-and-play lean: usable, but not clean enough to force.'
 
     return {
         'headline': headline,
@@ -1505,6 +1172,7 @@ def build_analyzer_interpretation(
         'bullets': bullets[:4],
         'market_takeaway': market_takeaway,
     }
+
 
 def get_stat_label_for_copy(stat: str) -> str:
     labels = {
@@ -1702,8 +1370,8 @@ def fetch_scoreboard_games(game_date: str) -> list[dict[str, Any]]:
         away_score_row = line_score_lookup.get((game_id, away_team_id), {})
 
         enriched_row = dict(row)
-        enriched_row["PTS_HOME"] = safe_int_score(home_score_row.get("PTS"), row.get("PTS_HOME"), 0)
-        enriched_row["PTS_AWAY"] = safe_int_score(away_score_row.get("PTS"), row.get("PTS_AWAY"), 0)
+        enriched_row["PTS_HOME"] = int(home_score_row.get("PTS") or row.get("PTS_HOME") or 0)
+        enriched_row["PTS_AWAY"] = int(away_score_row.get("PTS") or row.get("PTS_AWAY") or 0)
         enriched_rows.append(enriched_row)
 
     SCOREBOARD_CACHE[game_date] = {"timestamp": time.time(), "rows": enriched_rows}
@@ -1903,16 +1571,7 @@ def estimate_model_probabilities(
     average: float,
     line: float,
     matchup_delta_pct: float | None = None,
-    *,
-    stat: str | None = None,
-    opportunity: dict[str, Any] | None = None,
-    team_context: dict[str, Any] | None = None,
-    environment: dict[str, Any] | None = None,
 ) -> tuple[float, float]:
-    opportunity = opportunity or {}
-    team_context = team_context or {}
-    environment = environment or {}
-
     base = hit_rate_pct / 100.0
     edge_term = 0.0
     scale = max(1.0, max(line, 1.0) * 0.18)
@@ -1920,30 +1579,95 @@ def estimate_model_probabilities(
     matchup_term = 0.0
     if matchup_delta_pct is not None:
         matchup_term = clamp(matchup_delta_pct / 100.0 * 0.2, -0.12, 0.12)
-
-    role_term = 0.0
-    if opportunity.get('minutes_trend') == 'up':
-        role_term += 0.03
-    elif opportunity.get('minutes_trend') == 'down':
-        role_term -= 0.04
-
-    scoring_stats = {'PTS', '3PM', 'PRA', 'PR', 'PA'}
-    if opportunity.get('volume_trend') == 'up':
-        role_term += 0.04 if stat in scoring_stats else 0.02
-    elif opportunity.get('volume_trend') == 'down':
-        role_term -= 0.04 if stat in scoring_stats else 0.02
-
-    if int(team_context.get('impact_count') or 0) > 0:
-        role_term += min(0.03, int(team_context.get('impact_count') or 0) * 0.01)
-
-    environment_term = 0.0
-    if environment.get('is_back_to_back'):
-        environment_term -= 0.03
-    elif isinstance(environment.get('rest_days'), int) and environment.get('rest_days') >= 2:
-        environment_term += 0.02
-
-    model_over = clamp(base + edge_term + matchup_term + role_term + environment_term, 0.02, 0.98)
+    model_over = clamp(base + edge_term + matchup_term, 0.02, 0.98)
     return round(model_over, 4), round(1 - model_over, 4)
+
+
+def infer_team_id_from_season_rows(season_rows: list[dict[str, Any]]) -> int | None:
+    if not season_rows:
+        return None
+    matchup = str(season_rows[0].get("MATCHUP") or "").strip().upper()
+    if not matchup:
+        return None
+    team_abbr = matchup.split(" ", 1)[0].strip().lower()
+    team = TEAM_ALIAS_LOOKUP.get(team_abbr)
+    return int(team["id"]) if team else None
+
+
+def resolve_position_from_roster(team_id: int | None, player_id: int, season: str) -> str:
+    if not team_id:
+        return ""
+    try:
+        roster_rows = fetch_team_roster(team_id=team_id, season=season)
+    except HTTPException:
+        return ""
+    for row in roster_rows:
+        raw_player_id = row.get("PLAYER_ID")
+        if raw_player_id in (None, ""):
+            continue
+        try:
+            if int(raw_player_id) == player_id:
+                return str(row.get("POSITION", "") or "").strip()
+        except Exception:
+            continue
+    return ""
+
+
+def get_player_base_context(
+    player_id: int,
+    season: str,
+    season_type: str,
+    team_id: int | None = None,
+    player_position: str | None = None,
+) -> dict[str, Any]:
+    cache_key = (player_id, season, season_type, int(team_id or 0), str(player_position or "").strip().upper())
+    cached = PLAYER_BASE_CONTEXT_CACHE.get(cache_key)
+    now_ts = time.time()
+    if cached and now_ts - cached["timestamp"] < PLAYER_BASE_CONTEXT_TTL_SECONDS:
+        return cached["payload"]
+
+    season_rows = fetch_player_game_log(player_id=player_id, season=season, season_type=season_type)
+    resolved_team_id = team_id or infer_team_id_from_season_rows(season_rows)
+    resolved_position = str(player_position or "").strip()
+
+    if resolved_team_id and not resolved_position:
+        resolved_position = resolve_position_from_roster(resolved_team_id, player_id, season)
+
+    profile_row = None
+    if resolved_team_id is None or not resolved_position:
+        try:
+            profile_row = fetch_common_player_info(player_id)
+        except HTTPException:
+            profile_row = None
+        if profile_row:
+            if resolved_team_id is None:
+                raw_team_id = profile_row.get("TEAM_ID")
+                resolved_team_id = int(raw_team_id) if raw_team_id not in (None, "") else None
+            if not resolved_position:
+                resolved_position = str(profile_row.get("POSITION", "") or "").strip()
+
+    position_code, position_label = resolve_primary_position(resolved_position)
+    next_game = resolve_team_next_game(
+        team_id=resolved_team_id,
+        primary_player_id=player_id,
+        season=season,
+        season_type=season_type,
+    )
+    team_name = TEAM_LOOKUP.get(resolved_team_id, {}).get("full_name") if resolved_team_id else None
+    availability = build_availability_payload(player_name=next((p for p in PLAYER_POOL if p["id"] == player_id), {}).get("full_name", ""), team_name=team_name)
+
+    payload = {
+        "season_rows": season_rows,
+        "resolved_team_id": resolved_team_id,
+        "resolved_position": resolved_position,
+        "position_code": position_code,
+        "position_label": position_label,
+        "next_game": next_game,
+        "team_name": team_name,
+        "availability": availability,
+    }
+    PLAYER_BASE_CONTEXT_CACHE[cache_key] = {"timestamp": time.time(), "payload": payload}
+    return payload
 
 
 def build_prop_analysis_payload(
@@ -1955,78 +1679,43 @@ def build_prop_analysis_payload(
     season_type: str,
     team_id: int | None = None,
     player_position: str | None = None,
-    location: str = 'all',
-    result: str = 'all',
-    margin_min: float | None = None,
-    margin_max: float | None = None,
-    min_minutes: float | None = None,
-    max_minutes: float | None = None,
-    min_fga: float | None = None,
-    max_fga: float | None = None,
-    h2h_only: bool = False,
 ) -> dict[str, Any]:
-    cache_key = (player_id, stat, float(line), int(last_n), season, season_type, team_id, player_position or '', location, result, margin_min, margin_max, min_minutes, max_minutes, min_fga, max_fga, h2h_only)
-    cached = ANALYSIS_CACHE.get(cache_key)
-    now_ts = time.time()
-    if cached and now_ts - float(cached.get('timestamp') or 0.0) < ANALYSIS_CACHE_TTL_SECONDS:
-        return copy.deepcopy(cached['payload'])
-
     player = next((p for p in PLAYER_POOL if p["id"] == player_id), None)
     if not player:
         raise HTTPException(status_code=404, detail="Player not found.")
 
-    season_rows = fetch_player_game_log(player_id=player_id, season=season, season_type=season_type)
+    analysis_cache_key = (
+        player_id,
+        stat,
+        round(float(line), 3),
+        int(last_n),
+        season,
+        season_type,
+        int(team_id or 0),
+        str(player_position or "").strip().upper(),
+    )
+    cached_analysis = PROP_ANALYSIS_CACHE.get(analysis_cache_key)
+    now_ts = time.time()
+    if cached_analysis and now_ts - cached_analysis["timestamp"] < PROP_ANALYSIS_CACHE_TTL_SECONDS:
+        return cached_analysis["payload"]
 
-    profile_row = None
-    resolved_team_id = team_id
-    resolved_position = player_position
-
-    if resolved_team_id is None or not resolved_position:
-        try:
-            profile_row = fetch_common_player_info(player_id)
-        except HTTPException:
-            profile_row = None
-        if profile_row:
-            if resolved_team_id is None:
-                raw_team_id = profile_row.get("TEAM_ID")
-                resolved_team_id = int(raw_team_id) if raw_team_id not in (None, "") else None
-            if not resolved_position:
-                resolved_position = str(profile_row.get("POSITION", "")).strip()
-
-    position_code, position_label = resolve_primary_position(resolved_position)
-    next_game = resolve_team_next_game(
-        team_id=resolved_team_id,
-        primary_player_id=player_id,
+    base_context = get_player_base_context(
+        player_id=player_id,
         season=season,
         season_type=season_type,
+        team_id=team_id,
+        player_position=player_position,
     )
+    season_rows = base_context["season_rows"]
+    resolved_team_id = base_context["resolved_team_id"]
+    resolved_position = base_context["resolved_position"]
+    position_code = base_context["position_code"]
+    position_label = base_context["position_label"]
+    next_game = base_context["next_game"]
+    team_name = base_context["team_name"]
+    availability = base_context["availability"]
 
-    needs_margin_context = margin_min is not None or margin_max is not None
-    if needs_margin_context:
-        enriched_rows = enrich_game_logs_with_context(
-            season_rows,
-            resolved_team_id,
-            season,
-            season_type,
-            player_id,
-        )
-    else:
-        enriched_rows = enrich_game_logs_light(season_rows)
-    filtered_pool = apply_game_log_filters(
-        enriched_rows,
-        location=location,
-        result=result,
-        margin_min=margin_min,
-        margin_max=margin_max,
-        min_minutes=min_minutes,
-        max_minutes=max_minutes,
-        min_fga=min_fga,
-        max_fga=max_fga,
-        h2h_only=h2h_only,
-        opponent_abbreviation=(next_game or {}).get('opponent_abbreviation'),
-    )
-    rows = filtered_pool[:last_n]
-
+    rows = season_rows[:last_n]
     games: list[dict[str, Any]] = []
     hit_count = 0
     values: list[float] = []
@@ -2040,9 +1729,6 @@ def build_prop_analysis_payload(
 
     average = round(sum(values) / len(values), 2) if values else 0
     hit_rate = round((hit_count / len(values)) * 100, 1) if values else 0
-
-    team_name = TEAM_LOOKUP.get(resolved_team_id, {}).get("full_name") if resolved_team_id else None
-    availability = build_availability_payload(player_name=player["full_name"], team_name=team_name)
 
     vs_position = None
     if next_game and position_code:
@@ -2066,7 +1752,7 @@ def build_prop_analysis_payload(
     if next_game and next_game.get("opponent_abbreviation"):
         opponent_abbreviation = str(next_game.get("opponent_abbreviation") or "").upper().strip()
         h2h_rows = [
-            row for row in (filtered_pool or enriched_rows)
+            row for row in season_rows
             if opponent_abbreviation and opponent_abbreviation in str(row.get("MATCHUP") or "").upper()
         ]
         h2h_games: list[dict[str, Any]] = []
@@ -2089,9 +1775,8 @@ def build_prop_analysis_payload(
                 "games": list(reversed(h2h_games)),
             }
 
-    opportunity = build_opportunity_context(filtered_pool or enriched_rows or season_rows, last_n)
+    opportunity = build_opportunity_context(season_rows, last_n)
     team_context = build_team_opportunity_context(team_name=team_name, player_name=player["full_name"], stat=stat)
-    environment = build_game_environment_context(filtered_pool or enriched_rows or season_rows, next_game)
     interpretation = build_analyzer_interpretation(
         stat=stat,
         line=line,
@@ -2102,32 +1787,7 @@ def build_prop_analysis_payload(
         opportunity=opportunity,
         team_context=team_context,
         h2h=h2h_payload,
-        environment=environment,
     )
-
-    filter_summary = build_filter_summary(
-        location=location,
-        result=result,
-        margin_min=margin_min,
-        margin_max=margin_max,
-        min_minutes=min_minutes,
-        max_minutes=max_minutes,
-        min_fga=min_fga,
-        max_fga=max_fga,
-        h2h_only=h2h_only,
-    )
-
-    if not rows:
-        interpretation = {
-            'headline': 'No filtered sample',
-            'tone': 'warning',
-            'summary': 'The current filters removed every game from the sample. Relax the split to rebuild the trend view.',
-            'bullets': [
-                f"Active filters: {filter_summary['label']}",
-                f"Season pool: {len(season_rows)} games",
-            ],
-            'market_takeaway': 'No lean until the filter sample is rebuilt.',
-        }
 
     payload = {
         "player": {
@@ -2157,15 +1817,10 @@ def build_prop_analysis_payload(
         "h2h": h2h_payload,
         "opportunity": opportunity,
         "team_context": team_context,
-        "environment": environment,
         "interpretation": interpretation,
-        "active_filters": filter_summary,
-        "filtered_pool_count": len(filtered_pool),
-        "season_pool_count": len(season_rows),
     }
-    ANALYSIS_CACHE[cache_key] = {"timestamp": time.time(), "payload": copy.deepcopy(payload)}
+    PROP_ANALYSIS_CACHE[analysis_cache_key] = {"timestamp": time.time(), "payload": payload}
     return payload
-
 
 def compute_recent_hit_streak(hit_flags: list[bool]) -> int:
     streak = 0
@@ -2298,13 +1953,9 @@ def resolve_team_next_game(
         TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": time.time(), "row": next_game}
         return next_game
 
-    fallback_next_game = find_team_next_game_via_scoreboard(team_id=team_id, lookahead_days=10)
-    if fallback_next_game:
-        TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": time.time(), "row": fallback_next_game}
-        return fallback_next_game
-
-    TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": time.time(), "row": None}
-    return None
+    fallback_next_game = find_team_next_game_via_scoreboard(team_id=team_id, lookahead_days=7)
+    TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": time.time(), "row": fallback_next_game}
+    return fallback_next_game
 
 
 @app.get("/")
@@ -2520,14 +2171,14 @@ def market_scan(
     if not isinstance(rows, list) or not rows:
         raise HTTPException(status_code=400, detail="Please provide at least one market row.")
 
-    results: list[dict[str, Any]] = []
-    errors: list[dict[str, Any]] = []
-    local_analysis_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
-
+    # Warm the latest injury report once so each row does not trigger its own first parse.
     try:
         fetch_latest_injury_report_payload()
     except Exception:
         pass
+
+    prepared_rows: list[tuple[int, dict[str, Any], dict[str, Any] | None, dict[str, Any] | None, dict[str, Any]]] = []
+    errors: list[dict[str, Any]] = []
 
     for index, row in enumerate(rows, start=1):
         if not isinstance(row, dict):
@@ -2557,26 +2208,37 @@ def market_scan(
             errors.append({"row": index, "player_name": player_name, "reason": "Player not found."})
             continue
 
-        analysis_key = (int(player["id"]), stat, line, default_last_n, selected_season, season_type, team_id)
-        try:
-            if analysis_key in local_analysis_cache:
-                analysis = copy.deepcopy(local_analysis_cache[analysis_key])
-            else:
-                analysis = build_prop_analysis_payload(
-                    player_id=int(player["id"]),
-                    stat=stat,
-                    line=line,
-                    last_n=default_last_n,
-                    season=selected_season,
-                    season_type=season_type,
-                    team_id=team_id,
-                    player_position=None,
-                )
-                local_analysis_cache[analysis_key] = copy.deepcopy(analysis)
-        except HTTPException as exc:
-            errors.append({"row": index, "player_name": player_name, "reason": exc.detail})
-            continue
+        prepared_rows.append((index, row, team, opponent, {
+            "player_id": int(player["id"]),
+            "player_name": player_name,
+            "stat": stat,
+            "line": line,
+            "over_odds": over_odds,
+            "under_odds": under_odds,
+            "team_id": team_id,
+        }))
 
+    def analyze_prepared(item: tuple[int, dict[str, Any], dict[str, Any] | None, dict[str, Any] | None, dict[str, Any]]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        index, row, team, opponent, meta = item
+        player_name = meta["player_name"]
+        try:
+            analysis = build_prop_analysis_payload(
+                player_id=meta["player_id"],
+                stat=meta["stat"],
+                line=meta["line"],
+                last_n=default_last_n,
+                season=selected_season,
+                season_type=season_type,
+                team_id=meta["team_id"],
+                player_position=None,
+            )
+        except HTTPException as exc:
+            return None, {"row": index, "player_name": player_name, "reason": exc.detail}
+
+        stat = meta["stat"]
+        line = meta["line"]
+        over_odds = meta["over_odds"]
+        under_odds = meta["under_odds"]
         matchup = analysis.get("matchup", {})
         next_game = matchup.get("next_game") or {}
         vs_position = matchup.get("vs_position") or {}
@@ -2587,10 +2249,6 @@ def market_scan(
             average=float(analysis["average"]),
             line=line,
             matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
-            stat=stat,
-            opportunity=analysis.get("opportunity") or {},
-            team_context=analysis.get("team_context") or {},
-            environment=analysis.get("environment") or {},
         )
         implied_over = decimal_implied_probability(over_odds)
         implied_under = decimal_implied_probability(under_odds)
@@ -2622,9 +2280,6 @@ def market_scan(
             ev=best_ev,
             matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
             availability=availability,
-            opportunity=analysis.get("opportunity") or {},
-            team_context=analysis.get("team_context") or {},
-            environment=analysis.get("environment") or {},
         )
 
         display_side = best_side
@@ -2633,19 +2288,19 @@ def market_scan(
         elif availability.get("is_risky"):
             display_side = f"{best_side}?"
 
-        resolved_team_id = analysis["player"].get("team_id") or team_id
+        resolved_team_id = analysis["player"].get("team_id") or meta["team_id"]
         resolved_team = TEAM_LOOKUP.get(int(resolved_team_id)) if resolved_team_id else None
         resolved_team_abbreviation = (
             (resolved_team or {}).get("abbreviation")
             or next_game.get("player_team_abbreviation")
-            or (team.get("abbreviation") if team else team_text)
+            or (team.get("abbreviation") if team else str(row.get("team") or "").strip())
         )
         resolved_opponent_abbreviation = (
             next_game.get("opponent_abbreviation")
-            or (opponent.get("abbreviation") if opponent else opponent_text)
+            or (opponent.get("abbreviation") if opponent else str(row.get("opponent") or "").strip())
         )
 
-        results.append({
+        result = {
             "row": index,
             "player": {
                 "id": analysis["player"]["id"],
@@ -2677,7 +2332,6 @@ def market_scan(
                 "h2h": analysis.get("h2h") or {},
                 "opportunity": analysis.get("opportunity") or {},
                 "team_context": analysis.get("team_context") or {},
-                "environment": analysis.get("environment") or {},
                 "interpretation": analysis.get("interpretation") or {},
             },
             "model": {
@@ -2710,7 +2364,20 @@ def market_scan(
                 "next_game": next_game,
                 "vs_position": vs_position,
             },
-        })
+        }
+        return result, None
+
+    results: list[dict[str, Any]] = []
+    if prepared_rows:
+        max_workers = min(4, max(1, len(prepared_rows)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(analyze_prepared, item) for item in prepared_rows]
+            for future in as_completed(futures):
+                result, error = future.result()
+                if error:
+                    errors.append(error)
+                elif result:
+                    results.append(result)
 
     results.sort(
         key=lambda item: (
@@ -2722,6 +2389,7 @@ def market_scan(
         ),
         reverse=True,
     )
+    errors.sort(key=lambda item: item.get("row", 0))
 
     return {
         "season": selected_season,
@@ -2760,8 +2428,8 @@ def todays_games(game_date: str | None = None) -> dict[str, Any]:
         home_team = TEAM_LOOKUP.get(home_team_id, {})
         away_team = TEAM_LOOKUP.get(away_team_id, {})
         game_status = str(row.get("GAME_STATUS_TEXT") or "").strip()
-        home_score = safe_int_score(row.get("PTS_HOME"), 0)
-        away_score = safe_int_score(row.get("PTS_AWAY"), 0)
+        home_score = int(row.get("PTS_HOME") or 0)
+        away_score = int(row.get("PTS_AWAY") or 0)
         home_summary = build_team_availability_summary(str(home_team.get("full_name") or ""), report_payload)
         away_summary = build_team_availability_summary(str(away_team.get("full_name") or ""), report_payload)
 
@@ -2806,15 +2474,6 @@ def player_prop(
     season_type: str = Query("Regular Season"),
     team_id: int | None = Query(None),
     player_position: str | None = Query(None),
-    location: str = Query('all', pattern='^(all|home|away)$'),
-    result: str = Query('all', pattern='^(all|win|loss)$'),
-    margin_min: float | None = Query(None, ge=0),
-    margin_max: float | None = Query(None, ge=0),
-    min_minutes: float | None = Query(None, ge=0),
-    max_minutes: float | None = Query(None, ge=0),
-    min_fga: float | None = Query(None, ge=0),
-    max_fga: float | None = Query(None, ge=0),
-    h2h_only: bool = Query(False),
 ) -> dict[str, Any]:
     selected_season = season or current_nba_season()
     stat = stat.upper()
@@ -2827,13 +2486,4 @@ def player_prop(
         season_type=season_type,
         team_id=team_id,
         player_position=player_position,
-        location=location,
-        result=result,
-        margin_min=margin_min,
-        margin_max=margin_max,
-        min_minutes=min_minutes,
-        max_minutes=max_minutes,
-        min_fga=min_fga,
-        max_fga=max_fga,
-        h2h_only=h2h_only,
     )

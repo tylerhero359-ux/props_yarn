@@ -153,14 +153,35 @@
             <div class="section-head">
               <div>
                 <p class="section-kicker">Best Bets</p>
-                <h2>Latest board leaders</h2>
+                <h2>Today's board</h2>
               </div>
               <span id="overviewBestBetsMeta" class="small-meta">Populated by your latest Market Scanner run.</span>
             </div>
-            <div id="overviewBestBets" class="overview-best-bets-list empty-state-panel compact">
-              <div class="empty-icon">⭐</div>
-              <strong>No best bets saved yet.</strong>
-              <span>Run Market Scanner to pin the strongest current board edges here.</span>
+            <div class="overview-board-grid">
+              <div class="overview-board-column">
+                <div class="mini-section-head"><h3>Top 5 plays</h3></div>
+                <div id="overviewBestBets" class="overview-best-bets-list empty-state-panel compact">
+                  <div class="empty-icon">⭐</div>
+                  <strong>No best bets saved yet.</strong>
+                  <span>Run Market Scanner to pin the strongest current board edges here.</span>
+                </div>
+              </div>
+              <div class="overview-board-column">
+                <div class="mini-section-head"><h3>Use caution</h3></div>
+                <div id="overviewCautionBoard" class="overview-best-bets-list empty-state-panel compact">
+                  <div class="empty-icon">⚠️</div>
+                  <strong>No caution spots yet.</strong>
+                  <span>Risky plays will appear here after a board scan.</span>
+                </div>
+              </div>
+              <div class="overview-board-column">
+                <div class="mini-section-head"><h3>Injury boosts</h3></div>
+                <div id="overviewBoostBoard" class="overview-best-bets-list empty-state-panel compact">
+                  <div class="empty-icon">📈</div>
+                  <strong>No injury boosts yet.</strong>
+                  <span>Plays with teammate-absence boosts will appear here.</span>
+                </div>
+              </div>
             </div>
           </article>
         </section>
@@ -211,6 +232,20 @@
               <div class="empty-icon">🗓️</div>
               <strong>No slate loaded yet.</strong>
               <span>The dashboard will show today’s games and injury-report context here.</span>
+            </div>
+          </article>
+          <article class="card glass favorites-card">
+            <div class="section-head">
+              <div>
+                <p class="section-kicker">Favorites</p>
+                <h2>Saved players and props</h2>
+              </div>
+              <span class="small-meta">Reusable shortcuts</span>
+            </div>
+            <div id="favoritesList" class="favorites-list empty-state-panel compact">
+              <div class="empty-icon">💾</div>
+              <strong>No favorites yet.</strong>
+              <span>Star a player or save a prop from the analyzer to keep it here.</span>
             </div>
           </article>
         </section>
@@ -311,6 +346,86 @@
               <button class="prop-chip" data-stat="RA" type="button">RA</button>
             </div>
           </div>
+          <div id="stickyAnalyzerSummary" class="sticky-analyzer-summary">
+            <div class="sticky-player-pill">
+              <span class="small-label">Selected</span>
+              <strong id="stickyPlayerName">No player selected</strong>
+            </div>
+            <div class="sticky-prop-pill">
+              <span class="small-label">Prop</span>
+              <strong id="stickyPropLabel">PTS 25.5</strong>
+            </div>
+            <div class="sticky-action-row">
+              <button id="favoritePlayerBtn" class="icon-btn" type="button" title="Favorite player">★</button>
+              <button id="savePropBtn" class="secondary-btn" type="button">Save prop</button>
+            </div>
+          </div>
+
+          <div class="card glass analyzer-filter-card">
+            <div class="section-head">
+              <div>
+                <p class="section-kicker">Analyzer Filters</p>
+                <h2>Quick splits and ranges</h2>
+              </div>
+              <div class="section-head-actions filter-head-actions">
+                <span id="filtersBadge" class="spotlight-pill neutral">All games</span>
+                <button id="toggleAdvancedFiltersBtn" class="text-btn" type="button">Advanced</button>
+              </div>
+            </div>
+            <div id="quickFilterChips" class="quick-filter-chip-row">
+              <button class="filter-chip active" type="button" data-filter-preset="all">All</button>
+              <button class="filter-chip" type="button" data-filter-preset="home">Home</button>
+              <button class="filter-chip" type="button" data-filter-preset="away">Away</button>
+              <button class="filter-chip" type="button" data-filter-preset="wins">Wins</button>
+              <button class="filter-chip" type="button" data-filter-preset="losses">Losses</button>
+              <button class="filter-chip" type="button" data-filter-preset="h2h">H2H only</button>
+              <button class="filter-chip" type="button" data-filter-preset="min30">30+ MIN</button>
+              <button class="filter-chip" type="button" data-filter-preset="close">Close</button>
+              <button class="filter-chip" type="button" data-filter-preset="blowout">Blowout</button>
+            </div>
+            <div id="activeFiltersSummary" class="active-filters-summary">No active filters. Using all games in the selected season.</div>
+            <div id="advancedFiltersPanel" class="advanced-filters-panel hidden">
+              <div class="advanced-filter-grid">
+                <div class="control-group compact-filter-group">
+                  <label for="filterLocationSelect">Location</label>
+                  <div class="input-shell"><select id="filterLocationSelect"><option value="all">All</option><option value="home">Home</option><option value="away">Away</option></select></div>
+                </div>
+                <div class="control-group compact-filter-group">
+                  <label for="filterResultSelect">Result</label>
+                  <div class="input-shell"><select id="filterResultSelect"><option value="all">All</option><option value="win">Wins</option><option value="loss">Losses</option></select></div>
+                </div>
+                <div class="control-group compact-filter-group">
+                  <label for="filterMarginMin">Margin min</label>
+                  <div class="input-shell"><input id="filterMarginMin" type="number" min="0" step="1" placeholder="0" /></div>
+                </div>
+                <div class="control-group compact-filter-group">
+                  <label for="filterMarginMax">Margin max</label>
+                  <div class="input-shell"><input id="filterMarginMax" type="number" min="0" step="1" placeholder="12" /></div>
+                </div>
+                <div class="control-group compact-filter-group">
+                  <label for="filterMinMinutes">MIN min</label>
+                  <div class="input-shell"><input id="filterMinMinutes" type="number" min="0" step="1" placeholder="30" /></div>
+                </div>
+                <div class="control-group compact-filter-group">
+                  <label for="filterMaxMinutes">MIN max</label>
+                  <div class="input-shell"><input id="filterMaxMinutes" type="number" min="0" step="1" placeholder="40" /></div>
+                </div>
+                <div class="control-group compact-filter-group">
+                  <label for="filterMinFga">FGA min</label>
+                  <div class="input-shell"><input id="filterMinFga" type="number" min="0" step="1" placeholder="10" /></div>
+                </div>
+                <div class="control-group compact-filter-group">
+                  <label for="filterMaxFga">FGA max</label>
+                  <div class="input-shell"><input id="filterMaxFga" type="number" min="0" step="1" placeholder="25" /></div>
+                </div>
+              </div>
+              <label class="filter-checkbox-row"><input id="filterH2HOnly" type="checkbox" /><span>Only show games against the next opponent</span></label>
+              <div class="filter-action-row">
+                <button id="applyFiltersBtn" class="primary-btn compact-action" type="button">Apply filters</button>
+                <button id="resetFiltersBtn" class="secondary-btn compact-action" type="button">Reset filters</button>
+              </div>
+            </div>
+          </div>
         </section>
 
         <section class="explorer-grid analyzer-explorer-grid">
@@ -363,12 +478,15 @@
         </section>
 
         <section class="card glass matchup-panel analyzer-matchup-panel">
-          <div class="section-head">
+          <div class="section-head collapsible-head">
             <div>
               <p class="section-kicker">Next Matchup</p>
               <h2>Opponent context</h2>
             </div>
-            <span id="analyzerMatchupLeanBadge" class="spotlight-pill neutral">Waiting for analysis</span>
+            <div class="section-head-actions">
+              <span id="analyzerMatchupLeanBadge" class="spotlight-pill neutral">Waiting for analysis</span>
+              <button class="collapse-btn" type="button" data-collapse-target="analyzerMatchupBody" aria-label="Toggle opponent context">−</button>
+            </div>
           </div>
           <div id="analyzerMatchupBody" class="empty-state-panel compact matchup-empty">
             <div class="empty-icon">🛡️</div>
@@ -377,14 +495,35 @@
           </div>
         </section>
 
-        <section class="dashboard-grid analyzer-insight-grid">
+                <section class="dashboard-grid analyzer-insight-grid">
+          <article class="card glass insight-card recommendation-card">
+            <div class="section-head collapsible-head">
+              <div>
+                <p class="section-kicker">Recommendation</p>
+                <h2>Traffic light</h2>
+              </div>
+              <div class="section-head-actions">
+                <span id="recommendationTone" class="spotlight-pill neutral">Waiting for analysis</span>
+                <button class="collapse-btn" type="button" data-collapse-target="recommendationBody" aria-label="Toggle recommendation">−</button>
+              </div>
+            </div>
+            <div id="recommendationBody" class="empty-state-panel compact matchup-empty">
+              <div class="empty-icon">🚦</div>
+              <strong>No recommendation yet.</strong>
+              <span>Analyze a player prop to get a simple green / yellow / red read.</span>
+            </div>
+          </article>
+
           <article class="card glass insight-card">
-            <div class="section-head">
+            <div class="section-head collapsible-head">
               <div>
                 <p class="section-kicker">Interpretation</p>
                 <h2>Quick read</h2>
               </div>
-              <span id="interpretationTone" class="spotlight-pill neutral">Waiting for analysis</span>
+              <div class="section-head-actions">
+                <span id="interpretationTone" class="spotlight-pill neutral">Waiting for analysis</span>
+                <button class="collapse-btn" type="button" data-collapse-target="interpretationBody" aria-label="Toggle quick read">−</button>
+              </div>
             </div>
             <div id="interpretationBody" class="empty-state-panel compact matchup-empty">
               <div class="empty-icon">🧠</div>
@@ -393,18 +532,39 @@
             </div>
           </article>
 
-          <article class="card glass insight-card">
-            <div class="section-head">
+          <article class="card glass insight-card analyzer-detail-only">
+            <div class="section-head collapsible-head">
               <div>
                 <p class="section-kicker">Opportunity</p>
                 <h2>Opportunity profile</h2>
               </div>
-              <span id="opportunityTone" class="spotlight-pill neutral">Waiting for analysis</span>
+              <div class="section-head-actions">
+                <span id="opportunityTone" class="spotlight-pill neutral">Waiting for analysis</span>
+                <button class="collapse-btn" type="button" data-collapse-target="opportunityBody" aria-label="Toggle opportunity profile">−</button>
+              </div>
             </div>
             <div id="opportunityBody" class="empty-state-panel compact matchup-empty">
               <div class="empty-icon">⏱️</div>
               <strong>No opportunity profile yet.</strong>
               <span>Analyze a player prop to see minutes, shot attempts, and teammate absence context.</span>
+            </div>
+          </article>
+
+          <article class="card glass insight-card analyzer-detail-only">
+            <div class="section-head collapsible-head">
+              <div>
+                <p class="section-kicker">Environment</p>
+                <h2>Schedule spot</h2>
+              </div>
+              <div class="section-head-actions">
+                <span id="environmentTone" class="spotlight-pill neutral">Waiting for analysis</span>
+                <button class="collapse-btn" type="button" data-collapse-target="environmentBody" aria-label="Toggle schedule spot">−</button>
+              </div>
+            </div>
+            <div id="environmentBody" class="empty-state-panel compact matchup-empty">
+              <div class="empty-icon">📅</div>
+              <strong>No schedule read yet.</strong>
+              <span>Analyze a player prop to see rest, back-to-back risk, and next-game setup.</span>
             </div>
           </article>
         </section>
@@ -423,6 +583,18 @@
                 <span><i class="legend-line"></i> Prop line</span>
               </div>
             </div>
+            <div class="chart-controls-bar">
+              <div class="segmented-toggle" role="tablist" aria-label="Chart style">
+                <button id="chartModeBarsBtn" class="segmented-toggle-btn active" type="button">Bars</button>
+                <button id="chartModeComboBtn" class="segmented-toggle-btn" type="button">Line + bars</button>
+              </div>
+              <div class="segmented-toggle" role="tablist" aria-label="Chart sample">
+                <button class="segmented-toggle-btn chart-sample-btn" type="button" data-sample="5">5</button>
+                <button class="segmented-toggle-btn chart-sample-btn active" type="button" data-sample="10">10</button>
+                <button class="segmented-toggle-btn chart-sample-btn" type="button" data-sample="15">15</button>
+              </div>
+              <button id="chartHighlightBtn" class="secondary-btn compact-btn" type="button">Highlight O/U</button>
+            </div>
             <div class="chart-chip-row" id="chartChips">
               <span class="chart-chip">Waiting for data</span>
             </div>
@@ -432,20 +604,21 @@
           </article>
 
           <article class="table-card card glass">
-            <div class="section-head table-head game-log-head">
+            <div class="section-head table-head game-log-head collapsible-head">
               <div>
                 <p class="section-kicker">Game Log</p>
                 <h2>Recent results and H2H</h2>
               </div>
               <div class="game-log-head-right">
                 <span id="gameLogMeta" class="small-meta">Hit / miss tags included</span>
-                <div class="segmented-toggle" role="tablist" aria-label="Game log views">
+                <div class="segmented-toggle game-log-toggle" role="tablist" aria-label="Game log views">
                   <button id="recentLogTab" class="segmented-toggle-btn active" type="button">Last N</button>
                   <button id="h2hLogTab" class="segmented-toggle-btn" type="button">H2H</button>
                 </div>
+                <button class="collapse-btn" type="button" data-collapse-target="gameLogContent" aria-label="Toggle game log">−</button>
               </div>
             </div>
-            <div class="table-wrap">
+            <div id="gameLogContent" class="table-wrap">
               <table>
                 <thead>
                   <tr>
@@ -477,7 +650,7 @@
       </section>
 
       <section class="dashboard-view" data-view="today">
-        <section class="tool-intro-card card glass">
+        <section class="tool-intro-card card glass analyzer-sticky-shell">
           <div>
             <p class="section-kicker">Today's Games</p>
             <h2>Track the active slate, injury-report notes, and fast team entry points.</h2>
@@ -568,6 +741,19 @@
         </section>
       </section>
     </main>
+  </div>
+
+
+  <div id="actionBanner" class="action-banner" aria-live="polite" aria-atomic="true">
+    <div class="action-banner-track"></div>
+    <div class="action-banner-inner">
+      <div class="action-banner-spinner" aria-hidden="true"></div>
+      <div class="action-banner-copy">
+        <strong id="actionBannerTitle">Working on it…</strong>
+        <span id="actionBannerDetail">Please wait while the dashboard updates.</span>
+      </div>
+      <span id="actionBannerState" class="action-banner-state">Working</span>
+    </div>
   </div>
 
   <script src="/static/app.js"></script>
