@@ -1647,16 +1647,29 @@ function renderTable(payload) {
 
 function getMarketTemplate() {
   return [
+    '# NOTE:',
+    '# The "stat" column must use one of the following parameters:',
+    '# PTS = Points',
+    '# REB = Rebounds',
+    '# AST = Assists',
+    '# 3PM = Three-Pointers Made (maps to FG3M)',
+    '# STL = Steals',
+    '# BLK = Blocks',
+    '# PRA = Points + Rebounds + Assists',
+    '# PR  = Points + Rebounds',
+    '# PA  = Points + Assists',
+    '# RA  = Rebounds + Assists',
+    '#',
+    '# Correct the spelling of the names, you can use the internet to double check it.',
+    '',
     'player_name,stat,line,over_odds,under_odds',
-    'Nikola Jokic,REB,12.5,2.00,1.73',
+    'Nikola Jokić,REB,12.5,2.00,1.73',
     'Aaron Gordon,REB,5.5,1.90,1.80',
     'Jamal Murray,REB,4.5,1.95,1.75',
     'Christian Braun,REB,4.5,1.85,1.85',
     'Deni Avdija,REB,6.5,1.75,1.95',
     'Toumani Camara,REB,4.5,2.05,1.68',
-    'Donovan Clingan,REB,11.5,1.85,1.85',
-    '',
-    'Correct the spelling of the names, you can use the internet to double check it.'
+    'Donovan Clingan,REB,11.5,1.85,1.85'
   ].join('\n');
 }
 
