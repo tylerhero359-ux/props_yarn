@@ -1825,46 +1825,18 @@ async function focusMarketPlayer(item) {
   await analyzePlayerProp();
 }
 
-
-function getMarketSortLabel(sortKey) {
-  if (sortKey === "best_edge") return "Sorted by best edge";
-  if (sortKey === "highest_hit_rate") return "Sorted by highest hit rate";
-  if (sortKey === "best_combo") return "Sorted by best combo";
-  return "Sorted by best EV";
-}
-
-function getMarketSortValue(item, sortKey) {
-  const ev = Number(item?.best_bet?.ev ?? Number.NEGATIVE_INFINITY);
-  const edge = Number(item?.best_bet?.edge ?? Number.NEGATIVE_INFINITY);
-  const hitRate = Number(item?.analysis?.hit_rate ?? Number.NEGATIVE_INFINITY);
-  const confidence = Number(item?.best_bet?.confidence_score ?? Number.NEGATIVE_INFINITY);
-  const availabilityPenalty = Number(item?.availability?.sort_rank ?? item?.analysis?.availability?.sort_rank ?? 3);
-
-  if (sortKey === 'best_edge') return [edge, ev, hitRate, confidence, -availabilityPenalty];
-  if (sortKey === 'highest_hit_rate') return [hitRate, ev, edge, confidence, -availabilityPenalty];
-  if (sortKey === 'best_combo') return [confidence, ev, edge, hitRate, -availabilityPenalty];
-  return [ev, edge, hitRate, confidence, -availabilityPenalty];
-}
-
-function compareMarketRows(a, b, sortKey) {
-  const av = getMarketSortValue(a, sortKey);
-  const bv = getMarketSortValue(b, sortKey);
-  for (let i = 0; i < av.length; i += 1) {
-    if (av[i] === bv[i]) continue;
-    return bv[i] - av[i];
-  }
-  return 0;
-}
-
 function renderMarketResults(payload) {
-  const results = payload.results || [];
+  currentMarketResultsPayload = payload;
+  const sortKey = currentMarketSort || 'best_ev';
+  const results = [...(payload.results || [])].sort((a, b) => compareMarketRows(a, b, sortKey));
 
   if (!results.length) {
     renderMarketEmpty('No rows produced a usable result. Check names and try again.');
     return;
   }
 
-  marketMeta.textContent = `${results.length} props scanned • Sorted by best edge and EV`;
+  if (marketSortSelect) marketSortSelect.value = sortKey;
+  marketMeta.textContent = `${results.length} props scanned • ${getMarketSortLabel(sortKey)}`;
   marketResults.className = 'market-results-shell';
   marketResults.innerHTML = `
     <div class="market-results-table-wrap">
@@ -1875,11 +1847,11 @@ function renderMarketResults(payload) {
             <th>Availability</th>
             <th>Prop</th>
             <th>Best side</th>
-            <th>Edge</th>
-            <th>EV</th>
+            <th><button class="market-sort-header" data-sort-key="best_edge" type="button" title="Sort by best edge" style="cursor:pointer">Edge ${sortKey === 'best_edge' ? '↓' : ''}</button></th>
+            <th><button class="market-sort-header" data-sort-key="best_ev" type="button" title="Sort by best EV" style="cursor:pointer">EV ${sortKey === 'best_ev' ? '↓' : ''}</button></th>
             <th>Model %</th>
             <th>Implied %</th>
-            <th>Last ${payload.last_n}</th>
+            <th><button class="market-sort-header" data-sort-key="highest_hit_rate" type="button" title="Sort by highest win rate" style="cursor:pointer">Last ${payload.last_n} ${sortKey === 'highest_hit_rate' ? '↓' : ''}</button></th>
             <th>Average</th>
             <th>Matchup</th>
           </tr>
@@ -1945,7 +1917,19 @@ function renderMarketResults(payload) {
       }
     });
   });
+
+  marketResults.querySelectorAll('.market-sort-header').forEach(header => {
+    header.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      currentMarketSort = header.dataset.sortKey || 'best_ev';
+      localStorage.setItem('nba-props-market-sort', currentMarketSort);
+      if (marketSortSelect) marketSortSelect.value = currentMarketSort;
+      renderMarketResults(currentMarketResultsPayload || payload);
+    });
+  });
 }
+
 
 async function runMarketScan() {
   switchView('market');
@@ -2124,7 +2108,6 @@ teamSelect.addEventListener('change', async () => {
     betFinderMeta.textContent = 'Uses your current team, prop, line, and recent-game sample.';
     renderBetFinderEmpty();
     renderMarketEmpty();
-  if (marketSortSelect) marketSortSelect.value = currentMarketSort;
     setStatus('Ready');
     return;
   }
@@ -2204,11 +2187,14 @@ clearRecentBtn.addEventListener('click', () => clearRecentPlayersState({ resetCu
 marketTemplateBtn.addEventListener('click', () => { marketTextarea.value = getMarketTemplate(); });
 marketClearBtn.addEventListener('click', () => { marketTextarea.value = ''; renderMarketEmpty(); });
 marketScanBtn.addEventListener('click', runMarketScan);
-marketSortSelect?.addEventListener('change', () => {
-  currentMarketSort = marketSortSelect.value || 'best_ev';
-  localStorage.setItem('nba-props-market-sort', currentMarketSort);
-  if (currentMarketResultsPayload) renderMarketResults(currentMarketResultsPayload);
-});
+if (marketSortSelect) {
+  marketSortSelect.value = currentMarketSort;
+  marketSortSelect.addEventListener('change', () => {
+    currentMarketSort = marketSortSelect.value || 'best_ev';
+    localStorage.setItem('nba-props-market-sort', currentMarketSort);
+    if (currentMarketResultsPayload) renderMarketResults(currentMarketResultsPayload);
+  });
+}
 recentLogTab?.addEventListener('click', () => renderGameLogTab('recent'));
 h2hLogTab?.addEventListener('click', () => renderGameLogTab('h2h'));
 
@@ -2789,54 +2775,79 @@ function renderSelectedPlayerContext() {
     return '';
   }
 
-  const leanTone = getLeanClass(vsPosition?.lean_tone);
+  const toneMap = { good: 'good', bad: 'bad', warning: 'neutral', neutral: 'neutral' };
+  const leanTone = toneMap[getLeanClass(vsPosition?.lean_tone)] || 'neutral';
   const leanText = vsPosition?.lean || (nextGame ? 'Upcoming game found' : 'Partial matchup');
   const nextGameLabel = nextGame
     ? `${nextGame.matchup_label || nextGame.opponent_name || 'Upcoming game'} • ${nextGame.game_date || 'Date TBA'}${nextGame.game_time ? ` • ${nextGame.game_time}` : ''}`
     : 'Upcoming game unavailable';
   const venueLabel = nextGame ? (nextGame.is_home ? 'Home game' : 'Away game') : 'Venue unavailable';
+  const oppVal = typeof vsPosition?.opponent_value === 'number' ? vsPosition.opponent_value.toFixed(2) : (vsPosition?.opponent_value ?? '—');
+  const lgVal = typeof vsPosition?.league_average === 'number' ? vsPosition.league_average.toFixed(2) : (vsPosition?.league_average ?? '—');
+  const delta = typeof vsPosition?.delta_pct === 'number' ? `${formatDelta(vsPosition.delta_pct)}%` : '—';
+  const sample = typeof vsPosition?.sample_gp === 'number' ? `${vsPosition.sample_gp.toFixed(0)}` : '—';
+  const defRankValue = vsPosition?.rank_label || (vsPosition?.def_rank ? `#${vsPosition.def_rank}` : (vsPosition?.rank ? `#${vsPosition.rank}` : '—'));
+  const defRankSub = vsPosition?.position_label ? `vs ${vsPosition.position_label}` : 'Position ranking';
 
   let summaryText = 'Defense-vs-position data unavailable for this player and stat.';
   if (vsPosition) {
-    const oppVal = typeof vsPosition.opponent_value === 'number' ? vsPosition.opponent_value.toFixed(2) : (vsPosition.opponent_value ?? '—');
-    const lgVal = typeof vsPosition.league_average === 'number' ? vsPosition.league_average.toFixed(2) : (vsPosition.league_average ?? '—');
-    const delta = typeof vsPosition.delta_pct === 'number' ? formatDelta(vsPosition.delta_pct) : '—';
-    summaryText = `${nextGame?.opponent_name || 'This opponent'} allows ${oppVal} ${getStatLabel(vsPosition.stat).toLowerCase()} per player-game to ${String(vsPosition.position_label || 'this position').toLowerCase()}, versus a league baseline of ${lgVal} (${delta}%).`;
+    summaryText = `${nextGame?.opponent_name || 'This opponent'} allows ${oppVal} ${getStatLabel(vsPosition.stat).toLowerCase()} per player-game to ${String(vsPosition.position_label || 'this position').toLowerCase()}, versus a league baseline of ${lgVal} (${delta}).`;
   }
 
   matchupSection.classList.remove('hidden');
-  tile.className = 'card glass selected-player-matchup-tile matchup-panel-inline';
+  tile.className = `card glass selected-player-matchup-tile matchup-panel-inline matchup-tone-${leanTone} fade-in-up`;
   tile.innerHTML = `
     <div class="section-head compact-inline-head">
-      <div>
+      <div class="matchup-head-copy">
         <p class="section-kicker">Next Matchup</p>
         <h3>Opponent context</h3>
+        <small>${escapeHtml(nextGameLabel)}</small>
       </div>
       <span class="spotlight-pill ${leanTone}">${escapeHtml(leanText)}</span>
     </div>
-    <div class="matchup-grid">
-      <article class="matchup-tile">
+    <div class="selected-matchup-grid">
+      <article class="matchup-tile matchup-stat-tile">
         <span class="small-label">Next game</span>
         <strong>${escapeHtml(nextGame?.opponent_name || 'Unavailable')}</strong>
         <small>${escapeHtml(nextGameLabel)}</small>
       </article>
-      <article class="matchup-tile">
+      <article class="matchup-tile matchup-stat-tile">
         <span class="small-label">Venue</span>
         <strong>${escapeHtml(venueLabel)}</strong>
         <small>${escapeHtml(nextGame?.player_team_abbreviation || 'NBA')}</small>
       </article>
-      <article class="matchup-tile">
+      <article class="matchup-tile matchup-stat-tile">
         <span class="small-label">Availability</span>
         <strong>${renderAvailabilityBadge(availability, true) || '—'}</strong>
         <small>${escapeHtml(availability?.reason || availability?.note || 'Official status unavailable')}</small>
       </article>
-      <article class="matchup-tile">
+      <article class="matchup-tile matchup-stat-tile">
         <span class="small-label">Vs position</span>
         <strong>${escapeHtml(vsPosition?.position_label || 'Unavailable')}</strong>
-        <small>${escapeHtml(vsPosition ? `${vsPosition.opponent_value?.toFixed ? vsPosition.opponent_value.toFixed(2) : vsPosition.opponent_value} allowed • ${formatDelta(vsPosition.delta_pct)}% vs avg` : 'Defense-vs-position unavailable')}</small>
+        <small>${escapeHtml(vsPosition ? getStatLabel(vsPosition.stat) : 'Defense-vs-position unavailable')}</small>
+      </article>
+      <article class="matchup-tile matchup-stat-tile">
+        <span class="small-label">Opponent allow rate</span>
+        <strong>${escapeHtml(String(oppVal))}</strong>
+        <small>League avg ${escapeHtml(String(lgVal))}</small>
+      </article>
+      <article class="matchup-tile matchup-stat-tile">
+        <span class="small-label">Delta vs average</span>
+        <strong class="${leanTone === 'good' ? 'match-good' : leanTone === 'bad' ? 'match-bad' : 'match-neutral'}">${escapeHtml(delta)}</strong>
+        <small>${escapeHtml(vsPosition?.lean || 'Neutral')}</small>
+      </article>
+      <article class="matchup-tile matchup-stat-tile">
+        <span class="small-label">Sample</span>
+        <strong>${escapeHtml(String(sample))}</strong>
+        <small>${vsPosition ? `player-games vs ${escapeHtml(nextGame?.opponent_abbreviation || '')}` : 'No sample'}</small>
+      </article>
+      <article class="matchup-tile matchup-stat-tile matchup-rank-tile">
+        <span class="small-label">DEF RANK</span>
+        <strong>${escapeHtml(String(defRankValue))}</strong>
+        <small>${escapeHtml(defRankSub)}</small>
       </article>
     </div>
-    <div class="insight-summary ${leanTone}">
+    <div class="matchup-summary matchup-summary-inline">
       <span class="insight-summary-label">Matchup read</span>
       <strong>${escapeHtml(leanText)}</strong>
       <p>${escapeHtml(summaryText)}</p>
@@ -2966,96 +2977,38 @@ function saveLatestMarketResults(payload) {
   localStorage.setItem(MARKET_RESULTS_KEY, JSON.stringify(snapshot));
 }
 
-function renderMarketResults(payload) {
-  currentMarketResultsPayload = payload;
-  const sortKey = currentMarketSort || 'best_ev';
-  const results = [...(payload.results || [])].sort((a, b) => compareMarketRows(a, b, sortKey));
 
-  if (marketSortSelect) marketSortSelect.value = sortKey;
-
-  if (!results.length) {
-    renderMarketEmpty('No rows produced a usable result. Check names and try again.');
-    return;
-  }
-
-  marketMeta.textContent = `${results.length} props scanned • ${getMarketSortLabel(sortKey)}`;
-  marketResults.className = 'market-results-shell';
-  marketResults.innerHTML = `
-    <div class="market-results-toolbar">
-      <div class="market-results-toolbar-copy">
-        <strong>Scanner results</strong>
-        <small>${getMarketSortLabel(sortKey)}. Click any row to open it in Player Analyzer.</small>
-      </div>
-    </div>
-    <div class="market-results-table-wrap">
-      <table class="market-results-table">
-        <thead>
-          <tr>
-            <th>Player</th>
-            <th>Availability</th>
-            <th>Prop</th>
-            <th>Best side</th>
-            <th>Edge</th>
-            <th>EV</th>
-            <th>Model %</th>
-            <th>Implied %</th>
-            <th>Last ${payload.last_n}</th>
-            <th>Average</th>
-            <th>Matchup</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${results.map((item, index) => {
-    const availability = item.analysis.availability || item.availability || { status: 'Unknown', tone: 'neutral', reason: 'No report found', note: '' };
-    const matchup = item.analysis.matchup || item.matchup || {};
-    const matchupLean = matchup?.vs_position?.lean || 'No matchup';
-    const matchupDetail = matchup?.next_game?.matchup_label || 'No next opponent';
-    const trafficTone = item.best_bet.traffic_light?.tone || item.best_bet.confidence_tone || '';
-    return `
-              <tr class="market-row" data-index="${index}">
-                <td>
-                  <div class="market-player-cell">
-                    <img src="${getPlayerImage(item.player.id)}" alt="${escapeHtml(item.player.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
-                    <div>
-                      <strong>${escapeHtml(item.player.full_name)}</strong>
-                      <small>${escapeHtml(item.player.team)} vs ${escapeHtml(item.player.opponent || '')}</small>
-                      <p class="market-explainer">${escapeHtml(item.best_bet.explanation || item.best_bet.user_read || '')}</p>
-                    </div>
-                  </div>
-                </td>
-                <td><div class="market-availability-cell">${renderAvailabilityBadge(availability, true)}<small>${escapeHtml(availability.reason || availability.note || 'No official note')}</small></div></td>
-                <td>${escapeHtml(item.market.stat)} ${item.market.line}</td>
-                <td><span class="finder-badge ${trafficTone}">${item.best_bet.display_side || item.best_bet.side} • ${item.best_bet.traffic_light?.label || item.best_bet.confidence}</span></td>
-                <td class="${(item.best_bet.edge || 0) >= 0 ? 'hit-value' : 'miss-value'}">${item.best_bet.edge ?? '—'}%</td>
-                <td class="${(item.best_bet.ev || 0) >= 0 ? 'hit-value' : 'miss-value'}">${item.best_bet.ev ?? '—'}%</td>
-                <td>${item.best_bet.model_probability ?? '—'}%</td>
-                <td>${item.best_bet.implied_probability ?? '—'}%</td>
-                <td>${item.analysis.hit_count}/${item.analysis.games_count} (${item.analysis.hit_rate}%)</td>
-                <td>${item.analysis.average}</td>
-                <td><div class="market-matchup-cell"><strong>${escapeHtml(matchupLean)}</strong><small>${escapeHtml(matchupDetail)}</small></div></td>
-              </tr>`;
-  }).join('')}
-        </tbody>
-      </table>
-    </div>
-  `;
-
-  marketResults.querySelectorAll('.market-row').forEach(row => {
-    row.addEventListener('click', async () => {
-      const item = results[Number(row.dataset.index)];
-      if (!item) return;
-      try {
-        setStatus('Loading market pick');
-        await focusMarketPlayer(item);
-        setStatus('Ready');
-      } catch (error) {
-        console.error(error);
-        alert(error.message || 'Failed to open that market pick.');
-        setStatus('Error');
-      }
-    });
-  });
+function getMarketSortLabel(sortKey) {
+  if (sortKey === 'best_edge') return 'Sorted by best edge';
+  if (sortKey === 'highest_hit_rate') return 'Sorted by highest win rate';
+  if (sortKey === 'best_combo') return 'Sorted by best combo';
+  return 'Sorted by best EV';
 }
+
+function getMarketSortValue(item, sortKey) {
+  const ev = Number(item?.best_bet?.ev ?? Number.NEGATIVE_INFINITY);
+  const edge = Number(item?.best_bet?.edge ?? Number.NEGATIVE_INFINITY);
+  const hitRate = Number(item?.analysis?.hit_rate ?? Number.NEGATIVE_INFINITY);
+  const confidence = Number(item?.best_bet?.confidence_score ?? Number.NEGATIVE_INFINITY);
+  const availabilityRank = Number(item?.availability?.sort_rank ?? 3);
+
+  if (sortKey === 'best_edge') return [edge, ev, hitRate, confidence, -availabilityRank];
+  if (sortKey === 'highest_hit_rate') return [hitRate, ev, edge, confidence, -availabilityRank];
+  if (sortKey === 'best_combo') return [confidence, ev, edge, hitRate, -availabilityRank];
+  return [ev, edge, hitRate, confidence, -availabilityRank];
+}
+
+function compareMarketRows(a, b, sortKey) {
+  const av = getMarketSortValue(a, sortKey);
+  const bv = getMarketSortValue(b, sortKey);
+  for (let i = 0; i < av.length; i += 1) {
+    if (av[i] === bv[i]) continue;
+    return bv[i] - av[i];
+  }
+  return 0;
+}
+
+// duplicate renderMarketResults removed; using primary implementation above
 
 
 async function loadTodayGames(force = false) {
