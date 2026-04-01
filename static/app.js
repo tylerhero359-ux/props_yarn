@@ -2,6 +2,7 @@ const teamSelect = document.getElementById('teamSelect');
 const playerSearchInput = document.getElementById('playerSearch');
 const searchResults = document.getElementById('searchResults');
 const selectedPlayerBadge = document.getElementById('selectedPlayer');
+let selectedPlayerMatchupTile = document.getElementById('selectedPlayerMatchupTile');
 const playerGrid = document.getElementById('playerGrid');
 const rosterTitle = document.getElementById('rosterTitle');
 const rosterMeta = document.getElementById('rosterMeta');
@@ -46,6 +47,7 @@ const marketClearBtn = document.getElementById('marketClearBtn');
 const marketScanBtn = document.getElementById('marketScanBtn');
 const marketResults = document.getElementById('marketResults');
 const marketMeta = document.getElementById('marketMeta');
+const marketSortSelect = document.getElementById('marketSortSelect');
 const workspaceTitle = document.getElementById('workspaceTitle');
 const workspaceSubtitle = document.getElementById('workspaceSubtitle');
 const workspaceEyebrow = document.getElementById('workspaceEyebrow');
@@ -133,6 +135,8 @@ let activeWorkCount = 0;
 let latestTodayGamesPayload = null;
 let currentGameLogPayload = null;
 let activeGameLogView = 'recent';
+let currentMarketResultsPayload = null;
+let currentMarketSort = localStorage.getItem('nba-props-market-sort') || 'best_ev';
 
 const VIEW_META = {
   overview: {
@@ -264,6 +268,10 @@ function renderOverviewSelection() {
     ? `<div class="selected-player-meta-row">${renderAvailabilityBadge(selectedPlayer.availability)}<small>${escapeHtml(selectedPlayer.availability.reason || selectedPlayer.availability.note || '')}</small></div>`
     : '';
 
+  const contextData = getSelectedPlayerContextData();
+  const nextGame = contextData.matchup?.next_game || null;
+  const overviewContextHtml = nextGame ? `<div class="overview-current-context"><span class="selected-player-section-label">Next Matchup</span><strong>${escapeHtml(nextGame.opponent_name || nextGame.matchup_label || 'Upcoming game')}</strong><small>${escapeHtml(nextGame.game_date || 'Date TBA')}${nextGame.game_time ? ` • ${escapeHtml(nextGame.game_time)}` : ''}</small></div>` : '';
+
   overviewCurrentCard.innerHTML = `
     <img class="overview-current-avatar-img" src="${getPlayerImage(selectedPlayer.id)}" alt="${escapeHtml(selectedPlayer.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
     <div class="overview-current-copy">
@@ -271,6 +279,7 @@ function renderOverviewSelection() {
       <strong>${escapeHtml(selectedPlayer.full_name)}</strong>
       <small>${escapeHtml(subLine || (selectedPlayer.is_active ? 'Active player' : 'Player'))}</small>
       ${availabilityHtml}
+      ${overviewContextHtml}
     </div>
   `;
 
@@ -531,6 +540,64 @@ function updateSelectedCardStyles() {
   });
 }
 
+function getSelectedPlayerContextData() {
+  const payload = lastPayload && String(lastPayload?.player?.id || '') === String(selectedPlayer?.id || '') ? lastPayload : null;
+  return {
+    matchup: selectedPlayer?.matchup || payload?.matchup || null,
+    environment: selectedPlayer?.environment || payload?.environment || null,
+    availability: selectedPlayer?.availability || payload?.availability || null
+  };
+}
+
+function renderSelectedPlayerContext() {
+  if (!selectedPlayer) return '';
+  const { matchup, environment, availability } = getSelectedPlayerContextData();
+  const nextGame = matchup?.next_game || null;
+  const vsPosition = matchup?.vs_position || null;
+  if (!nextGame && !vsPosition && !environment) return '';
+
+  const matchupLabel = nextGame?.matchup_label || nextGame?.opponent_name || 'Upcoming game';
+  const opponentContext = vsPosition
+    ? `${vsPosition.lean || 'Neutral'} • ${vsPosition.position_label || 'Position'} • ${typeof vsPosition.opponent_value === 'number' ? vsPosition.opponent_value.toFixed(2) : (vsPosition.opponent_value ?? '—')} ${getStatLabel(vsPosition.stat).toLowerCase()}`
+    : 'Defense-vs-position pending';
+  const venueLabel = environment?.venue_label || (nextGame ? (nextGame.is_home ? 'Home game' : 'Away game') : 'TBD');
+  const scheduleLabel = environment?.schedule_summary || nextGame?.game_date || 'Upcoming spot';
+  const restDays = environment?.rest_days ?? nextGame?.rest_days;
+  const gamesIn7 = environment?.games_in_7 ?? nextGame?.games_in_last_7;
+  const backToBack = environment?.is_back_to_back ?? nextGame?.is_back_to_back;
+  const availabilityNote = availability?.reason || availability?.note || '';
+  const restStrong = restDays === null || restDays === undefined ? '—' : `${restDays} day${Number(restDays) === 1 ? '' : 's'} rest`;
+  const loadSmall = backToBack ? 'Back-to-back spot' : `Games in last 7: ${gamesIn7 ?? '—'}`;
+
+  return `
+    <div class="selected-player-context">
+      <div class="selected-player-context-header">
+        <span class="selected-player-section-label">Next Matchup</span>
+        <strong>${escapeHtml(matchupLabel)}</strong>
+        <small>${escapeHtml(nextGame?.game_date || 'Date TBA')}${nextGame?.game_time ? ` • ${escapeHtml(nextGame.game_time)}` : ''}</small>
+      </div>
+      <div class="selected-player-context-grid">
+        <div class="selected-player-context-chip">
+          <span class="small-label">Opponent context</span>
+          <strong>${escapeHtml(nextGame?.opponent_name || nextGame?.opponent_abbreviation || 'Unavailable')}</strong>
+          <small>${escapeHtml(opponentContext)}</small>
+        </div>
+        <div class="selected-player-context-chip">
+          <span class="small-label">Venue</span>
+          <strong>${escapeHtml(venueLabel)}</strong>
+          <small>${escapeHtml(scheduleLabel)}</small>
+        </div>
+        <div class="selected-player-context-chip">
+          <span class="small-label">Rest / Load</span>
+          <strong>${escapeHtml(restStrong)}</strong>
+          <small>${escapeHtml(loadSmall)}</small>
+        </div>
+      </div>
+      ${availabilityNote ? `<div class="selected-player-meta-row context-availability-row">${renderAvailabilityBadge(availability, true)}<small>${escapeHtml(availabilityNote)}</small></div>` : ''}
+    </div>
+  `;
+}
+
 function renderSelectedPlayer() {
   if (!selectedPlayer) {
     selectedPlayerBadge.className = 'selected-player selected-player-empty';
@@ -551,8 +618,10 @@ function renderSelectedPlayer() {
     selectedPlayer.position || '',
     selectedPlayer.jersey ? `#${selectedPlayer.jersey}` : ''
   ].filter(Boolean).join(' • ');
-  const availabilityHtml = selectedPlayer.availability
-    ? `<div class="selected-player-meta-row">${renderAvailabilityBadge(selectedPlayer.availability)}<small>${escapeHtml(selectedPlayer.availability.reason || selectedPlayer.availability.note || '')}</small></div>`
+  const contextData = getSelectedPlayerContextData();
+  const availabilitySource = contextData.availability || selectedPlayer.availability;
+  const availabilityHtml = availabilitySource
+    ? `<div class="selected-player-meta-row">${renderAvailabilityBadge(availabilitySource)}<small>${escapeHtml(availabilitySource.reason || availabilitySource.note || '')}</small></div>`
     : '';
 
   selectedPlayerBadge.className = 'selected-player';
@@ -563,6 +632,7 @@ function renderSelectedPlayer() {
       <strong>${escapeHtml(selectedPlayer.full_name)}</strong>
       <small>${escapeHtml(subLine || (selectedPlayer.is_active ? 'Active player' : 'Player'))}</small>
       ${availabilityHtml}
+      ${renderSelectedPlayerContext()}
     </div>
   `;
   renderOverviewSelection();
@@ -1647,29 +1717,16 @@ function renderTable(payload) {
 
 function getMarketTemplate() {
   return [
-    '# NOTE:',
-    '# The "stat" column must use one of the following parameters:',
-    '# PTS = Points',
-    '# REB = Rebounds',
-    '# AST = Assists',
-    '# 3PM = Three-Pointers Made (maps to FG3M)',
-    '# STL = Steals',
-    '# BLK = Blocks',
-    '# PRA = Points + Rebounds + Assists',
-    '# PR  = Points + Rebounds',
-    '# PA  = Points + Assists',
-    '# RA  = Rebounds + Assists',
-    '#',
-    '# Correct the spelling of the names, you can use the internet to double check it.',
-    '',
     'player_name,stat,line,over_odds,under_odds',
-    'Nikola Jokić,REB,12.5,2.00,1.73',
+    'Nikola Jokic,REB,12.5,2.00,1.73',
     'Aaron Gordon,REB,5.5,1.90,1.80',
     'Jamal Murray,REB,4.5,1.95,1.75',
     'Christian Braun,REB,4.5,1.85,1.85',
     'Deni Avdija,REB,6.5,1.75,1.95',
     'Toumani Camara,REB,4.5,2.05,1.68',
-    'Donovan Clingan,REB,11.5,1.85,1.85'
+    'Donovan Clingan,REB,11.5,1.85,1.85',
+    '',
+    'Correct the spelling of the names, you can use the internet to double check it.'
   ].join('\n');
 }
 
@@ -1756,13 +1813,47 @@ async function focusMarketPlayer(item) {
     team_name: item.player.team_name || '',
     team_id: item.player.team_id || null,
     position: item.player.position || '',
-    jersey: item.player.jersey || ''
+    jersey: item.player.jersey || '',
+    availability: item.analysis?.availability || item.availability || null,
+    matchup: item.analysis?.matchup || item.matchup || null,
+    environment: item.analysis?.environment || item.environment || null
   });
 
   setActiveProp(item.market.stat);
   lineInput.value = item.market.line;
   switchView('analyzer');
   await analyzePlayerProp();
+}
+
+
+function getMarketSortLabel(sortKey) {
+  if (sortKey === "best_edge") return "Sorted by best edge";
+  if (sortKey === "highest_hit_rate") return "Sorted by highest hit rate";
+  if (sortKey === "best_combo") return "Sorted by best combo";
+  return "Sorted by best EV";
+}
+
+function getMarketSortValue(item, sortKey) {
+  const ev = Number(item?.best_bet?.ev ?? Number.NEGATIVE_INFINITY);
+  const edge = Number(item?.best_bet?.edge ?? Number.NEGATIVE_INFINITY);
+  const hitRate = Number(item?.analysis?.hit_rate ?? Number.NEGATIVE_INFINITY);
+  const confidence = Number(item?.best_bet?.confidence_score ?? Number.NEGATIVE_INFINITY);
+  const availabilityPenalty = Number(item?.availability?.sort_rank ?? item?.analysis?.availability?.sort_rank ?? 3);
+
+  if (sortKey === 'best_edge') return [edge, ev, hitRate, confidence, -availabilityPenalty];
+  if (sortKey === 'highest_hit_rate') return [hitRate, ev, edge, confidence, -availabilityPenalty];
+  if (sortKey === 'best_combo') return [confidence, ev, edge, hitRate, -availabilityPenalty];
+  return [ev, edge, hitRate, confidence, -availabilityPenalty];
+}
+
+function compareMarketRows(a, b, sortKey) {
+  const av = getMarketSortValue(a, sortKey);
+  const bv = getMarketSortValue(b, sortKey);
+  for (let i = 0; i < av.length; i += 1) {
+    if (av[i] === bv[i]) continue;
+    return bv[i] - av[i];
+  }
+  return 0;
 }
 
 function renderMarketResults(payload) {
@@ -1989,7 +2080,9 @@ async function analyzePlayerProp(options = {}) {
       ...selectedPlayer,
       team_id: payload.player.team_id || selectedPlayer.team_id,
       position: payload.player.position || selectedPlayer.position,
-      availability: payload.availability || null
+      availability: payload.availability || null,
+      matchup: payload.matchup || null,
+      environment: payload.environment || null
     };
     renderSelectedPlayer();
     renderSummary(payload);
@@ -2031,6 +2124,7 @@ teamSelect.addEventListener('change', async () => {
     betFinderMeta.textContent = 'Uses your current team, prop, line, and recent-game sample.';
     renderBetFinderEmpty();
     renderMarketEmpty();
+  if (marketSortSelect) marketSortSelect.value = currentMarketSort;
     setStatus('Ready');
     return;
   }
@@ -2110,6 +2204,11 @@ clearRecentBtn.addEventListener('click', () => clearRecentPlayersState({ resetCu
 marketTemplateBtn.addEventListener('click', () => { marketTextarea.value = getMarketTemplate(); });
 marketClearBtn.addEventListener('click', () => { marketTextarea.value = ''; renderMarketEmpty(); });
 marketScanBtn.addEventListener('click', runMarketScan);
+marketSortSelect?.addEventListener('change', () => {
+  currentMarketSort = marketSortSelect.value || 'best_ev';
+  localStorage.setItem('nba-props-market-sort', currentMarketSort);
+  if (currentMarketResultsPayload) renderMarketResults(currentMarketResultsPayload);
+});
 recentLogTab?.addEventListener('click', () => renderGameLogTab('recent'));
 h2hLogTab?.addEventListener('click', () => renderGameLogTab('h2h'));
 
@@ -2648,6 +2747,104 @@ function setActiveProp(stat) {
   updateStickyAnalyzerSummary();
 }
 
+function getSelectedPlayerContextData() {
+  const payload = lastPayload && String(lastPayload?.player?.id || '') === String(selectedPlayer?.id || '') ? lastPayload : null;
+  return {
+    matchup: selectedPlayer?.matchup || payload?.matchup || null,
+    environment: selectedPlayer?.environment || payload?.environment || null,
+    availability: selectedPlayer?.availability || payload?.availability || null
+  };
+}
+
+function ensureSelectedPlayerMatchupTile() {
+  if (selectedPlayerMatchupTile) return selectedPlayerMatchupTile;
+  const matchupSection = document.getElementById('selectedPlayerMatchupSection');
+  if (!matchupSection) return null;
+  selectedPlayerMatchupTile = document.createElement('article');
+  selectedPlayerMatchupTile.id = 'selectedPlayerMatchupTile';
+  selectedPlayerMatchupTile.className = 'card glass selected-player-matchup-tile empty-state-panel compact matchup-empty hidden';
+  matchupSection.appendChild(selectedPlayerMatchupTile);
+  return selectedPlayerMatchupTile;
+}
+
+function renderSelectedPlayerContext() {
+  const tile = ensureSelectedPlayerMatchupTile();
+  const matchupSection = document.getElementById('selectedPlayerMatchupSection');
+  if (!tile || !matchupSection) return '';
+  if (!selectedPlayer) {
+    tile.className = 'card glass selected-player-matchup-tile empty-state-panel compact matchup-empty hidden';
+    tile.innerHTML = '';
+    matchupSection.classList.add('hidden');
+    return '';
+  }
+
+  const { matchup, availability } = getSelectedPlayerContextData();
+  const nextGame = matchup?.next_game || null;
+  const vsPosition = matchup?.vs_position || null;
+
+  if (!nextGame && !vsPosition && !availability) {
+    tile.className = 'card glass selected-player-matchup-tile empty-state-panel compact matchup-empty hidden';
+    tile.innerHTML = '';
+    matchupSection.classList.add('hidden');
+    return '';
+  }
+
+  const leanTone = getLeanClass(vsPosition?.lean_tone);
+  const leanText = vsPosition?.lean || (nextGame ? 'Upcoming game found' : 'Partial matchup');
+  const nextGameLabel = nextGame
+    ? `${nextGame.matchup_label || nextGame.opponent_name || 'Upcoming game'} • ${nextGame.game_date || 'Date TBA'}${nextGame.game_time ? ` • ${nextGame.game_time}` : ''}`
+    : 'Upcoming game unavailable';
+  const venueLabel = nextGame ? (nextGame.is_home ? 'Home game' : 'Away game') : 'Venue unavailable';
+
+  let summaryText = 'Defense-vs-position data unavailable for this player and stat.';
+  if (vsPosition) {
+    const oppVal = typeof vsPosition.opponent_value === 'number' ? vsPosition.opponent_value.toFixed(2) : (vsPosition.opponent_value ?? '—');
+    const lgVal = typeof vsPosition.league_average === 'number' ? vsPosition.league_average.toFixed(2) : (vsPosition.league_average ?? '—');
+    const delta = typeof vsPosition.delta_pct === 'number' ? formatDelta(vsPosition.delta_pct) : '—';
+    summaryText = `${nextGame?.opponent_name || 'This opponent'} allows ${oppVal} ${getStatLabel(vsPosition.stat).toLowerCase()} per player-game to ${String(vsPosition.position_label || 'this position').toLowerCase()}, versus a league baseline of ${lgVal} (${delta}%).`;
+  }
+
+  matchupSection.classList.remove('hidden');
+  tile.className = 'card glass selected-player-matchup-tile matchup-panel-inline';
+  tile.innerHTML = `
+    <div class="section-head compact-inline-head">
+      <div>
+        <p class="section-kicker">Next Matchup</p>
+        <h3>Opponent context</h3>
+      </div>
+      <span class="spotlight-pill ${leanTone}">${escapeHtml(leanText)}</span>
+    </div>
+    <div class="matchup-grid">
+      <article class="matchup-tile">
+        <span class="small-label">Next game</span>
+        <strong>${escapeHtml(nextGame?.opponent_name || 'Unavailable')}</strong>
+        <small>${escapeHtml(nextGameLabel)}</small>
+      </article>
+      <article class="matchup-tile">
+        <span class="small-label">Venue</span>
+        <strong>${escapeHtml(venueLabel)}</strong>
+        <small>${escapeHtml(nextGame?.player_team_abbreviation || 'NBA')}</small>
+      </article>
+      <article class="matchup-tile">
+        <span class="small-label">Availability</span>
+        <strong>${renderAvailabilityBadge(availability, true) || '—'}</strong>
+        <small>${escapeHtml(availability?.reason || availability?.note || 'Official status unavailable')}</small>
+      </article>
+      <article class="matchup-tile">
+        <span class="small-label">Vs position</span>
+        <strong>${escapeHtml(vsPosition?.position_label || 'Unavailable')}</strong>
+        <small>${escapeHtml(vsPosition ? `${vsPosition.opponent_value?.toFixed ? vsPosition.opponent_value.toFixed(2) : vsPosition.opponent_value} allowed • ${formatDelta(vsPosition.delta_pct)}% vs avg` : 'Defense-vs-position unavailable')}</small>
+      </article>
+    </div>
+    <div class="insight-summary ${leanTone}">
+      <span class="insight-summary-label">Matchup read</span>
+      <strong>${escapeHtml(leanText)}</strong>
+      <p>${escapeHtml(summaryText)}</p>
+    </div>
+  `;
+  return '';
+}
+
 function renderSelectedPlayer() {
   if (!selectedPlayer) {
     selectedPlayerBadge.className = 'selected-player selected-player-empty';
@@ -2659,6 +2856,7 @@ function renderSelectedPlayer() {
         <small>Choose a team, then click a player card to start.</small>
       </div>
     `;
+    renderSelectedPlayerContext();
     renderOverviewSelection();
     updateStickyAnalyzerSummary();
     return;
@@ -2669,8 +2867,10 @@ function renderSelectedPlayer() {
     selectedPlayer.position || '',
     selectedPlayer.jersey ? `#${selectedPlayer.jersey}` : ''
   ].filter(Boolean).join(' • ');
-  const availabilityHtml = selectedPlayer.availability
-    ? `<div class="selected-player-meta-row">${renderAvailabilityBadge(selectedPlayer.availability)}<small>${escapeHtml(selectedPlayer.availability.reason || selectedPlayer.availability.note || '')}</small></div>`
+  const contextData = getSelectedPlayerContextData();
+  const availabilitySource = contextData.availability || selectedPlayer.availability;
+  const availabilityHtml = availabilitySource
+    ? `<div class="selected-player-meta-row">${renderAvailabilityBadge(availabilitySource)}<small>${escapeHtml(availabilitySource.reason || availabilitySource.note || '')}</small></div>`
     : '';
 
   selectedPlayerBadge.className = 'selected-player';
@@ -2683,6 +2883,7 @@ function renderSelectedPlayer() {
       ${availabilityHtml}
     </div>
   `;
+  renderSelectedPlayerContext();
   renderOverviewSelection();
   updateStickyAnalyzerSummary();
 }
@@ -2766,16 +2967,26 @@ function saveLatestMarketResults(payload) {
 }
 
 function renderMarketResults(payload) {
-  const results = payload.results || [];
+  currentMarketResultsPayload = payload;
+  const sortKey = currentMarketSort || 'best_ev';
+  const results = [...(payload.results || [])].sort((a, b) => compareMarketRows(a, b, sortKey));
+
+  if (marketSortSelect) marketSortSelect.value = sortKey;
 
   if (!results.length) {
     renderMarketEmpty('No rows produced a usable result. Check names and try again.');
     return;
   }
 
-  marketMeta.textContent = `${results.length} props scanned • Sorted by best edge and EV`;
+  marketMeta.textContent = `${results.length} props scanned • ${getMarketSortLabel(sortKey)}`;
   marketResults.className = 'market-results-shell';
   marketResults.innerHTML = `
+    <div class="market-results-toolbar">
+      <div class="market-results-toolbar-copy">
+        <strong>Scanner results</strong>
+        <small>${getMarketSortLabel(sortKey)}. Click any row to open it in Player Analyzer.</small>
+      </div>
+    </div>
     <div class="market-results-table-wrap">
       <table class="market-results-table">
         <thead>
@@ -2845,6 +3056,7 @@ function renderMarketResults(payload) {
     });
   });
 }
+
 
 async function loadTodayGames(force = false) {
   if (latestTodayGamesPayload && !force) {
@@ -3123,7 +3335,9 @@ async function analyzePlayerProp(options = {}) {
       ...selectedPlayer,
       team_id: payload.player.team_id || selectedPlayer.team_id,
       position: payload.player.position || selectedPlayer.position,
-      availability: payload.availability || null
+      availability: payload.availability || null,
+      matchup: payload.matchup || null,
+      environment: payload.environment || null
     };
     renderSelectedPlayer();
     renderSummary(payload);

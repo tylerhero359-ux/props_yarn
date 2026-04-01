@@ -569,6 +569,8 @@
           </article>
         </section>
 
+        <section id="selectedPlayerMatchupSection" class="selected-player-matchup-section hidden"></section>
+
         <section class="dashboard-grid">
           <article class="chart-card card glass">
             <div class="chart-topbar">
@@ -705,7 +707,16 @@
               <h2>Paste your prop board and rank the best bets automatically.</h2>
               <p id="marketMeta" class="small-meta">Paste rows using the template below. Team and opponent are detected automatically from the player.</p>
             </div>
-            <span class="small-badge">Manual paste template</span>
+            <div class="market-topbar-actions">
+              <span class="small-badge">Manual paste template</span>
+              <label class="market-sort-label" for="marketSortSelect">Sort by</label>
+              <select id="marketSortSelect" class="market-sort-select">
+                <option value="best_ev">Best EV</option>
+                <option value="best_edge">Best Edge</option>
+                <option value="highest_hit_rate">Highest Hit Rate</option>
+                <option value="best_combo">Best Combo</option>
+              </select>
+            </div>
           </div>
 
           <div class="market-input-grid">

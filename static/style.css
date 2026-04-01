@@ -544,9 +544,9 @@ select option {
 }
 
 .mini-player-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
-  overflow-x: auto;
   padding-bottom: 2px;
   scrollbar-width: auto;
   scrollbar-color: rgba(var(--accent-rgb), 0.34) transparent;
@@ -578,7 +578,7 @@ select option {
 }
 
 .mini-player-card {
-  min-width: 138px;
+  min-width: 0;
   border-radius: 18px;
   border: 1px solid var(--border);
   background: rgba(255, 255, 255, 0.04);
@@ -617,7 +617,7 @@ select option {
 
 .player-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 14px;
   max-height: 720px;
   overflow-y: scroll;
@@ -3716,6 +3716,30 @@ body.sidebar-collapsed .theme-toggle {
   }
 }
 
+
+.selected-player-matchup-tile {
+  margin-top: 16px;
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  background:
+    radial-gradient(circle at top right, rgba(var(--accent-rgb), 0.12), transparent 44%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.03));
+  box-shadow: var(--shadow-soft);
+  padding: 16px;
+}
+
+.selected-player-matchup-tile.hidden {
+  display: none;
+}
+
+.compact-inline-head {
+  margin-bottom: 14px;
+}
+
+.compact-inline-head h3 {
+  margin: 0;
+  font-size: 18px;
+}
 @media (max-width: 980px) {
   .favorites-grid {
     grid-template-columns: 1fr;
@@ -3888,5 +3912,101 @@ body.light-theme .action-banner-inner {
     justify-self: start;
     min-width: 0;
     padding: 8px 10px;
+  }
+}
+
+
+@media (max-width: 980px) {
+  .player-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .mini-player-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .selected-player-context-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .player-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .mini-player-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+
+.selected-player-matchup-section {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  margin-top: 1rem;
+  margin-bottom: 1rem;
+}
+
+.selected-player-matchup-section.hidden {
+  display: none;
+}
+
+.selected-player-matchup-section .selected-player-matchup-tile {
+  width: 100%;
+}
+
+.market-topbar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.market-sort-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.market-sort-select {
+  min-width: 160px;
+  padding: 10px 38px 10px 12px;
+  border-radius: 14px;
+  background-color: rgba(255, 255, 255, 0.06);
+}
+
+.market-results-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.market-results-toolbar-copy {
+  display: grid;
+  gap: 4px;
+}
+
+.market-results-toolbar-copy strong {
+  font-size: 15px;
+}
+
+.market-results-toolbar-copy small {
+  color: var(--muted);
+}
+
+@media (max-width: 760px) {
+  .market-topbar-actions,
+  .market-results-toolbar {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .market-sort-select {
+    width: 100%;
   }
 }
