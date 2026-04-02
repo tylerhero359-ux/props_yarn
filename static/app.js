@@ -48,6 +48,7 @@ const marketScanBtn = document.getElementById('marketScanBtn');
 const marketResults = document.getElementById('marketResults');
 const marketMeta = document.getElementById('marketMeta');
 const marketSortSelect = document.getElementById('marketSortSelect');
+const marketFilterChips = document.getElementById('marketFilterChips');
 const workspaceTitle = document.getElementById('workspaceTitle');
 const workspaceSubtitle = document.getElementById('workspaceSubtitle');
 const workspaceEyebrow = document.getElementById('workspaceEyebrow');
@@ -137,6 +138,8 @@ let currentGameLogPayload = null;
 let activeGameLogView = 'recent';
 let currentMarketResultsPayload = null;
 let currentMarketSort = localStorage.getItem('nba-props-market-sort') || 'best_ev';
+let currentMarketSortDirection = localStorage.getItem('nba-props-market-sort-direction') || 'desc';
+let currentMarketFilter = localStorage.getItem('nba-props-market-filter') || 'all';
 
 const VIEW_META = {
   overview: {
@@ -1828,7 +1831,8 @@ async function focusMarketPlayer(item) {
 function renderMarketResults(payload) {
   currentMarketResultsPayload = payload;
   const sortKey = currentMarketSort || 'best_ev';
-  const results = [...(payload.results || [])].sort((a, b) => compareMarketRows(a, b, sortKey));
+  const filterKey = currentMarketFilter || 'all';
+  const results = [...filterMarketRows(payload.results || [], filterKey)].sort((a, b) => compareMarketRows(a, b, sortKey, currentMarketSortDirection));
 
   if (!results.length) {
     renderMarketEmpty('No rows produced a usable result. Check names and try again.');
@@ -1836,7 +1840,8 @@ function renderMarketResults(payload) {
   }
 
   if (marketSortSelect) marketSortSelect.value = sortKey;
-  marketMeta.textContent = `${results.length} props scanned • ${getMarketSortLabel(sortKey)}`;
+  renderMarketFilterChips();
+  marketMeta.textContent = `${results.length} props scanned • ${getMarketSortLabel(sortKey)} • ${getMarketFilterLabel(filterKey)}`;
   marketResults.className = 'market-results-shell';
   marketResults.innerHTML = `
     <div class="market-results-table-wrap">
@@ -1847,11 +1852,11 @@ function renderMarketResults(payload) {
             <th>Availability</th>
             <th>Prop</th>
             <th>Best side</th>
-            <th><button class="market-sort-header" data-sort-key="best_edge" type="button" title="Sort by best edge" style="cursor:pointer">Edge ${sortKey === 'best_edge' ? '↓' : ''}</button></th>
-            <th><button class="market-sort-header" data-sort-key="best_ev" type="button" title="Sort by best EV" style="cursor:pointer">EV ${sortKey === 'best_ev' ? '↓' : ''}</button></th>
+            <th aria-sort="${getMarketAriaSort('best_edge')}"><button class="market-sort-header" data-sort-key="best_edge" type="button" title="Sort by best edge"><span>Edge</span><span class="market-sort-arrow">${getMarketSortArrow('best_edge')}</span></button></th>
+            <th aria-sort="${getMarketAriaSort('best_ev')}"><button class="market-sort-header" data-sort-key="best_ev" type="button" title="Sort by best EV"><span>EV</span><span class="market-sort-arrow">${getMarketSortArrow('best_ev')}</span></button></th>
             <th>Model %</th>
             <th>Implied %</th>
-            <th><button class="market-sort-header" data-sort-key="highest_hit_rate" type="button" title="Sort by highest win rate" style="cursor:pointer">Last ${payload.last_n} ${sortKey === 'highest_hit_rate' ? '↓' : ''}</button></th>
+            <th aria-sort="${getMarketAriaSort('highest_hit_rate')}"><button class="market-sort-header" data-sort-key="highest_hit_rate" type="button" title="Sort by highest win rate"><span>Last ${payload.last_n}</span><span class="market-sort-arrow">${getMarketSortArrow('highest_hit_rate')}</span></button></th>
             <th>Average</th>
             <th>Matchup</th>
           </tr>
@@ -1859,7 +1864,7 @@ function renderMarketResults(payload) {
         <tbody>
           ${results.map((item, index) => {
     const tone = getConfidenceTone(item.best_bet.confidence);
-    const availability = item.analysis?.availability || item.availability || { status: 'Unknown', tone: 'neutral', reason: 'No report found', note: '' };
+    const availability = item.availability || item.analysis?.availability || { status: 'Unknown', tone: 'neutral', reason: 'No report found', note: '' };
     const matchupData = item.analysis?.matchup || item.matchup || {};
     const matchupLean = matchupData?.vs_position?.lean || 'No matchup';
     const matchupDetail = matchupData?.next_game?.matchup_label || 'No next opponent';
@@ -1922,8 +1927,7 @@ function renderMarketResults(payload) {
     header.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
-      currentMarketSort = header.dataset.sortKey || 'best_ev';
-      localStorage.setItem('nba-props-market-sort', currentMarketSort);
+      toggleMarketSort(header.dataset.sortKey || 'best_ev');
       if (marketSortSelect) marketSortSelect.value = currentMarketSort;
       renderMarketResults(currentMarketResultsPayload || payload);
     });
@@ -2191,7 +2195,24 @@ if (marketSortSelect) {
   marketSortSelect.value = currentMarketSort;
   marketSortSelect.addEventListener('change', () => {
     currentMarketSort = marketSortSelect.value || 'best_ev';
+    currentMarketSortDirection = 'desc';
     localStorage.setItem('nba-props-market-sort', currentMarketSort);
+    localStorage.setItem('nba-props-market-sort-direction', currentMarketSortDirection);
+    if (currentMarketResultsPayload) renderMarketResults(currentMarketResultsPayload);
+  });
+}
+
+if (marketFilterChips) {
+  marketFilterChips.addEventListener('click', (event) => {
+    const chip = event.target.closest('[data-filter-key]');
+    if (!chip) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const nextFilter = chip.dataset.filterKey || 'all';
+    if (currentMarketFilter === nextFilter) return;
+    currentMarketFilter = nextFilter;
+    localStorage.setItem('nba-props-market-filter', currentMarketFilter);
+    renderMarketFilterChips();
     if (currentMarketResultsPayload) renderMarketResults(currentMarketResultsPayload);
   });
 }
@@ -2230,6 +2251,7 @@ window.addEventListener('keydown', (event) => {
   resetDashboardForNoSelection();
   renderBetFinderEmpty();
   renderMarketEmpty();
+  renderMarketFilterChips();
   setActiveProp(selectedStat);
   switchView(activeView);
   setStatus('Loading teams');
@@ -2978,6 +3000,59 @@ function saveLatestMarketResults(payload) {
 }
 
 
+
+function getMarketFilterLabel(filterKey) {
+  if (filterKey === 'positive_ev') return 'Filter: +EV';
+  if (filterKey === 'edge_5') return 'Filter: Edge ≥ 5%';
+  if (filterKey === 'win_rate_60') return 'Filter: Win Rate ≥ 60%';
+  if (filterKey === 'available_only') return 'Filter: Available';
+  if (filterKey === 'good_matchup') return 'Filter: Good Matchup';
+  return 'Filter: All';
+}
+
+function filterMarketRows(rows, filterKey) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (filterKey === 'positive_ev') {
+    return list.filter(item => Number(item?.best_bet?.ev ?? Number.NEGATIVE_INFINITY) > 0);
+  }
+  if (filterKey === 'edge_5') {
+    return list.filter(item => Number(item?.best_bet?.edge ?? Number.NEGATIVE_INFINITY) >= 5);
+  }
+  if (filterKey === 'win_rate_60') {
+    return list.filter(item => Number(item?.analysis?.hit_rate ?? Number.NEGATIVE_INFINITY) >= 60);
+  }
+  if (filterKey === 'available_only') {
+    return list.filter(item => {
+      const availability = item?.availability || item?.analysis?.availability;
+      if (!availability) return true;
+      const status = String(availability?.status || '').toLowerCase();
+      return !status.includes('out') && !status.includes('doubtful');
+    });
+  }
+  if (filterKey === 'good_matchup') {
+    return list.filter(item => {
+      const tone = String(item?.analysis?.matchup?.vs_position?.lean_tone || item?.matchup?.vs_position?.lean_tone || '').toLowerCase();
+      return tone === 'good';
+    });
+  }
+  return list;
+}
+
+function renderMarketFilterChips() {
+  if (!marketFilterChips) return;
+  const filters = [
+    ['all', 'All'],
+    ['positive_ev', '+EV'],
+    ['edge_5', 'Edge ≥ 5%'],
+    ['win_rate_60', 'Win Rate ≥ 60%'],
+    ['available_only', 'Available'],
+    ['good_matchup', 'Good Matchup'],
+  ];
+  marketFilterChips.innerHTML = filters.map(([key, label]) => `
+    <button class="market-filter-chip ${currentMarketFilter === key ? 'active' : ''}" type="button" data-filter-key="${key}">${label}</button>
+  `).join('');
+}
+
 function getMarketSortLabel(sortKey) {
   if (sortKey === 'best_edge') return 'Sorted by best edge';
   if (sortKey === 'highest_hit_rate') return 'Sorted by highest win rate';
@@ -2998,14 +3073,37 @@ function getMarketSortValue(item, sortKey) {
   return [ev, edge, hitRate, confidence, -availabilityRank];
 }
 
-function compareMarketRows(a, b, sortKey) {
+function compareMarketRows(a, b, sortKey, direction = currentMarketSortDirection || 'desc') {
   const av = getMarketSortValue(a, sortKey);
   const bv = getMarketSortValue(b, sortKey);
+  const multiplier = direction === 'asc' ? 1 : -1;
   for (let i = 0; i < av.length; i += 1) {
     if (av[i] === bv[i]) continue;
-    return bv[i] - av[i];
+    return (av[i] - bv[i]) * multiplier;
   }
   return 0;
+}
+
+function getMarketSortArrow(sortKey) {
+  if (currentMarketSort !== sortKey) return '↕';
+  return currentMarketSortDirection === 'asc' ? '↑' : '↓';
+}
+
+function getMarketAriaSort(sortKey) {
+  if (currentMarketSort !== sortKey) return 'none';
+  return currentMarketSortDirection === 'asc' ? 'ascending' : 'descending';
+}
+
+function toggleMarketSort(sortKey) {
+  if (!sortKey) return;
+  if (currentMarketSort === sortKey) {
+    currentMarketSortDirection = currentMarketSortDirection === 'desc' ? 'asc' : 'desc';
+  } else {
+    currentMarketSort = sortKey;
+    currentMarketSortDirection = 'desc';
+  }
+  localStorage.setItem('nba-props-market-sort', currentMarketSort);
+  localStorage.setItem('nba-props-market-sort-direction', currentMarketSortDirection);
 }
 
 // duplicate renderMarketResults removed; using primary implementation above
