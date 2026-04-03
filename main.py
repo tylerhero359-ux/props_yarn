@@ -38,6 +38,7 @@ from nba_api.stats.endpoints import (
     PlayerGameLog,
     PlayerNextNGames,
     ScoreboardV2,
+    TeamGameLog,
 )
 from nba_api.stats.static import players as static_players
 from nba_api.stats.static import teams as static_teams
@@ -217,6 +218,9 @@ POSITION_DASH_FETCH_ATTEMPTS_WITH_RELIABLE_STALE = 1
 POSITION_DASH_FETCH_ATTEMPTS_NO_RELIABLE_STALE = 2
 POSITION_DASH_FETCH_TIMEOUT_CAP_SECONDS = 12
 POSITION_DASH_FETCH_TIMEOUT_FLOOR_SECONDS = 3
+TEAM_GAME_LOG_CACHE: dict[tuple[int, str, str], dict[str, Any]] = {}
+TEAM_RECENT_CONTEXT_CACHE: dict[tuple[int, str, str, int], dict[str, Any]] = {}
+TEAM_CONTEXT_TTL_SECONDS = 3600
 SCOREBOARD_CACHE: dict[str, dict[str, Any]] = {}
 ENRICHED_LOG_CACHE: dict[tuple[int, str, str, int | None], dict[str, Any]] = {}
 ANALYSIS_CACHE_TTL_SECONDS = 300
@@ -476,6 +480,32 @@ def build_player_variant_lookup() -> dict[int, set[str]]:
 
 PLAYER_VARIANTS_LOOKUP = build_player_variant_lookup()
 
+ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4"
+ODDS_DEFAULT_MARKETS = [
+    "player_points",
+    "player_rebounds",
+    "player_assists",
+    "player_threes",
+    "player_blocks",
+    "player_steals",
+    "player_turnovers",
+    "player_points_rebounds_assists",
+    "player_points_rebounds",
+    "player_points_assists",
+    "player_rebounds_assists",
+]
+ODDS_MARKET_TO_STAT = {
+    "player_points": "PTS",
+    "player_rebounds": "REB",
+    "player_assists": "AST",
+    "player_threes": "3PM",
+    "player_blocks": "BLK",
+    "player_steals": "STL",
+    "player_points_rebounds_assists": "PRA",
+    "player_points_rebounds": "PR",
+    "player_points_assists": "PA",
+    "player_rebounds_assists": "RA",
+}
 
 def report_name_variants(name: str) -> set[str]:
     """Backward-compatible alias for player name variant generation."""
@@ -1424,7 +1454,125 @@ def parse_game_date_any(raw_value: Any) -> datetime | None:
     return None
 
 
-def build_game_environment_context(season_rows: list[dict[str, Any]], next_game: dict[str, Any] | None) -> dict[str, Any]:
+
+@timed_call("team_game_log")
+def fetch_team_game_log(team_id: int, season: str, season_type: str) -> list[dict[str, Any]]:
+    cache_key = (int(team_id), str(season), str(season_type))
+    cached = TEAM_GAME_LOG_CACHE.get(cache_key)
+    now_ts = time.time()
+    if cached and now_ts - float(cached.get("timestamp") or 0.0) < TEAM_CONTEXT_TTL_SECONDS:
+        return [dict(row) for row in (cached.get("rows") or [])]
+
+    try:
+        response = call_nba_with_retries(
+            lambda: TeamGameLog(
+                team_id=team_id,
+                season=season,
+                season_type_all_star=season_type,
+                timeout=12,
+            ),
+            label="team game log request",
+            attempts=2,
+            base_delay=0.6,
+        )
+        df = response.get_data_frames()[0]
+        rows = df.to_dict(orient="records") if not df.empty else []
+        TEAM_GAME_LOG_CACHE[cache_key] = {"timestamp": now_ts, "rows": rows}
+        return [dict(row) for row in rows]
+    except Exception:
+        if cached:
+            return [dict(row) for row in (cached.get("rows") or [])]
+        return []
+
+
+def _team_possessions_proxy(row: dict[str, Any]) -> float:
+    fga = safe_stat_number(row, "FGA")
+    fta = safe_stat_number(row, "FTA")
+    oreb = safe_stat_number(row, "OREB")
+    tov = safe_stat_number(row, "TOV")
+    return fga + (0.44 * fta) - oreb + tov
+
+
+def build_team_recent_context(team_id: int | None, season: str, season_type: str, last_n: int = 10) -> dict[str, Any] | None:
+    if not team_id:
+        return None
+    cache_key = (int(team_id), str(season), str(season_type), int(last_n))
+    cached = TEAM_RECENT_CONTEXT_CACHE.get(cache_key)
+    now_ts = time.time()
+    if cached and now_ts - float(cached.get("timestamp") or 0.0) < TEAM_CONTEXT_TTL_SECONDS:
+        payload = cached.get("payload")
+        return dict(payload) if isinstance(payload, dict) else None
+
+    rows = fetch_team_game_log(int(team_id), season, season_type)
+    recent_rows = rows[: max(1, int(last_n))]
+    if not recent_rows:
+        TEAM_RECENT_CONTEXT_CACHE[cache_key] = {"timestamp": now_ts, "payload": None}
+        return None
+
+    pace_samples = [_team_possessions_proxy(row) for row in recent_rows]
+    pace_value = round(sum(pace_samples) / len(pace_samples), 2) if pace_samples else None
+
+    plus_minus_samples: list[float] = []
+    for row in recent_rows:
+        raw_pm = row.get("PLUS_MINUS")
+        try:
+            plus_minus_samples.append(float(raw_pm or 0.0))
+        except (TypeError, ValueError):
+            continue
+    avg_plus_minus = round(sum(plus_minus_samples) / len(plus_minus_samples), 2) if plus_minus_samples else None
+
+    payload = {
+        "team_id": int(team_id),
+        "sample_games": len(recent_rows),
+        "pace_proxy": pace_value,
+        "avg_plus_minus": avg_plus_minus,
+    }
+    TEAM_RECENT_CONTEXT_CACHE[cache_key] = {"timestamp": now_ts, "payload": dict(payload)}
+    return payload
+
+
+def enrich_environment_with_team_context(environment: dict[str, Any], team_context: dict[str, Any] | None, opponent_context: dict[str, Any] | None) -> dict[str, Any]:
+    payload = dict(environment or {})
+    team_pace = None if not team_context else team_context.get("pace_proxy")
+    opponent_pace = None if not opponent_context else opponent_context.get("pace_proxy")
+    if isinstance(team_pace, (int, float)) and isinstance(opponent_pace, (int, float)):
+        combined_pace = round((float(team_pace) + float(opponent_pace)) / 2.0, 2)
+        payload["team_pace_proxy"] = round(float(team_pace), 2)
+        payload["opponent_pace_proxy"] = round(float(opponent_pace), 2)
+        payload["combined_pace_proxy"] = combined_pace
+        if combined_pace >= 101.5:
+            payload["pace_bucket"] = "fast"
+            payload["pace_label"] = "Fast pace setup"
+        elif combined_pace <= 97.5:
+            payload["pace_bucket"] = "slow"
+            payload["pace_label"] = "Slow pace caution"
+        else:
+            payload["pace_bucket"] = "neutral"
+            payload["pace_label"] = "Neutral pace"
+
+    team_pm = None if not team_context else team_context.get("avg_plus_minus")
+    opp_pm = None if not opponent_context else opponent_context.get("avg_plus_minus")
+    if isinstance(team_pm, (int, float)) and isinstance(opp_pm, (int, float)):
+        projected_spread = round(float(team_pm) - float(opp_pm), 1)
+        payload["projected_spread"] = projected_spread
+        if projected_spread >= 13:
+            payload["spread_bucket"] = "blowout"
+            payload["spread_label"] = f"Blowout risk • est. -{abs(projected_spread):.1f}"
+        elif projected_spread >= 5:
+            payload["spread_bucket"] = "favorite"
+            payload["spread_label"] = f"Favorite script • est. -{abs(projected_spread):.1f}"
+        elif projected_spread <= -13:
+            payload["spread_bucket"] = "blowout"
+            payload["spread_label"] = f"Blowout risk • est. +{abs(projected_spread):.1f}"
+        elif projected_spread <= -5:
+            payload["spread_bucket"] = "underdog"
+            payload["spread_label"] = f"Underdog script • est. +{abs(projected_spread):.1f}"
+        else:
+            payload["spread_bucket"] = "close"
+            payload["spread_label"] = f"Close spread setup • est. {projected_spread:+.1f}"
+    return payload
+
+def build_game_environment_context(season_rows: list[dict[str, Any]], next_game: dict[str, Any] | None, team_id: int | None = None, season: str = "", season_type: str = "") -> dict[str, Any]:
     last_game_dt = parse_game_date_any(season_rows[0].get("GAME_DATE")) if season_rows else None
     next_game_dt = parse_game_date_any((next_game or {}).get("game_date"))
 
@@ -1476,7 +1624,10 @@ def build_game_environment_context(season_rows: list[dict[str, Any]], next_game:
 
 def build_game_log_entry(row: dict[str, Any], stat: str, line: float) -> dict[str, Any]:
     value = round(compute_stat_value(row, stat), 1)
-    return {
+    pts = round(safe_stat_number(row, "PTS"), 1)
+    reb = round(safe_stat_number(row, "REB"), 1)
+    ast = round(safe_stat_number(row, "AST"), 1)
+    entry = {
         "game_date": row["GAME_DATE"],
         "matchup": row.get("MATCHUP", ""),
         "value": value,
@@ -1485,7 +1636,20 @@ def build_game_log_entry(row: dict[str, Any], stat: str, line: float) -> dict[st
         "fga": round(safe_stat_number(row, "FGA"), 1),
         "fg3a": round(safe_stat_number(row, "FG3A"), 1),
         "fta": round(safe_stat_number(row, "FTA"), 1),
+        "pts": pts,
+        "reb": reb,
+        "ast": ast,
+        "components": {},
     }
+    if stat == "PRA":
+        entry["components"] = {"PTS": pts, "REB": reb, "AST": ast}
+    elif stat == "PR":
+        entry["components"] = {"PTS": pts, "REB": reb}
+    elif stat == "PA":
+        entry["components"] = {"PTS": pts, "AST": ast}
+    elif stat == "RA":
+        entry["components"] = {"REB": reb, "AST": ast}
+    return entry
 
 def parse_matchup_descriptor(matchup: str) -> dict[str, Any]:
     raw = str(matchup or '').strip()
@@ -2070,6 +2234,130 @@ def build_debug_metadata(*, cache_status: dict[str, Any], freshness: dict[str, A
         "timing_enabled": bool(timings_enabled),
         "generated_at": datetime.utcnow().isoformat() + "Z",
     }
+
+
+def mask_api_key_for_display(api_key: str) -> str:
+    raw = str(api_key or "").strip()
+    if len(raw) <= 8:
+        return raw
+    return f"{raw[:4]}…{raw[-4:]}"
+
+
+def odds_api_build_query(params: dict[str, Any]) -> str:
+    search = []
+    for key, value in params.items():
+        if value in (None, ""):
+            continue
+        search.append((key, str(value)))
+    return requests.compat.urlencode(search)
+
+
+def convert_american_to_decimal(price: Any) -> float | None:
+    try:
+        value = float(price)
+    except (TypeError, ValueError):
+        return None
+    if value == 0:
+        return None
+    if value > 0:
+        return round((value / 100.0) + 1.0, 2)
+    return round((100.0 / abs(value)) + 1.0, 2)
+
+
+def normalize_decimal_price(price: Any, odds_format: str) -> float | None:
+    try:
+        value = float(price)
+    except (TypeError, ValueError):
+        return None
+    if str(odds_format or "decimal").lower() == "american":
+        return convert_american_to_decimal(value)
+    return round(value, 2)
+
+
+def odds_api_fetch(endpoint: str, api_key: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    key = str(api_key or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="Missing Odds API key.")
+
+    query = dict(params or {})
+    query["apiKey"] = key
+    url = f"{ODDS_API_BASE_URL}{endpoint}?{odds_api_build_query(query)}"
+    response = requests.get(url, timeout=(5, 30), headers={"User-Agent": NBA_USER_AGENT, "Accept": "application/json"})
+    remaining = response.headers.get("x-requests-remaining")
+    used = response.headers.get("x-requests-used")
+    last = response.headers.get("x-requests-last")
+
+    if not response.ok:
+        detail = response.text.strip() or f"Odds API error {response.status_code}"
+        raise HTTPException(status_code=response.status_code, detail=detail)
+
+    try:
+        data = response.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Failed to parse Odds API response.") from exc
+
+    return {
+        "data": data,
+        "quota": {"remaining": remaining, "used": used, "last": last},
+    }
+
+
+def build_odds_import_rows(event_payload: dict[str, Any], odds_format: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    # Keyed by (market_key, player_name, line_value) — bookmaker intentionally excluded
+    # so that duplicate props from different books collapse into a single row.
+    # The first bookmaker that supplies a complete over+under pair wins.
+    pair_map: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    for bookmaker in event_payload.get("bookmakers") or []:
+        bookmaker_title = str(bookmaker.get("title") or bookmaker.get("key") or "Book")
+        for market in bookmaker.get("markets") or []:
+            market_key = str(market.get("key") or "")
+            stat_code = ODDS_MARKET_TO_STAT.get(market_key)
+            if not stat_code:
+                continue
+            market_updated = market.get("last_update") or bookmaker.get("last_update")
+            for outcome in market.get("outcomes") or []:
+                side = str(outcome.get("name") or "").strip().lower()
+                if side not in {"over", "under"}:
+                    continue
+                player_name = str(outcome.get("description") or "").strip()
+                line_value = outcome.get("point")
+                decimal_odds = normalize_decimal_price(outcome.get("price"), odds_format)
+                if not player_name or line_value in (None, "") or decimal_odds is None:
+                    continue
+                # Dedup key: market + player + line only (no bookmaker)
+                pair_key = (market_key, player_name, str(line_value))
+                bucket = pair_map.setdefault(pair_key, {
+                    "bookmaker_title": bookmaker_title,
+                    "market_key": market_key,
+                    "player_name": player_name,
+                    "stat": stat_code,
+                    "line": float(line_value),
+                    "over_odds": None,
+                    "under_odds": None,
+                    "market_last_update": market_updated,
+                })
+                # Only fill in odds that haven't been set yet (first bookmaker wins)
+                if bucket[f"{side}_odds"] is None:
+                    bucket[f"{side}_odds"] = decimal_odds
+
+    for bucket in pair_map.values():
+        if bucket.get("over_odds") is None or bucket.get("under_odds") is None:
+            continue
+        rows.append({
+            "player_name": bucket["player_name"],
+            "stat": bucket["stat"],
+            "line": round(float(bucket["line"]), 1),
+            "over_odds": float(bucket["over_odds"]),
+            "under_odds": float(bucket["under_odds"]),
+            "bookmaker_title": bucket["bookmaker_title"],
+            "market_key": bucket["market_key"],
+            "market_last_update": bucket["market_last_update"],
+            "csv_row": f"{bucket['player_name']},{bucket['stat']},{round(float(bucket['line']),1)},{float(bucket['over_odds'])},{float(bucket['under_odds'])}",
+        })
+    rows.sort(key=lambda item: (item["player_name"].lower(), item["stat"], item["line"]))
+    return rows
 
 
 def _position_dash_cache_is_reliable_stale(cached: dict[str, Any] | None, cached_ts: float) -> bool:
@@ -2977,7 +3265,7 @@ def build_prop_analysis_payload(
         return build_team_opportunity_context(team_name=team_name, player_name=player["full_name"], stat=stat)
 
     def _compute_environment() -> dict[str, Any]:
-        return build_game_environment_context(analysis_source_rows, next_game)
+        return build_game_environment_context(analysis_source_rows, next_game, team_id=resolved_team_id, season=season, season_type=season_type)
 
     if ANALYSIS_PARALLEL_ENABLED:
         with ThreadPoolExecutor(max_workers=min(ANALYSIS_PARALLEL_MAX_WORKERS, 3)) as executor:
@@ -3744,6 +4032,329 @@ def market_scan(
         "template": "player_name,stat,line,over_odds,under_odds",
         "results": results,
         "errors": errors,
+    }
+
+
+@app.post("/api/odds/events")
+def odds_events(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    api_key = str(payload.get("api_key") or "").strip()
+    sport = str(payload.get("sport") or "basketball_nba")
+    result = odds_api_fetch(f"/sports/{sport}/events", api_key, {"dateFormat": "iso"})
+    return {
+        "events": result["data"],
+        "quota": result["quota"],
+        "api_key_used": api_key,
+        "api_key_masked": mask_api_key_for_display(api_key),
+        "sport": sport,
+    }
+
+
+@app.post("/api/odds/player-props-import")
+def odds_player_props_import(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    api_key = str(payload.get("api_key") or "").strip()
+    sport = str(payload.get("sport") or "basketball_nba")
+    event_id = str(payload.get("event_id") or "").strip()
+    regions = str(payload.get("regions") or "us")
+    odds_format = str(payload.get("odds_format") or "decimal")
+    markets_value = payload.get("markets") or ",".join(ODDS_DEFAULT_MARKETS)
+    if isinstance(markets_value, list):
+        markets = ",".join(str(item).strip() for item in markets_value if str(item).strip())
+    else:
+        markets = str(markets_value).strip()
+    if not event_id:
+        raise HTTPException(status_code=400, detail="Missing event_id.")
+
+    result = odds_api_fetch(
+        f"/sports/{sport}/events/{event_id}/odds",
+        api_key,
+        {
+            "regions": regions,
+            "markets": markets,
+            "oddsFormat": odds_format,
+            "dateFormat": "iso",
+        },
+    )
+    event_payload = result["data"] or {}
+    import_rows = build_odds_import_rows(event_payload, odds_format)
+    return {
+        "event": {
+            "id": event_payload.get("id"),
+            "sport_key": event_payload.get("sport_key"),
+            "sport_title": event_payload.get("sport_title"),
+            "commence_time": event_payload.get("commence_time"),
+            "home_team": event_payload.get("home_team"),
+            "away_team": event_payload.get("away_team"),
+        },
+        "import_rows": import_rows,
+        "csv_rows": [row["csv_row"] for row in import_rows],
+        "quota": result["quota"],
+        "api_key_used": api_key,
+        "api_key_masked": mask_api_key_for_display(api_key),
+        "odds_format": odds_format,
+        "regions": regions,
+        "sport": sport,
+        "markets": markets,
+    }
+
+
+@app.post("/api/parlay-builder")
+def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Scrape all today's NBA events + all markets in batches using rotating API keys,
+    analyze every prop via the existing bulk engine, rank by hit rate, and build
+    the best N-leg parlay the user requested.
+
+    Payload:
+      api_keys      list[str]   – one or more Odds API keys (rotated round-robin)
+      legs          int         – 2–6 (number of parlay legs)
+      sport         str         – default "basketball_nba"
+      regions       str         – default "us"
+      odds_format   str         – "decimal" | "american"
+      last_n        int         – recent-game sample size for analysis (default 10)
+      season        str         – e.g. "2024-25"
+      season_type   str         – "Regular Season"
+      batch_size    int         – events per batch (default 3, keeps credit bursts small)
+    """
+    # ── Validate inputs ─────────────────────────────────────────────────
+    raw_keys = payload.get("api_keys") or []
+    if isinstance(raw_keys, str):
+        raw_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+    api_keys: list[str] = [str(k).strip() for k in raw_keys if str(k).strip()]
+    if not api_keys:
+        raise HTTPException(status_code=400, detail="Provide at least one Odds API key in 'api_keys'.")
+
+    legs = int(payload.get("legs") or 3)
+    if legs < 2 or legs > 6:
+        raise HTTPException(status_code=400, detail="'legs' must be between 2 and 6.")
+
+    sport        = str(payload.get("sport") or "basketball_nba")
+    regions      = str(payload.get("regions") or "us")
+    odds_format  = str(payload.get("odds_format") or "decimal")
+    last_n       = int(payload.get("last_n") or 10)
+    season       = str(payload.get("season") or current_nba_season())
+    season_type  = str(payload.get("season_type") or "Regular Season")
+    batch_size   = max(1, int(payload.get("batch_size") or 3))
+    markets      = ",".join(ODDS_DEFAULT_MARKETS)
+
+    # ── Phase 1: Fetch today's events (1 credit, first key) ─────────────
+    key_index = 0
+    quota_log: list[dict[str, Any]] = []
+
+    def next_key() -> str:
+        nonlocal key_index
+        key = api_keys[key_index % len(api_keys)]
+        key_index += 1
+        return key
+
+    try:
+        events_result = odds_api_fetch(
+            f"/sports/{sport}/events",
+            next_key(),
+            {"dateFormat": "iso"},
+        )
+    except HTTPException as exc:
+        raise HTTPException(status_code=exc.status_code, detail=f"Failed to fetch events: {exc.detail}")
+
+    events: list[dict[str, Any]] = events_result["data"] or []
+    quota_log.append({"call": "events_list", "quota": events_result["quota"]})
+
+    if not events:
+        return {
+            "legs": legs,
+            "parlay": [],
+            "parlay_odds": None,
+            "all_props_scored": [],
+            "events_scraped": 0,
+            "props_found": 0,
+            "errors": [],
+            "quota_log": quota_log,
+            "message": "No events found for today.",
+        }
+
+    # ── Phase 2: Fetch odds per event in batches, rotating keys ─────────
+    all_import_rows: list[dict[str, Any]] = []
+    scrape_errors: list[dict[str, Any]] = []
+
+    for batch_start in range(0, len(events), batch_size):
+        batch = events[batch_start: batch_start + batch_size]
+        for event in batch:
+            event_id = str(event.get("id") or "")
+            if not event_id:
+                continue
+            try:
+                result = odds_api_fetch(
+                    f"/sports/{sport}/events/{event_id}/odds",
+                    next_key(),
+                    {
+                        "regions": regions,
+                        "markets": markets,
+                        "oddsFormat": odds_format,
+                        "dateFormat": "iso",
+                        # 1 bookmaker only — we deduplicate anyway, saves ~80% credits
+                        "bookmakers": "draftkings",
+                    },
+                )
+                quota_log.append({"call": f"event_{event_id[:8]}", "quota": result["quota"]})
+                rows = build_odds_import_rows(result["data"] or {}, odds_format)
+                all_import_rows.extend(rows)
+            except HTTPException as exc:
+                scrape_errors.append({
+                    "event_id": event_id,
+                    "home_team": event.get("home_team"),
+                    "away_team": event.get("away_team"),
+                    "reason": exc.detail,
+                    "status_code": exc.status_code,
+                })
+                # 402 / 429 → key is exhausted; advance to next key
+                if exc.status_code in (402, 429):
+                    key_index += 1
+            except Exception as exc:
+                scrape_errors.append({"event_id": event_id, "reason": str(exc)})
+
+    if not all_import_rows:
+        return {
+            "legs": legs,
+            "parlay": [],
+            "parlay_odds": None,
+            "all_props_scored": [],
+            "events_scraped": len(events),
+            "props_found": 0,
+            "errors": scrape_errors,
+            "quota_log": quota_log,
+            "message": "No props found across today's events. Check your API keys or try again later.",
+        }
+
+    # ── Phase 3: Bulk-analyze all props in one shot (free, parallel) ──
+    defaults = {"last_n": last_n, "season": season, "season_type": season_type}
+    local_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+    analysis_rows: list[dict[str, Any]] = []
+    analysis_errors: list[dict[str, Any]] = []
+
+    # Resolve player IDs first (same logic as market-scan)
+    prepared: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for row in all_import_rows:
+        player_name = str(row.get("player_name") or "").strip()
+        player = find_player_by_name(player_name)
+        if not player:
+            analysis_errors.append({"player_name": player_name, "reason": "Player not found."})
+            continue
+        bulk_row = {
+            "player_id": int(player["id"]),
+            "player_name": player_name,
+            "stat": row["stat"],
+            "line": row["line"],
+            "team_id": None,
+            "player_position": None,
+        }
+        prepared.append((bulk_row, row))
+
+    # Deduplicate: one analysis per (player_id, stat, line)
+    seen_analysis_keys: set[tuple[Any, ...]] = set()
+    deduped_prepared: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for bulk_row, orig_row in prepared:
+        ak = (bulk_row["player_id"], bulk_row["stat"], float(bulk_row["line"]))
+        if ak not in seen_analysis_keys:
+            seen_analysis_keys.add(ak)
+            deduped_prepared.append((bulk_row, orig_row))
+
+    max_workers = min(BULK_ANALYSIS_MAX_WORKERS, max(1, len(deduped_prepared)))
+
+    if max_workers <= 1:
+        for idx, (bulk_row, orig_row) in enumerate(deduped_prepared, start=1):
+            try:
+                result = _build_bulk_prop_item(idx, bulk_row, defaults, local_cache)
+                analysis_rows.append((result, orig_row))
+            except Exception as exc:
+                analysis_errors.append({"player_name": bulk_row["player_name"], "reason": str(exc)})
+    else:
+        futures_list: list[tuple[int, dict[str, Any], dict[str, Any], Any]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for idx, (bulk_row, orig_row) in enumerate(deduped_prepared, start=1):
+                fut = executor.submit(_build_bulk_prop_item, idx, bulk_row, defaults, local_cache)
+                futures_list.append((idx, bulk_row, orig_row, fut))
+            for idx, bulk_row, orig_row, fut in futures_list:
+                try:
+                    result = fut.result()
+                    analysis_rows.append((result, orig_row))
+                except Exception as exc:
+                    analysis_errors.append({"player_name": bulk_row["player_name"], "reason": str(exc)})
+
+    # ── Phase 4: Score every prop by hit rate, pick best N legs ─────────
+    scored: list[dict[str, Any]] = []
+    for result, orig_row in analysis_rows:
+        analysis = result.get("analysis") or {}
+        hit_rate  = float(analysis.get("hit_rate") or 0)
+        avg       = float(analysis.get("average") or 0)
+        line      = float(result.get("line") or orig_row.get("line") or 0)
+        stat      = str(result.get("stat") or orig_row.get("stat") or "")
+
+        # Determine best side purely by hit rate vs 50%
+        # Over hit_rate > 50 → OVER is the stronger side
+        if hit_rate >= 50:
+            side = "OVER"
+            odds = float(orig_row.get("over_odds") or 1.91)
+            side_hit_rate = hit_rate
+        else:
+            side = "UNDER"
+            odds = float(orig_row.get("under_odds") or 1.91)
+            side_hit_rate = 100.0 - hit_rate
+
+        # Skip unavailable players
+        availability = analysis.get("availability") or {}
+        if availability.get("is_unavailable"):
+            continue
+
+        scored.append({
+            "player_name": result.get("player_name") or "",
+            "player_id": result.get("player_id"),
+            "stat": stat,
+            "line": line,
+            "side": side,
+            "odds": odds,
+            "hit_rate": round(side_hit_rate, 1),
+            "average": round(avg, 2),
+            "games_count": int(analysis.get("games_count") or 0),
+            "last_n": int(analysis.get("last_n") or last_n),
+            "bookmaker": orig_row.get("bookmaker_title") or "N/A",
+            "market_key": orig_row.get("market_key") or "",
+            "availability_label": availability.get("label") or "Active",
+        })
+
+    # Sort descending by hit rate (primary), then odds (prefer value)
+    scored.sort(key=lambda x: (x["hit_rate"], x["odds"]), reverse=True)
+
+    # Pick top N — enforce one leg per player (avoid stacking same player)
+    parlay_legs: list[dict[str, Any]] = []
+    seen_player_ids: set[int] = set()
+    for prop in scored:
+        if len(parlay_legs) >= legs:
+            break
+        pid = prop.get("player_id")
+        if pid in seen_player_ids:
+            continue
+        seen_player_ids.add(pid)
+        parlay_legs.append(prop)
+
+    # Calculate combined parlay odds (decimal product)
+    parlay_odds: float | None = None
+    if parlay_legs:
+        parlay_odds = 1.0
+        for leg in parlay_legs:
+            parlay_odds *= leg["odds"]
+        parlay_odds = round(parlay_odds, 2)
+
+    all_errors = scrape_errors + analysis_errors
+
+    return {
+        "legs": legs,
+        "parlay": parlay_legs,
+        "parlay_odds": parlay_odds,
+        "all_props_scored": scored,
+        "events_scraped": len(events),
+        "props_found": len(all_import_rows),
+        "props_analyzed": len(scored),
+        "errors": all_errors,
+        "quota_log": quota_log,
     }
 
 

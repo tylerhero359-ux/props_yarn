@@ -68,6 +68,13 @@
             <small>Paste and rank a full board</small>
           </span>
         </button>
+        <button class="nav-item" type="button" data-view="parlay">
+          <span class="nav-icon">🎰</span>
+          <span>
+            <strong>Parlay Builder</strong>
+            <small>Auto-build best-hit-rate parlays</small>
+          </span>
+        </button>
       </nav>
 
       <div class="sidebar-summary card">
@@ -718,9 +725,62 @@
           </div>
           </div>
 
+          <div class="market-api-panel card">
+            <div class="section-head compact-inline-head">
+              <div>
+                <p class="section-kicker">Odds API Import</p>
+                <h3>Load events, pull player props, then send them straight into Market Scanner.</h3>
+              </div>
+              <span id="oddsApiStatus" class="small-badge">Ready</span>
+            </div>
+            <div class="market-api-grid">
+              <label class="field-inline field-wide">
+                <span class="small-label">Odds API key</span>
+                <input id="oddsApiKeyInput" class="market-api-input" type="text" placeholder="Enter your The Odds API key">
+              </label>
+              <label class="field-inline">
+                <span class="small-label">Sport</span>
+                <select id="oddsSportSelect" class="market-api-input">
+                  <option value="basketball_nba">NBA</option>
+                  <option value="basketball_wnba">WNBA</option>
+                  <option value="basketball_ncaab">NCAAB</option>
+                </select>
+              </label>
+              <label class="field-inline">
+                <span class="small-label">Regions</span>
+                <input id="oddsRegionsInput" class="market-api-input" type="text" value="us">
+              </label>
+              <label class="field-inline">
+                <span class="small-label">Odds format</span>
+                <select id="oddsFormatSelect" class="market-api-input">
+                  <option value="decimal">Decimal</option>
+                  <option value="american">American</option>
+                </select>
+              </label>
+              <label class="field-inline field-wide">
+                <span class="small-label">Markets</span>
+                <input id="oddsMarketsInput" class="market-api-input" type="text" value="player_points,player_rebounds,player_assists,player_threes,player_blocks,player_steals,player_points_rebounds_assists,player_points_rebounds,player_points_assists,player_rebounds_assists">
+              </label>
+            </div>
+            <div class="market-api-actions">
+              <button id="oddsLoadEventsBtn" class="secondary-btn" type="button">Load Events</button>
+              <label class="field-inline field-grow">
+                <span class="small-label">Event</span>
+                <select id="oddsEventSelect" class="market-api-input">
+                  <option value="">Load events first</option>
+                </select>
+              </label>
+              <button id="oddsImportScanBtn" class="primary-btn" type="button">Import Props & Scan</button>
+            </div>
+            <div class="market-api-meta-row">
+              <div id="oddsQuotaMeta" class="small-meta">Credits used will appear here after an Odds API call.</div>
+              <div id="oddsApiKeyMeta" class="small-meta">API key used: none</div>
+            </div>
+          </div>
+
           <div class="market-input-grid">
             <div class="market-form">
-              <label for="marketTextarea" class="small-label">Paste market rows</label>
+              <label for="marketTextarea" class="small-label">Paste or import market rows</label>
               <textarea id="marketTextarea" class="market-textarea" spellcheck="false" placeholder="player_name,stat,line,over_odds,under_odds&#10;Nikola Jokic,REB,12.5,2.00,1.73"></textarea>
               <div class="market-template-note">
                 Template: <code>player_name,stat,line,over_odds,under_odds</code>
@@ -735,7 +795,7 @@
               <p class="section-kicker">How to fill it</p>
               <h3>One prop per line.</h3>
               <ul class="market-guide-list">
-                <li>Use decimal odds only.</li>
+                <li>Imported Odds API rows are converted to decimal before scanning.</li>
                 <li>Use stat codes like <strong>PTS</strong>, <strong>REB</strong>, <strong>AST</strong>, <strong>3PM</strong>, <strong>PRA</strong>.</li>
                 <li>Teams and opponents are auto-detected from the player.</li>
                 <li>The scanner ranks by EV first, then edge, then recent hit rate.</li>
@@ -743,13 +803,149 @@
             </div>
           </div>
 
-          <div id="marketFilterChips" class="market-filter-chip-row"></div>
+          <div class="market-filter-group">
+            <span class="small-label market-filter-label">Standard filters</span>
+            <div id="marketFilterChips" class="market-filter-chip-row"></div>
+          </div>
+
+          <div class="market-filter-group expert-filter-group">
+            <span class="small-label market-filter-label">Expert angles</span>
+            <div id="marketExpertFilterChips" class="market-filter-chip-row"></div>
+          </div>
 
           <div id="marketResults" class="bet-finder-state empty-state-panel compact">
             <div class="empty-icon">🧾</div>
             <strong>No market scan yet.</strong>
             <span>Paste your board using the template, then click Analyze Board.</span>
           </div>
+        </section>
+      </section>
+
+      <section class="dashboard-view" data-view="parlay">
+        <section class="tool-intro-card card glass parlay-intro-card">
+          <div>
+            <p class="section-kicker">Parlay Builder</p>
+            <h2>Scrape every today's game, find the highest hit-rate props, build your parlay.</h2>
+            <p class="small-meta">Uses key rotation across your API keys so no single key runs dry. One bookmaker per call saves ~80% of credits. Props are analyzed in parallel then ranked by win rate.</p>
+          </div>
+        </section>
+
+        <section id="parlayPanel" class="card glass parlay-panel">
+
+          <!-- Config row -->
+          <div class="parlay-config-grid">
+            <label class="field-inline">
+              <span class="small-label">Odds API keys <span class="parlay-key-hint">(comma-separate multiple)</span></span>
+              <textarea id="parlayApiKeys" class="parlay-keys-textarea" rows="2" placeholder="key1,key2,key3 — separate multiple keys with commas"></textarea>
+            </label>
+            <div class="parlay-config-row">
+              <label class="field-inline">
+                <span class="small-label">Sport</span>
+                <select id="parlaySportSelect" class="market-api-input">
+                  <option value="basketball_nba">NBA</option>
+                  <option value="basketball_wnba">WNBA</option>
+                </select>
+              </label>
+              <label class="field-inline">
+                <span class="small-label">Odds format</span>
+                <select id="parlayOddsFormatSelect" class="market-api-input">
+                  <option value="decimal">Decimal</option>
+                  <option value="american">American</option>
+                </select>
+              </label>
+              <label class="field-inline">
+                <span class="small-label">Legs</span>
+                <select id="parlayLegsSelect" class="market-api-input">
+                  <option value="2">2-Leg</option>
+                  <option value="3" selected>3-Leg</option>
+                  <option value="4">4-Leg</option>
+                  <option value="5">5-Leg</option>
+                  <option value="6">6-Leg</option>
+                </select>
+              </label>
+              <label class="field-inline">
+                <span class="small-label">Sample (games)</span>
+                <select id="parlayLastNSelect" class="market-api-input">
+                  <option value="5">Last 5</option>
+                  <option value="10" selected>Last 10</option>
+                  <option value="15">Last 15</option>
+                  <option value="20">Last 20</option>
+                </select>
+              </label>
+            </div>
+          </div>
+
+          <div class="parlay-action-row">
+            <button id="parlayBuildBtn" class="primary-btn parlay-build-btn" type="button">
+              <span class="parlay-btn-icon">🎰</span> Scrape &amp; Build
+            </button>
+            <button id="parlayRebuildBtn" class="secondary-btn parlay-build-btn" type="button" style="display:none" title="Re-pick legs from cached props — no API calls">
+              <span class="parlay-btn-icon">🔄</span> Rebuild Legs
+            </button>
+            <button id="parlayRescrapeBtn" class="text-btn" type="button" style="display:none" title="Re-scrape all events and re-analyze — uses API credits">
+              ↺ Re-scrape
+            </button>
+            <div id="parlayStatusMeta" class="small-meta parlay-status-meta">Configure your keys and legs, then hit Scrape &amp; Build.</div>
+          </div>
+
+          <!-- Quota tracker -->
+          <div id="parlayQuotaBar" class="parlay-quota-bar" style="display:none">
+            <div class="parlay-quota-inner">
+              <span class="small-label">Credit log</span>
+              <div id="parlayQuotaList" class="parlay-quota-list"></div>
+            </div>
+          </div>
+
+          <!-- Results: selected parlay ticket -->
+          <div id="parlayTicket" class="parlay-ticket" style="display:none">
+            <div class="parlay-ticket-header">
+              <div>
+                <p class="section-kicker">Your Parlay</p>
+                <h2 id="parlayTicketTitle">Best <span id="parlayTicketLegs">3</span>-Leg by Hit Rate</h2>
+              </div>
+              <div class="parlay-ticket-odds-block">
+                <span class="small-label">Combined odds</span>
+                <strong id="parlayTicketOdds" class="parlay-combined-odds">—</strong>
+              </div>
+            </div>
+            <div id="parlayTicketLegs" class="parlay-legs-grid"></div>
+          </div>
+
+          <!-- All props board -->
+          <div id="parlayAllPropsWrap" style="display:none">
+            <div class="section-head" style="padding: 0 0 12px">
+              <div>
+                <p class="section-kicker">All Props Scored</p>
+                <h3 id="parlayAllPropsTitle">Ranked by hit rate</h3>
+              </div>
+              <span id="parlayPropCount" class="small-badge">0 props</span>
+            </div>
+            <div class="parlay-all-props-table-wrap">
+              <table class="parlay-all-props-table">
+                <thead>
+                  <tr>
+                    <th>Player</th>
+                    <th>Stat</th>
+                    <th>Line</th>
+                    <th>Side</th>
+                    <th>Hit %</th>
+                    <th>Avg</th>
+                    <th>Games</th>
+                    <th>Odds</th>
+                  </tr>
+                </thead>
+                <tbody id="parlayAllPropsBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Empty state -->
+          <div id="parlayEmptyState" class="bet-finder-state empty-state-panel compact">
+            <div class="empty-icon">🎰</div>
+            <strong>No parlay built yet.</strong>
+            <span>Enter your Odds API key(s), choose your legs, and click Build Parlay.</span>
+          </div>
+
         </section>
       </section>
     </main>
