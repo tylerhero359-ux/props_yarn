@@ -190,6 +190,11 @@ const VIEW_META = {
     eyebrow: 'Parlay builder',
     title: 'Parlay Builder',
     subtitle: 'Scrape every game, rank props by hit rate, and auto-build the strongest 2–6 leg parlay.'
+  },
+  tracker: {
+    eyebrow: 'Live tracking',
+    title: 'Prop Tracker',
+    subtitle: 'Add your active bets and watch each bar fill toward the line in real time.'
   }
 };
 
@@ -1133,8 +1138,15 @@ async function loadRoster(teamId) {
 }
 
 function renderRoster(team, season, players) {
-  rosterTitle.textContent = `${team.full_name} roster`;
-  rosterMeta.textContent = `${players.length} players • ${season}`;
+  rosterTitle.textContent = team.full_name + ' roster';
+  const outCnt  = players.filter(p => p.is_unavailable).length;
+  const riskCnt = players.filter(p => p.is_risky && !p.is_unavailable).length;
+  let injNote = '';
+  if (outCnt)  injNote += ' • ' + outCnt + ' out';
+  if (riskCnt) injNote += (outCnt ? ', ' : ' • ') + riskCnt + ' questionable';
+  rosterMeta.innerHTML =
+    players.length + ' players • ' + season + injNote +
+    '&nbsp;<button class="inj-report-btn" onclick="toggleInjuryPanel(' + team.id + ')">Injury Report</button>';
 
   if (!players.length) {
     playerGrid.classList.remove('has-scroll');
@@ -1150,17 +1162,26 @@ function renderRoster(team, season, players) {
   }
 
   playerGrid.classList.remove('empty-grid');
-  playerGrid.innerHTML = players.map(player => `
-    <button class="player-card" data-id="${player.id}">
+  playerGrid.innerHTML = players.map(player => {
+    const injSt  = player.injury_status || '';
+    const isOut  = !!player.is_unavailable;
+    const isRisk = !!player.is_risky && !isOut;
+    const cardCls = isOut ? 'player-card player-card--out' : isRisk ? 'player-card player-card--risk' : 'player-card';
+    const badge   = isOut
+      ? `<span class="inj-badge out">${escapeHtml(injSt)}</span>`
+      : isRisk
+        ? `<span class="inj-badge risk">${escapeHtml(injSt)}</span>`
+        : '';
+    return `<button class="${cardCls}" data-id="${player.id}">
       <img src="${getPlayerImage(player.id)}" alt="${escapeHtml(player.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
       <div class="player-card-head">
         <div class="player-card-name">${escapeHtml(player.full_name)}</div>
         <span class="jersey-pill">${escapeHtml(player.jersey || '--')}</span>
       </div>
-      <div class="player-card-meta">${escapeHtml(player.position || 'Position N/A')}</div>
+      <div class="player-card-meta">${escapeHtml(player.position || 'N/A')} ${badge}</div>
       <div class="player-card-team">${escapeHtml(player.team_abbreviation || team.abbreviation)}</div>
-    </button>
-  `).join('');
+    </button>`;
+  }).join('');
 
   playerGrid.querySelectorAll('.player-card').forEach((card, index) => {
     card.addEventListener('click', () => {
@@ -1171,6 +1192,55 @@ function renderRoster(team, season, players) {
 
   updateSelectedCardStyles();
   updateRosterScrollState(players, season);
+}
+
+// ── Injury report slide-down panel ───────────────────────────────────────
+let _injPanelTeamId = null;
+
+async function toggleInjuryPanel(teamId) {
+  let panel = document.getElementById('rosterInjuryPanel');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'rosterInjuryPanel';
+    panel.className = 'roster-injury-panel';
+    const grid = document.getElementById('playerGrid');
+    if (grid && grid.parentNode) grid.parentNode.insertBefore(panel, grid);
+  }
+  if (_injPanelTeamId === teamId && panel.classList.contains('open')) {
+    panel.classList.remove('open');
+    _injPanelTeamId = null;
+    return;
+  }
+  _injPanelTeamId = teamId;
+  panel.classList.add('open');
+  panel.innerHTML = '<div class="inj-panel-loading">Loading injury report…</div>';
+  try {
+    const resp = await fetch('/api/teams/' + teamId + '/injury-report');
+    if (!resp.ok) throw new Error('Failed');
+    const d = await resp.json();
+    const ps = d.players || [];
+    const rl = d.report_label ? '<span class="inj-report-date">' + escapeHtml(d.report_label) + '</span>' : '';
+    if (!ps.length) {
+      panel.innerHTML = '<div class="inj-panel-clean">' + escapeHtml(d.team_name) + ' — no players listed on injury report. ' + rl + '</div>';
+      return;
+    }
+    panel.innerHTML =
+      '<div class="inj-panel-header">' +
+        '<strong>' + escapeHtml(d.team_name) + ' Injury Report</strong>' + rl +
+      '</div>' +
+      '<div class="inj-panel-rows">' +
+        ps.map(function(p) {
+          const cls = p.is_unavailable ? 'out' : p.is_risky ? 'risk' : 'ok';
+          return '<div class="inj-panel-row ' + cls + '">' +
+            '<span class="ipn">' + escapeHtml(p.name) + '</span>' +
+            '<span class="ips inj-badge ' + cls + '">' + escapeHtml(p.status) + '</span>' +
+            '<span class="ipr">' + escapeHtml(p.reason || '') + '</span>' +
+          '</div>';
+        }).join('') +
+      '</div>';
+  } catch(e) {
+    panel.innerHTML = '<div class="inj-panel-loading">Could not load injury report.</div>';
+  }
 }
 
 async function searchPlayers(query) {
@@ -2340,7 +2410,14 @@ async function focusMarketPlayer(item) {
   const teamId = item.player.team_id;
   if (teamId && String(teamSelect.value) !== String(teamId)) {
     teamSelect.value = String(teamId);
-    await loadRoster(teamId);
+    try {
+      await loadRoster(teamId);
+    } catch (rosterErr) {
+      // Roster load failed (NBA API throttle/timeout) — continue anyway.
+      // The player is already known from the market scan result so analysis
+      // can still run; the roster panel will just be empty/stale.
+      console.warn('Roster load failed, continuing with player from market scan:', rosterErr.message || rosterErr);
+    }
   }
 
   setSelectedPlayer({
@@ -2460,7 +2537,12 @@ function renderMarketResults(payload) {
         setStatus('Ready');
       } catch (error) {
         console.error(error);
-        alert(error.message || 'Failed to open that market pick.');
+        // Only surface the error as an alert if it's NOT a roster issue
+        // (roster failures are handled gracefully inside focusMarketPlayer)
+        const msg = error.message || '';
+        if (!msg.toLowerCase().includes('roster')) {
+          alert(msg || 'Failed to open that market pick.');
+        }
         setStatus('Error');
       }
     });
@@ -2937,7 +3019,7 @@ function renderFavoritesUpgrade() {
         <div class="favorite-card-body">
           <div class="favorite-visual-shell">
             <img class="favorite-player-shot" src="${headshot}" alt="${escapeHtml(playerName)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
-            ${logo ? `<img class="favorite-team-logo" src="${logo}" alt="${escapeHtml(teamAbbr || 'Team')}" onerror="this.style.display='none'">` : ''}
+            ${logo ? `<img class="favorite-team-logo" src="${logo}" alt="${escapeHtml(teamAbbr || 'Team')}" onerror="this.hidden=true">` : ''}
           </div>
           <div class="favorite-copy">
             <strong>${escapeHtml(item.title)}</strong>
@@ -4439,323 +4521,818 @@ function buildSparklineSvg(values, line, width, height) {
   const PARLAY_KEYS_STORAGE     = 'nba-props-parlay-keys';
   const PARLAY_SETTINGS_STORAGE = 'nba-props-parlay-settings';
 
-  const parlayApiKeys       = document.getElementById('parlayApiKeys');
-  const parlaySportSelect   = document.getElementById('parlaySportSelect');
-  const parlayOddsFormatSel = document.getElementById('parlayOddsFormatSelect');
-  const parlayLegsSelect    = document.getElementById('parlayLegsSelect');
-  const parlayLastNSelect   = document.getElementById('parlayLastNSelect');
-  const parlayBuildBtn      = document.getElementById('parlayBuildBtn');
-  const parlayRebuildBtn    = document.getElementById('parlayRebuildBtn');
-  const parlayRescrapeBtn   = document.getElementById('parlayRescrapeBtn');
-  const parlayStatusMeta    = document.getElementById('parlayStatusMeta');
-  const parlayQuotaBar      = document.getElementById('parlayQuotaBar');
-  const parlayQuotaList     = document.getElementById('parlayQuotaList');
-  const parlayTicket        = document.getElementById('parlayTicket');
-  const parlayTicketOdds    = document.getElementById('parlayTicketOdds');
-  const parlayAllPropsWrap  = document.getElementById('parlayAllPropsWrap');
-  const parlayAllPropsTitle = document.getElementById('parlayAllPropsTitle');
-  const parlayPropCount     = document.getElementById('parlayPropCount');
-  const parlayAllPropsBody  = document.getElementById('parlayAllPropsBody');
-  const parlayEmptyState    = document.getElementById('parlayEmptyState');
+  // ── DOM refs ──────────────────────────────────────────────────────────
+  const parlayApiKeys         = document.getElementById('parlayApiKeys');
+  const parlaySportSelect     = document.getElementById('parlaySportSelect');
+  const parlayOddsFormatSel   = document.getElementById('parlayOddsFormatSelect');
+  const parlayLegsSelect      = document.getElementById('parlayLegsSelect');
+  const parlayLastNSelect     = document.getElementById('parlayLastNSelect');
+  const parlayBookmakerSelect = document.getElementById('parlayBookmakerSelect');
+  const parlayLoadEventsBtn   = document.getElementById('parlayLoadEventsBtn');
+  const parlayEventPickerWrap = document.getElementById('parlayEventPickerWrap');
+  const parlayEventList       = document.getElementById('parlayEventList');
+  const parlaySelectAllBtn    = document.getElementById('parlaySelectAllBtn');
+  const parlaySelectNoneBtn   = document.getElementById('parlaySelectNoneBtn');
+  const parlayEventSelMeta    = document.getElementById('parlayEventSelectionMeta');
+  const parlayBuildWrap       = document.getElementById('parlayBuildWrap');
+  const parlayBuildBtn        = document.getElementById('parlayBuildBtn');
+  const parlayRebuildBtn      = document.getElementById('parlayRebuildBtn');
+  const parlayRescrapeBtn     = document.getElementById('parlayRescrapeBtn');
+  const parlayStatusMeta      = document.getElementById('parlayStatusMeta');
+  const parlayQuotaBar        = document.getElementById('parlayQuotaBar');
+  const parlayQuotaList       = document.getElementById('parlayQuotaList');
+  const parlayTicket          = document.getElementById('parlayTicket');
+  const parlayTicketOdds      = document.getElementById('parlayTicketOdds');
+  const parlayAllPropsWrap    = document.getElementById('parlayAllPropsWrap');
+  const parlayAllPropsTitle   = document.getElementById('parlayAllPropsTitle');
+  const parlayPropCount       = document.getElementById('parlayPropCount');
+  const parlayAllPropsBody    = document.getElementById('parlayAllPropsBody');
+  const parlayEmptyState      = document.getElementById('parlayEmptyState');
 
-  if (!parlayBuildBtn) return;
+  if (!parlayLoadEventsBtn) return;
 
-  // ── In-memory scrape cache — survives leg changes, cleared only on Re-scrape ──
-  let cachedScoredProps  = null;  // all props returned by backend, already ranked
+  // ── State ─────────────────────────────────────────────────────────────
+  let allEvents        = [];       // events returned by /api/odds/events
+  let selectedEventIds = new Set();
+  let cachedScoredProps  = null;
   let cachedQuotaLog     = null;
-  let cachedScrapeMeta   = null;  // { evCount, propCount, analyzed, scrapedAt }
+  let cachedScrapeMeta   = null;
 
-  // ── Persist & restore settings ────────────────────────────────────────
+  // ── Persist / restore ─────────────────────────────────────────────────
   try {
-    const savedKeys = localStorage.getItem(PARLAY_KEYS_STORAGE);
-    if (savedKeys && parlayApiKeys) parlayApiKeys.value = savedKeys;
+    const k = localStorage.getItem(PARLAY_KEYS_STORAGE);
+    if (k && parlayApiKeys) parlayApiKeys.value = k;
     const s = JSON.parse(localStorage.getItem(PARLAY_SETTINGS_STORAGE) || '{}');
-    if (s.sport        && parlaySportSelect)   parlaySportSelect.value   = s.sport;
-    if (s.odds_format  && parlayOddsFormatSel) parlayOddsFormatSel.value = s.odds_format;
-    if (s.legs         && parlayLegsSelect)    parlayLegsSelect.value    = String(s.legs);
-    if (s.last_n       && parlayLastNSelect)   parlayLastNSelect.value   = String(s.last_n);
+    if (s.sport       && parlaySportSelect)   parlaySportSelect.value   = s.sport;
+    if (s.odds_format && parlayOddsFormatSel) parlayOddsFormatSel.value = s.odds_format;
+    if (s.legs        && parlayLegsSelect)    parlayLegsSelect.value    = String(s.legs);
+    if (s.last_n      && parlayLastNSelect)   parlayLastNSelect.value   = String(s.last_n);
+    if (s.bookmaker   && parlayBookmakerSelect) parlayBookmakerSelect.value = s.bookmaker;
   } catch(e) {}
 
   function saveSettings() {
     try {
-      localStorage.setItem(PARLAY_KEYS_STORAGE, parlayApiKeys.value.trim());
+      localStorage.setItem(PARLAY_KEYS_STORAGE, (parlayApiKeys.value || '').trim());
       localStorage.setItem(PARLAY_SETTINGS_STORAGE, JSON.stringify({
-        sport:       parlaySportSelect.value,
-        odds_format: parlayOddsFormatSel.value,
-        legs:        parseInt(parlayLegsSelect.value),
-        last_n:      parseInt(parlayLastNSelect.value),
+        sport: parlaySportSelect.value, odds_format: parlayOddsFormatSel.value,
+        legs: parseInt(parlayLegsSelect.value), last_n: parseInt(parlayLastNSelect.value),
+        bookmaker: parlayBookmakerSelect ? parlayBookmakerSelect.value : 'draftkings',
       }));
     } catch(e) {}
   }
 
-  // ── Small helpers ─────────────────────────────────────────────────────
-  function setStatus(msg, isError) {
+  // ── Helpers ───────────────────────────────────────────────────────────
+  function escHtml(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function fmtOdds(v) { return v != null ? Number(v).toFixed(2) : '—'; }
+  function show(el, v) { if (el) el.style.display = v ? '' : 'none'; }
+  function setStatus(msg, err) {
     if (!parlayStatusMeta) return;
     parlayStatusMeta.textContent = msg;
-    parlayStatusMeta.style.color = isError ? 'var(--bad)' : '';
+    parlayStatusMeta.style.color = err ? 'var(--bad)' : '';
+  }
+  function hitClass(pct) { return pct >= 70 ? 'hit-pct-high' : pct >= 55 ? 'hit-pct-mid' : 'hit-pct-low'; }
+
+  function formatEventTime(iso) {
+    if (!iso) return '';
+    try {
+      const d = new Date(iso);
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } catch(e) { return ''; }
   }
 
-  function showSection(el, show) {
-    if (el) el.style.display = show ? '' : 'none';
+  // ── Update legs dropdown to match selected event count ─────────────────
+  function syncLegsToEventCount() {
+    const count = selectedEventIds.size;
+    if (!parlayLegsSelect) return;
+    const current = parseInt(parlayLegsSelect.value) || 3;
+    // Remove options beyond event count, add up to max(event count, 6)
+    parlayLegsSelect.innerHTML = '';
+    const max = Math.min(count, 6);
+    for (let i = 2; i <= max; i++) {
+      const opt = document.createElement('option');
+      opt.value = String(i);
+      opt.textContent = i + '-Leg';
+      if (i === Math.min(current, max)) opt.selected = true;
+      parlayLegsSelect.appendChild(opt);
+    }
+    // Show/hide build wrap based on whether enough events selected
+    show(parlayBuildWrap, count >= 2);
+    if (parlayEventSelMeta) {
+      parlayEventSelMeta.textContent = count === 0
+        ? 'Select at least 2 games'
+        : count === 1
+          ? '1 game selected — select at least 1 more'
+          : count + ' games selected · up to ' + max + '-leg parlay available';
+    }
   }
 
-  function hitRateClass(pct) {
-    if (pct >= 70) return 'hit-pct-high';
-    if (pct >= 55) return 'hit-pct-mid';
-    return 'hit-pct-low';
-  }
+  // ── Render event picker chips ──────────────────────────────────────────
+  function renderEventPicker(events) {
+    parlayEventList.innerHTML = events.map(function(ev) {
+      const time = formatEventTime(ev.commence_time);
+      return '<div class="parlay-event-chip" data-event-id="' + escHtml(ev.id) + '">' +
+        '<span class="parlay-chip-check">✓</span>' +
+        '<div>' +
+          '<div class="parlay-chip-teams">' + escHtml(ev.away_team) + ' @ ' + escHtml(ev.home_team) + '</div>' +
+          (time ? '<div class="parlay-chip-time">' + time + '</div>' : '') +
+        '</div>' +
+      '</div>';
+    }).join('');
 
-  function fmtOdds(v) {
-    return v != null ? Number(v).toFixed(2) : '—';
-  }
-
-  function escHtml(str) {
-    return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    parlayEventList.querySelectorAll('.parlay-event-chip').forEach(function(chip) {
+      chip.addEventListener('click', function() {
+        const id = chip.dataset.eventId;
+        if (selectedEventIds.has(id)) {
+          selectedEventIds.delete(id);
+          chip.classList.remove('selected');
+        } else {
+          selectedEventIds.add(id);
+          chip.classList.add('selected');
+        }
+        syncLegsToEventCount();
+        // Clear cache when selection changes — different events = different scrape
+        if (cachedScoredProps) {
+          cachedScoredProps = null; cachedQuotaLog = null; cachedScrapeMeta = null;
+          showCacheButtons(false);
+          show(parlayTicket, false);
+          show(parlayAllPropsWrap, false);
+          setStatus('Event selection changed — click Scrape & Build to refresh.', false);
+        }
+      });
+    });
   }
 
   function showCacheButtons(hasCache) {
-    showSection(parlayRebuildBtn,  hasCache);
-    showSection(parlayRescrapeBtn, hasCache);
-    // Hide the main "Scrape & Build" label when cache exists — keep it but rename
-    if (parlayBuildBtn) {
-      parlayBuildBtn.style.display = hasCache ? 'none' : '';
-    }
+    show(parlayRebuildBtn,  hasCache);
+    show(parlayRescrapeBtn, hasCache);
+    if (parlayBuildBtn) parlayBuildBtn.style.display = hasCache ? 'none' : '';
   }
 
-  // ── Pick top N legs from cached props (pure JS, zero API calls) ───────
-  function pickLegs(allProps, n) {
-    const legs = [];
-    const seenPlayers = new Set();
-    for (const prop of allProps) {
-      if (legs.length >= n) break;
-      const pid = Number(prop.player_id);
-      if (seenPlayers.has(pid)) continue;
-      seenPlayers.add(pid);
-      legs.push(prop);
-    }
-    return legs;
-  }
-
-  function calcParlayOdds(legs) {
-    if (!legs.length) return null;
-    return Math.round(legs.reduce(function(acc, l) { return acc * l.odds; }, 1) * 100) / 100;
-  }
-
-  // ── Render quota pills ────────────────────────────────────────────────
-  function renderQuota(quotaLog) {
-    if (!quotaLog || !quotaLog.length) return;
-    showSection(parlayQuotaBar, true);
-    parlayQuotaList.innerHTML = quotaLog.map(function(entry) {
-      const q = entry.quota || {};
-      return '<span class="parlay-quota-pill">' +
-        '<strong>' + escHtml(entry.call || '?') + '</strong>' +
+  // ── Render quota pills ─────────────────────────────────────────────────
+  function renderQuota(log) {
+    if (!log || !log.length) return;
+    show(parlayQuotaBar, true);
+    parlayQuotaList.innerHTML = log.map(function(e) {
+      const q = e.quota || {};
+      return '<span class="parlay-quota-pill"><strong>' + escHtml(e.call||'?') + '</strong>' +
         (q.remaining != null ? ' · rem: ' + q.remaining : '') +
-        (q.last      != null ? ' · cost: ' + q.last     : '') +
-        '</span>';
+        (q.last != null ? ' · cost: ' + q.last : '') + '</span>';
     }).join('');
   }
 
-  // ── Render parlay ticket ──────────────────────────────────────────────
+  // ── Pick top N legs from cached props ──────────────────────────────────
+  function pickLegs(props, n) {
+    const legs = [], seenPlayers = new Set(), seenEvents = new Set();
+    for (const p of props) {
+      if (legs.length >= n) break;
+      const pid = Number(p.player_id);
+      const eid = p.event_id || '';
+      if (seenPlayers.has(pid)) continue;
+      if (eid && seenEvents.has(eid)) continue; // no same-game parlay
+      seenPlayers.add(pid);
+      if (eid) seenEvents.add(eid);
+      legs.push(p);
+    }
+    return legs;
+  }
+  function calcOdds(legs) {
+    if (!legs.length) return null;
+    return Math.round(legs.reduce(function(a,l){ return a * l.odds; }, 1) * 100) / 100;
+  }
+
+  // ── Render ticket ──────────────────────────────────────────────────────
   function renderTicket(parlay, legs, parlayOdds) {
     if (!parlay || !parlay.length) return;
-    showSection(parlayTicket, true);
-
-    // Update leg count label inside ticket header
-    const legsLabel = parlayTicket.querySelector('#parlayTicketLegs');
-    if (legsLabel) legsLabel.textContent = legs;
-    parlayTicketOdds.textContent = parlayOdds != null ? fmtOdds(parlayOdds) + 'x' : '—';
-
+    show(parlayTicket, true);
+    const legsSpan = parlayTicket.querySelector('#parlayTicketLegs');
+    if (legsSpan && legsSpan.tagName === 'SPAN') legsSpan.textContent = legs;
+    if (parlayTicketOdds) parlayTicketOdds.textContent = parlayOdds != null ? fmtOdds(parlayOdds) + 'x' : '—';
     const grid = parlayTicket.querySelector('.parlay-legs-grid');
     if (!grid) return;
-    grid.innerHTML = parlay.map(function(leg, idx) {
-      const sideClass = leg.side === 'OVER' ? 'over' : 'under';
-      const fillPct   = Math.min(100, leg.hit_rate || 0);
+    grid.innerHTML = parlay.map(function(leg, i) {
+      const sc = leg.side === 'OVER' ? 'over' : 'under';
+      const fp = Math.min(100, leg.hit_rate || 0);
       return '<div class="parlay-leg-card">' +
-        '<span class="parlay-leg-rank">#' + (idx + 1) + ' pick</span>' +
+        '<span class="parlay-leg-rank">#' + (i+1) + '</span>' +
         '<div class="parlay-leg-player">' + escHtml(leg.player_name) + '</div>' +
         '<div class="parlay-leg-market">' +
           '<span class="parlay-leg-stat">' + escHtml(leg.stat) + '</span>' +
           '<span class="parlay-leg-line">' + leg.line + '</span>' +
-          '<span class="parlay-leg-side ' + sideClass + '">' + leg.side + '</span>' +
+          '<span class="parlay-leg-side ' + sc + '">' + leg.side + '</span>' +
         '</div>' +
         '<div class="parlay-leg-stats-row">' +
           '<div class="parlay-leg-stat-item"><span class="slabel">Hit %</span><span class="sval">' + leg.hit_rate + '%</span></div>' +
-          '<div class="parlay-leg-stat-item"><span class="slabel">Avg</span>  <span class="sval">' + (leg.average || '—') + '</span></div>' +
-          '<div class="parlay-leg-stat-item"><span class="slabel">Games</span><span class="sval">' + (leg.games_count || '—') + '</span></div>' +
-          '<div class="parlay-leg-stat-item"><span class="slabel">Odds</span> <span class="sval">' + fmtOdds(leg.odds) + '</span></div>' +
+          '<div class="parlay-leg-stat-item"><span class="slabel">Avg</span><span class="sval">'   + (leg.average||'—')     + '</span></div>' +
+          '<div class="parlay-leg-stat-item"><span class="slabel">Games</span><span class="sval">' + (leg.games_count||'—') + '</span></div>' +
+          '<div class="parlay-leg-stat-item"><span class="slabel">Odds</span><span class="sval">'  + fmtOdds(leg.odds)      + '</span></div>' +
         '</div>' +
-        '<div class="parlay-leg-hit-bar"><div class="parlay-leg-hit-fill" style="width:' + fillPct + '%"></div></div>' +
+        '<div class="parlay-leg-hit-bar"><div class="parlay-leg-hit-fill" style="width:' + fp + '%"></div></div>' +
       '</div>';
     }).join('');
   }
 
-  // ── Render all props table ────────────────────────────────────────────
-  function renderAllProps(allProps, selectedPlayerIds) {
-    if (!allProps || !allProps.length) return;
-    showSection(parlayAllPropsWrap, true);
-    const count = allProps.length;
-    if (parlayPropCount)     parlayPropCount.textContent     = count + ' prop' + (count !== 1 ? 's' : '');
-    if (parlayAllPropsTitle) parlayAllPropsTitle.textContent = 'All ' + count + ' props ranked by hit rate';
-
-    const selectedSet = new Set((selectedPlayerIds || []).map(Number));
-    parlayAllPropsBody.innerHTML = allProps.map(function(prop) {
-      const isSelected = selectedSet.has(Number(prop.player_id));
-      const sideClass  = prop.side === 'OVER' ? 'side-over' : 'side-under';
-      const hitClass   = hitRateClass(prop.hit_rate);
-      return '<tr class="' + (isSelected ? 'parlay-selected-row' : '') + '">' +
-        '<td>' + escHtml(prop.player_name) + (isSelected ? ' ⭐' : '') + '</td>' +
-        '<td>' + escHtml(prop.stat) + '</td>' +
-        '<td>' + prop.line + '</td>' +
-        '<td class="' + sideClass + '">' + prop.side + '</td>' +
-        '<td class="hit-pct-cell ' + hitClass + '">' + prop.hit_rate + '%</td>' +
-        '<td>' + (prop.average    || '—') + '</td>' +
-        '<td>' + (prop.games_count || '—') + '</td>' +
-        '<td>' + fmtOdds(prop.odds) + '</td>' +
-      '</tr>';
+  // ── Render all props table (clickable → analyzer) ─────────────────────
+  function renderAllProps(all, selectedIds) {
+    if (!all || !all.length) return;
+    show(parlayAllPropsWrap, true);
+    if (parlayPropCount)     parlayPropCount.textContent     = all.length + ' props — click any row to analyze';
+    if (parlayAllPropsTitle) parlayAllPropsTitle.textContent = all.length + ' props ranked by hit rate';
+    const sel = new Set((selectedIds||[]).map(Number));
+    parlayAllPropsBody.innerHTML = all.map(function(p, idx) {
+      const isSel = sel.has(Number(p.player_id));
+      const imgSrc = 'https://cdn.nba.com/headshots/nba/latest/1040x760/' + (p.player_id||'') + '.png';
+      const gameTag = p.game_label ? '<span class="parlay-game-label">' + escHtml(p.game_label) + '</span>' : '';
+      return '<tr class="' + (isSel ? 'parlay-selected-row' : '') + '" data-prop-idx="' + idx + '" title="Analyze ' + escHtml(p.player_name) + '">' +
+        '<td><span style="display:flex;align-items:center;gap:8px"><img src="' + imgSrc + '" style="width:26px;height:26px;border-radius:50%;object-fit:cover;object-position:top" onerror="this.hidden=true">' +
+          '<span style="display:flex;flex-direction:column;gap:2px">' +
+            '<span>' + escHtml(p.player_name) + (isSel ? ' ⭐' : '') + '</span>' + gameTag +
+          '</span></span></td>' +
+        '<td>' + escHtml(p.stat) + '</td><td>' + p.line + '</td>' +
+        '<td class="' + (p.side==='OVER'?'side-over':'side-under') + '">' + p.side + '</td>' +
+        '<td class="hit-pct-cell ' + hitClass(p.hit_rate) + '">' + p.hit_rate + '%</td>' +
+        '<td>' + (p.average||'—') + '</td><td>' + (p.games_count||'—') + '</td>' +
+        '<td>' + fmtOdds(p.odds) + '</td>' +
+        '<td><button class="parlay-track-btn" data-track-idx="' + idx + '">+ Track</button></td>' +
+        '</tr>';
     }).join('');
+    parlayAllPropsBody.querySelectorAll('tr[data-prop-idx]').forEach(function(row) {
+      row.addEventListener('click', async function(e) {
+        if (e.target.closest('.parlay-track-btn')) return;
+        const prop = all[parseInt(row.dataset.propIdx)];
+        if (!prop || !prop.player_id) return;
+        try {
+          const teamId = prop.team_id || null;
+          if (teamId && typeof teamSelect !== 'undefined' && String(teamSelect.value) !== String(teamId)) {
+            teamSelect.value = String(teamId);
+            try { await loadRoster(teamId); } catch(e) {}
+          }
+          if (typeof setSelectedPlayer === 'function') setSelectedPlayer({ id: prop.player_id, full_name: prop.player_name, is_active: true, team_id: teamId });
+          if (typeof setActiveProp === 'function') setActiveProp(prop.stat);
+          if (typeof lineInput !== 'undefined' && lineInput) lineInput.value = prop.line;
+          if (typeof switchView === 'function') switchView('analyzer');
+          if (typeof analyzePlayerProp === 'function') await analyzePlayerProp();
+        } catch(e) { console.warn('Parlay row nav failed:', e); }
+      });
+    });
+    parlayAllPropsBody.querySelectorAll('.parlay-track-btn').forEach(function(btn) {
+      btn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        addPropToTracker(all[parseInt(btn.dataset.trackIdx)]);
+      });
+    });
   }
 
-  // ── Rebuild from cache (no API call) ─────────────────────────────────
+  // ── Rebuild from cache (zero API calls) ───────────────────────────────
   function rebuildFromCache() {
     if (!cachedScoredProps || !cachedScoredProps.length) return;
-    const legs        = parseInt(parlayLegsSelect.value) || 3;
-    const pickedLegs  = pickLegs(cachedScoredProps, legs);
-    const parlayOdds  = calcParlayOdds(pickedLegs);
-    const selectedIds = pickedLegs.map(function(l) { return l.player_id; });
-
-    renderTicket(pickedLegs, legs, parlayOdds);
-    renderAllProps(cachedScoredProps, selectedIds);
-
+    const n    = parseInt(parlayLegsSelect.value) || 3;
+    const legs = pickLegs(cachedScoredProps, n);
+    const odds = calcOdds(legs);
+    renderTicket(legs, n, odds);
+    renderAllProps(cachedScoredProps, legs.map(function(l){ return l.player_id; }));
     const m = cachedScrapeMeta || {};
-    const ago = m.scrapedAt
-      ? ' · cached ' + Math.round((Date.now() - m.scrapedAt) / 60000) + 'm ago'
-      : '';
-    setStatus(
-      (m.evCount || 0) + ' games · ' +
-      (m.analyzed || 0) + ' props analyzed' +
-      ago + ' — no credits used',
-      false
-    );
+    const ago = m.scrapedAt ? ' · cached ' + Math.round((Date.now()-m.scrapedAt)/60000) + 'm ago' : '';
+    setStatus((m.evCount||0) + ' events · ' + (m.analyzed||0) + ' props analyzed' + ago + ' — no credits used', false);
   }
 
-  // ── Full scrape → analyze → render ───────────────────────────────────
+  // ── Full scrape selected events → analyze → render ───────────────────
   async function runScrape() {
     const rawKeys = (parlayApiKeys.value || '').trim();
-    if (!rawKeys) {
-      setStatus('Please enter at least one Odds API key.', true);
-      return;
-    }
-    const keys      = rawKeys.split(',').map(function(k) { return k.trim(); }).filter(Boolean);
-    const legs      = parseInt(parlayLegsSelect.value) || 3;
+    if (!rawKeys) { setStatus('Enter at least one API key.', true); return; }
+    const keys = rawKeys.split(',').map(function(k){ return k.trim(); }).filter(Boolean);
+    if (selectedEventIds.size === 0) { setStatus('Select at least one event first.', true); return; }
+    const legs      = parseInt(parlayLegsSelect.value) || 2;
     const sport     = parlaySportSelect.value;
     const oddsFormat = parlayOddsFormatSel.value;
     const lastN     = parseInt(parlayLastNSelect.value) || 10;
 
     saveSettings();
-
-    // Reset UI
-    showSection(parlayTicket,      false);
-    showSection(parlayAllPropsWrap, false);
-    showSection(parlayQuotaBar,    false);
-    showSection(parlayEmptyState,  false);
+    show(parlayTicket, false); show(parlayAllPropsWrap, false);
+    show(parlayQuotaBar, false); show(parlayEmptyState, false);
     parlayQuotaList.innerHTML = '';
-    setStatus('Scraping today\'s events…', false);
-    parlayBuildBtn.disabled   = true;
-    if (parlayRebuildBtn)  parlayRebuildBtn.disabled  = true;
+    setStatus('Scraping ' + selectedEventIds.size + ' event(s)…', false);
+    if (parlayBuildBtn)   parlayBuildBtn.disabled   = true;
+    if (parlayRebuildBtn) parlayRebuildBtn.disabled = true;
     if (parlayRescrapeBtn) parlayRescrapeBtn.disabled = true;
-
-    if (typeof showBanner === 'function') showBanner('Building parlay…', 'Fetching events and odds. This may take 15–30 seconds.');
+    if (typeof showBanner === 'function') showBanner('Building parlay…', 'Fetching odds for ' + selectedEventIds.size + ' game(s). Please wait…');
 
     try {
       const resp = await fetch('/api/parlay-builder', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ api_keys: keys, legs: legs, sport: sport, odds_format: oddsFormat, last_n: lastN }),
+        body: JSON.stringify({
+          api_keys: keys, legs: legs, sport: sport,
+          odds_format: oddsFormat, last_n: lastN,
+          event_ids: Array.from(selectedEventIds),
+          bookmaker: parlayBookmakerSelect ? parlayBookmakerSelect.value : 'draftkings',
+        }),
       });
-
       if (!resp.ok) {
-        const err = await resp.json().catch(function() { return {}; });
-        throw new Error(err.detail || ('Server error ' + resp.status));
+        const err = await resp.json().catch(function(){ return {}; });
+        throw new Error(err.detail || 'Server error ' + resp.status);
       }
-
       const data = await resp.json();
 
-      // Store in cache
       cachedScoredProps = data.all_props_scored || [];
       cachedQuotaLog    = data.quota_log || [];
-      cachedScrapeMeta  = {
-        evCount:   data.events_scraped || 0,
-        propCount: data.props_found    || 0,
-        analyzed:  data.props_analyzed || 0,
-        scrapedAt: Date.now(),
-      };
+      cachedScrapeMeta  = { evCount: data.events_scraped||0, propCount: data.props_found||0, analyzed: data.props_analyzed||0, scrapedAt: Date.now() };
 
       renderQuota(cachedQuotaLog);
-
       const m = cachedScrapeMeta;
-      setStatus(m.evCount + ' game' + (m.evCount !== 1 ? 's' : '') + ' scraped · ' + m.propCount + ' props found · ' + m.analyzed + ' analyzed', false);
+      setStatus(m.evCount + ' event(s) scraped · ' + m.propCount + ' props found · ' + m.analyzed + ' analyzed', false);
 
       if (!cachedScoredProps.length) {
-        showSection(parlayEmptyState, true);
-        const strong = parlayEmptyState.querySelector('strong');
-        const small  = parlayEmptyState.querySelector('span');
-        if (strong) strong.textContent = data.message || 'No parlay built.';
-        if (small)  small.textContent  = 'Try different keys or check back when games are posted.';
+        show(parlayEmptyState, true);
+        const s = parlayEmptyState.querySelector('strong'), sp = parlayEmptyState.querySelector('span');
+        if (s) s.textContent = data.message || 'No props found for selected events.';
+        if (sp) sp.textContent = 'Try different events or check your API keys.';
         if (typeof hideBanner === 'function') hideBanner();
         return;
       }
-
-      // Show cache-aware buttons, hide initial scrape button
       showCacheButtons(true);
       rebuildFromCache();
-
       if (typeof hideBanner === 'function') hideBanner();
-
     } catch(err) {
-      setStatus('Error: ' + (err.message || 'Unknown error'), true);
-      showSection(parlayEmptyState, true);
+      setStatus('Error: ' + (err.message || 'Unknown'), true);
+      show(parlayEmptyState, true);
       if (typeof hideBanner === 'function') hideBanner();
     } finally {
-      parlayBuildBtn.disabled   = false;
+      if (parlayBuildBtn)    parlayBuildBtn.disabled    = false;
       if (parlayRebuildBtn)  parlayRebuildBtn.disabled  = false;
       if (parlayRescrapeBtn) parlayRescrapeBtn.disabled = false;
     }
-  } // end runScrape
+  }
 
-  // ── Button bindings ───────────────────────────────────────────────────
+  // ── Step 1: Load today's events ───────────────────────────────────────
+  parlayLoadEventsBtn.addEventListener('click', async function() {
+    const rawKeys = (parlayApiKeys.value || '').trim();
+    if (!rawKeys) { setStatus('Enter at least one API key first.', true); return; }
+    const keys = rawKeys.split(',').map(function(k){ return k.trim(); }).filter(Boolean);
+    saveSettings();
+    parlayLoadEventsBtn.disabled = true;
+    parlayLoadEventsBtn.textContent = 'Loading…';
+    show(parlayEventPickerWrap, false);
+    show(parlayBuildWrap, false);
 
-  // "Scrape & Build" — first-time, burns API credits
-  parlayBuildBtn.addEventListener('click', function() { runScrape(); });
+    try {
+      const resp = await fetch('/api/odds/events', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ api_key: keys[0], sport: parlaySportSelect.value }),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(function(){ return {}; });
+        throw new Error(err.detail || 'Failed to load events');
+      }
+      const data = await resp.json();
+      allEvents = (data.events || []).filter(function(e){ return e.id && e.home_team; });
 
-  // "Rebuild Legs" — re-picks from cache instantly, zero credits
-  if (parlayRebuildBtn) {
-    parlayRebuildBtn.addEventListener('click', function() {
-      if (!cachedScoredProps || !cachedScoredProps.length) {
-        setStatus('No cached data. Run Scrape & Build first.', true);
+      if (!allEvents.length) {
+        setStatus('No events found for today. Try again later.', true);
         return;
       }
+
+      // Reset state
+      selectedEventIds.clear();
+      cachedScoredProps = null; cachedQuotaLog = null; cachedScrapeMeta = null;
+      showCacheButtons(false);
+      show(parlayTicket, false); show(parlayAllPropsWrap, false);
+
+      renderEventPicker(allEvents);
+      show(parlayEventPickerWrap, true);
+      syncLegsToEventCount();
+      setStatus(allEvents.length + ' events loaded. Pick your games.', false);
+    } catch(err) {
+      setStatus('Error loading events: ' + err.message, true);
+    } finally {
+      parlayLoadEventsBtn.disabled = false;
+      parlayLoadEventsBtn.textContent = "Load Today's Events";
+    }
+  });
+
+  // Select all / none
+  if (parlaySelectAllBtn) {
+    parlaySelectAllBtn.addEventListener('click', function() {
+      parlayEventList.querySelectorAll('.parlay-event-chip').forEach(function(c) {
+        selectedEventIds.add(c.dataset.eventId);
+        c.classList.add('selected');
+      });
+      syncLegsToEventCount();
+    });
+  }
+  if (parlaySelectNoneBtn) {
+    parlaySelectNoneBtn.addEventListener('click', function() {
+      selectedEventIds.clear();
+      parlayEventList.querySelectorAll('.parlay-event-chip').forEach(function(c) { c.classList.remove('selected'); });
+      syncLegsToEventCount();
+    });
+  }
+
+  // Scrape & Build
+  if (parlayBuildBtn) parlayBuildBtn.addEventListener('click', function() { runScrape(); });
+
+  // Reshuffle (re-pick from cache, zero credits)
+  if (parlayRebuildBtn) {
+    parlayRebuildBtn.addEventListener('click', function() {
+      if (!cachedScoredProps || !cachedScoredProps.length) { setStatus('No cached data. Run Scrape & Build first.', true); return; }
+      // Rotate the cached props so a different combination surfaces
+      if (cachedScoredProps.length > 1) cachedScoredProps.push(cachedScoredProps.shift());
       rebuildFromCache();
     });
   }
 
-  // "Re-scrape" — explicit credit-burning refresh
+  // Re-scrape (clear cache, burn credits)
   if (parlayRescrapeBtn) {
     parlayRescrapeBtn.addEventListener('click', function() {
-      cachedScoredProps = null;
-      cachedQuotaLog    = null;
-      cachedScrapeMeta  = null;
+      cachedScoredProps = null; cachedQuotaLog = null; cachedScrapeMeta = null;
       showCacheButtons(false);
       runScrape();
     });
   }
 
-  // Leg count change -> instant rebuild from cache if available, zero credits
+  // Leg change → instant local rebuild
   if (parlayLegsSelect) {
     parlayLegsSelect.addEventListener('change', function() {
-      if (cachedScoredProps && cachedScoredProps.length) {
-        rebuildFromCache();
-      }
+      if (cachedScoredProps && cachedScoredProps.length) rebuildFromCache();
     });
   }
+
+})();
+
+/* ═══════════════════════════════════════════════════════════════════════
+   PROP TRACKER
+═══════════════════════════════════════════════════════════════════════ */
+(function initPropTracker() {
+  const TRACKER_STORAGE_KEY = 'nba-props-tracker-bets';
+
+  const trackerPlayerInput = document.getElementById('trackerPlayerInput');
+  const trackerStatSelect  = document.getElementById('trackerStatSelect');
+  const trackerLineInput   = document.getElementById('trackerLineInput');
+  const trackerSideSelect  = document.getElementById('trackerSideSelect');
+  const trackerOddsInput   = document.getElementById('trackerOddsInput');
+  const trackerBookInput   = document.getElementById('trackerBookInput');
+  const trackerAddBtn      = document.getElementById('trackerAddBtn');
+  const trackerAddError    = document.getElementById('trackerAddError');
+  const trackerRefreshBtn  = document.getElementById('trackerRefreshBtn');
+  const trackerCards       = document.getElementById('trackerCards');
+  const trackerEmpty       = document.getElementById('trackerEmpty');
+
+  if (!trackerAddBtn) return;
+
+  // ── State ─────────────────────────────────────────────────────────────
+  // bet = { id, player_name, player_id, stat, line, side, odds, book,
+  //         current_val, games_count, last_updated, status }
+  let bets = [];
+
+  // ── Persist ───────────────────────────────────────────────────────────
+  function saveBets() {
+    try { localStorage.setItem(TRACKER_STORAGE_KEY, JSON.stringify(bets)); } catch(e) {}
+  }
+  function loadBets() {
+    try { return JSON.parse(localStorage.getItem(TRACKER_STORAGE_KEY) || '[]'); } catch(e) { return []; }
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────
+  function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function escapeHtmlT(s) { return esc(s); }
+  function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2,6); }
+  function showErr(msg) {
+    if (!trackerAddError) return;
+    trackerAddError.textContent = msg;
+    trackerAddError.style.display = msg ? '' : 'none';
+  }
+  function showEmpty(v) {
+    if (trackerEmpty) trackerEmpty.style.display = v ? '' : 'none';
+    if (trackerCards) trackerCards.style.display = v ? 'none' : '';
+  }
+
+  // ── Compute status from current val vs line ────────────────────────────
+  function computeStatus(bet) {
+    const val  = bet.current_val;
+    const line = parseFloat(bet.line);
+    if (val === null || val === undefined) return 'pending';
+    const v = parseFloat(val);
+    if (bet.side === 'OVER')  return v >= line ? 'hit'    : v >= line * 0.85 ? 'close' : 'progress';
+    if (bet.side === 'UNDER') return v <= line ? 'hit'    : v <= line * 1.15 ? 'close' : 'busted';
+    return 'progress';
+  }
+
+  // For UNDER, the bar fills inversely: more value = worse
+  function computeBarPct(bet) {
+    const val  = bet.current_val;
+    const line = parseFloat(bet.line);
+    if (val === null || val === undefined) return 0;
+    const v = parseFloat(val);
+    if (bet.side === 'OVER') {
+      return Math.min(100, Math.round((v / line) * 100));
+    } else {
+      // UNDER: bar fills as remaining room shrinks; hits 100% when val === 0
+      const pct = Math.max(0, Math.round(((line - v) / line) * 100));
+      return Math.min(100, pct);
+    }
+  }
+
+  // ── Render a single card ───────────────────────────────────────────────
+  function renderCard(bet) {
+    const status  = computeStatus(bet);
+    const barPct  = computeBarPct(bet);
+    const val     = bet.current_val !== null && bet.current_val !== undefined
+                    ? parseFloat(bet.current_val).toFixed(1) : '—';
+    const line    = parseFloat(bet.line).toFixed(1);
+    const imgSrc  = bet.player_id
+                    ? 'https://cdn.nba.com/headshots/nba/latest/1040x760/' + bet.player_id + '.png'
+                    : '';
+
+    // Card-level class
+    const cardClass = (status === 'hit' ? 'tracker-card hit'
+                    : status === 'busted' ? 'tracker-card busted'
+                    : 'tracker-card') + extraCardCls;
+
+    // Bar track class
+    const barClass  = status === 'hit'     ? 'tracker-bar-track hit'
+                    : status === 'close'   ? 'tracker-bar-track close'
+                    : status === 'busted'  ? 'tracker-bar-track busted'
+                    : status === 'pending' ? 'tracker-bar-track pending'
+                    :                        'tracker-bar-track progress';
+
+    // Status badge
+    const badgeLabel = status === 'hit'     ? '✓ HIT'
+                     : status === 'busted'  ? '✗ BUST'
+                     : status === 'close'   ? 'CLOSE'
+                     : status === 'pending' ? 'PENDING'
+                     :                        'IN PROGRESS';
+    const badgeClass = status === 'hit' || status === 'close' ? 'hit'
+                     : status === 'busted' ? 'busted'
+                     : status === 'pending' ? 'pending' : 'active';
+
+    // Injury pill
+    const injPill = bet.is_injured
+      ? '<span class="tracker-injury-pill">' + escapeHtmlT(bet.injury_status || 'Injured') + '</span>'
+      : '';
+
+    // Source pill
+    const src = bet.source || '';
+    const srcPill = src === 'LIVE'
+      ? '<span class="tracker-source-pill live">LIVE</span>'
+      : src === 'FINAL'    ? '<span class="tracker-source-pill final">FINAL</span>'
+      : src === 'UPCOMING' ? '<span class="tracker-source-pill upcoming">UPCOMING</span>'
+      : src === 'NO GAME TODAY' ? '<span class="tracker-source-pill nogame">NO GAME</span>'
+      : '';
+
+    // Period/clock
+    const gameCtx = bet.game_label
+      ? esc(bet.game_label) + (bet.game_status === 'live' && bet.period ? ' · ' + esc(bet.period) + (bet.clock ? ' ' + esc(bet.clock) : '') : '')
+      : '';
+
+    // Card gets extra class when injured or busted
+    const extraCardCls = bet.is_injured ? ' injured' : '';
+
+    const sideClass = bet.side === 'OVER' ? 'over' : 'under';
+    const lastUpd   = bet.last_updated
+                    ? new Date(bet.last_updated).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})
+                    : '—';
+
+    // Line tick position — where the line marker sits on the bar
+    const tickPct = bet.side === 'OVER' ? 100 : Math.round(((parseFloat(bet.line)) / (parseFloat(bet.line) * 1.5)) * 100);
+
+    return `
+<div class="${cardClass}" data-bet-id="${esc(bet.id)}" id="tracker-card-${esc(bet.id)}">
+  <div class="tracker-card-inner">
+    <div class="tracker-avatar-strip">
+      ${imgSrc ? `<img src="${imgSrc}" alt="${esc(bet.player_name)}" onerror="this.style.display='none'">` : '<div style="width:80px;height:80px;display:flex;align-items:center;justify-content:center;font-size:1.8rem;opacity:0.4">🏀</div>'}
+    </div>
+    <div class="tracker-card-body">
+      <div class="tracker-card-top">
+        <div class="tracker-player-name">${esc(bet.player_name)}</div>
+        <span class="tracker-stat-pill">${esc(bet.stat)}</span>
+        <span class="tracker-side-pill ${sideClass}">${esc(bet.side)}</span>
+        ${bet.book ? `<span class="tracker-book-pill">${esc(bet.book)}</span>` : ''}
+        <button class="tracker-remove-btn" data-remove-id="${esc(bet.id)}" title="Remove this prop" type="button">✕</button>
+      </div>
+
+      <div class="tracker-value-row">
+        <span class="tracker-current-val">${val}</span>
+        <span class="tracker-line-label">/ ${line} ${esc(bet.stat)}</span>
+        <span class="tracker-status-badge ${badgeClass}">${badgeLabel}</span>
+        ${injPill}${srcPill}
+        ${gameCtx ? '<span class="tracker-game-label">' + gameCtx + '</span>' : ''}
+      </div>
+
+      <div class="tracker-bar-wrap">
+        <div class="${barClass}" style="width:${barPct}%"></div>
+        <div class="tracker-bar-line-tick" style="left:calc(100% - 2px)"></div>
+      </div>
+
+      <div class="tracker-card-meta">
+        <div class="tracker-meta-item"><span class="ml">Odds</span><span class="mv">${parseFloat(bet.odds||1.91).toFixed(2)}</span></div>
+        <div class="tracker-meta-item"><span class="ml">Line</span><span class="mv">${line}</span></div>
+        <div class="tracker-meta-item"><span class="ml">Source</span><span class="mv">${esc(bet.source || '—')}</span></div>
+        <div class="tracker-meta-item"><span class="ml">Updated</span><span class="mv">${lastUpd}</span></div>
+      </div>
+    </div>
+  </div>
+</div>`;
+  }
+
+  // ── Re-render all cards ────────────────────────────────────────────────
+  function renderAll() {
+    if (!bets.length) { showEmpty(true); return; }
+    showEmpty(false);
+    // Animate bars after render using rAF
+    trackerCards.innerHTML = bets.map(renderCard).join('');
+    // Wire remove buttons
+    trackerCards.querySelectorAll('[data-remove-id]').forEach(function(btn) {
+      btn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        const id = btn.dataset.removeId;
+        bets = bets.filter(function(b) { return b.id !== id; });
+        saveBets();
+        renderAll();
+      });
+    });
+    // Trigger bar animation on next frame (bars start at 0 via CSS, then widen)
+    requestAnimationFrame(function() {
+      trackerCards.querySelectorAll('.tracker-bar-track').forEach(function(bar) {
+        bar.style.transition = 'width 1.1s cubic-bezier(0.34,1.56,0.64,1), background 0.5s';
+      });
+    });
+  }
+
+  // ── Fetch live stat — today/future only, no historical fallback ────────
+  async function refreshBet(bet) {
+    if (!bet.player_id) return;
+    try {
+      const lp = new URLSearchParams({ player_id: bet.player_id, stat: bet.stat });
+      const lr = await fetch('/api/tracker/live-stat?' + lp.toString());
+      if (!lr.ok) return;
+      const d = await lr.json();
+      bet.is_injured    = d.is_injured    || false;
+      bet.injury_status = d.injury_status || '';
+      const gs = d.game_status;
+      if ((gs === 'live' || gs === 'final') && d.live_val !== null && d.live_val !== undefined) {
+        bet.current_val  = d.live_val;
+        bet.game_status  = gs;
+        bet.game_label   = d.game_label || '';
+        bet.period       = d.period || '';
+        bet.clock        = d.clock  || '';
+        bet.source       = gs === 'live' ? 'LIVE' : 'FINAL';
+        bet.last_updated = new Date().toISOString();
+        return;
+      }
+      if (gs === 'scheduled') {
+        bet.game_status  = 'scheduled';
+        bet.game_label   = d.game_label || '';
+        bet.source       = 'UPCOMING';
+        bet.current_val  = null;
+        bet.last_updated = new Date().toISOString();
+        return;
+      }
+      bet.game_status  = 'no_game';
+      bet.source       = 'NO GAME TODAY';
+      bet.last_updated = new Date().toISOString();
+    } catch(e) {
+      console.warn('Refresh failed for', bet.player_name, e);
+    }
+  }
+
+  // ── Resolve player_id from name via search ────────────────────────────
+  async function resolvePlayerId(name) {
+    try {
+      const resp = await fetch('/api/players/search?q=' + encodeURIComponent(name) + '&limit=1');
+      if (!resp.ok) return null;
+      const data = await resp.json();
+      const results = data.results || data.players || data || [];
+      if (Array.isArray(results) && results.length) return results[0].id || results[0].player_id || null;
+    } catch(e) {}
+    return null;
+  }
+
+  // ── Add prop from parlay to tracker ────────────────────────────────────
+  function addPropToTracker(prop) {
+    if (!prop || !prop.player_name || !(parseFloat(prop.line) > 0)) return;
+    const newBet = {
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      player_name:  prop.player_name,
+      player_id:    prop.player_id || null,
+      stat:         prop.stat || 'PTS',
+      line:         parseFloat(prop.line),
+      side:         prop.side || 'OVER',
+      odds:         parseFloat(prop.odds) || 1.91,
+      book:         prop.bookmaker || '',
+      game_label:   prop.game_label || '',
+      current_val:  null, game_status: null,
+      source: null, is_injured: false, injury_status: '', last_updated: null,
+    };
+    try {
+      const stored = JSON.parse(localStorage.getItem('nba-props-tracker-bets') || '[]');
+      const dupe = stored.some(function(b) {
+        return String(b.player_id) === String(newBet.player_id) &&
+               b.stat === newBet.stat && parseFloat(b.line) === newBet.line && b.side === newBet.side;
+      });
+      if (!dupe) { stored.unshift(newBet); localStorage.setItem('nba-props-tracker-bets', JSON.stringify(stored)); }
+    } catch(e) {}
+    _showTrackerToast(prop.player_name + ' added to Tracker');
+    if (typeof switchView === 'function') switchView('tracker');
+  }
+
+  function _showTrackerToast(msg) {
+    let el = document.getElementById('_trackerToast');
+    if (!el) {
+      el = document.createElement('div'); el.id = '_trackerToast';
+      el.style.cssText = 'position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(20px);'
+        + 'background:var(--accent,#7c6ef5);color:#fff;padding:10px 22px;border-radius:40px;'
+        + 'font-size:.9rem;font-weight:600;z-index:9999;opacity:0;transition:opacity .25s,transform .25s;'
+        + 'pointer-events:none;white-space:nowrap;';
+      document.body.appendChild(el);
+    }
+    el.textContent = msg;
+    el.style.opacity = '1'; el.style.transform = 'translateX(-50%) translateY(0)';
+    clearTimeout(el._t);
+    el._t = setTimeout(function() {
+      el.style.opacity = '0'; el.style.transform = 'translateX(-50%) translateY(20px)';
+    }, 2600);
+  }
+
+  // ── Add bet handler ────────────────────────────────────────────────────
+  trackerAddBtn.addEventListener('click', async function() {
+    showErr('');
+    const playerName = (trackerPlayerInput.value || '').trim();
+    const stat       = trackerStatSelect.value;
+    const line       = parseFloat(trackerLineInput.value);
+    const side       = trackerSideSelect.value;
+    const odds       = parseFloat(trackerOddsInput.value) || 1.91;
+    const book       = (trackerBookInput.value || '').trim();
+
+    if (!playerName) return showErr('Enter a player name.');
+    if (isNaN(line) || line <= 0) return showErr('Enter a valid line (e.g. 25.5).');
+
+    trackerAddBtn.disabled = true;
+    trackerAddBtn.textContent = 'Adding…';
+
+    const playerId = await resolvePlayerId(playerName);
+
+    const bet = {
+      id: uid(),
+      player_name: playerName,
+      player_id: playerId,
+      stat, line, side, odds, book,
+      current_val: null,
+      games_count: null,
+      last_updated: null,
+      status: 'pending',
+    };
+
+    bets.unshift(bet);
+    saveBets();
+    renderAll();
+
+    // Clear inputs
+    trackerPlayerInput.value = '';
+    trackerLineInput.value   = '';
+    trackerOddsInput.value   = '';
+    trackerBookInput.value   = '';
+    trackerAddBtn.disabled   = false;
+    trackerAddBtn.textContent = 'Add Prop';
+
+    // Auto-refresh the newly added bet
+    if (playerId) {
+      await refreshBet(bet);
+      saveBets();
+      renderAll();
+    }
+  });
+
+  // ── Refresh all handler ────────────────────────────────────────────────
+  trackerRefreshBtn.addEventListener('click', async function() {
+    if (!bets.length) return;
+    trackerRefreshBtn.classList.add('spinning');
+    trackerRefreshBtn.disabled = true;
+
+    const refreshable = bets.filter(function(b) { return b.player_id; });
+    await Promise.allSettled(refreshable.map(refreshBet));
+    saveBets();
+
+    // Pulse any newly-hit cards
+    renderAll();
+    trackerCards.querySelectorAll('.tracker-card.hit').forEach(function(card) {
+      card.classList.add('hit-new');
+      setTimeout(function() { card.classList.remove('hit-new'); }, 2000);
+    });
+
+    trackerRefreshBtn.classList.remove('spinning');
+    trackerRefreshBtn.disabled = false;
+  });
+
+  // ── Init: restore from localStorage ───────────────────────────────────
+  bets = loadBets();
+  renderAll();
+
+  // Auto-refresh every 30s when live/upcoming game
+  setInterval(async function() {
+    const active = bets.some(function(b) { return b.game_status === 'live' || b.game_status === 'scheduled'; });
+    if (!bets.length || !active) return;
+    await Promise.allSettled(bets.filter(function(b){ return b.player_id; }).map(refreshBet));
+    saveBets(); renderAll();
+  }, 30000);
 
 })();

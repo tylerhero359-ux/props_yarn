@@ -2309,6 +2309,12 @@ def build_odds_import_rows(event_payload: dict[str, Any], odds_format: str) -> l
     # The first bookmaker that supplies a complete over+under pair wins.
     pair_map: dict[tuple[str, str, str], dict[str, Any]] = {}
 
+    # Capture event-level metadata for same-game parlay prevention
+    event_id = str(event_payload.get("id") or "")
+    home_team = str(event_payload.get("home_team") or "")
+    away_team = str(event_payload.get("away_team") or "")
+    game_label = f"{away_team} @ {home_team}" if home_team or away_team else ""
+
     for bookmaker in event_payload.get("bookmakers") or []:
         bookmaker_title = str(bookmaker.get("title") or bookmaker.get("key") or "Book")
         for market in bookmaker.get("markets") or []:
@@ -2337,6 +2343,8 @@ def build_odds_import_rows(event_payload: dict[str, Any], odds_format: str) -> l
                     "over_odds": None,
                     "under_odds": None,
                     "market_last_update": market_updated,
+                    "event_id": event_id,
+                    "game_label": game_label,
                 })
                 # Only fill in odds that haven't been set yet (first bookmaker wins)
                 if bucket[f"{side}_odds"] is None:
@@ -2354,6 +2362,8 @@ def build_odds_import_rows(event_payload: dict[str, Any], odds_format: str) -> l
             "bookmaker_title": bucket["bookmaker_title"],
             "market_key": bucket["market_key"],
             "market_last_update": bucket["market_last_update"],
+            "event_id": bucket.get("event_id", ""),
+            "game_label": bucket.get("game_label", ""),
             "csv_row": f"{bucket['player_name']},{bucket['stat']},{round(float(bucket['line']),1)},{float(bucket['over_odds'])},{float(bucket['under_odds'])}",
         })
     rows.sort(key=lambda item: (item["player_name"].lower(), item["stat"], item["line"]))
@@ -3606,21 +3616,40 @@ def get_team_roster(team_id: int, season: str | None = None) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Team not found.")
 
     rows = fetch_team_roster(team_id=team_id, season=selected_season)
+
+    # Fetch injury data for whole team in one call
+    team_name = str(team.get("full_name") or "")
+    report_payload = fetch_latest_injury_report_payload()
+    injury_rows = [r for r in (report_payload.get("rows") or []) if r.get("team_name") == team_name]
+    # Build lookup by normalized name
+    injury_lookup: dict[str, dict[str, Any]] = {}
+    for ir in injury_rows:
+        key = normalize_report_person_name(str(ir.get("player_display") or ""))
+        injury_lookup[key] = ir
+
     roster = []
     for row in rows:
         player_id = row.get("PLAYER_ID")
         if not player_id:
             continue
+        full_name = str(row.get("PLAYER", "")).strip()
+        norm_name = normalize_report_person_name(full_name)
+        inj = injury_lookup.get(norm_name) or {}
+        inj_status = str(inj.get("status") or "")
         roster.append(
             {
                 "id": int(player_id),
-                "full_name": str(row.get("PLAYER", "")).strip(),
+                "full_name": full_name,
                 "jersey": str(row.get("NUM", "")).strip(),
                 "position": str(row.get("POSITION", "")).strip(),
                 "is_active": True,
                 "team_id": team["id"],
                 "team_name": team["full_name"],
                 "team_abbreviation": team["abbreviation"],
+                "injury_status": inj_status,
+                "injury_reason": str(inj.get("reason") or ""),
+                "is_unavailable": inj_status in UNAVAILABLE_STATUSES,
+                "is_risky": inj_status in RISKY_STATUSES,
             }
         )
 
@@ -3632,6 +3661,44 @@ def get_team_roster(team_id: int, season: str | None = None) -> dict[str, Any]:
         },
         "season": selected_season,
         "results": roster,
+    }
+
+
+@app.get("/api/teams/{team_id}/injury-report")
+def get_team_injury_report(team_id: int) -> dict[str, Any]:
+    """Return injury report rows for a specific team, from the latest official NBA PDF."""
+    team = TEAM_LOOKUP.get(team_id)
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found.")
+
+    team_name = str(team.get("full_name") or "")
+    summary = build_team_availability_summary(team_name)
+    payload = fetch_latest_injury_report_payload()
+
+    # Build full player list with statuses
+    rows = [row for row in (payload.get("rows") or []) if row.get("team_name") == team_name]
+    players = [
+        {
+            "name": str(row.get("player_display") or "").strip(),
+            "status": str(row.get("status") or "").strip(),
+            "reason": str(row.get("reason") or "").strip(),
+            "is_unavailable": str(row.get("status") or "") in UNAVAILABLE_STATUSES,
+            "is_risky": str(row.get("status") or "") in RISKY_STATUSES,
+        }
+        for row in rows
+    ]
+    players.sort(key=lambda p: INJURY_STATUS_ORDER.get(p["status"], 3))
+
+    return {
+        "team_id": team_id,
+        "team_name": team_name,
+        "team_abbreviation": team.get("abbreviation", ""),
+        "headline": summary.get("headline", ""),
+        "tone": summary.get("tone", "neutral"),
+        "report_label": payload.get("report_label", ""),
+        "report_url": payload.get("report_url", ""),
+        "players": players,
+        "ok": payload.get("ok", False),
     }
 
 
@@ -4100,12 +4167,13 @@ def odds_player_props_import(payload: dict[str, Any] = Body(...)) -> dict[str, A
 @app.post("/api/parlay-builder")
 def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """
-    Scrape all today's NBA events + all markets in batches using rotating API keys,
+    Scrape selected NBA events + all markets in batches using rotating API keys,
     analyze every prop via the existing bulk engine, rank by hit rate, and build
     the best N-leg parlay the user requested.
 
     Payload:
       api_keys      list[str]   – one or more Odds API keys (rotated round-robin)
+      event_ids     list[str]   – specific event IDs to scrape (from /api/odds/events)
       legs          int         – 2–6 (number of parlay legs)
       sport         str         – default "basketball_nba"
       regions       str         – default "us"
@@ -4134,9 +4202,16 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     season       = str(payload.get("season") or current_nba_season())
     season_type  = str(payload.get("season_type") or "Regular Season")
     batch_size   = max(1, int(payload.get("batch_size") or 3))
+    bookmaker    = str(payload.get("bookmaker") or "draftkings").strip().lower()
     markets      = ",".join(ODDS_DEFAULT_MARKETS)
 
-    # ── Phase 1: Fetch today's events (1 credit, first key) ─────────────
+    # event_ids — if provided, skip fetching the events list entirely (saves 1 credit)
+    requested_event_ids: set[str] = set()
+    raw_event_ids = payload.get("event_ids") or []
+    if isinstance(raw_event_ids, list):
+        requested_event_ids = {str(e).strip() for e in raw_event_ids if str(e).strip()}
+
+    # ── Phase 1: Resolve events ──────────────────────────────────────────
     key_index = 0
     quota_log: list[dict[str, Any]] = []
 
@@ -4146,17 +4221,22 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         key_index += 1
         return key
 
-    try:
-        events_result = odds_api_fetch(
-            f"/sports/{sport}/events",
-            next_key(),
-            {"dateFormat": "iso"},
-        )
-    except HTTPException as exc:
-        raise HTTPException(status_code=exc.status_code, detail=f"Failed to fetch events: {exc.detail}")
+    if requested_event_ids:
+        # User already selected specific events — build stub dicts directly
+        # so we don't spend a credit on the events list
+        events: list[dict[str, Any]] = [{"id": eid} for eid in requested_event_ids]
+    else:
+        try:
+            events_result = odds_api_fetch(
+                f"/sports/{sport}/events",
+                next_key(),
+                {"dateFormat": "iso"},
+            )
+        except HTTPException as exc:
+            raise HTTPException(status_code=exc.status_code, detail=f"Failed to fetch events: {exc.detail}")
 
-    events: list[dict[str, Any]] = events_result["data"] or []
-    quota_log.append({"call": "events_list", "quota": events_result["quota"]})
+        events = events_result["data"] or []
+        quota_log.append({"call": "events_list", "quota": events_result["quota"]})
 
     if not events:
         return {
@@ -4191,7 +4271,7 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
                         "oddsFormat": odds_format,
                         "dateFormat": "iso",
                         # 1 bookmaker only — we deduplicate anyway, saves ~80% credits
-                        "bookmakers": "draftkings",
+                        "bookmakers": bookmaker,
                     },
                 )
                 quota_log.append({"call": f"event_{event_id[:8]}", "quota": result["quota"]})
@@ -4318,21 +4398,30 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             "bookmaker": orig_row.get("bookmaker_title") or "N/A",
             "market_key": orig_row.get("market_key") or "",
             "availability_label": availability.get("label") or "Active",
+            "event_id": orig_row.get("event_id") or "",
+            "game_label": orig_row.get("game_label") or "",
         })
 
     # Sort descending by hit rate (primary), then odds (prefer value)
     scored.sort(key=lambda x: (x["hit_rate"], x["odds"]), reverse=True)
 
-    # Pick top N — enforce one leg per player (avoid stacking same player)
+    # Pick top N — enforce one leg per player AND one leg per game (no SGP)
     parlay_legs: list[dict[str, Any]] = []
     seen_player_ids: set[int] = set()
+    seen_event_ids: set[str] = set()
     for prop in scored:
         if len(parlay_legs) >= legs:
             break
         pid = prop.get("player_id")
+        eid = str(prop.get("event_id") or "")
         if pid in seen_player_ids:
             continue
+        # Block same-game parlay: if this event already has a leg, skip
+        if eid and eid in seen_event_ids:
+            continue
         seen_player_ids.add(pid)
+        if eid:
+            seen_event_ids.add(eid)
         parlay_legs.append(prop)
 
     # Calculate combined parlay odds (decimal product)
@@ -4419,6 +4508,183 @@ def todays_games(game_date: str | None = None) -> dict[str, Any]:
         "fallback_used": fallback_used,
         "report_label": report_payload.get("report_label") or "",
         "games": games,
+    }
+
+
+# ── Live boxscore stat for tracker ────────────────────────────────────────────
+_LIVE_BOX_CACHE: dict[str, dict[str, Any]] = {}
+_LIVE_BOX_CACHE_TTL = 30  # seconds
+
+# NBA CDN live scoreboard — much faster than ScoreboardV2
+_LIVE_SCOREBOARD_CACHE: dict[str, Any] = {}
+_LIVE_SCOREBOARD_TTL = 20  # seconds
+
+_NBA_CDN_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://www.nba.com",
+    "Referer": "https://www.nba.com/",
+}
+
+
+def _fetch_nba_live_scoreboard() -> dict[str, Any] | None:
+    """Fetch NBA CDN live scoreboard — real-time game states and IDs."""
+    cached = _LIVE_SCOREBOARD_CACHE.get("data")
+    if cached and time.time() - _LIVE_SCOREBOARD_CACHE.get("ts", 0) < _LIVE_SCOREBOARD_TTL:
+        return cached
+    try:
+        url = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
+        resp = requests.get(url, timeout=8, headers=_NBA_CDN_HEADERS)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        _LIVE_SCOREBOARD_CACHE["data"] = data
+        _LIVE_SCOREBOARD_CACHE["ts"] = time.time()
+        return data
+    except Exception:
+        return None
+
+
+def _fetch_live_boxscore(game_id: str) -> dict[str, Any] | None:
+    """Fetch live/final boxscore from NBA CDN live data endpoint."""
+    cached = _LIVE_BOX_CACHE.get(game_id)
+    if cached and time.time() - cached["ts"] < _LIVE_BOX_CACHE_TTL:
+        return cached["data"]
+    try:
+        url = f"https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{game_id}.json"
+        resp = requests.get(url, timeout=8, headers=_NBA_CDN_HEADERS)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        _LIVE_BOX_CACHE[game_id] = {"ts": time.time(), "data": data}
+        return data
+    except Exception:
+        return None
+
+
+@app.get("/api/tracker/live-stat")
+def tracker_live_stat(player_id: int, stat: str = Query(..., pattern="^(PTS|REB|AST|3PM|STL|BLK|PRA|PR|PA|RA)$")) -> dict[str, Any]:
+    """Return today's live/final in-game stat for a player using NBA CDN live data."""
+    stat = stat.upper()
+
+    player = PLAYER_LOOKUP.get(player_id)
+    if not player:
+        raise HTTPException(status_code=404, detail="Player not found.")
+
+    live_val: float | None = None
+    game_status: str = "no_game"
+    game_label: str = ""
+    period: str = ""
+    clock: str = ""
+
+    # ── 1. NBA CDN live scoreboard (20s cache) ─────────────────────────────
+    sb = _fetch_nba_live_scoreboard()
+    game_id: str | None = None
+
+    if sb:
+        try:
+            games = sb.get("scoreboard", {}).get("games", [])
+            for g in games:
+                home_tid = int((g.get("homeTeam") or {}).get("teamId") or 0)
+                away_tid = int((g.get("awayTeam") or {}).get("teamId") or 0)
+
+                # Match by checking boxscore player list (fast path: match team first via player profile)
+                # We'll try to match team_id from player profile cache
+                player_team_id: int | None = None
+                try:
+                    info = fetch_common_player_info(player_id)
+                    raw = info.get("TEAM_ID")
+                    player_team_id = int(raw) if raw not in (None, "") else None
+                except Exception:
+                    pass
+
+                if player_team_id and player_team_id not in (home_tid, away_tid):
+                    continue  # not this player's game
+
+                gstatus = int(g.get("gameStatus") or 1)
+                # gameStatus: 1=scheduled, 2=live, 3=final
+                home_abbr = (g.get("homeTeam") or {}).get("teamTricode", "")
+                away_abbr = (g.get("awayTeam") or {}).get("teamTricode", "")
+                game_label = f"{away_abbr} @ {home_abbr}"
+                gid = str(g.get("gameId") or "").strip()
+                period_num = g.get("period", 0)
+                game_clock = str(g.get("gameClock") or "").replace("PT", "").replace("M", ":").replace("S", "").strip()
+
+                if gstatus == 1:
+                    game_status = "scheduled"
+                    game_id = gid
+                    break
+                elif gstatus in (2, 3):
+                    game_id = gid
+                    game_status = "live" if gstatus == 2 else "final"
+                    period = f"Q{period_num}" if period_num else ""
+                    clock = game_clock
+                    break
+        except Exception:
+            pass
+
+    # ── 2. Pull live boxscore from NBA CDN ────────────────────────────────
+    if game_id and game_status in ("live", "final"):
+        box = _fetch_live_boxscore(game_id)
+        if box:
+            try:
+                home_players = box["game"]["homeTeam"]["players"]
+                away_players = box["game"]["awayTeam"]["players"]
+                all_players = home_players + away_players
+                p_row = next((p for p in all_players if int(p.get("personId", -1)) == player_id), None)
+                if p_row:
+                    stats = p_row.get("statistics", {})
+                    def gs(k: str) -> float:
+                        return float(stats.get(k) or 0)
+                    if stat == "PTS":   live_val = gs("points")
+                    elif stat == "REB": live_val = gs("reboundsTotal")
+                    elif stat == "AST": live_val = gs("assists")
+                    elif stat == "3PM": live_val = gs("threePointersMade")
+                    elif stat == "STL": live_val = gs("steals")
+                    elif stat == "BLK": live_val = gs("blocks")
+                    elif stat == "PRA": live_val = gs("points") + gs("reboundsTotal") + gs("assists")
+                    elif stat == "PR":  live_val = gs("points") + gs("reboundsTotal")
+                    elif stat == "PA":  live_val = gs("points") + gs("assists")
+                    elif stat == "RA":  live_val = gs("reboundsTotal") + gs("assists")
+            except (KeyError, TypeError, StopIteration):
+                pass
+
+    # ── 3. Fallback to last game log if no live data ───────────────────────
+    fallback_val: float | None = None
+    fallback_date: str | None = None
+    try:
+        season = current_nba_season()
+        rows = fetch_player_game_log(player_id=player_id, season=season, season_type="Regular Season")
+        if rows:
+            r = rows[0]
+            fallback_val = compute_stat_value(r, stat)
+            fallback_date = str(r.get("GAME_DATE") or "")
+    except Exception:
+        pass
+
+    # ── 4. Injury status check ────────────────────────────────────────────
+    injury_status: str = ""
+    is_injured: bool = False
+    try:
+        avail = build_availability_payload(player.get("full_name", ""))
+        injury_status = avail.get("status") or ""
+        is_injured = bool(avail.get("is_unavailable")) or bool(avail.get("is_risky"))
+    except Exception:
+        pass
+
+    return {
+        "player_id": player_id,
+        "stat": stat,
+        "live_val": live_val,
+        "game_status": game_status,
+        "game_label": game_label,
+        "period": period,
+        "clock": clock,
+        "fallback_val": fallback_val,
+        "fallback_date": fallback_date,
+        "injury_status": injury_status,
+        "is_injured": is_injured,
     }
 
 

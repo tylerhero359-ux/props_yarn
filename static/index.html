@@ -75,6 +75,13 @@
             <small>Auto-build best-hit-rate parlays</small>
           </span>
         </button>
+        <button class="nav-item" type="button" data-view="tracker">
+          <span class="nav-icon">📡</span>
+          <span>
+            <strong>Prop Tracker</strong>
+            <small>Live bar tracking for active bets</small>
+          </span>
+        </button>
       </nav>
 
       <div class="sidebar-summary card">
@@ -832,11 +839,12 @@
 
         <section id="parlayPanel" class="card glass parlay-panel">
 
-          <!-- Config row -->
+          <!-- Step 1: API config -->
+          <div class="parlay-step-label"><span class="parlay-step-num">1</span> API Setup</div>
           <div class="parlay-config-grid">
             <label class="field-inline">
-              <span class="small-label">Odds API keys <span class="parlay-key-hint">(comma-separate multiple)</span></span>
-              <textarea id="parlayApiKeys" class="parlay-keys-textarea" rows="2" placeholder="key1,key2,key3 — separate multiple keys with commas"></textarea>
+              <span class="small-label">Odds API keys <span class="parlay-key-hint">(comma-separate multiple — rotated per call)</span></span>
+              <textarea id="parlayApiKeys" class="parlay-keys-textarea" rows="2" placeholder="key1,key2,key3"></textarea>
             </label>
             <div class="parlay-config-row">
               <label class="field-inline">
@@ -854,13 +862,16 @@
                 </select>
               </label>
               <label class="field-inline">
-                <span class="small-label">Legs</span>
-                <select id="parlayLegsSelect" class="market-api-input">
-                  <option value="2">2-Leg</option>
-                  <option value="3" selected>3-Leg</option>
-                  <option value="4">4-Leg</option>
-                  <option value="5">5-Leg</option>
-                  <option value="6">6-Leg</option>
+                <span class="small-label">Bookmaker</span>
+                <select id="parlayBookmakerSelect" class="market-api-input">
+                  <option value="draftkings">DraftKings</option>
+                  <option value="fanduel">FanDuel</option>
+                  <option value="betmgm">BetMGM</option>
+                  <option value="caesars">Caesars</option>
+                  <option value="pointsbet_us">PointsBet</option>
+                  <option value="bet365_us">Bet365</option>
+                  <option value="betrivers">BetRivers</option>
+                  <option value="unibet_us">Unibet</option>
                 </select>
               </label>
               <label class="field-inline">
@@ -872,20 +883,48 @@
                   <option value="20">Last 20</option>
                 </select>
               </label>
+              <div class="field-inline" style="align-self:flex-end">
+                <button id="parlayLoadEventsBtn" class="secondary-btn" type="button">Load Today's Events</button>
+              </div>
             </div>
           </div>
 
-          <div class="parlay-action-row">
-            <button id="parlayBuildBtn" class="primary-btn parlay-build-btn" type="button">
-              <span class="parlay-btn-icon">🎰</span> Scrape &amp; Build
-            </button>
-            <button id="parlayRebuildBtn" class="secondary-btn parlay-build-btn" type="button" style="display:none" title="Re-pick legs from cached props — no API calls">
-              <span class="parlay-btn-icon">🔄</span> Rebuild Legs
-            </button>
-            <button id="parlayRescrapeBtn" class="text-btn" type="button" style="display:none" title="Re-scrape all events and re-analyze — uses API credits">
-              ↺ Re-scrape
-            </button>
-            <div id="parlayStatusMeta" class="small-meta parlay-status-meta">Configure your keys and legs, then hit Scrape &amp; Build.</div>
+          <!-- Step 2: Event picker (hidden until events load) -->
+          <div id="parlayEventPickerWrap" style="display:none">
+            <div class="parlay-step-label"><span class="parlay-step-num">2</span> Pick Events <span class="parlay-key-hint">(select the games you want props from)</span></div>
+            <div id="parlayEventList" class="parlay-event-list"></div>
+            <div class="parlay-event-actions">
+              <button id="parlaySelectAllBtn" class="text-btn" type="button">Select all</button>
+              <button id="parlaySelectNoneBtn" class="text-btn" type="button">Clear</button>
+              <span id="parlayEventSelectionMeta" class="small-meta"></span>
+            </div>
+          </div>
+
+          <!-- Step 3: Leg count + build (hidden until events picked) -->
+          <div id="parlayBuildWrap" style="display:none">
+            <div class="parlay-step-label"><span class="parlay-step-num">3</span> Build Parlay</div>
+            <div class="parlay-action-row">
+              <label class="field-inline">
+                <span class="small-label">Legs</span>
+                <select id="parlayLegsSelect" class="market-api-input">
+                  <option value="2">2-Leg</option>
+                  <option value="3" selected>3-Leg</option>
+                  <option value="4">4-Leg</option>
+                  <option value="5">5-Leg</option>
+                  <option value="6">6-Leg</option>
+                </select>
+              </label>
+              <button id="parlayBuildBtn" class="primary-btn parlay-build-btn" type="button">
+                <span class="parlay-btn-icon">🎰</span> Scrape &amp; Build
+              </button>
+              <button id="parlayRebuildBtn" class="secondary-btn parlay-build-btn" type="button" style="display:none" title="Re-pick legs from cache — no API calls">
+                <span class="parlay-btn-icon">🔀</span> Reshuffle
+              </button>
+              <button id="parlayRescrapeBtn" class="text-btn" type="button" style="display:none" title="Re-scrape selected events — uses API credits">
+                ↺ Re-scrape
+              </button>
+              <div id="parlayStatusMeta" class="small-meta parlay-status-meta"></div>
+            </div>
           </div>
 
           <!-- Quota tracker -->
@@ -932,6 +971,7 @@
                     <th>Avg</th>
                     <th>Games</th>
                     <th>Odds</th>
+                    <th></th>
                   </tr>
                 </thead>
                 <tbody id="parlayAllPropsBody"></tbody>
@@ -947,6 +987,78 @@
           </div>
 
         </section>
+      </section>
+
+      <section class="dashboard-view" data-view="tracker">
+        <section class="tracker-hero card glass">
+          <div class="tracker-hero-copy">
+            <p class="section-kicker">Live Prop Tracker</p>
+            <h2>Watch your bets fill in real time.</h2>
+            <p class="small-meta">Add player props below and hit Refresh to pull the latest game log stats. Each bar fills toward the line — green when it hits.</p>
+          </div>
+          <button id="trackerRefreshBtn" class="primary-btn tracker-refresh-btn" type="button">
+            <span class="tracker-refresh-icon">↻</span> Refresh All
+          </button>
+        </section>
+
+        <section class="card glass tracker-add-panel">
+          <div class="parlay-step-label"><span class="parlay-step-num">+</span> Add a Prop to Track</div>
+          <div class="tracker-add-grid">
+            <label class="field-inline tracker-field-player">
+              <span class="small-label">Player name</span>
+              <div class="tracker-player-autocomplete">
+                <input id="trackerPlayerInput" class="market-api-input" type="text" placeholder="e.g. LeBron James" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-owns="trackerPlayerDropdown">
+                <ul id="trackerPlayerDropdown" class="tracker-player-dropdown" role="listbox" aria-label="Player suggestions"></ul>
+              </div>
+            </label>
+            <label class="field-inline">
+              <span class="small-label">Stat</span>
+              <select id="trackerStatSelect" class="market-api-input">
+                <option value="PTS">PTS</option>
+                <option value="REB">REB</option>
+                <option value="AST">AST</option>
+                <option value="3PM">3PM</option>
+                <option value="STL">STL</option>
+                <option value="BLK">BLK</option>
+                <option value="PRA">PRA</option>
+                <option value="PR">PR</option>
+                <option value="PA">PA</option>
+                <option value="RA">RA</option>
+              </select>
+            </label>
+            <label class="field-inline">
+              <span class="small-label">Line</span>
+              <input id="trackerLineInput" class="market-api-input" type="number" step="0.5" min="0" placeholder="e.g. 25.5">
+            </label>
+            <label class="field-inline">
+              <span class="small-label">Side</span>
+              <select id="trackerSideSelect" class="market-api-input">
+                <option value="OVER">OVER</option>
+                <option value="UNDER">UNDER</option>
+              </select>
+            </label>
+            <label class="field-inline">
+              <span class="small-label">Odds (decimal)</span>
+              <input id="trackerOddsInput" class="market-api-input" type="number" step="0.01" min="1" placeholder="e.g. 1.91">
+            </label>
+            <label class="field-inline">
+              <span class="small-label">Bookmaker</span>
+              <input id="trackerBookInput" class="market-api-input" type="text" placeholder="e.g. DraftKings">
+            </label>
+            <div class="field-inline tracker-add-btn-wrap">
+              <button id="trackerAddBtn" class="secondary-btn" type="button">Add Prop</button>
+            </div>
+          </div>
+          <div id="trackerAddError" class="small-meta" style="color:var(--bad);display:none"></div>
+        </section>
+
+        <div id="trackerCards" class="tracker-cards"></div>
+
+        <div id="trackerEmpty" class="bet-finder-state empty-state-panel compact">
+          <div class="empty-icon">📡</div>
+          <strong>No props tracked yet.</strong>
+          <span>Add a prop above to start watching it fill toward the line.</span>
+        </div>
       </section>
     </main>
   </div>
