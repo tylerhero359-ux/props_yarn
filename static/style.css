@@ -5421,3 +5421,170 @@ body.light-theme .action-banner-inner {
   margin-left: 8px;
   vertical-align: middle;
 }
+
+/* ══════════════════════════════════════════════════════
+   TODAY'S GAMES — Injury panel
+══════════════════════════════════════════════════════ */
+.today-inj-toggle-btn {
+  background: rgba(255,170,40,0.10);
+  border: 1px solid rgba(255,170,40,0.28);
+  color: #ffb020;
+  border-radius: var(--radius-sm);
+  padding: 5px 12px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.18s, border-color 0.18s;
+}
+.today-inj-toggle-btn:hover {
+  background: rgba(255,170,40,0.2);
+  border-color: rgba(255,170,40,0.5);
+}
+.today-inj-panel {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid rgba(255,255,255,0.07);
+  border-radius: var(--radius-sm);
+  animation: fadeSlideIn 0.2s ease;
+}
+@keyframes fadeSlideIn { from { opacity:0; transform:translateY(-6px); } to { opacity:1; transform:translateY(0); } }
+.today-inj-team-row {
+  display: flex;
+  gap: 16px;
+}
+.today-inj-team-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.today-inj-team-label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+.today-inj-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.today-inj-chip {
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 2px 9px;
+  border-radius: 999px;
+  cursor: default;
+}
+.today-inj-chip.out   { background: rgba(255,60,60,0.15); color: #ff5050; }
+.today-inj-chip.risky { background: rgba(255,170,40,0.15); color: #ffb020; }
+.today-inj-clean      { font-size: 0.76rem; color: var(--good); font-weight: 600; }
+.today-inj-more       { font-size: 0.72rem; color: var(--muted); padding: 2px 6px; }
+
+/* ══════════════════════════════════════════════════════
+   PARLAY — Track button
+══════════════════════════════════════════════════════ */
+.parlay-track-btn {
+  background: rgba(var(--accent-rgb), 0.10);
+  border: 1px solid rgba(var(--accent-rgb), 0.28);
+  color: var(--accent);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 0.73rem;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.18s, border-color 0.18s, color 0.18s;
+}
+.parlay-track-btn:hover:not(:disabled) {
+  background: rgba(var(--accent-rgb), 0.22);
+  border-color: var(--accent);
+}
+.parlay-track-btn:disabled {
+  cursor: default;
+  opacity: 0.8;
+}
+
+/* ══════════════════════════════════════════════════════
+   PARLAY BUILDER — scrape progress bar
+══════════════════════════════════════════════════════ */
+.parlay-progress-wrap {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 0;
+  animation: fadeSlideIn 0.2s ease;
+}
+.parlay-progress-track {
+  flex: 1;
+  height: 8px;
+  background: rgba(255,255,255,0.07);
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid rgba(255,255,255,0.06);
+}
+.parlay-progress-bar {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), #8571ff, var(--good));
+  background-size: 200% 100%;
+  transition: width 0.55s cubic-bezier(0.4, 0, 0.2, 1);
+  animation: progressShimmer 1.8s linear infinite;
+}
+@keyframes progressShimmer {
+  0%   { background-position: 200% center; }
+  100% { background-position: -200% center; }
+}
+.parlay-progress-label {
+  font-size: 0.78rem;
+  color: var(--muted);
+  white-space: nowrap;
+  min-width: 200px;
+  font-style: italic;
+}
+body.light-theme .parlay-progress-track {
+  background: rgba(0,0,0,0.06);
+  border-color: rgba(0,0,0,0.04);
+}
+
+/* ══════════════════════════════════════════════════════
+   PARLAY event chips — PH time styling
+══════════════════════════════════════════════════════ */
+.parlay-chip-time {
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ══════════════════════════════════════════════════════
+   OPPONENT OVERRIDE — notice banner & selector styling
+══════════════════════════════════════════════════════ */
+.override-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.65rem 0.9rem;
+  margin-bottom: 1rem;
+  border-radius: 10px;
+  background: rgba(var(--warning-rgb, 251, 191, 36), 0.12);
+  border: 1px solid rgba(var(--warning-rgb, 251, 191, 36), 0.35);
+  font-size: 0.82rem;
+  color: var(--fg);
+  line-height: 1.4;
+}
+.override-notice strong {
+  font-weight: 600;
+  color: var(--fg);
+}
+body.light-theme .override-notice {
+  background: rgba(251, 191, 36, 0.1);
+  border-color: rgba(251, 191, 36, 0.4);
+}
+
+/* Highlight the oppSelect when a manual override is active */
+#oppSelect.override-active {
+  border-color: #fbbf24 !important;
+  box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.25);
+}

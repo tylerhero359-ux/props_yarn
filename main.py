@@ -195,7 +195,7 @@ def build_team_alias_lookup() -> dict[str, dict[str, Any]]:
 
 
 TEAM_ALIAS_LOOKUP = build_team_alias_lookup()
-CACHE_TTL_SECONDS = 1800
+CACHE_TTL_SECONDS = 21600
 PROFILE_TTL_SECONDS = 86400
 POSITION_TTL_SECONDS = 43200
 NEXT_GAME_TTL_SECONDS = 3600
@@ -223,7 +223,7 @@ TEAM_RECENT_CONTEXT_CACHE: dict[tuple[int, str, str, int], dict[str, Any]] = {}
 TEAM_CONTEXT_TTL_SECONDS = 3600
 SCOREBOARD_CACHE: dict[str, dict[str, Any]] = {}
 ENRICHED_LOG_CACHE: dict[tuple[int, str, str, int | None], dict[str, Any]] = {}
-ANALYSIS_CACHE_TTL_SECONDS = 300
+ANALYSIS_CACHE_TTL_SECONDS = 7200
 ANALYSIS_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 AVAILABILITY_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
 TEAM_OPPORTUNITY_CACHE: dict[tuple[str, str, str, str], dict[str, Any]] = {}
@@ -278,13 +278,13 @@ INJURY_REPORT_PDF_TIMEOUT = (3, 8)
 INJURY_REPORT_LINKS_TTL_SECONDS = 300
 INJURY_REPORT_FAILURE_COOLDOWN_SECONDS = 180
 INJURY_REPORT_MAX_STALE_SECONDS = 6 * 60 * 60
-GAME_LOG_FAILURE_COOLDOWN_SECONDS = 180
+GAME_LOG_FAILURE_COOLDOWN_SECONDS = 60
 GAME_LOG_MAX_STALE_SECONDS = 6 * 60 * 60
-GAME_LOG_FETCH_BUDGET_WITH_RELIABLE_STALE_SECONDS = 8
-GAME_LOG_FETCH_BUDGET_NO_RELIABLE_STALE_SECONDS = 90
+GAME_LOG_FETCH_BUDGET_WITH_RELIABLE_STALE_SECONDS = 5
+GAME_LOG_FETCH_BUDGET_NO_RELIABLE_STALE_SECONDS = 18
 GAME_LOG_FETCH_ATTEMPTS_WITH_RELIABLE_STALE = 1
-GAME_LOG_FETCH_ATTEMPTS_NO_RELIABLE_STALE = 4
-GAME_LOG_FETCH_TIMEOUT_CAP_SECONDS = 20
+GAME_LOG_FETCH_ATTEMPTS_NO_RELIABLE_STALE = 2
+GAME_LOG_FETCH_TIMEOUT_CAP_SECONDS = 12
 GAME_LOG_FETCH_TIMEOUT_FLOOR_SECONDS = 3
 PLAYER_INFO_FAILURE_META: dict[int, dict[str, float]] = {}
 PLAYER_INFO_MAX_STALE_SECONDS = 7 * 24 * 60 * 60
@@ -432,7 +432,13 @@ def normalize_report_person_name(name: str) -> str:
 
     if "," in raw:
         last, first = [part.strip() for part in raw.split(",", 1)]
+        # Handle CamelCase fused last names from PDF text extraction
+        # e.g. "JonesGarcia" -> "Jones Garcia", "MooreJr" -> "Moore Jr"
+        last = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", last)
         raw = f"{first} {last}".strip()
+    else:
+        # Handle CamelCase in names without comma (rare but defensive)
+        raw = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", raw)
 
     raw = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", " ", raw, flags=re.IGNORECASE)
     raw = re.sub(r"[^A-Za-z\s]", " ", raw)
@@ -559,14 +565,24 @@ def parse_injury_report_rows(report_text: str) -> dict[str, Any]:
         if not line:
             continue
         compact_line = normalize_compact_text(line)
-        if line.startswith("Injury Report:") or line.startswith("Page ") or compact_line.startswith("page"):
+        if line.startswith("Injury Report:") or line.startswith("Page ") or compact_line.startswith("page") or re.match(r"^page\d+of\d+$", compact_line):
             continue
-        if line.startswith("Game Date ") or line.startswith("Current Status") or compact_line.startswith("gamedate"):
+        if line.startswith("Game Date ") or line.startswith("Current Status") or compact_line.startswith("gamedate") or compact_line.startswith("gamedategametimematchup"):
             continue
 
         full_row_match = re.match(r"^\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}\s*\(ET\)\s+[A-Z]{2,4}@[A-Z]{2,4}\s+(.*)$", line)
         if full_row_match:
             line = full_row_match.group(1).strip()
+        else:
+            # Strip "HH:MM(ET) AAA@BBB " prefix (time + matchup, no date)
+            time_matchup = re.match(r"^\d{2}:\d{2}\s*\(ET\)\s+[A-Z]{2,4}@[A-Z]{2,4}\s+(.*)$", line)
+            if time_matchup:
+                line = time_matchup.group(1).strip()
+            else:
+                # Strip bare "AAA@BBB " matchup prefix (no date, no time)
+                bare_matchup = re.match(r"^[A-Z]{2,4}@[A-Z]{2,4}\s+(.*)$", line)
+                if bare_matchup:
+                    line = bare_matchup.group(1).strip()
 
         team_name, remainder = extract_team_prefix(line)
         if team_name:
@@ -586,6 +602,9 @@ def parse_injury_report_rows(report_text: str) -> dict[str, Any]:
         )
         if row_match and current_team:
             player_display = row_match.group("player").strip()
+            # Normalise display name: PDF text-extract can fuse "Last,First" with no space.
+            # Insert space after comma if missing so keys and display are consistent.
+            player_display = re.sub(r",(?!\s)", ", ", player_display)
             status = row_match.group("status").strip()
             reason = (row_match.group("reason") or "").strip()
             row_payload = {
@@ -605,6 +624,105 @@ def parse_injury_report_rows(report_text: str) -> dict[str, Any]:
                 last_row["reason"] = f"{last_row.get('reason', '').strip()} {continuation}".strip()
 
     return {"rows": rows, "pending_teams": sorted(pending_teams)}
+
+
+def extract_injury_report_rows_from_table(pdf_bytes: bytes) -> list[dict[str, Any]] | None:
+    """Use pdfplumber's table extractor to read the NBA injury report PDF as a
+    structured table, giving us exact (team, player, status, reason) columns
+    without the column-interleaving bugs that plague free-text extraction."""
+    if pdfplumber is None:
+        return None
+    try:
+        rows: list[dict[str, Any]] = []
+        # Track the last valid team across rows — the PDF only names the team on
+        # the first row for that team; subsequent rows leave the team cell blank.
+        last_team_name: str | None = None
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:  # type: ignore[arg-type]
+            for page in pdf.pages:
+                tables = page.extract_tables() or []
+                for table in tables:
+                    for row in table:
+                        if not row:
+                            continue
+                        # NBA injury report table columns (0-indexed):
+                        # 0: Game Date  1: Game Time  2: Matchup  3: Team
+                        # 4: Player     5: Current Status  6: Reason
+                        cells = [str(c or "").strip() for c in row]
+                        if len(cells) < 5:
+                            continue
+                        # Skip header rows
+                        if cells[0].lower() in ("game date", "date") or cells[3].lower() in ("team",):
+                            continue
+                        # Skip totally empty rows
+                        if not any(cells):
+                            continue
+
+                        # Search for a team name in columns 2-5
+                        team_col_idx = None
+                        for ci in range(2, min(6, len(cells))):
+                            cell_compact = normalize_compact_text(cells[ci])
+                            for team in TEAM_POOL:
+                                if normalize_compact_text(team["full_name"]) == cell_compact:
+                                    team_col_idx = ci
+                                    break
+                            if team_col_idx is not None:
+                                break
+
+                        if team_col_idx is not None:
+                            # New team found in this row — resolve and carry forward
+                            tc = normalize_compact_text(cells[team_col_idx])
+                            for team in TEAM_POOL:
+                                if normalize_compact_text(team["full_name"]) == tc:
+                                    last_team_name = str(team["full_name"])
+                                    break
+                            player_col_idx = team_col_idx + 1
+                            status_col_idx = team_col_idx + 2
+                            reason_col_idx = team_col_idx + 3
+                        else:
+                            # No team cell — use carry-forward team (same team, next player)
+                            if not last_team_name:
+                                continue
+                            # Canonical column layout: col 4=player, 5=status, 6=reason
+                            player_col_idx = 4
+                            status_col_idx = 5
+                            reason_col_idx = 6
+
+                        team_full_name = last_team_name
+                        if not team_full_name:
+                            continue
+
+                        player_cell = cells[player_col_idx] if player_col_idx < len(cells) else ""
+                        status_cell = cells[status_col_idx] if status_col_idx < len(cells) else ""
+                        reason_cell = cells[reason_col_idx] if reason_col_idx < len(cells) else ""
+
+                        # Validate status
+                        status_cell = status_cell.strip()
+                        if status_cell not in REPORT_STATUSES:
+                            found = None
+                            for s in sorted(REPORT_STATUSES, key=len, reverse=True):
+                                if s.lower() in status_cell.lower():
+                                    found = s
+                                    break
+                            if not found:
+                                continue
+                            status_cell = found
+
+                        player_display = player_cell.strip()
+                        # Normalise: PDF text-extract can produce "Last,First" with no space.
+                        player_display = re.sub(r",(?!\s)", ", ", player_display)
+                        if not player_display:
+                            continue
+
+                        rows.append({
+                            "team_name": team_full_name,
+                            "player_display": player_display,
+                            "player_key": normalize_report_person_name(player_display),
+                            "status": status_cell,
+                            "reason": reason_cell.strip(),
+                        })
+        return rows if rows else None
+    except Exception:
+        return None
 
 
 def extract_injury_report_text_candidates(pdf_bytes: bytes) -> list[dict[str, str]]:
@@ -642,8 +760,26 @@ def extract_injury_report_text_candidates(pdf_bytes: bytes) -> list[dict[str, st
 
 
 def choose_best_injury_report_parse(pdf_bytes: bytes) -> dict[str, Any]:
+    # ── Strategy 1: Table extraction (most accurate — reads columns directly) ──
+    table_rows = extract_injury_report_rows_from_table(pdf_bytes)
+    if table_rows:
+        LOGGER.info("Injury report: table extraction succeeded with %d rows", len(table_rows))
+        # Reconstruct raw_text for debugging from the structured rows
+        raw_lines = [
+            f"{r['team_name']} {r['player_display']} {r['status']} {r['reason']}"
+            for r in table_rows
+        ]
+        return {
+            "rows": table_rows,
+            "pending_teams": [],
+            "raw_text": "\n".join(raw_lines),
+            "method": "pdfplumber_table",
+        }
+
+    # ── Strategy 2: Free-text extraction (fallback) ──
+    LOGGER.warning("Injury report: table extraction returned no rows, falling back to text parsing")
     candidates = extract_injury_report_text_candidates(pdf_bytes)
-    best_payload = {"rows": [], "pending_teams": [], "raw_text": "", "method": "none"}
+    best_payload: dict[str, Any] = {"rows": [], "pending_teams": [], "raw_text": "", "method": "none"}
 
     for candidate in candidates:
         parsed = parse_injury_report_rows(candidate["text"])
@@ -779,10 +915,11 @@ def search_report_payload_for_player(report_payload: dict[str, Any], player_name
                 if variant and variant.lower() in remainder.lower():
                     row_match = re.match(rf"^(?P<player>.+?)\s+(?P<status>{STATUS_PATTERN})\b(?:\s+(?P<reason>.*))?$", remainder)
                     if row_match:
+                        raw_disp = re.sub(r",(?!\s)", ", ", row_match.group("player").strip())
                         return {
                             "team_name": current_team or wanted_team,
-                            "player_display": row_match.group("player").strip(),
-                            "player_key": normalize_report_person_name(row_match.group("player").strip()),
+                            "player_display": raw_disp,
+                            "player_key": normalize_report_person_name(raw_disp),
                             "status": row_match.group("status").strip(),
                             "reason": (row_match.group("reason") or "").strip(),
                         }
@@ -1211,7 +1348,7 @@ def build_team_availability_summary(team_name: str | None, report_payload: dict[
         "probable_count": probable_count,
         "players": [
             {
-                "name": str(row.get("player_display") or "").strip(),
+                "name": re.sub(r",(?!\s)", ", ", str(row.get("player_display") or "").strip()),
                 "status": str(row.get("status") or "").strip(),
             }
             for row in rows[:4]
@@ -1363,8 +1500,8 @@ def throttle_request() -> None:
 
     with REQUEST_LOCK:
         elapsed = time.time() - LAST_REQUEST_TIME
-        if elapsed < 0.35:
-            time.sleep(0.35 - elapsed)
+        if elapsed < 0.20:
+            time.sleep(0.20 - elapsed)
         LAST_REQUEST_TIME = time.time()
 
 
@@ -1998,7 +2135,7 @@ def build_team_opportunity_context(team_name: str | None, player_name: str, stat
         'impact_count': len(impacted),
         'players': [
             {
-                'name': str(row.get('player_display') or '').strip(),
+                'name': re.sub(r",(?!\s)", ", ", str(row.get('player_display') or '').strip()),
                 'status': str(row.get('status') or '').strip(),
             }
             for row in impacted[:4]
@@ -3091,8 +3228,9 @@ def build_prop_analysis_payload(
     max_fga: float | None = None,
     h2h_only: bool = False,
     debug: bool = False,
+    override_opponent_id: int | None = None,
 ) -> dict[str, Any]:
-    cache_key = (player_id, stat, float(line), int(last_n), season, season_type, team_id, player_position or '', location, result, margin_min, margin_max, min_minutes, max_minutes, min_fga, max_fga, h2h_only)
+    cache_key = (player_id, stat, float(line), int(last_n), season, season_type, team_id, player_position or '', location, result, margin_min, margin_max, min_minutes, max_minutes, min_fga, max_fga, h2h_only, override_opponent_id)
     cached = ANALYSIS_CACHE.get(cache_key)
     now_ts = time.time()
     if cached and now_ts - float(cached.get('timestamp') or 0.0) < ANALYSIS_CACHE_TTL_SECONDS:
@@ -3128,12 +3266,38 @@ def build_prop_analysis_payload(
                 resolved_position = str(profile_row.get("POSITION", "")).strip()
 
     position_code, position_label = resolve_primary_position(resolved_position)
-    next_game = resolve_team_next_game(
-        team_id=resolved_team_id,
-        primary_player_id=player_id,
-        season=season,
-        season_type=season_type,
-    )
+
+    # If caller supplied an override opponent, build a synthetic next_game
+    if override_opponent_id and override_opponent_id != 0:
+        override_opp = TEAM_LOOKUP.get(int(override_opponent_id))
+        if override_opp:
+            player_team = TEAM_LOOKUP.get(resolved_team_id, {}) if resolved_team_id else {}
+            override_abbr = str(override_opp.get("abbreviation") or "").strip()
+            next_game = {
+                "game_date": "",
+                "game_time": "",
+                "is_home": None,
+                "matchup_label": f"vs {override_abbr}",
+                "opponent_team_id": int(override_opponent_id),
+                "opponent_name": str(override_opp.get("full_name") or "").strip(),
+                "opponent_abbreviation": override_abbr,
+                "player_team_abbreviation": str(player_team.get("abbreviation") or "").strip(),
+                "is_override": True,
+            }
+        else:
+            next_game = resolve_team_next_game(
+                team_id=resolved_team_id,
+                primary_player_id=player_id,
+                season=season,
+                season_type=season_type,
+            )
+    else:
+        next_game = resolve_team_next_game(
+            team_id=resolved_team_id,
+            primary_player_id=player_id,
+            season=season,
+            season_type=season_type,
+        )
 
     needs_margin_context = margin_min is not None or margin_max is not None
     if needs_margin_context:
@@ -3221,7 +3385,10 @@ def build_prop_analysis_payload(
 
     availability = None
     vs_position = None
-    if ANALYSIS_PARALLEL_ENABLED and position_cache_key:
+    # Always run both computations in parallel when parallel mode is on —
+    # previously gated on position_cache_key being truthy, which silently
+    # skipped vs_position whenever position_code was not yet resolved.
+    if ANALYSIS_PARALLEL_ENABLED:
         with ThreadPoolExecutor(max_workers=min(ANALYSIS_PARALLEL_MAX_WORKERS, 2)) as executor:
             future_availability = executor.submit(_compute_availability)
             future_vs_position = executor.submit(_compute_vs_position)
@@ -3422,39 +3589,44 @@ def build_position_matchup(
     delta = round(opponent_value - league_average, 2)
     delta_pct = round((delta / league_average) * 100, 1) if league_average else 0.0
 
+    # Build defense rank by querying each NBA team individually.
+    # league_rows (opponent_team_id=0) returns season totals without per-opponent
+    # breakdown, so OPP_TEAM_ID is absent. We use cached per-team queries instead,
+    # falling back gracefully if they are unavailable to avoid extra API calls.
     defense_rank = None
     rank_label = None
     team_summaries: list[dict[str, Any]] = []
-    if league_rows:
-        grouped_rows: dict[int, list[dict[str, Any]]] = {}
-        for row in league_rows:
-            team_id_raw = row.get("OPP_TEAM_ID") or row.get("TEAM_ID") or row.get("TEAMID") or row.get("OPPONENT_TEAM_ID")
-            try:
-                team_id_value = int(team_id_raw or 0)
-            except (TypeError, ValueError):
-                team_id_value = 0
-            if team_id_value <= 0:
+
+    for team in TEAM_POOL:
+        tid = int(team.get("id") or 0)
+        if not tid:
+            continue
+        per_team_cache_key = (season, season_type, position_code, tid)
+        per_team_cached = POSITION_DASH_CACHE.get(per_team_cache_key)
+        if not per_team_cached or not per_team_cached.get("rows"):
+            # Only use already-cached per-team data to avoid 30 extra API calls.
+            # The opponent team itself will always be cached from the query above.
+            if tid != int(opponent_team_id):
                 continue
-            grouped_rows.setdefault(team_id_value, []).append(row)
+            per_team_rows = opponent_rows
+        else:
+            per_team_rows = per_team_cached["rows"]
+        summary = summarize_position_environment(per_team_rows, stat)
+        if not summary:
+            continue
+        team_summaries.append({
+            "team_id": tid,
+            "per_player_game": summary["per_player_game"],
+        })
 
-        if grouped_rows:
-            for team_id_value, rows_for_team in grouped_rows.items():
-                summary = summarize_position_environment(rows_for_team, stat)
-                if not summary:
-                    continue
-                team_summaries.append({
-                    "team_id": team_id_value,
-                    "per_player_game": summary["per_player_game"],
-                })
-
-            if team_summaries:
-                ranked = sorted(team_summaries, key=lambda item: float(item.get("per_player_game") or 0.0), reverse=True)
-                for index, item in enumerate(ranked, start=1):
-                    if int(item.get("team_id") or 0) == int(opponent_team_id):
-                        defense_rank = index
-                        break
-                if defense_rank:
-                    rank_label = f"#{defense_rank} vs {POSITION_LABELS.get(position_code, position_code)}"
+    if team_summaries:
+        ranked = sorted(team_summaries, key=lambda item: float(item.get("per_player_game") or 0.0), reverse=True)
+        for index, item in enumerate(ranked, start=1):
+            if int(item.get("team_id") or 0) == int(opponent_team_id):
+                defense_rank = index
+                break
+        if defense_rank:
+            rank_label = f"#{defense_rank} vs {POSITION_LABELS.get(position_code, position_code)}"
 
     if delta_pct >= 12:
         lean = "Very favorable"
@@ -3617,15 +3789,19 @@ def get_team_roster(team_id: int, season: str | None = None) -> dict[str, Any]:
 
     rows = fetch_team_roster(team_id=team_id, season=selected_season)
 
-    # Fetch injury data for whole team in one call
+    # Fetch injury data for this specific team only — filter by team_name so
+    # players with the same normalized name on different teams don't bleed across.
     team_name = str(team.get("full_name") or "")
     report_payload = fetch_latest_injury_report_payload()
-    injury_rows = [r for r in (report_payload.get("rows") or []) if r.get("team_name") == team_name]
-    # Build lookup by normalized name
+    all_injury_rows = report_payload.get("rows") or []
+    # Build lookup: player_key -> row, scoped to this team only
     injury_lookup: dict[str, dict[str, Any]] = {}
-    for ir in injury_rows:
-        key = normalize_report_person_name(str(ir.get("player_display") or ""))
-        injury_lookup[key] = ir
+    for ir in all_injury_rows:
+        if str(ir.get("team_name") or "").strip() != team_name:
+            continue
+        pk = str(ir.get("player_key") or "").strip()
+        if pk and pk not in injury_lookup:
+            injury_lookup[pk] = ir
 
     roster = []
     for row in rows:
@@ -3679,7 +3855,7 @@ def get_team_injury_report(team_id: int) -> dict[str, Any]:
     rows = [row for row in (payload.get("rows") or []) if row.get("team_name") == team_name]
     players = [
         {
-            "name": str(row.get("player_display") or "").strip(),
+            "name": re.sub(r",(?!\s)", ", ", str(row.get("player_display") or "").strip()),
             "status": str(row.get("status") or "").strip(),
             "reason": str(row.get("reason") or "").strip(),
             "is_unavailable": str(row.get("status") or "") in UNAVAILABLE_STATUSES,
@@ -4304,6 +4480,46 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             "message": "No props found across today's events. Check your API keys or try again later.",
         }
 
+    # ── Phase 3a: Pre-warm game-log cache with one bulk LeagueDash call ────
+    # This single call fetches season stats for ALL players, warming the cache
+    # so individual fetch_player_game_log calls hit cache instead of NBA API.
+    try:
+        _bulk_dash = LeagueDashPlayerStats(
+            season=season,
+            season_type_all_star=season_type,
+            per_mode_detailed="PerGame",
+            timeout=15,
+        )
+        _bulk_df = _bulk_dash.get_data_frames()[0]
+        # Build a quick lookup so we can seed GAME_LOG_CACHE for each player
+        # (LeagueDash gives season averages, not per-game logs — we can't fully
+        # replace PlayerGameLog, but we CAN use it to pre-populate player info
+        # and skip fetch_common_player_info calls for every player.)
+        _bulk_rows = _bulk_df.to_dict(orient="records") if not _bulk_df.empty else []
+        _dash_lookup: dict[int, dict[str, Any]] = {
+            int(r.get("PLAYER_ID", 0)): r for r in _bulk_rows if r.get("PLAYER_ID")
+        }
+        # Seed PLAYER_INFO_CACHE for every player we're about to analyze
+        now_ts_bulk = time.time()
+        for row in _bulk_rows:
+            pid = int(row.get("PLAYER_ID", 0))
+            if not pid:
+                continue
+            if pid not in PLAYER_INFO_CACHE or (now_ts_bulk - float((PLAYER_INFO_CACHE.get(pid) or {}).get("timestamp", 0))) > PROFILE_TTL_SECONDS:
+                team_id_val = row.get("TEAM_ID")
+                PLAYER_INFO_CACHE[pid] = {
+                    "timestamp": now_ts_bulk,
+                    "row": {
+                        "TEAM_ID": team_id_val,
+                        "TEAM_ABBREVIATION": row.get("TEAM_ABBREVIATION", ""),
+                        "POSITION": row.get("PLAYER_POSITION", ""),
+                        "DISPLAY_FIRST_LAST": row.get("PLAYER_NAME", ""),
+                    }
+                }
+        LOGGER.info("Parlay pre-warm: seeded PLAYER_INFO_CACHE for %d players from LeagueDash", len(_dash_lookup))
+    except Exception as _bulk_exc:
+        LOGGER.warning("Parlay pre-warm LeagueDash failed (non-fatal): %s", _bulk_exc)
+
     # ── Phase 3: Bulk-analyze all props in one shot (free, parallel) ──
     defaults = {"last_n": last_n, "season": season, "season_type": season_type}
     local_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -4336,6 +4552,28 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         if ak not in seen_analysis_keys:
             seen_analysis_keys.add(ak)
             deduped_prepared.append((bulk_row, orig_row))
+
+    # Pre-warm game log cache concurrently for all unique player IDs
+    # This fires off all PlayerGameLog requests in parallel with a short timeout
+    # so the sequential analysis loop below hits cache instead of blocking 1-by-1.
+    unique_player_ids: set[int] = {int(br["player_id"]) for br, _ in deduped_prepared}
+    already_cached_ids: set[int] = {
+        pid for pid in unique_player_ids
+        if GAME_LOG_CACHE.get((pid, season, season_type)) and
+           (time.time() - float(GAME_LOG_CACHE[(pid, season, season_type)].get("timestamp", 0))) < CACHE_TTL_SECONDS
+    }
+    ids_to_fetch = unique_player_ids - already_cached_ids
+    if ids_to_fetch:
+        LOGGER.info("Parlay pre-fetching game logs for %d uncached players", len(ids_to_fetch))
+        def _prefetch_log(pid: int) -> None:
+            try:
+                fetch_player_game_log(player_id=pid, season=season, season_type=season_type)
+            except Exception:
+                pass  # failures are tolerated; analysis loop will handle them
+        prewarm_workers = min(BULK_ANALYSIS_MAX_WORKERS, len(ids_to_fetch), 8)
+        with ThreadPoolExecutor(max_workers=prewarm_workers) as _pre_ex:
+            list(_pre_ex.map(_prefetch_log, ids_to_fetch))
+        LOGGER.info("Parlay game-log pre-warm complete for %d players", len(ids_to_fetch))
 
     max_workers = min(BULK_ANALYSIS_MAX_WORKERS, max(1, len(deduped_prepared)))
 
@@ -4384,9 +4622,24 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         if availability.get("is_unavailable"):
             continue
 
+        # Skip props with odds below 1.40 — too low to be meaningful in a parlay
+        if odds < 1.40:
+            continue
+
+        # Resolve team + opponent IDs from the analysis payload so the frontend
+        # can auto-populate the analyzer without the user having to re-select manually.
+        player_info    = analysis.get("player") or {}
+        next_game_info = (analysis.get("matchup") or {}).get("next_game") or {}
+        resolved_team_id_scored    = player_info.get("team_id")
+        resolved_opponent_team_id  = next_game_info.get("opponent_team_id")
+        resolved_opponent_abbr     = str(next_game_info.get("opponent_abbreviation") or "").strip()
+
         scored.append({
             "player_name": result.get("player_name") or "",
             "player_id": result.get("player_id"),
+            "team_id": resolved_team_id_scored,
+            "opponent_team_id": resolved_opponent_team_id,
+            "opponent_abbreviation": resolved_opponent_abbr,
             "stat": stat,
             "line": line,
             "side": side,
@@ -4480,6 +4733,42 @@ def todays_games(game_date: str | None = None) -> dict[str, Any]:
         home_summary = build_team_availability_summary(str(home_team.get("full_name") or ""), report_payload)
         away_summary = build_team_availability_summary(str(away_team.get("full_name") or ""), report_payload)
 
+        def _inj_players(team_full_name: str) -> list[dict[str, Any]]:
+            seen_keys: set[str] = set()
+            result: list[dict[str, Any]] = []
+            team_full_name_norm = team_full_name.strip()
+            for ir in (report_payload.get("rows") or []):
+                status = str(ir.get("status") or "").strip()
+                if status not in UNAVAILABLE_STATUSES and status not in RISKY_STATUSES:
+                    continue
+                # Use exact team name match (same as build_team_availability_summary)
+                # to prevent players bleeding across teams when PDF parsing misassigns rows.
+                ir_team = str(ir.get("team_name") or "").strip()
+                if ir_team != team_full_name_norm:
+                    continue
+                pk = str(ir.get("player_key") or "")
+                if pk in seen_keys:
+                    continue
+                seen_keys.add(pk)
+                raw_display = str(ir.get("player_display") or "").strip()
+                # Normalise display: PDF text-extract gives "Last,First" (no space).
+                # Insert space after comma if missing so the UI shows "Last, First".
+                display = re.sub(r",(?!\s)", ", ", raw_display)
+                # Derive a short name: if "Last, First" format use last name, else last word.
+                if "," in display:
+                    short = display.split(",")[0].strip()
+                else:
+                    short = display.split()[-1] if display.split() else display
+                result.append({
+                    "full_name": display,
+                    "short_name": short,
+                    "status": status,
+                    "injury_reason": str(ir.get("reason") or ""),
+                    "is_unavailable": status in UNAVAILABLE_STATUSES,
+                    "is_risky": status in RISKY_STATUSES,
+                })
+            return result
+
         games.append({
             "game_id": str(row.get("GAME_ID") or "").strip(),
             "game_date": resolved_date,
@@ -4492,6 +4781,7 @@ def todays_games(game_date: str | None = None) -> dict[str, Any]:
                 "abbreviation": str(home_team.get("abbreviation") or "").strip(),
                 "score": home_score,
                 "availability": home_summary,
+                "injury_players": _inj_players(str(home_team.get("full_name") or "")),
             },
             "away": {
                 "team_id": away_team_id,
@@ -4499,6 +4789,7 @@ def todays_games(game_date: str | None = None) -> dict[str, Any]:
                 "abbreviation": str(away_team.get("abbreviation") or "").strip(),
                 "score": away_score,
                 "availability": away_summary,
+                "injury_players": _inj_players(str(away_team.get("full_name") or "")),
             },
         })
 
@@ -4708,6 +4999,7 @@ def player_prop(
     min_fga: float | None = Query(None, ge=0),
     max_fga: float | None = Query(None, ge=0),
     h2h_only: bool = Query(False),
+    override_opponent_id: int | None = Query(None),
 ) -> dict[str, Any]:
     selected_season = season or current_nba_season()
     stat = stat.upper()
@@ -4729,6 +5021,7 @@ def player_prop(
         min_fga=min_fga,
         max_fga=max_fga,
         h2h_only=h2h_only,
+        override_opponent_id=override_opponent_id,
     )
 
 BULK_ANALYSIS_ENABLED = os.getenv("NBA_BULK_ANALYSIS_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
@@ -4829,6 +5122,7 @@ def _build_bulk_prop_item(row_index: int, row: dict[str, Any], defaults: dict[st
             max_fga=float(max_fga) if max_fga not in (None, "") else None,
             h2h_only=bool(h2h_only),
             debug=bool(debug),
+            override_opponent_id=int(defaults.get("override_opponent_id")) if defaults.get("override_opponent_id") else None,
         )
         local_cache[cache_key] = copy.deepcopy(analysis)
 
@@ -4912,4 +5206,31 @@ def bulk_player_props(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         "errors": errors,
         "defaults": defaults,
         "max_workers": max_workers,
+    }
+
+
+@app.get("/api/debug/injury-report-raw")
+def debug_injury_report_raw() -> dict[str, Any]:
+    """Debug endpoint: returns raw extracted PDF text and parsed rows so the
+    team-assignment logic can be inspected without guessing."""
+    payload = fetch_latest_injury_report_payload()
+    raw_text = str(payload.get("raw_text") or "")
+    rows = payload.get("rows") or []
+    # Group rows by team so misassignments are obvious
+    by_team: dict[str, list[str]] = {}
+    for r in rows:
+        t = str(r.get("team_name") or "UNKNOWN")
+        by_team.setdefault(t, []).append(
+            f"{r.get('player_display')} | {r.get('status')} | {r.get('reason','')}"
+        )
+    return {
+        "ok": payload.get("ok"),
+        "report_label": payload.get("report_label"),
+        "parse_method": payload.get("parse_method"),
+        "total_rows": len(rows),
+        "teams_found": sorted(by_team.keys()),
+        "by_team": by_team,
+        # First 3000 chars of raw text so we can see what the PDF extraction produced
+        "raw_text_preview": raw_text[:3000],
+        "raw_text_lines": raw_text.splitlines()[:80],
     }

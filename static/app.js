@@ -1,4 +1,5 @@
 const teamSelect = document.getElementById('teamSelect');
+const oppSelect = document.getElementById('oppSelect');
 const playerSearchInput = document.getElementById('playerSearch');
 const searchResults = document.getElementById('searchResults');
 const selectedPlayerBadge = document.getElementById('selectedPlayer');
@@ -260,6 +261,19 @@ function saveLatestMarketResults(payload) {
   localStorage.setItem(MARKET_RESULTS_KEY, JSON.stringify(snapshot));
 }
 
+/**
+ * Convert injury-report name format "Last, First" -> "First Last" for display.
+ * If name has no comma it is returned as-is.
+ */
+function formatPlayerName(name) {
+  if (!name) return '';
+  const comma = name.indexOf(',');
+  if (comma === -1) return name;
+  const last = name.slice(0, comma).trim();
+  const first = name.slice(comma + 1).trim();
+  return first ? `${first} ${last}` : last;
+}
+
 function formatStoredTime(value) {
   if (!value) return 'Latest saved board unavailable.';
   const date = new Date(value);
@@ -517,7 +531,7 @@ function renderOverviewSelection() {
   const venueText = nextGame ? (nextGame.is_home ? 'Home' : 'Away') : (environment?.venue_label || 'Venue TBD');
   const restText = Number.isInteger(environment?.rest_days) ? `${environment.rest_days} day${environment.rest_days === 1 ? '' : 's'} rest` : 'Rest TBD';
   const opponentText = nextGame?.opponent_abbreviation || nextGame?.opponent_name || 'Opponent TBD';
-  const gameDateText = nextGame?.game_date ? formatTrendAxisDate(nextGame.game_date) : 'Date TBD';
+  const gameDateText = nextGame?.game_date ? formatNextGameDate(nextGame.game_date) : 'Date TBD';
 
   overviewCurrentCard.innerHTML = `
     <div class="overview-snapshot-shell">
@@ -849,7 +863,7 @@ function renderSelectedPlayerContext() {
     ? `${vsPosition.lean || 'Neutral'} • ${vsPosition.position_label || 'Position'} • ${typeof vsPosition.opponent_value === 'number' ? vsPosition.opponent_value.toFixed(2) : (vsPosition.opponent_value ?? '—')} ${getStatLabel(vsPosition.stat).toLowerCase()}`
     : 'Defense-vs-position pending';
   const venueLabel = environment?.venue_label || (nextGame ? (nextGame.is_home ? 'Home game' : 'Away game') : 'TBD');
-  const scheduleLabel = environment?.schedule_summary || nextGame?.game_date || 'Upcoming spot';
+  const scheduleLabel = environment?.schedule_summary || (nextGame?.game_date ? formatNextGameDate(nextGame.game_date) : 'Upcoming spot');
   const restDays = environment?.rest_days ?? nextGame?.rest_days;
   const gamesIn7 = environment?.games_in_7 ?? nextGame?.games_in_last_7;
   const backToBack = environment?.is_back_to_back ?? nextGame?.is_back_to_back;
@@ -862,7 +876,7 @@ function renderSelectedPlayerContext() {
       <div class="selected-player-context-header">
         <span class="selected-player-section-label">Next Matchup</span>
         <strong>${escapeHtml(matchupLabel)}</strong>
-        <small>${escapeHtml(nextGame?.game_date || 'Date TBA')}${nextGame?.game_time ? ` • ${escapeHtml(nextGame.game_time)}` : ''}</small>
+        <small>${escapeHtml(nextGame?.game_date ? formatNextGameDate(nextGame.game_date) : 'Date TBA')}${nextGame?.game_time ? ` • ${escapeHtml(nextGame.game_time)}` : ''}</small>
       </div>
       <div class="selected-player-context-grid">
         <div class="selected-player-context-chip">
@@ -1106,6 +1120,22 @@ async function loadTeams(force = false) {
     option.dataset.name = team.full_name || option.textContent;
     teamSelect.appendChild(option);
   });
+
+  // Also populate the opponent override selector
+  if (oppSelect) {
+    oppSelect.innerHTML = '';
+    const autoOpt = document.createElement('option');
+    autoOpt.value = '';
+    autoOpt.textContent = 'Auto (next scheduled)';
+    oppSelect.appendChild(autoOpt);
+    teams.forEach(team => {
+      const option = document.createElement('option');
+      option.value = String(team.id);
+      option.textContent = `${team.abbreviation || ''} — ${team.full_name || ''}`.trim();
+      option.dataset.abbreviation = team.abbreviation || '';
+      oppSelect.appendChild(option);
+    });
+  }
 }
 
 async function ensureTeamsLoaded(force = false) {
@@ -1232,7 +1262,7 @@ async function toggleInjuryPanel(teamId) {
         ps.map(function(p) {
           const cls = p.is_unavailable ? 'out' : p.is_risky ? 'risk' : 'ok';
           return '<div class="inj-panel-row ' + cls + '">' +
-            '<span class="ipn">' + escapeHtml(p.name) + '</span>' +
+            '<span class="ipn">' + escapeHtml(formatPlayerName(p.name)) + '</span>' +
             '<span class="ips inj-badge ' + cls + '">' + escapeHtml(p.status) + '</span>' +
             '<span class="ipr">' + escapeHtml(p.reason || '') + '</span>' +
           '</div>';
@@ -1334,8 +1364,24 @@ function buildTodayGameCard(game, compact = false) {
   const scoreLine = game.status_category === 'scheduled'
     ? `<div class="today-game-time">${escapeHtml(game.status_text)}</div>`
     : `<div class="today-game-scoreline"><span>${game.away.score}</span><small>-</small><span>${game.home.score}</span></div>`;
+
+  // Injury summary chips for each team
+  function injChips(teamData) {
+    const players = teamData.injury_players || [];
+    if (!players.length) return '<span class="today-inj-clean">\u2713 Clean</span>';
+    return players.slice(0, 4).map(function(p) {
+      const cls = p.is_unavailable ? 'out' : 'risky';
+      return '<span class="today-inj-chip ' + cls + '" title="' + escapeHtml(p.injury_reason || '') + '">'
+        + escapeHtml(p.short_name || formatPlayerName(p.full_name)) + '</span>';
+    }).join('') + (players.length > 4 ? '<span class="today-inj-more">+' + (players.length - 4) + '</span>' : '');
+  }
+
+  const awayInj  = injChips(game.away);
+  const homeInj  = injChips(game.home);
+  const gameKey  = (game.away.team_id || '') + '-' + (game.home.team_id || '');
+
   return `
-    <article class="today-game-card ${compact ? 'compact' : ''} ${statusClass}">
+    <article class="today-game-card ${compact ? 'compact' : ''} ${statusClass}" data-game-key="${gameKey}">
       <div class="today-game-head">
         <span class="small-badge ${statusClass}">${escapeHtml(game.status_text)}</span>
         <span class="small-meta">${escapeHtml(game.game_label)}</span>
@@ -1356,6 +1402,19 @@ function buildTodayGameCard(game, compact = false) {
         <div class="today-game-actions">
           <button class="mini-team-btn" type="button" data-team-id="${game.away.team_id}">Open ${escapeHtml(game.away.abbreviation)}</button>
           <button class="mini-team-btn" type="button" data-team-id="${game.home.team_id}">Open ${escapeHtml(game.home.abbreviation)}</button>
+          <button class="today-inj-toggle-btn" type="button" data-game-key="${gameKey}">\uD83E\uDE79 Injuries</button>
+        </div>
+        <div class="today-inj-panel" id="inj-panel-${gameKey}" style="display:none">
+          <div class="today-inj-team-row">
+            <div class="today-inj-team-col">
+              <span class="today-inj-team-label">${escapeHtml(game.away.abbreviation)} (Away)</span>
+              <div class="today-inj-chips">${awayInj}</div>
+            </div>
+            <div class="today-inj-team-col">
+              <span class="today-inj-team-label">${escapeHtml(game.home.abbreviation)} (Home)</span>
+              <div class="today-inj-chips">${homeInj}</div>
+            </div>
+          </div>
         </div>`}
       </div>
     </article>
@@ -1378,6 +1437,18 @@ function bindSlateTeamButtons(root) {
         console.error(error);
         alert(error.message || 'Failed to open team roster.');
       }
+    });
+  });
+
+  // Injury toggle button per game card
+  root.querySelectorAll('.today-inj-toggle-btn').forEach(btn => {
+    btn.addEventListener('click', function() {
+      const gameKey = btn.dataset.gameKey;
+      const panel   = document.getElementById('inj-panel-' + gameKey);
+      if (!panel) return;
+      const open = panel.style.display !== 'none';
+      panel.style.display = open ? 'none' : '';
+      btn.textContent = open ? '\uD83E\uDE79 Injuries' : '\u25B2 Hide';
     });
   });
 }
@@ -1688,12 +1759,17 @@ function renderMatchup(payload) {
   const leanText = vsPosition?.lean || (nextGame ? 'Upcoming game found' : 'Partial matchup');
 
   const nextGameLabel = nextGame
-    ? `${nextGame.matchup_label} • ${nextGame.game_date || 'Date TBA'}${nextGame.game_time ? ` • ${nextGame.game_time}` : ''}`
+    ? `${nextGame.matchup_label} • ${nextGame.game_date ? formatNextGameDate(nextGame.game_date) : 'Date TBA'}${nextGame.game_time ? ` • ${nextGame.game_time}` : ''}`
     : 'Upcoming game unavailable';
 
+  const isOverride = Boolean(nextGame?.is_override);
   const venueLabel = nextGame
-    ? (nextGame.is_home ? 'Home game' : 'Away game')
+    ? (isOverride ? 'Opponent override' : (nextGame.is_home ? 'Home game' : 'Away game'))
     : 'Venue unavailable';
+
+  const overrideBannerHtml = isOverride
+    ? `<div class="override-notice">📌 <strong>Manual opponent override:</strong> ${escapeHtml(nextGame?.opponent_name || nextGame?.opponent_abbreviation || 'Custom opponent')} — defense-vs-position and H2H stats reflect this selection, not the actual scheduled game.</div>`
+    : '';
 
   let summaryText = 'Defense-vs-position data unavailable for this player and stat.';
   if (vsPosition) {
@@ -1701,6 +1777,7 @@ function renderMatchup(payload) {
   }
 
   const bodyHtml = `
+    ${overrideBannerHtml}
     <div class="matchup-grid">
       <article class="matchup-tile">
         <span class="small-label">Next game</span>
@@ -1743,8 +1820,8 @@ function renderMatchup(payload) {
   `;
 
   targets.forEach(({ badge, body }) => {
-    badge.className = `spotlight-pill ${leanTone}`;
-    badge.textContent = leanText;
+    badge.className = `spotlight-pill ${isOverride ? 'warning' : leanTone}`;
+    badge.textContent = isOverride ? `📌 vs ${nextGame?.opponent_abbreviation || 'Override'}` : leanText;
     body.className = 'matchup-body';
     body.innerHTML = bodyHtml;
   });
@@ -1791,7 +1868,7 @@ function renderInterpretationPanels(payload) {
   }
 
   if (opportunityBody) {
-    const listedPlayers = (teamContext.players || []).map(item => `${item.name} (${item.status})`);
+    const listedPlayers = (teamContext.players || []).map(item => `${formatPlayerName(item.name)} (${item.status})`);
     opportunityBody.className = 'opportunity-body';
     opportunityBody.innerHTML = `
       <div class="opportunity-chip-grid refined-opportunity-grid">
@@ -2296,7 +2373,7 @@ function renderOddsEvents(events) {
     return;
   }
   oddsEventSelect.innerHTML = '<option value="">Select an event</option>' + events.map(event => {
-    const timeText = event?.commence_time ? new Date(event.commence_time).toLocaleString() : 'Time TBA';
+    const timeText = event?.commence_time ? formatPHT(event.commence_time) : 'Time TBA';
     return `<option value="${escapeHtml(event.id)}">${escapeHtml(event.away_team || '')} @ ${escapeHtml(event.home_team || '')} • ${escapeHtml(timeText)}</option>`;
   }).join('');
 }
@@ -2682,6 +2759,9 @@ async function analyzePlayerProp(options = {}) {
     const season = seasonInput.value.trim();
     if (season) params.set('season', season);
 
+    const overrideOppId = oppSelect?.value;
+    if (overrideOppId) params.set('override_opponent_id', overrideOppId);
+
     const response = await fetch(`/api/player-prop?${params.toString()}`);
     const payload = await response.json();
 
@@ -2812,6 +2892,17 @@ if (betFinderViewRunBtn) {
 
 analyzeBtn.addEventListener('click', analyzePlayerProp);
 betFinderBtn.addEventListener('click', runBetFinder);
+
+// Opponent override selector — highlight when a manual team is chosen
+if (oppSelect) {
+  oppSelect.addEventListener('change', () => {
+    if (oppSelect.value) {
+      oppSelect.classList.add('override-active');
+    } else {
+      oppSelect.classList.remove('override-active');
+    }
+  });
+}
 clearRecentBtn.addEventListener('click', () => clearRecentPlayersState({ resetCurrent: true }));
 marketTemplateBtn.addEventListener('click', () => { marketTextarea.value = getMarketTemplate(); });
 marketClearBtn.addEventListener('click', () => { marketTextarea.value = ''; renderMarketEmpty(); });
@@ -3051,6 +3142,8 @@ function renderFavoritesUpgrade() {
         setSelectedPlayer(item.player);
         setActiveProp(item.stat);
         lineInput.value = item.line;
+        // Reset opponent to auto when loading from favorites (no specific game context)
+        if (oppSelect) { oppSelect.value = ''; oppSelect.classList.remove('override-active'); }
         switchView('analyzer');
         await analyzePlayerProp();
       }
@@ -3138,46 +3231,7 @@ function renderOverviewBestBets() {
   renderBoard(overviewBoostBoardEl, boosts, '📈', 'No injury boosts yet.', 'Plays with teammate-absence boosts will appear here.');
 }
 
-function buildTodayGameCard(game, compact = false) {
-  const statusClass = game.status_category || 'scheduled';
-  const homeSummary = game.home.availability?.headline || 'Clean report';
-  const awaySummary = game.away.availability?.headline || 'Clean report';
-  const scoreLine = game.status_category === 'scheduled'
-    ? `<div class="today-game-time">${escapeHtml(game.status_text)}</div>`
-    : `<div class="today-game-scoreline"><span>${game.away.score}</span><small>-</small><span>${game.home.score}</span></div>`;
-  return `
-    <article class="today-game-card ${compact ? 'compact' : ''} ${statusClass}">
-      <div class="today-game-head">
-        <span class="small-badge ${statusClass}">${escapeHtml(game.status_text)}</span>
-        <span class="small-meta">${escapeHtml(game.game_label)}</span>
-      </div>
-      <div class="today-game-main">
-        <div class="today-team-row with-logos">
-          <div class="today-team-side">
-            <img class="today-team-logo" src="${escapeHtml(game.away.logo || getTeamLogo(game.away.team_id))}" alt="${escapeHtml(game.away.abbreviation)} logo" onerror="this.style.display='none'">
-            <div>
-              <strong>${escapeHtml(game.away.abbreviation)}</strong>
-              <small>${escapeHtml(awaySummary)}</small>
-            </div>
-          </div>
-          ${scoreLine}
-          <div class="today-team-side today-team-home">
-            <div>
-              <strong>${escapeHtml(game.home.abbreviation)}</strong>
-              <small>${escapeHtml(homeSummary)}</small>
-            </div>
-            <img class="today-team-logo" src="${escapeHtml(game.home.logo || getTeamLogo(game.home.team_id))}" alt="${escapeHtml(game.home.abbreviation)} logo" onerror="this.style.display='none'">
-          </div>
-        </div>
-        ${compact ? '' : `
-        <div class="today-game-actions">
-          <button class="mini-team-btn" type="button" data-team-id="${game.away.team_id}">Open ${escapeHtml(game.away.abbreviation)}</button>
-          <button class="mini-team-btn" type="button" data-team-id="${game.home.team_id}">Open ${escapeHtml(game.home.abbreviation)}</button>
-        </div>`}
-      </div>
-    </article>
-  `;
-}
+// buildTodayGameCard defined above (with injury panel)
 
 function renderTodayGames(payload) {
   latestTodayGamesPayload = payload;
@@ -3268,7 +3322,7 @@ function renderInterpretationPanels(payload) {
       <ul class="insight-bullet-list compact-bullets">${bullets.length ? bullets.map(item => `<li>${escapeHtml(item)}</li>`).join('') : '<li>Analyze a player prop to fill this section.</li>'}</ul>`;
   }
   if (opportunityBody) {
-    const listedPlayers = (teamContext.players || []).map(item => `${item.name} (${item.status})`);
+    const listedPlayers = (teamContext.players || []).map(item => `${formatPlayerName(item.name)} (${item.status})`);
     const focusMetrics = Array.isArray(opportunity.focus_metrics) ? opportunity.focus_metrics : [];
     opportunityBody.className = 'opportunity-body';
     opportunityBody.innerHTML = `
@@ -3348,6 +3402,38 @@ function formatTrendAxisDate(value) {
     return parsedText.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
   }
   return cleaned;
+}
+
+/**
+ * Format any date/datetime string in Philippines Time (Asia/Manila, UTC+8).
+ * Returns e.g. "Apr 5 • 8:00 AM PHT" or "Apr 5 PHT" if no time component.
+ */
+function formatPHT(value) {
+  if (!value) return '';
+  const PHT = 'Asia/Manila';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value).trim();
+  const datePart = d.toLocaleDateString('en-PH', { timeZone: PHT, month: 'short', day: 'numeric' });
+  // Only show time if there is a non-midnight time component or an explicit T in the string
+  const hasTime = String(value).includes('T') || String(value).includes(' ') && String(value).match(/\d{1,2}:\d{2}/);
+  if (hasTime) {
+    const timePart = d.toLocaleTimeString('en-PH', { timeZone: PHT, hour: 'numeric', minute: '2-digit' });
+    return `${datePart} • ${timePart} PHT`;
+  }
+  return `${datePart} PHT`;
+}
+
+/**
+ * Format a next-game date string for display in the matchup panels.
+ * Uses PHT if value looks like an ISO datetime, otherwise falls back to formatTrendAxisDate.
+ */
+function formatNextGameDate(value) {
+  if (!value) return 'Date TBD';
+  // ISO datetime (contains T or is YYYY-MM-DD format)
+  if (/^\d{4}-\d{2}-\d{2}/.test(String(value).trim())) {
+    return formatPHT(value);
+  }
+  return formatTrendAxisDate(value);
 }
 
 function renderChart(payload) {
@@ -3536,12 +3622,13 @@ function renderSelectedPlayerContext() {
   }
 
   const toneMap = { good: 'good', bad: 'bad', warning: 'neutral', neutral: 'neutral' };
-  const leanTone = toneMap[getLeanClass(vsPosition?.lean_tone)] || 'neutral';
-  const leanText = vsPosition?.lean || (nextGame ? 'Upcoming game found' : 'Partial matchup');
+  const isOverrideTile = Boolean(nextGame?.is_override);
+  const leanTone = isOverrideTile ? 'warning' : (toneMap[getLeanClass(vsPosition?.lean_tone)] || 'neutral');
+  const leanText = isOverrideTile ? `📌 vs ${nextGame?.opponent_abbreviation || 'Override'}` : (vsPosition?.lean || (nextGame ? 'Upcoming game found' : 'Partial matchup'));
   const nextGameLabel = nextGame
-    ? `${nextGame.matchup_label || nextGame.opponent_name || 'Upcoming game'} • ${nextGame.game_date || 'Date TBA'}${nextGame.game_time ? ` • ${nextGame.game_time}` : ''}`
+    ? `${nextGame.matchup_label || nextGame.opponent_name || 'Upcoming game'} • ${nextGame.game_date ? formatNextGameDate(nextGame.game_date) : 'Date TBA'}${nextGame.game_time ? ` • ${nextGame.game_time}` : ''}`
     : 'Upcoming game unavailable';
-  const venueLabel = nextGame ? (nextGame.is_home ? 'Home game' : 'Away game') : 'Venue unavailable';
+  const venueLabel = nextGame ? (isOverrideTile ? 'Opponent override' : (nextGame.is_home ? 'Home game' : 'Away game')) : 'Venue unavailable';
   const oppVal = typeof vsPosition?.opponent_value === 'number' ? vsPosition.opponent_value.toFixed(2) : (vsPosition?.opponent_value ?? '—');
   const lgVal = typeof vsPosition?.league_average === 'number' ? vsPosition.league_average.toFixed(2) : (vsPosition?.league_average ?? '—');
   const delta = typeof vsPosition?.delta_pct === 'number' ? `${formatDelta(vsPosition.delta_pct)}%` : '—';
@@ -4153,6 +4240,9 @@ async function analyzePlayerProp(options = {}) {
     if (filters.max_fga !== null) params.set('max_fga', String(filters.max_fga));
     if (filters.h2h_only) params.set('h2h_only', 'true');
 
+    const overrideOppId = oppSelect?.value;
+    if (overrideOppId) params.set('override_opponent_id', overrideOppId);
+
     const response = await fetch(`/api/player-prop?${params.toString()}`);
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.detail || 'Failed to analyze player prop.');
@@ -4529,6 +4619,18 @@ function buildSparklineSvg(values, line, width, height) {
   const parlayLastNSelect     = document.getElementById('parlayLastNSelect');
   const parlayBookmakerSelect = document.getElementById('parlayBookmakerSelect');
   const parlayLoadEventsBtn   = document.getElementById('parlayLoadEventsBtn');
+
+  // ── Progress bar helper ───────────────────────────────────────────────
+  function setParlayProgress(pct, label) {
+    var bar  = document.getElementById('parlayProgressBar');
+    var lbl  = document.getElementById('parlayProgressLabel');
+    var wrap = document.getElementById('parlayProgressWrap');
+    if (!wrap) return;
+    if (pct <= 0) { wrap.style.display = 'none'; return; }
+    wrap.style.display = '';
+    if (bar)  { bar.style.width = pct + '%'; bar.setAttribute('aria-valuenow', pct); }
+    if (lbl && label) lbl.textContent = label;
+  }
   const parlayEventPickerWrap = document.getElementById('parlayEventPickerWrap');
   const parlayEventList       = document.getElementById('parlayEventList');
   const parlaySelectAllBtn    = document.getElementById('parlaySelectAllBtn');
@@ -4596,7 +4698,10 @@ function buildSparklineSvg(values, line, width, height) {
     if (!iso) return '';
     try {
       const d = new Date(iso);
-      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      // Always show Philippines Time (Asia/Manila, UTC+8)
+      const datePart = d.toLocaleDateString('en-PH', { timeZone: 'Asia/Manila', month: 'short', day: 'numeric' });
+      const timePart = d.toLocaleTimeString('en-PH', { timeZone: 'Asia/Manila', hour: '2-digit', minute: '2-digit' });
+      return datePart + ' ' + timePart + ' PHT';
     } catch(e) { return ''; }
   }
 
@@ -4712,7 +4817,7 @@ function buildSparklineSvg(values, line, width, height) {
     grid.innerHTML = parlay.map(function(leg, i) {
       const sc = leg.side === 'OVER' ? 'over' : 'under';
       const fp = Math.min(100, leg.hit_rate || 0);
-      return '<div class="parlay-leg-card">' +
+      return '<div class="parlay-leg-card" data-leg-idx="' + i + '" title="Analyze ' + escHtml(leg.player_name) + '" style="cursor:pointer">' +
         '<span class="parlay-leg-rank">#' + (i+1) + '</span>' +
         '<div class="parlay-leg-player">' + escHtml(leg.player_name) + '</div>' +
         '<div class="parlay-leg-market">' +
@@ -4727,8 +4832,40 @@ function buildSparklineSvg(values, line, width, height) {
           '<div class="parlay-leg-stat-item"><span class="slabel">Odds</span><span class="sval">'  + fmtOdds(leg.odds)      + '</span></div>' +
         '</div>' +
         '<div class="parlay-leg-hit-bar"><div class="parlay-leg-hit-fill" style="width:' + fp + '%"></div></div>' +
+        '<div class="parlay-leg-analyze-hint" style="font-size:0.72rem;color:var(--muted);margin-top:6px;text-align:center">Click to analyze →</div>' +
       '</div>';
     }).join('');
+
+    // Wire up click → analyzer with full auto-populate
+    grid.querySelectorAll('.parlay-leg-card[data-leg-idx]').forEach(function(card) {
+      card.addEventListener('click', async function() {
+        const leg = parlay[parseInt(card.dataset.legIdx)];
+        if (!leg || !leg.player_id) return;
+        try {
+          const teamId = leg.team_id || null;
+          if (teamId && typeof teamSelect !== 'undefined' && String(teamSelect.value) !== String(teamId)) {
+            teamSelect.value = String(teamId);
+            try { await loadRoster(Number(teamId)); } catch(e) {}
+          }
+          if (typeof setSelectedPlayer === 'function') {
+            setSelectedPlayer({ id: leg.player_id, full_name: leg.player_name, is_active: true, team_id: teamId });
+          }
+          if (typeof setActiveProp === 'function') setActiveProp(leg.stat);
+          if (typeof lineInput !== 'undefined' && lineInput) lineInput.value = leg.line;
+          if (typeof oppSelect !== 'undefined' && oppSelect) {
+            if (leg.opponent_team_id) {
+              oppSelect.value = String(leg.opponent_team_id);
+              oppSelect.classList.add('override-active');
+            } else {
+              oppSelect.value = '';
+              oppSelect.classList.remove('override-active');
+            }
+          }
+          if (typeof switchView === 'function') switchView('analyzer');
+          if (typeof analyzePlayerProp === 'function') await analyzePlayerProp();
+        } catch(err) { console.warn('Parlay ticket leg nav failed:', err); }
+      });
+    });
   }
 
   // ── Render all props table (clickable → analyzer) ─────────────────────
@@ -4761,14 +4898,34 @@ function buildSparklineSvg(values, line, width, height) {
         const prop = all[parseInt(row.dataset.propIdx)];
         if (!prop || !prop.player_id) return;
         try {
+          // 1. Set team select + load roster
           const teamId = prop.team_id || null;
           if (teamId && typeof teamSelect !== 'undefined' && String(teamSelect.value) !== String(teamId)) {
             teamSelect.value = String(teamId);
-            try { await loadRoster(teamId); } catch(e) {}
+            try { await loadRoster(Number(teamId)); } catch(e) {}
           }
-          if (typeof setSelectedPlayer === 'function') setSelectedPlayer({ id: prop.player_id, full_name: prop.player_name, is_active: true, team_id: teamId });
+
+          // 2. Set selected player
+          if (typeof setSelectedPlayer === 'function') {
+            setSelectedPlayer({ id: prop.player_id, full_name: prop.player_name, is_active: true, team_id: teamId });
+          }
+
+          // 3. Set stat + line
           if (typeof setActiveProp === 'function') setActiveProp(prop.stat);
           if (typeof lineInput !== 'undefined' && lineInput) lineInput.value = prop.line;
+
+          // 4. Auto-set opponent override so the analyzer loads the right matchup
+          if (typeof oppSelect !== 'undefined' && oppSelect) {
+            if (prop.opponent_team_id) {
+              oppSelect.value = String(prop.opponent_team_id);
+              oppSelect.classList.add('override-active');
+            } else {
+              oppSelect.value = '';
+              oppSelect.classList.remove('override-active');
+            }
+          }
+
+          // 5. Switch to analyzer and run analysis immediately
           if (typeof switchView === 'function') switchView('analyzer');
           if (typeof analyzePlayerProp === 'function') await analyzePlayerProp();
         } catch(e) { console.warn('Parlay row nav failed:', e); }
@@ -4777,7 +4934,16 @@ function buildSparklineSvg(values, line, width, height) {
     parlayAllPropsBody.querySelectorAll('.parlay-track-btn').forEach(function(btn) {
       btn.addEventListener('click', function(e) {
         e.stopPropagation();
-        addPropToTracker(all[parseInt(btn.dataset.trackIdx)]);
+        var prop = all[parseInt(btn.dataset.trackIdx)];
+        if (typeof window._trackerAddProp === 'function') {
+          window._trackerAddProp(prop);
+          btn.textContent = '\u2713 Added';
+          btn.disabled = true;
+          btn.style.background = 'rgba(57,217,138,0.15)';
+          btn.style.color = 'var(--good)';
+          btn.style.borderColor = 'var(--good)';
+          if (typeof switchView === 'function') switchView('tracker');
+        }
       });
     });
   }
@@ -4810,11 +4976,22 @@ function buildSparklineSvg(values, line, width, height) {
     show(parlayTicket, false); show(parlayAllPropsWrap, false);
     show(parlayQuotaBar, false); show(parlayEmptyState, false);
     parlayQuotaList.innerHTML = '';
-    setStatus('Scraping ' + selectedEventIds.size + ' event(s)…', false);
+    const totalEvents = selectedEventIds.size;
+    setStatus('⏳ Step 1/3 — Fetching odds for ' + totalEvents + ' game(s)…', false);
+    setParlayProgress(5, 'Connecting to Odds API…');
     if (parlayBuildBtn)   parlayBuildBtn.disabled   = true;
     if (parlayRebuildBtn) parlayRebuildBtn.disabled = true;
     if (parlayRescrapeBtn) parlayRescrapeBtn.disabled = true;
-    if (typeof showBanner === 'function') showBanner('Building parlay…', 'Fetching odds for ' + selectedEventIds.size + ' game(s). Please wait…');
+
+    // Simulate progress steps while waiting for the single fetch
+    var progressTimer = null;
+    var fakeStep = 5;
+    progressTimer = setInterval(function() {
+      fakeStep = Math.min(fakeStep + 3, 75);
+      if (fakeStep < 30)      setParlayProgress(fakeStep, '⏳ Scraping game odds… (' + totalEvents + ' events)');
+      else if (fakeStep < 55) setParlayProgress(fakeStep, '⏳ Analyzing ' + totalEvents * 15 + '+ props…');
+      else                    setParlayProgress(fakeStep, '⏳ Ranking by hit rate…');
+    }, 600);
 
     try {
       const resp = await fetch('/api/parlay-builder', {
@@ -4837,9 +5014,13 @@ function buildSparklineSvg(values, line, width, height) {
       cachedQuotaLog    = data.quota_log || [];
       cachedScrapeMeta  = { evCount: data.events_scraped||0, propCount: data.props_found||0, analyzed: data.props_analyzed||0, scrapedAt: Date.now() };
 
+      clearInterval(progressTimer);
+      setParlayProgress(90, '⏳ Building parlay ticket…');
       renderQuota(cachedQuotaLog);
       const m = cachedScrapeMeta;
-      setStatus(m.evCount + ' event(s) scraped · ' + m.propCount + ' props found · ' + m.analyzed + ' analyzed', false);
+      setStatus('✓ Done — ' + m.evCount + ' event(s) scraped · ' + m.propCount + ' props found · ' + m.analyzed + ' analyzed', false);
+      setParlayProgress(100, '✓ Complete!');
+      setTimeout(function() { setParlayProgress(0, ''); }, 2000);
 
       if (!cachedScoredProps.length) {
         show(parlayEmptyState, true);
@@ -4853,9 +5034,10 @@ function buildSparklineSvg(values, line, width, height) {
       rebuildFromCache();
       if (typeof hideBanner === 'function') hideBanner();
     } catch(err) {
-      setStatus('Error: ' + (err.message || 'Unknown'), true);
+      clearInterval(progressTimer);
+      setParlayProgress(0, '');
+      setStatus('❌ Error: ' + (err.message || 'Unknown'), true);
       show(parlayEmptyState, true);
-      if (typeof hideBanner === 'function') hideBanner();
     } finally {
       if (parlayBuildBtn)    parlayBuildBtn.disabled    = false;
       if (parlayRebuildBtn)  parlayRebuildBtn.disabled  = false;
@@ -4979,6 +5161,69 @@ function buildSparklineSvg(values, line, width, height) {
 
   if (!trackerAddBtn) return;
 
+  // ── Autocomplete dropdown for player input ────────────────────────────
+  const trackerPlayerDropdown = document.getElementById('trackerPlayerDropdown');
+  let _autocompleteDebounce = null;
+  let _selectedPlayerName = '';
+  let _selectedPlayerId = null;
+
+  function closeDropdown() {
+    if (trackerPlayerDropdown) {
+      trackerPlayerDropdown.innerHTML = '';
+      trackerPlayerDropdown.style.display = 'none';
+    }
+    if (trackerPlayerInput) {
+      trackerPlayerInput.setAttribute('aria-expanded', 'false');
+    }
+  }
+
+  function openDropdown(results) {
+    if (!trackerPlayerDropdown) return;
+    if (!results.length) { closeDropdown(); return; }
+    trackerPlayerDropdown.innerHTML = results.map(function(p) {
+      return '<li role="option" class="tracker-player-option" data-id="' + p.id + '" data-name="' + esc(p.full_name) + '" style="padding:8px 12px;cursor:pointer;list-style:none;border-bottom:1px solid var(--border,#333)">'
+        + esc(p.full_name) + (p.is_active ? '' : ' <small style="opacity:.5">(inactive)</small>') + '</li>';
+    }).join('');
+    trackerPlayerDropdown.style.display = 'block';
+    if (trackerPlayerInput) trackerPlayerInput.setAttribute('aria-expanded', 'true');
+
+    trackerPlayerDropdown.querySelectorAll('.tracker-player-option').forEach(function(li) {
+      li.addEventListener('mousedown', function(e) {
+        e.preventDefault(); // prevent blur before click
+        _selectedPlayerId   = li.dataset.id ? Number(li.dataset.id) : null;
+        _selectedPlayerName = li.dataset.name || '';
+        trackerPlayerInput.value = _selectedPlayerName;
+        closeDropdown();
+      });
+    });
+  }
+
+  if (trackerPlayerInput) {
+    trackerPlayerInput.addEventListener('input', function() {
+      const q = trackerPlayerInput.value.trim();
+      _selectedPlayerId = null; // reset cached selection on new typing
+      clearTimeout(_autocompleteDebounce);
+      if (q.length < 2) { closeDropdown(); return; }
+      _autocompleteDebounce = setTimeout(async function() {
+        try {
+          const r = await fetch('/api/players/search?q=' + encodeURIComponent(q));
+          if (!r.ok) return;
+          const data = await r.json();
+          openDropdown((data.results || []).slice(0, 8));
+        } catch(e) { closeDropdown(); }
+      }, 220);
+    });
+
+    trackerPlayerInput.addEventListener('blur', function() {
+      // Slight delay so mousedown on option fires first
+      setTimeout(closeDropdown, 200);
+    });
+
+    trackerPlayerInput.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') closeDropdown();
+    });
+  }
+
   // ── State ─────────────────────────────────────────────────────────────
   // bet = { id, player_name, player_id, stat, line, side, odds, book,
   //         current_val, games_count, last_updated, status }
@@ -5043,6 +5288,9 @@ function buildSparklineSvg(values, line, width, height) {
                     ? 'https://cdn.nba.com/headshots/nba/latest/1040x760/' + bet.player_id + '.png'
                     : '';
 
+    // Card gets extra class when injured — must be declared before cardClass uses it
+    const extraCardCls = bet.is_injured ? ' injured' : '';
+
     // Card-level class
     const cardClass = (status === 'hit' ? 'tracker-card hit'
                     : status === 'busted' ? 'tracker-card busted'
@@ -5083,9 +5331,6 @@ function buildSparklineSvg(values, line, width, height) {
     const gameCtx = bet.game_label
       ? esc(bet.game_label) + (bet.game_status === 'live' && bet.period ? ' · ' + esc(bet.period) + (bet.clock ? ' ' + esc(bet.clock) : '') : '')
       : '';
-
-    // Card gets extra class when injured or busted
-    const extraCardCls = bet.is_injured ? ' injured' : '';
 
     const sideClass = bet.side === 'OVER' ? 'over' : 'under';
     const lastUpd   = bet.last_updated
@@ -5197,42 +5442,75 @@ function buildSparklineSvg(values, line, width, height) {
 
   // ── Resolve player_id from name via search ────────────────────────────
   async function resolvePlayerId(name) {
+    // If user picked from autocomplete dropdown, use the cached id directly
+    if (_selectedPlayerId && _selectedPlayerName.toLowerCase() === name.toLowerCase()) {
+      return _selectedPlayerId;
+    }
     try {
-      const resp = await fetch('/api/players/search?q=' + encodeURIComponent(name) + '&limit=1');
+      const ctrl = new AbortController();
+      const timer = setTimeout(function() { ctrl.abort(); }, 4000);
+      const resp = await fetch('/api/players/search?q=' + encodeURIComponent(name), { signal: ctrl.signal });
+      clearTimeout(timer);
       if (!resp.ok) return null;
       const data = await resp.json();
-      const results = data.results || data.players || data || [];
-      if (Array.isArray(results) && results.length) return results[0].id || results[0].player_id || null;
+      const results = data.results || [];
+      if (Array.isArray(results) && results.length) return results[0].id || null;
     } catch(e) {}
     return null;
   }
 
   // ── Add prop from parlay to tracker ────────────────────────────────────
+  // Returns true if actually added, false if duplicate or invalid.
   function addPropToTracker(prop) {
-    if (!prop || !prop.player_name || !(parseFloat(prop.line) > 0)) return;
+    if (!prop || !prop.player_name) return false;
+    const parsedLine = parseFloat(prop.line);
+    if (!parsedLine || parsedLine <= 0) return false;
+
     const newBet = {
-      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-      player_name:  prop.player_name,
+      id:           Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      player_name:  String(prop.player_name),
       player_id:    prop.player_id || null,
       stat:         prop.stat || 'PTS',
-      line:         parseFloat(prop.line),
+      line:         parsedLine,
       side:         prop.side || 'OVER',
       odds:         parseFloat(prop.odds) || 1.91,
-      book:         prop.bookmaker || '',
+      book:         prop.bookmaker || prop.book || '',
       game_label:   prop.game_label || '',
-      current_val:  null, game_status: null,
-      source: null, is_injured: false, injury_status: '', last_updated: null,
+      current_val:  null,
+      game_status:  null,
+      source:       null,
+      is_injured:   false,
+      injury_status:'',
+      last_updated: null,
     };
-    try {
-      const stored = JSON.parse(localStorage.getItem('nba-props-tracker-bets') || '[]');
-      const dupe = stored.some(function(b) {
-        return String(b.player_id) === String(newBet.player_id) &&
-               b.stat === newBet.stat && parseFloat(b.line) === newBet.line && b.side === newBet.side;
-      });
-      if (!dupe) { stored.unshift(newBet); localStorage.setItem('nba-props-tracker-bets', JSON.stringify(stored)); }
-    } catch(e) {}
+
+    let stored = [];
+    try { stored = JSON.parse(localStorage.getItem('nba-props-tracker-bets') || '[]'); } catch(e) { stored = []; }
+    if (!Array.isArray(stored)) stored = [];
+
+    // Dupe check: prefer player_id match when both sides have one, else fall back
+    // to name match — prevents null-id props from all blocking each other.
+    const isDupe = stored.some(function(b) {
+      const idMatch = newBet.player_id && b.player_id
+        ? String(b.player_id) === String(newBet.player_id)
+        : (b.player_name || '').toLowerCase() === newBet.player_name.toLowerCase();
+      return idMatch && b.stat === newBet.stat &&
+             parseFloat(b.line) === newBet.line && b.side === newBet.side;
+    });
+
+    if (isDupe) {
+      _showTrackerToast(prop.player_name + ' already in Tracker');
+      return false;
+    }
+
+    stored.unshift(newBet);
+    try { localStorage.setItem('nba-props-tracker-bets', JSON.stringify(stored)); } catch(e) {}
+
+    // Keep the IIFE-scoped bets in sync so renderAll sees the new entry
+    bets = stored;
+
     _showTrackerToast(prop.player_name + ' added to Tracker');
-    if (typeof switchView === 'function') switchView('tracker');
+    return true;
   }
 
   function _showTrackerToast(msg) {
@@ -5269,36 +5547,51 @@ function buildSparklineSvg(values, line, width, height) {
     trackerAddBtn.disabled = true;
     trackerAddBtn.textContent = 'Adding…';
 
-    const playerId = await resolvePlayerId(playerName);
+    try {
+      const playerId = await resolvePlayerId(playerName);
 
-    const bet = {
-      id: uid(),
-      player_name: playerName,
-      player_id: playerId,
-      stat, line, side, odds, book,
-      current_val: null,
-      games_count: null,
-      last_updated: null,
-      status: 'pending',
-    };
+      const bet = {
+        id: uid(),
+        player_name: playerName,
+        player_id: playerId,
+        stat, line, side, odds, book,
+        current_val: null,
+        games_count: null,
+        last_updated: null,
+        game_status: null,
+        source: null,
+        is_injured: false,
+        injury_status: '',
+        status: 'pending',
+      };
 
-    bets.unshift(bet);
-    saveBets();
-    renderAll();
-
-    // Clear inputs
-    trackerPlayerInput.value = '';
-    trackerLineInput.value   = '';
-    trackerOddsInput.value   = '';
-    trackerBookInput.value   = '';
-    trackerAddBtn.disabled   = false;
-    trackerAddBtn.textContent = 'Add Prop';
-
-    // Auto-refresh the newly added bet
-    if (playerId) {
-      await refreshBet(bet);
+      bets.unshift(bet);
       saveBets();
-      renderAll();
+      try { renderAll(); } catch(e) { console.error('Tracker renderAll error:', e); }
+
+      // Clear inputs and reset autocomplete state
+      trackerPlayerInput.value = '';
+      trackerLineInput.value   = '';
+      trackerOddsInput.value   = '';
+      trackerBookInput.value   = '';
+      _selectedPlayerId   = null;
+      _selectedPlayerName = '';
+      closeDropdown();
+
+      // Auto-refresh the newly added bet to get live stat
+      if (playerId) {
+        try {
+          await refreshBet(bet);
+          saveBets();
+          try { renderAll(); } catch(e) { /* non-fatal */ }
+        } catch(e) { /* non-fatal */ }
+      }
+    } catch(e) {
+      console.error('Add prop error:', e);
+      showErr('Failed to add prop. Please try again.');
+    } finally {
+      trackerAddBtn.disabled   = false;
+      trackerAddBtn.textContent = 'Add Prop';
     }
   });
 
@@ -5334,5 +5627,12 @@ function buildSparklineSvg(values, line, width, height) {
     await Promise.allSettled(bets.filter(function(b){ return b.player_id; }).map(refreshBet));
     saveBets(); renderAll();
   }, 30000);
+
+  // ── Expose globally so parlay builder (different IIFE) can call in ────
+  window._trackerAddProp = function(prop) {
+    const added = addPropToTracker(prop);
+    try { renderAll(); } catch(e) { console.error('Tracker renderAll failed:', e); }
+    if (typeof switchView === 'function') switchView('tracker');
+  };
 
 })();
