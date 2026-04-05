@@ -72,6 +72,7 @@ const betFinderViewRunBtn = document.getElementById('betFinderViewRunBtn');
 const overviewCurrentCard = document.getElementById('overviewCurrentCard');
 const sidebarMiniPlayer = document.getElementById('sidebarMiniPlayer');
 const sidebarToggle = document.getElementById('sidebarToggle');
+const mobileSidebarToggle = document.getElementById('mobileSidebarToggle');
 const todayGamesBoard = document.getElementById('todayGamesBoard');
 const todayGamesMeta = document.getElementById('todayGamesMeta');
 const overviewTodayGames = document.getElementById('overviewTodayGames');
@@ -209,6 +210,10 @@ function switchView(view, options = {}) {
   dashboardViews.forEach(section => {
     section.classList.toggle('active', section.dataset.view === view);
   });
+
+  if (window.innerWidth < 1280) {
+    document.body.classList.remove('sidebar-mobile-open');
+  }
 
   navItems.forEach(item => {
     item.classList.toggle('active', item.dataset.view === view);
@@ -683,11 +688,108 @@ function setStatus(text) {
 }
 
 
+let currentAccentTeam = null;
+
+function hexToRgbTuple(hex) {
+  const cleaned = String(hex || '').replace('#', '').trim();
+  const normalized = cleaned.length === 3
+    ? cleaned.split('').map((ch) => ch + ch).join('')
+    : cleaned.padEnd(6, '0').slice(0, 6);
+  const value = parseInt(normalized, 16);
+  return {
+    r: (value >> 16) & 255,
+    g: (value >> 8) & 255,
+    b: value & 255
+  };
+}
+
+function rgbTupleToHex({ r, g, b }) {
+  const clamp = (n) => Math.max(0, Math.min(255, Math.round(Number(n) || 0)));
+  return `#${[clamp(r), clamp(g), clamp(b)].map((v) => v.toString(16).padStart(2, '0')).join('')}`;
+}
+
+function rgbStringFromHex(hex) {
+  const { r, g, b } = hexToRgbTuple(hex);
+  return `${r}, ${g}, ${b}`;
+}
+
+function mixHex(hexA, hexB, weight = 0.5) {
+  const a = hexToRgbTuple(hexA);
+  const b = hexToRgbTuple(hexB);
+  const w = Math.max(0, Math.min(1, Number(weight) || 0));
+  return rgbTupleToHex({
+    r: a.r * (1 - w) + b.r * w,
+    g: a.g * (1 - w) + b.g * w,
+    b: a.b * (1 - w) + b.b * w
+  });
+}
+
+function relativeLuminance(hex) {
+  const { r, g, b } = hexToRgbTuple(hex);
+  const normalize = (value) => {
+    const channel = value / 255;
+    return channel <= 0.03928 ? channel / 12.92 : Math.pow((channel + 0.055) / 1.055, 2.4);
+  };
+  return (0.2126 * normalize(r)) + (0.7152 * normalize(g)) + (0.0722 * normalize(b));
+}
+
+function ensureReadableAccent(hex, theme = 'dark') {
+  let safe = hex || '#4da3ff';
+  const minLum = theme === 'light' ? 0.09 : 0.18;
+  const maxLum = theme === 'light' ? 0.28 : 0.62;
+  let lum = relativeLuminance(safe);
+  let guard = 0;
+
+  while (lum > maxLum && guard < 10) {
+    safe = mixHex(safe, '#10203f', theme === 'light' ? 0.3 : 0.18);
+    lum = relativeLuminance(safe);
+    guard += 1;
+  }
+
+  while (lum < minLum && guard < 20) {
+    safe = mixHex(safe, '#7fc7ff', theme === 'light' ? 0.1 : 0.2);
+    lum = relativeLuminance(safe);
+    guard += 1;
+  }
+
+  return safe;
+}
+
+function getReadableTeamPalette(teamAbbreviation, theme = 'dark') {
+  const base = TEAM_COLORS[teamAbbreviation] || { accent: '#4da3ff', accent2: '#8571ff', rgb: '77, 163, 255' };
+  const accent = ensureReadableAccent(base.accent, theme);
+  let accent2 = ensureReadableAccent(base.accent2 || base.accent, theme === 'light' ? 'light' : 'dark');
+
+  if (Math.abs(relativeLuminance(accent) - relativeLuminance(accent2)) < 0.05) {
+    accent2 = theme === 'light'
+      ? mixHex(accent2, '#ffffff', 0.12)
+      : mixHex(accent2, '#b58cff', 0.16);
+    accent2 = ensureReadableAccent(accent2, theme);
+  }
+
+  return {
+    accent,
+    accent2,
+    rgb: rgbStringFromHex(accent),
+    accent2Rgb: rgbStringFromHex(accent2)
+  };
+}
+
+function updateAccentForCurrentTheme(teamAbbreviation) {
+  const theme = document.body.classList.contains('light-theme') ? 'light' : 'dark';
+  const palette = getReadableTeamPalette(teamAbbreviation, theme);
+  document.documentElement.style.setProperty('--accent', palette.accent);
+  document.documentElement.style.setProperty('--accent-2', palette.accent2);
+  document.documentElement.style.setProperty('--accent-rgb', palette.rgb);
+  document.documentElement.style.setProperty('--accent-2-rgb', palette.accent2Rgb);
+}
+
 function setTheme(theme) {
   document.body.classList.toggle('light-theme', theme === 'light');
   localStorage.setItem(THEME_KEY, theme);
   themeToggle.querySelector('.theme-icon').textContent = theme === 'light' ? '🌙' : '☀';
   themeToggle.querySelector('.theme-text').textContent = theme === 'light' ? 'Dark' : 'Light';
+  updateAccentForCurrentTheme(currentAccentTeam);
 
   if (lastPayload) {
     renderChart(lastPayload);
@@ -695,15 +797,28 @@ function setTheme(theme) {
 }
 
 function applySavedTheme() {
-  const saved = localStorage.getItem(THEME_KEY) || 'dark';
-  setTheme(saved);
+  const saved = localStorage.getItem(THEME_KEY);
+  const prefersLight = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
+  setTheme(saved || (prefersLight ? 'light' : 'dark'));
+}
+
+if (window.matchMedia) {
+  const media = window.matchMedia('(prefers-color-scheme: light)');
+  const handleThemePreferenceChange = (event) => {
+    if (!localStorage.getItem(THEME_KEY)) {
+      setTheme(event.matches ? 'light' : 'dark');
+    }
+  };
+  if (typeof media.addEventListener === 'function') {
+    media.addEventListener('change', handleThemePreferenceChange);
+  } else if (typeof media.addListener === 'function') {
+    media.addListener(handleThemePreferenceChange);
+  }
 }
 
 function applyTeamAccent(teamAbbreviation) {
-  const palette = TEAM_COLORS[teamAbbreviation] || { accent: '#4da3ff', accent2: '#8571ff', rgb: '77, 163, 255' };
-  document.documentElement.style.setProperty('--accent', palette.accent);
-  document.documentElement.style.setProperty('--accent-2', palette.accent2);
-  document.documentElement.style.setProperty('--accent-rgb', palette.rgb);
+  currentAccentTeam = teamAbbreviation || null;
+  updateAccentForCurrentTheme(currentAccentTeam);
 
   if (lastPayload) {
     renderChart(lastPayload);
@@ -1536,6 +1651,12 @@ function renderBetFinderEmpty(message = 'Choose a team, set your prop line, then
   `;
 }
 
+function formatSignedMetric(value, suffix = '') {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return '—';
+  return `${num >= 0 ? '+' : ''}${num.toFixed(1)}${suffix}`;
+}
+
 function getFinderTone(hitRate) {
   if (hitRate >= 80) return 'elite';
   if (hitRate >= 70) return 'good';
@@ -1581,11 +1702,13 @@ function renderBetFinderResults(payload) {
   }
 
   betFinderMeta.textContent = `${payload.team.full_name} • ${getStatLabel(payload.stat)} ${payload.line} • Last ${payload.last_n} • Min ${payload.min_games} games`;
-  betFinderResults.className = 'bet-finder-grid';
+  betFinderResults.className = 'bet-finder-grid sportsbook-grid';
   betFinderResults.innerHTML = results.map((item, index) => {
     const tone = getFinderTone(item.hit_rate);
+    const sideGuess = item.average >= payload.line ? 'OVER' : 'UNDER';
+    const sideClass = sideGuess.toLowerCase();
     return `
-      <button class="finder-card ${tone}" type="button"
+      <button class="finder-card sportsbook-tile ${tone}" type="button"
         data-id="${item.player.id}"
         data-name="${escapeHtml(item.player.full_name)}"
         data-team-id="${item.player.team_id}"
@@ -1593,23 +1716,54 @@ function renderBetFinderResults(payload) {
         data-team-abbr="${escapeHtml(item.player.team_abbreviation || '')}"
         data-position="${escapeHtml(item.player.position || '')}"
         data-jersey="${escapeHtml(item.player.jersey || '')}">
-        <div class="finder-rank">#${index + 1}</div>
-        <div class="finder-player">
-          <img src="${getPlayerImage(item.player.id)}" alt="${escapeHtml(item.player.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
-          <div>
-            <strong>${escapeHtml(item.player.full_name)}</strong>
-            <span>${escapeHtml(item.player.position || 'Position N/A')} • ${escapeHtml(item.player.team_abbreviation || '')}</span>
+        <div class="finder-ticket-head">
+          <div class="finder-ticket-meta">
+            <span class="finder-ticket-label"><span class="ticket-dot"></span>Ranked prop slip</span>
+            <div class="finder-player">
+              <img src="${getPlayerImage(item.player.id)}" alt="${escapeHtml(item.player.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
+              <div>
+                <div class="finder-main-line">
+                  <strong>${escapeHtml(item.player.full_name)}</strong>
+                  <span class="finder-side-pill ${sideClass}">${sideGuess}</span>
+                </div>
+                <span>${escapeHtml(item.player.position || 'Position N/A')} • ${escapeHtml(item.player.team_abbreviation || '')}</span>
+                <small class="market-slip-subtext">${getStatLabel(payload.stat)} line ${payload.line} • Last ${payload.last_n}</small>
+              </div>
+            </div>
           </div>
+          <div class="finder-rank">#${index + 1}</div>
         </div>
         <div class="finder-chip-row">
           <span class="finder-chip">${item.hit_rate.toFixed(1)}% hit</span>
           <span class="finder-chip">${item.hit_count}/${item.games_count}</span>
           <span class="finder-chip">Avg ${item.average.toFixed(1)}</span>
-          <span class="finder-chip ${item.avg_edge >= 0 ? 'positive' : 'negative'}">Edge ${item.avg_edge >= 0 ? '+' : ''}${item.avg_edge.toFixed(1)}</span>
+          <span class="finder-chip ${item.avg_edge >= 0 ? 'positive' : 'negative'}">Edge ${formatSignedMetric(item.avg_edge)}</span>
         </div>
-        <div class="finder-footer">
+        <div class="finder-ticket-grid">
+          <div class="finder-ticket-stat">
+            <span>Last game</span>
+            <strong>${item.last_value.toFixed(1)}</strong>
+            <small>Most recent output</small>
+          </div>
+          <div class="finder-ticket-stat">
+            <span>Over streak</span>
+            <strong>${item.hit_streak}</strong>
+            <small>Current run</small>
+          </div>
+          <div class="finder-ticket-stat">
+            <span>Projection edge</span>
+            <strong>${formatSignedMetric(item.avg_edge)}</strong>
+            <small>Average vs line</small>
+          </div>
+          <div class="finder-ticket-stat">
+            <span>Read</span>
+            <strong>${getFinderLabel(item.hit_rate)}</strong>
+            <small>Quick confidence</small>
+          </div>
+        </div>
+        <div class="finder-ticket-footer">
           <span class="finder-badge ${tone}">${getFinderLabel(item.hit_rate)}</span>
-          <small>Last ${item.last_value.toFixed(1)} • Over streak ${item.hit_streak}</small>
+          <span class="finder-odds-pill">Tap to open analyzer</span>
         </div>
       </button>
     `;
@@ -1733,6 +1887,85 @@ function getMatchupTargets() {
 
 function formatDelta(value) {
   return value > 0 ? `+${value}` : `${value}`;
+}
+
+
+async function hydrateAnalyzerFromPropSelection(prop) {
+  if (!prop || !prop.player_id) return false;
+
+  try {
+    if (typeof ensureTeamsLoaded === 'function') {
+      await ensureTeamsLoaded();
+    }
+
+    const teamId = Number(prop.team_id || 0) || null;
+    let rosterMatch = null;
+    if (teamId && typeof teamSelect !== 'undefined' && teamSelect) {
+      if (String(teamSelect.value) !== String(teamId)) {
+        teamSelect.value = String(teamId);
+      }
+      try {
+        await loadRoster(Number(teamId));
+      } catch (e) {
+        console.warn('Roster load failed while hydrating analyzer from prop selection:', e);
+      }
+      rosterMatch = Array.isArray(rosterPlayers)
+        ? rosterPlayers.find(p => String(p.id) === String(prop.player_id))
+        : null;
+    }
+
+    const embeddedMatchup = prop.matchup && typeof prop.matchup === 'object' ? prop.matchup : null;
+    const embeddedEnvironment = prop.environment && typeof prop.environment === 'object' ? prop.environment : null;
+    const embeddedAvailability = prop.availability && typeof prop.availability === 'object' ? prop.availability : null;
+    const embeddedNextGame = embeddedMatchup?.next_game || null;
+    const overrideTeamId = Number(prop.opponent_team_id || embeddedNextGame?.opponent_team_id || 0) || null;
+
+    if (typeof oppSelect !== 'undefined' && oppSelect) {
+      if (overrideTeamId) {
+        const hasOption = Array.from(oppSelect.options || []).some(opt => String(opt.value) === String(overrideTeamId));
+        if (!hasOption) {
+          const option = document.createElement('option');
+          option.value = String(overrideTeamId);
+          option.textContent = embeddedNextGame?.opponent_abbreviation || prop.opponent_abbreviation || `Team ${overrideTeamId}`;
+          oppSelect.appendChild(option);
+        }
+        oppSelect.value = String(overrideTeamId);
+        oppSelect.classList.add('override-active');
+      } else {
+        oppSelect.value = '';
+        oppSelect.classList.remove('override-active');
+      }
+    }
+
+    const selectedPayload = {
+      ...(rosterMatch || {}),
+      id: Number(prop.player_id),
+      full_name: prop.player_name || rosterMatch?.full_name || '',
+      is_active: rosterMatch?.is_active ?? true,
+      team_id: teamId || rosterMatch?.team_id || null,
+      team_abbreviation: prop.team_abbreviation || rosterMatch?.team_abbreviation || '',
+      team_name: prop.team_name || rosterMatch?.team_name || '',
+      position: prop.player_position || rosterMatch?.position || '',
+      jersey: prop.player_jersey || rosterMatch?.jersey || '',
+      availability: embeddedAvailability || rosterMatch?.availability || null,
+      matchup: embeddedMatchup || null,
+      environment: embeddedEnvironment || null,
+    };
+
+    if (typeof setSelectedPlayer === 'function') {
+      setSelectedPlayer(selectedPayload);
+    }
+    if (typeof setActiveProp === 'function') setActiveProp(prop.stat);
+    if (typeof lineInput !== 'undefined' && lineInput) lineInput.value = prop.line;
+    if (typeof switchView === 'function') switchView('analyzer');
+    if (typeof analyzePlayerProp === 'function') {
+      await analyzePlayerProp({ preserveScroll: true });
+    }
+    return true;
+  } catch (err) {
+    console.warn('hydrateAnalyzerFromPropSelection failed:', err);
+    return false;
+  }
 }
 
 function renderMatchup(payload) {
@@ -2521,7 +2754,9 @@ function renderMarketResults(payload) {
   currentMarketResultsPayload = payload;
   const sortKey = currentMarketSort || 'best_ev';
   const filterKey = currentMarketFilter || 'all';
-  const results = [...filterMarketRows(payload.results || [], filterKey)].filter(item => passesExpertFilters(item)).sort((a, b) => compareMarketRows(a, b, sortKey, currentMarketSortDirection));
+  const results = [...filterMarketRows(payload.results || [], filterKey)]
+    .filter(item => passesExpertFilters(item))
+    .sort((a, b) => compareMarketRows(a, b, sortKey, currentMarketSortDirection));
 
   if (!results.length) {
     renderMarketEmpty('No rows produced a usable result. Check names and try again.');
@@ -2532,8 +2767,83 @@ function renderMarketResults(payload) {
   renderMarketFilterChips();
   renderMarketExpertFilterChips();
   marketMeta.textContent = `${results.length} props scanned • ${getMarketSortLabel(sortKey)} • ${getMarketFilterLabel(filterKey)} • ${getExpertFilterSummary()}`;
+
+  const featured = results.slice(0, 6);
   marketResults.className = 'market-results-shell';
   marketResults.innerHTML = `
+    <div class="market-slips-header">
+      <div>
+        <h3>Ranked prop slips</h3>
+        <p>The highest-value board looks are surfaced as sportsbook-style tiles before the full table.</p>
+      </div>
+      <span class="spotlight-pill neutral">Top ${featured.length} featured</span>
+    </div>
+    <div class="market-slips-grid">
+      ${featured.map((item, index) => {
+        const tone = getConfidenceTone(item.best_bet.confidence);
+        const availability = item.availability || item.analysis?.availability || { status: 'Unknown', tone: 'neutral', reason: 'No report found', note: '' };
+        const matchupData = item.analysis?.matchup || item.matchup || {};
+        const matchupLean = matchupData?.vs_position?.lean || 'No matchup';
+        const matchupDetail = matchupData?.next_game?.matchup_label || 'No next opponent';
+        const expertAngles = getMarketExpertAngles(item).slice(0, 3);
+        const side = (item.best_bet.display_side || item.best_bet.side || 'Lean').toUpperCase();
+        const sideClass = side.toLowerCase().includes('under') ? 'under' : 'over';
+        return `
+          <article class="market-slip-card" data-index="${index}">
+            <div class="market-slip-head">
+              <div class="market-slip-player">
+                <img src="${getPlayerImage(item.player.id)}" alt="${escapeHtml(item.player.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
+                <div>
+                  <strong>${escapeHtml(item.player.full_name)}</strong>
+                  <span>${escapeHtml(item.player.team)} vs ${escapeHtml(item.player.opponent || '')}</span>
+                  <small>${renderAvailabilityBadge(availability, true)} ${escapeHtml(availability.reason || availability.note || 'No official note')}</small>
+                </div>
+              </div>
+              <div class="market-slip-rank">#${index + 1}</div>
+            </div>
+            <div class="market-slip-body">
+              <div class="market-slip-line">
+                <strong>${escapeHtml(item.market.stat)} ${item.market.line}</strong>
+                <span class="market-slip-side ${sideClass}">${escapeHtml(side)}</span>
+              </div>
+              <span class="market-slip-confidence finder-badge ${tone}">${escapeHtml(item.best_bet.confidence || 'Neutral')} ${item.best_bet.confidence_score ? escapeHtml(item.best_bet.confidence_score) : ''}</span>
+              <p class="market-slip-summary">${escapeHtml(item.best_bet.user_read || item.best_bet.confidence_summary || 'Confidence summary unavailable.')}</p>
+              <div class="market-slip-stats">
+                <div class="market-slip-stat">
+                  <span>Edge</span>
+                  <strong class="${(item.best_bet.edge || 0) >= 0 ? 'hit-value' : 'miss-value'}">${item.best_bet.edge ?? '—'}%</strong>
+                  <small>Model advantage</small>
+                </div>
+                <div class="market-slip-stat">
+                  <span>EV</span>
+                  <strong class="${(item.best_bet.ev || 0) >= 0 ? 'hit-value' : 'miss-value'}">${item.best_bet.ev ?? '—'}%</strong>
+                  <small>Expected value</small>
+                </div>
+                <div class="market-slip-stat">
+                  <span>Hit rate</span>
+                  <strong>${item.analysis.hit_rate}%</strong>
+                  <small>${item.analysis.hit_count}/${item.analysis.games_count}</small>
+                </div>
+                <div class="market-slip-stat">
+                  <span>Average</span>
+                  <strong>${item.analysis.average}</strong>
+                  <small>Recent sample</small>
+                </div>
+              </div>
+            </div>
+            <div class="market-slip-footer">
+              <div class="market-slip-angle-row">
+                ${expertAngles.length ? expertAngles.map(angle => `<span class="market-angle-badge ${angle.tone ? `tone-${angle.tone}` : ''} ${angle.kind ? `kind-${angle.kind}` : ''}">${escapeHtml(angle.label)}</span>`).join('') : '<span class="market-angle-empty">No expert angle</span>'}
+              </div>
+              <div class="market-matchup-cell">
+                <strong>${escapeHtml(matchupLean)}</strong>
+                <small>${escapeHtml(matchupDetail)}</small>
+              </div>
+            </div>
+          </article>
+        `;
+      }).join('')}
+    </div>
     <div class="market-results-table-wrap">
       <table class="market-results-table">
         <thead>
@@ -2554,13 +2864,13 @@ function renderMarketResults(payload) {
         </thead>
         <tbody>
           ${results.map((item, index) => {
-    const tone = getConfidenceTone(item.best_bet.confidence);
-    const availability = item.availability || item.analysis?.availability || { status: 'Unknown', tone: 'neutral', reason: 'No report found', note: '' };
-    const matchupData = item.analysis?.matchup || item.matchup || {};
-    const matchupLean = matchupData?.vs_position?.lean || 'No matchup';
-    const matchupDetail = matchupData?.next_game?.matchup_label || 'No next opponent';
-    const expertAngles = getMarketExpertAngles(item);
-    return `
+            const tone = getConfidenceTone(item.best_bet.confidence);
+            const availability = item.availability || item.analysis?.availability || { status: 'Unknown', tone: 'neutral', reason: 'No report found', note: '' };
+            const matchupData = item.analysis?.matchup || item.matchup || {};
+            const matchupLean = matchupData?.vs_position?.lean || 'No matchup';
+            const matchupDetail = matchupData?.next_game?.matchup_label || 'No next opponent';
+            const expertAngles = getMarketExpertAngles(item);
+            return `
               <tr class="market-row" data-index="${index}">
                 <td>
                   <div class="market-player-cell">
@@ -2598,13 +2908,13 @@ function renderMarketResults(payload) {
                 </td>
               </tr>
             `;
-  }).join('')}
+          }).join('')}
         </tbody>
       </table>
     </div>
   `;
 
-  marketResults.querySelectorAll('.market-row').forEach(row => {
+  marketResults.querySelectorAll('.market-row, .market-slip-card').forEach(row => {
     row.addEventListener('click', async () => {
       const item = results[Number(row.dataset.index)];
       if (!item) return;
@@ -2614,8 +2924,6 @@ function renderMarketResults(payload) {
         setStatus('Ready');
       } catch (error) {
         console.error(error);
-        // Only surface the error as an alert if it's NOT a roster issue
-        // (roster failures are handled gracefully inside focusMarketPlayer)
         const msg = error.message || '';
         if (!msg.toLowerCase().includes('roster')) {
           alert(msg || 'Failed to open that market pick.');
@@ -2970,9 +3278,33 @@ if (sidebarToggle) {
   });
 }
 
+if (mobileSidebarToggle) {
+  mobileSidebarToggle.addEventListener('click', () => {
+    if (window.innerWidth < 1280) {
+      document.body.classList.toggle('sidebar-mobile-open');
+      return;
+    }
+    if (sidebarToggle) {
+      sidebarToggle.click();
+      return;
+    }
+    const collapsed = !document.body.classList.contains('sidebar-collapsed');
+    setSidebarCollapsed(collapsed);
+  });
+}
+
 document.addEventListener('click', (event) => {
   if (!playerSearchInput.contains(event.target) && !searchResults.contains(event.target)) {
     searchResults.classList.add('hidden');
+  }
+
+  if (
+    window.innerWidth < 1280 &&
+    document.body.classList.contains('sidebar-mobile-open') &&
+    !event.target.closest('.dashboard-sidebar') &&
+    !event.target.closest('#mobileSidebarToggle')
+  ) {
+    document.body.classList.remove('sidebar-mobile-open');
   }
 });
 
@@ -4842,27 +5174,7 @@ function buildSparklineSvg(values, line, width, height) {
         const leg = parlay[parseInt(card.dataset.legIdx)];
         if (!leg || !leg.player_id) return;
         try {
-          const teamId = leg.team_id || null;
-          if (teamId && typeof teamSelect !== 'undefined' && String(teamSelect.value) !== String(teamId)) {
-            teamSelect.value = String(teamId);
-            try { await loadRoster(Number(teamId)); } catch(e) {}
-          }
-          if (typeof setSelectedPlayer === 'function') {
-            setSelectedPlayer({ id: leg.player_id, full_name: leg.player_name, is_active: true, team_id: teamId });
-          }
-          if (typeof setActiveProp === 'function') setActiveProp(leg.stat);
-          if (typeof lineInput !== 'undefined' && lineInput) lineInput.value = leg.line;
-          if (typeof oppSelect !== 'undefined' && oppSelect) {
-            if (leg.opponent_team_id) {
-              oppSelect.value = String(leg.opponent_team_id);
-              oppSelect.classList.add('override-active');
-            } else {
-              oppSelect.value = '';
-              oppSelect.classList.remove('override-active');
-            }
-          }
-          if (typeof switchView === 'function') switchView('analyzer');
-          if (typeof analyzePlayerProp === 'function') await analyzePlayerProp();
+          await hydrateAnalyzerFromPropSelection(leg);
         } catch(err) { console.warn('Parlay ticket leg nav failed:', err); }
       });
     });
@@ -4898,36 +5210,7 @@ function buildSparklineSvg(values, line, width, height) {
         const prop = all[parseInt(row.dataset.propIdx)];
         if (!prop || !prop.player_id) return;
         try {
-          // 1. Set team select + load roster
-          const teamId = prop.team_id || null;
-          if (teamId && typeof teamSelect !== 'undefined' && String(teamSelect.value) !== String(teamId)) {
-            teamSelect.value = String(teamId);
-            try { await loadRoster(Number(teamId)); } catch(e) {}
-          }
-
-          // 2. Set selected player
-          if (typeof setSelectedPlayer === 'function') {
-            setSelectedPlayer({ id: prop.player_id, full_name: prop.player_name, is_active: true, team_id: teamId });
-          }
-
-          // 3. Set stat + line
-          if (typeof setActiveProp === 'function') setActiveProp(prop.stat);
-          if (typeof lineInput !== 'undefined' && lineInput) lineInput.value = prop.line;
-
-          // 4. Auto-set opponent override so the analyzer loads the right matchup
-          if (typeof oppSelect !== 'undefined' && oppSelect) {
-            if (prop.opponent_team_id) {
-              oppSelect.value = String(prop.opponent_team_id);
-              oppSelect.classList.add('override-active');
-            } else {
-              oppSelect.value = '';
-              oppSelect.classList.remove('override-active');
-            }
-          }
-
-          // 5. Switch to analyzer and run analysis immediately
-          if (typeof switchView === 'function') switchView('analyzer');
-          if (typeof analyzePlayerProp === 'function') await analyzePlayerProp();
+          await hydrateAnalyzerFromPropSelection(prop);
         } catch(e) { console.warn('Parlay row nav failed:', e); }
       });
     });

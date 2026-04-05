@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import math
 import os
+import queue
 
 import re
 import datetime as dt
@@ -83,7 +85,16 @@ WARM_CACHE_PRELOAD_TODAYS_GAMES = os.getenv("NBA_WARM_CACHE_PRELOAD_TODAYS_GAMES
 WARM_CACHE_PRELOAD_INJURIES = os.getenv("NBA_WARM_CACHE_PRELOAD_INJURIES", "1").strip().lower() not in {"0", "false", "no", "off"}
 WARM_CACHE_PRELOAD_PLAYERS = os.getenv("NBA_WARM_CACHE_PRELOAD_PLAYERS", "1").strip().lower() not in {"0", "false", "no", "off"}
 WARM_CACHE_PRELOAD_TEAMS = os.getenv("NBA_WARM_CACHE_PRELOAD_TEAMS", "1").strip().lower() not in {"0", "false", "no", "off"}
+WARM_CACHE_PRELOAD_TEAM_ROSTERS = os.getenv("NBA_WARM_CACHE_PRELOAD_TEAM_ROSTERS", "1").strip().lower() not in {"0", "false", "no", "off"}
+WARM_CACHE_TEAM_ROSTERS_MAX_WORKERS = max(1, int(os.getenv("NBA_WARM_CACHE_TEAM_ROSTERS_MAX_WORKERS", "2")))
 
+PERSISTENT_CACHE_DIR = BASE_DIR / ".runtime_cache"
+PERSISTENT_CACHE_PATH = PERSISTENT_CACHE_DIR / "persistent_cache.json"
+PERSISTENT_CACHE_ENABLED = os.getenv("NBA_PERSISTENT_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+PERSISTENT_CACHE_MAX_ROSTERS = max(30, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_ROSTERS", "120")))
+PERSISTENT_CACHE_MAX_PLAYER_INFO = max(100, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_PLAYER_INFO", "600")))
+PERSISTENT_CACHE_MAX_NEXT_GAMES = max(30, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_NEXT_GAMES", "240")))
+PERSISTENT_CACHE_LOCK = Lock()
 
 WARM_CACHE_START_LOCK = threading.Lock()
 WARM_CACHE_STARTED = False
@@ -102,6 +113,123 @@ def _today_scoreboard_date() -> str:
     return dt.datetime.now().strftime("%m/%d/%Y")
 
 
+def _ensure_persistent_cache_dir() -> None:
+    if not PERSISTENT_CACHE_ENABLED:
+        return
+    PERSISTENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _cache_key_to_jsonable(key: Any) -> Any:
+    if isinstance(key, tuple):
+        return [ _cache_key_to_jsonable(part) for part in key ]
+    return key
+
+
+def _cache_key_from_jsonable(value: Any) -> Any:
+    if isinstance(value, list):
+        return tuple(_cache_key_from_jsonable(part) for part in value)
+    return value
+
+
+def _trim_cache_dict(cache: dict[Any, dict[str, Any]], max_items: int) -> dict[Any, dict[str, Any]]:
+    if len(cache) <= max_items:
+        return dict(cache)
+    items = sorted(cache.items(), key=lambda item: float((item[1] or {}).get("timestamp") or 0.0), reverse=True)[:max_items]
+    return dict(items)
+
+
+def save_persistent_caches() -> None:
+    if not PERSISTENT_CACHE_ENABLED:
+        return
+    try:
+        _ensure_persistent_cache_dir()
+        with PERSISTENT_CACHE_LOCK:
+            payload = {
+                "version": 1,
+                "saved_at": time.time(),
+                "roster_cache": [
+                    {"key": _cache_key_to_jsonable(key), "value": value}
+                    for key, value in _trim_cache_dict(ROSTER_CACHE, PERSISTENT_CACHE_MAX_ROSTERS).items()
+                ],
+                "player_info_cache": [
+                    {"key": _cache_key_to_jsonable(key), "value": value}
+                    for key, value in _trim_cache_dict(PLAYER_INFO_CACHE, PERSISTENT_CACHE_MAX_PLAYER_INFO).items()
+                ],
+                "next_game_cache": [
+                    {"key": _cache_key_to_jsonable(key), "value": value}
+                    for key, value in _trim_cache_dict(NEXT_GAME_CACHE, PERSISTENT_CACHE_MAX_NEXT_GAMES).items()
+                ],
+                "team_next_game_cache": [
+                    {"key": _cache_key_to_jsonable(key), "value": value}
+                    for key, value in _trim_cache_dict(TEAM_NEXT_GAME_CACHE, PERSISTENT_CACHE_MAX_NEXT_GAMES).items()
+                ],
+            }
+            temp_path = PERSISTENT_CACHE_PATH.with_suffix(".tmp")
+            temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            temp_path.replace(PERSISTENT_CACHE_PATH)
+    except Exception as exc:
+        LOGGER.warning("Persistent cache save failed: %s", exc)
+
+
+def _load_named_persistent_cache(entries: list[dict[str, Any]] | None, target: dict[Any, dict[str, Any]]) -> None:
+    for entry in entries or []:
+        try:
+            key = _cache_key_from_jsonable(entry.get("key"))
+            value = entry.get("value")
+            if key is None or not isinstance(value, dict):
+                continue
+            target[key] = value
+        except Exception:
+            continue
+
+
+def load_persistent_caches() -> None:
+    if not PERSISTENT_CACHE_ENABLED or not PERSISTENT_CACHE_PATH.exists():
+        return
+    try:
+        with PERSISTENT_CACHE_LOCK:
+            payload = json.loads(PERSISTENT_CACHE_PATH.read_text(encoding="utf-8"))
+        _load_named_persistent_cache(payload.get("roster_cache"), ROSTER_CACHE)
+        _load_named_persistent_cache(payload.get("player_info_cache"), PLAYER_INFO_CACHE)
+        _load_named_persistent_cache(payload.get("next_game_cache"), NEXT_GAME_CACHE)
+        _load_named_persistent_cache(payload.get("team_next_game_cache"), TEAM_NEXT_GAME_CACHE)
+        LOGGER.info(
+            "Loaded persistent cache snapshot: %s rosters, %s player info, %s next games, %s team next games",
+            len(ROSTER_CACHE),
+            len(PLAYER_INFO_CACHE),
+            len(NEXT_GAME_CACHE),
+            len(TEAM_NEXT_GAME_CACHE),
+        )
+    except Exception as exc:
+        LOGGER.warning("Persistent cache load failed: %s", exc)
+
+
+def preload_team_rosters_for_current_season() -> None:
+    current_season = current_nba_season()
+    max_workers = min(WARM_CACHE_TEAM_ROSTERS_MAX_WORKERS, max(1, len(TEAM_POOL)))
+    team_ids = [int(team["id"]) for team in TEAM_POOL]
+    LOGGER.info("Preloading %s team roster(s) for %s with %s worker(s)", len(team_ids), current_season, max_workers)
+
+    def _fetch(team_id: int) -> None:
+        try:
+            fetch_team_roster(team_id=team_id, season=current_season)
+        except Exception as exc:
+            LOGGER.warning("Warm-cache roster preload failed for team %s: %s", team_id, exc)
+
+    if max_workers <= 1:
+        for team_id in team_ids:
+            _fetch(team_id)
+        return
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_fetch, team_id) for team_id in team_ids]
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception:
+                pass
+
+
 def warm_cache_on_startup() -> None:
     global WARM_CACHE_STARTED
     if not WARM_CACHE_ON_STARTUP_ENABLED:
@@ -110,6 +238,8 @@ def warm_cache_on_startup() -> None:
         if WARM_CACHE_STARTED:
             return
         WARM_CACHE_STARTED = True
+
+    load_persistent_caches()
 
     tasks: list[tuple[str, Any]] = []
 
@@ -124,6 +254,9 @@ def warm_cache_on_startup() -> None:
 
     if WARM_CACHE_PRELOAD_INJURIES:
         tasks.append(("injuries", lambda: fetch_latest_injury_report_payload()))
+
+    if WARM_CACHE_PRELOAD_TEAM_ROSTERS:
+        tasks.append(("team_rosters", preload_team_rosters_for_current_season))
 
     if not tasks:
         return
@@ -146,10 +279,6 @@ def warm_cache_on_startup() -> None:
 
 app = FastAPI(title="NBA Props Bar Chart App")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-@app.on_event("startup")
-def _startup_warm_cache() -> None:
-    warm_cache_on_startup()
 
 STAT_MAP = {
     "PTS": "PTS",
@@ -248,9 +377,19 @@ NBA_RETRY_TOTAL = 4
 NBA_BACKOFF_FACTOR = 0.8
 NBA_RETRY_STATUS_CODES = (429, 500, 502, 503, 504)
 
-TEAM_ROSTER_TIMEOUT_SECONDS = 12
-TEAM_ROSTER_RETRY_ATTEMPTS = 2
-TEAM_ROSTER_RETRY_BASE_DELAY = 0.5
+TEAM_ROSTER_TIMEOUT_SECONDS = 16
+TEAM_ROSTER_RETRY_ATTEMPTS = 3
+TEAM_ROSTER_RETRY_BASE_DELAY = 0.75
+TEAM_ROSTER_FAILURE_META: dict[tuple[int, str], dict[str, float]] = {}
+TEAM_ROSTER_CACHE_TTL_SECONDS = 12 * 60 * 60
+TEAM_ROSTER_MAX_STALE_SECONDS = 45 * 24 * 60 * 60
+TEAM_ROSTER_FAILURE_COOLDOWN_SECONDS = 300
+TEAM_ROSTER_FETCH_BUDGET_WITH_RELIABLE_STALE_SECONDS = 6
+TEAM_ROSTER_FETCH_BUDGET_NO_RELIABLE_STALE_SECONDS = 24
+TEAM_ROSTER_FETCH_ATTEMPTS_WITH_RELIABLE_STALE = 1
+TEAM_ROSTER_FETCH_ATTEMPTS_NO_RELIABLE_STALE = 3
+TEAM_ROSTER_FETCH_TIMEOUT_CAP_SECONDS = 18
+TEAM_ROSTER_FETCH_TIMEOUT_FLOOR_SECONDS = 4
 
 PLAYER_INFO_TIMEOUT_SECONDS = 12
 PLAYER_INFO_RETRY_ATTEMPTS = 2
@@ -312,11 +451,218 @@ STAT_SUMMARY_CACHE_TTL_SECONDS = 300
 STAT_SUMMARY_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 DEBUG_METADATA_ENABLED = os.getenv("NBA_DEBUG_METADATA_ENABLED", "0").strip() == "1"
+
+HYBRID_ANALYZER_ENABLED = os.getenv("NBA_HYBRID_ANALYZER_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+ANALYSIS_CACHE_TTL_SECONDS = min(ANALYSIS_CACHE_TTL_SECONDS, 300)
+HYBRID_ANALYSIS_MAX_STALE_SECONDS = max(ANALYSIS_CACHE_TTL_SECONDS, int(os.getenv("NBA_HYBRID_ANALYSIS_MAX_STALE_SECONDS", "1800")))
+HYBRID_GAME_LOG_SOFT_TTL_SECONDS = max(300, int(os.getenv("NBA_HYBRID_GAME_LOG_SOFT_TTL_SECONDS", "3600")))
+HYBRID_GAME_LOG_MAX_STALE_SECONDS = max(HYBRID_GAME_LOG_SOFT_TTL_SECONDS, int(os.getenv("NBA_HYBRID_GAME_LOG_MAX_STALE_SECONDS", "43200")))
+HYBRID_PLAYER_INFO_SOFT_TTL_SECONDS = max(1800, int(os.getenv("NBA_HYBRID_PLAYER_INFO_SOFT_TTL_SECONDS", "21600")))
+HYBRID_PLAYER_INFO_MAX_STALE_SECONDS = max(HYBRID_PLAYER_INFO_SOFT_TTL_SECONDS, int(os.getenv("NBA_HYBRID_PLAYER_INFO_MAX_STALE_SECONDS", "604800")))
+HYBRID_NEXT_GAME_SOFT_TTL_SECONDS = max(60, int(os.getenv("NBA_HYBRID_NEXT_GAME_SOFT_TTL_SECONDS", "900")))
+HYBRID_NEXT_GAME_MAX_STALE_SECONDS = max(HYBRID_NEXT_GAME_SOFT_TTL_SECONDS, int(os.getenv("NBA_HYBRID_NEXT_GAME_MAX_STALE_SECONDS", "21600")))
+HYBRID_REFRESH_QUEUE_MAXSIZE = max(32, int(os.getenv("NBA_HYBRID_REFRESH_QUEUE_MAXSIZE", "512")))
+HYBRID_REFRESH_WORKERS = max(1, int(os.getenv("NBA_HYBRID_REFRESH_WORKERS", "1")))
+HYBRID_REFRESH_LOG_COOLDOWN_SECONDS = max(30, int(os.getenv("NBA_HYBRID_REFRESH_LOG_COOLDOWN_SECONDS", "120")))
+
+HYBRID_REFRESH_QUEUE: queue.Queue[tuple[str, tuple[Any, ...], dict[str, Any]]] = queue.Queue(maxsize=HYBRID_REFRESH_QUEUE_MAXSIZE)
+HYBRID_REFRESH_PENDING: set[tuple[str, tuple[Any, ...]]] = set()
+HYBRID_REFRESH_LOCK = Lock()
+HYBRID_REFRESH_WORKER_STARTED = False
+HYBRID_REFRESH_LAST_LOG: dict[tuple[str, tuple[Any, ...]], float] = {}
+
 NBA_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+
+
+def _cache_age_seconds(entry: dict[str, Any] | None) -> float | None:
+    if not entry:
+        return None
+    ts = float(entry.get("timestamp") or 0.0)
+    if ts <= 0:
+        return None
+    return max(0.0, time.time() - ts)
+
+
+def _throttled_refresh_log(job_key: tuple[str, tuple[Any, ...]], message: str, *args: Any) -> None:
+    now_ts = time.time()
+    last_ts = float(HYBRID_REFRESH_LAST_LOG.get(job_key) or 0.0)
+    if now_ts - last_ts >= HYBRID_REFRESH_LOG_COOLDOWN_SECONDS:
+        LOGGER.info(message, *args)
+        HYBRID_REFRESH_LAST_LOG[job_key] = now_ts
+
+
+def enqueue_hybrid_refresh(job_type: str, key: tuple[Any, ...], **payload: Any) -> bool:
+    if not HYBRID_ANALYZER_ENABLED:
+        return False
+    job_key = (str(job_type), tuple(key))
+    with HYBRID_REFRESH_LOCK:
+        if job_key in HYBRID_REFRESH_PENDING:
+            return False
+        if HYBRID_REFRESH_QUEUE.full():
+            _throttled_refresh_log(job_key, "Hybrid refresh queue full; skipping %s %s", job_type, key)
+            return False
+        HYBRID_REFRESH_PENDING.add(job_key)
+    try:
+        HYBRID_REFRESH_QUEUE.put_nowait((str(job_type), tuple(key), dict(payload)))
+        return True
+    except Exception:
+        with HYBRID_REFRESH_LOCK:
+            HYBRID_REFRESH_PENDING.discard(job_key)
+        return False
+
+
+def _run_hybrid_refresh_job(job_type: str, key: tuple[Any, ...], payload: dict[str, Any]) -> None:
+    if job_type == "game_log":
+        player_id, season, season_type = key
+        fetch_player_game_log(player_id=int(player_id), season=str(season), season_type=str(season_type))
+        return
+    if job_type == "player_info":
+        (player_id,) = key
+        fetch_common_player_info(player_id=int(player_id))
+        return
+    if job_type == "team_next_game":
+        team_id, primary_player_id, season, season_type = key
+        resolve_team_next_game(team_id=int(team_id), primary_player_id=int(primary_player_id), season=str(season), season_type=str(season_type))
+        return
+    if job_type == "team_roster":
+        team_id, season = key
+        fetch_team_roster(team_id=int(team_id), season=str(season))
+        return
+
+
+def _hybrid_refresh_worker() -> None:
+    while True:
+        job_type, key, payload = HYBRID_REFRESH_QUEUE.get()
+        job_key = (job_type, key)
+        try:
+            _run_hybrid_refresh_job(job_type, key, payload)
+        except Exception as exc:
+            _throttled_refresh_log(job_key, "Hybrid refresh failed for %s %s: %s", job_type, key, exc)
+        finally:
+            with HYBRID_REFRESH_LOCK:
+                HYBRID_REFRESH_PENDING.discard(job_key)
+            HYBRID_REFRESH_QUEUE.task_done()
+
+
+def start_hybrid_refresh_workers() -> None:
+    global HYBRID_REFRESH_WORKER_STARTED
+    if not HYBRID_ANALYZER_ENABLED:
+        return
+    with HYBRID_REFRESH_LOCK:
+        if HYBRID_REFRESH_WORKER_STARTED:
+            return
+        HYBRID_REFRESH_WORKER_STARTED = True
+    for worker_index in range(HYBRID_REFRESH_WORKERS):
+        threading.Thread(target=_hybrid_refresh_worker, name=f"hybrid-refresh-{worker_index+1}", daemon=True).start()
+
+
+def get_player_game_log_hybrid(player_id: int, season: str, season_type: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    cache_key = (player_id, season, season_type)
+    cached = GAME_LOG_CACHE.get(cache_key)
+    age_seconds = _cache_age_seconds(cached)
+    if cached and isinstance(cached.get("rows"), list):
+        if age_seconds is not None and age_seconds < HYBRID_GAME_LOG_SOFT_TTL_SECONDS:
+            return cached["rows"], {"source": "cache-fresh", "seconds_ago": round(age_seconds, 2), "refresh_queued": False}
+        if age_seconds is not None and age_seconds < HYBRID_GAME_LOG_MAX_STALE_SECONDS:
+            queued = enqueue_hybrid_refresh("game_log", cache_key)
+            return cached["rows"], {"source": "cache-stale", "seconds_ago": round(age_seconds, 2), "refresh_queued": bool(queued)}
+    rows = fetch_player_game_log(player_id=player_id, season=season, season_type=season_type)
+    fresh_age = _cache_age_seconds(GAME_LOG_CACHE.get(cache_key))
+    return rows, {"source": "live", "seconds_ago": round(fresh_age, 2) if fresh_age is not None else None, "refresh_queued": False}
+
+
+def get_player_info_hybrid(player_id: int) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    cached = PLAYER_INFO_CACHE.get(player_id)
+    age_seconds = _cache_age_seconds(cached)
+    if cached and isinstance(cached.get("row"), dict):
+        if age_seconds is not None and age_seconds < HYBRID_PLAYER_INFO_SOFT_TTL_SECONDS:
+            return cached["row"], {"source": "cache-fresh", "seconds_ago": round(age_seconds, 2), "refresh_queued": False}
+        if age_seconds is not None and age_seconds < HYBRID_PLAYER_INFO_MAX_STALE_SECONDS:
+            queued = enqueue_hybrid_refresh("player_info", (player_id,))
+            return cached["row"], {"source": "cache-stale", "seconds_ago": round(age_seconds, 2), "refresh_queued": bool(queued)}
+    try:
+        row = fetch_common_player_info(player_id)
+    except HTTPException:
+        return None, {"source": "unavailable", "seconds_ago": round(age_seconds, 2) if age_seconds is not None else None, "refresh_queued": False}
+    fresh_age = _cache_age_seconds(PLAYER_INFO_CACHE.get(player_id))
+    return row, {"source": "live", "seconds_ago": round(fresh_age, 2) if fresh_age is not None else None, "refresh_queued": False}
+
+
+def get_team_next_game_hybrid(team_id: int | None, primary_player_id: int, season: str, season_type: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    if not team_id:
+        return None, {"source": "no-team", "seconds_ago": None, "refresh_queued": False}
+    cache_key = (team_id, season, season_type)
+    cached = TEAM_NEXT_GAME_CACHE.get(cache_key)
+    age_seconds = _cache_age_seconds(cached)
+    cached_row = cached.get("row") if cached else None
+    if cached and age_seconds is not None and age_seconds < HYBRID_NEXT_GAME_SOFT_TTL_SECONDS:
+        return cached_row, {"source": "cache-fresh", "seconds_ago": round(age_seconds, 2), "refresh_queued": False}
+    if cached and age_seconds is not None and age_seconds < HYBRID_NEXT_GAME_MAX_STALE_SECONDS:
+        queued = enqueue_hybrid_refresh("team_next_game", (team_id, primary_player_id, season, season_type))
+        return cached_row, {"source": "cache-stale", "seconds_ago": round(age_seconds, 2), "refresh_queued": bool(queued)}
+    row = resolve_team_next_game(team_id=team_id, primary_player_id=primary_player_id, season=season, season_type=season_type)
+    fresh_age = _cache_age_seconds(TEAM_NEXT_GAME_CACHE.get(cache_key))
+    return row, {"source": "live", "seconds_ago": round(fresh_age, 2) if fresh_age is not None else None, "refresh_queued": False}
+
+
+def build_h2h_payload_from_rows(rows_source: list[dict[str, Any]], next_game: dict[str, Any] | None, stat: str, line: float) -> dict[str, Any]:
+    payload = {
+        "opponent_name": next_game.get("opponent_name") if next_game else "",
+        "opponent_abbreviation": next_game.get("opponent_abbreviation") if next_game else "",
+        "games_count": 0,
+        "hit_count": 0,
+        "hit_rate": 0.0,
+        "average": 0.0,
+        "games": [],
+    }
+    if not next_game or not next_game.get("opponent_abbreviation"):
+        return payload
+    opponent_abbreviation = str(next_game.get("opponent_abbreviation") or "").upper().strip()
+    h2h_rows = [row for row in (rows_source or []) if opponent_abbreviation and opponent_abbreviation in str(row.get("MATCHUP") or "").upper()]
+    if not h2h_rows:
+        return payload
+    h2h_games: list[dict[str, Any]] = []
+    h2h_values: list[float] = []
+    h2h_hits = 0
+    for row in h2h_rows:
+        game_entry = build_game_log_entry(row, stat, line)
+        if game_entry["hit"]:
+            h2h_hits += 1
+        h2h_values.append(game_entry["value"])
+        h2h_games.append(game_entry)
+    payload.update({
+        "opponent_name": next_game.get("opponent_name") or "",
+        "opponent_abbreviation": opponent_abbreviation,
+        "games_count": len(h2h_games),
+        "hit_count": h2h_hits,
+        "hit_rate": round((h2h_hits / len(h2h_games)) * 100, 1),
+        "average": round(sum(h2h_values) / len(h2h_values), 2),
+        "games": list(reversed(h2h_games)),
+    })
+    return payload
+
+
+def overlay_sensitive_analysis_sections(payload: dict[str, Any], player_name: str, team_name: str | None, analysis_source_rows: list[dict[str, Any]], resolved_team_id: int | None, player_id: int, season: str, season_type: str, stat: str, line: float) -> tuple[dict[str, Any], dict[str, Any]]:
+    refreshed = copy.deepcopy(payload)
+    freshness_overlay: dict[str, Any] = {}
+    availability = build_availability_payload(player_name=player_name, team_name=team_name)
+    refreshed["availability"] = availability
+    freshness_overlay["availability_source"] = "live-overlay"
+    next_game, next_game_meta = get_team_next_game_hybrid(team_id=resolved_team_id, primary_player_id=player_id, season=season, season_type=season_type)
+    refreshed.setdefault("matchup", {})["next_game"] = next_game
+    refreshed["h2h"] = build_h2h_payload_from_rows(analysis_source_rows, next_game, stat, line)
+    try:
+        refreshed["environment"] = build_game_environment_context(analysis_source_rows, next_game, team_id=resolved_team_id, season=season, season_type=season_type)
+    except Exception:
+        pass
+    freshness_overlay["next_game_source"] = next_game_meta.get("source")
+    freshness_overlay["next_game_seconds_ago"] = next_game_meta.get("seconds_ago")
+    freshness_overlay["next_game_refresh_queued"] = next_game_meta.get("refresh_queued")
+    return refreshed, freshness_overlay
 
 
 def create_nba_http_session() -> requests.Session:
@@ -760,24 +1106,9 @@ def extract_injury_report_text_candidates(pdf_bytes: bytes) -> list[dict[str, st
 
 
 def choose_best_injury_report_parse(pdf_bytes: bytes) -> dict[str, Any]:
-    # ── Strategy 1: Table extraction (most accurate — reads columns directly) ──
-    table_rows = extract_injury_report_rows_from_table(pdf_bytes)
-    if table_rows:
-        LOGGER.info("Injury report: table extraction succeeded with %d rows", len(table_rows))
-        # Reconstruct raw_text for debugging from the structured rows
-        raw_lines = [
-            f"{r['team_name']} {r['player_display']} {r['status']} {r['reason']}"
-            for r in table_rows
-        ]
-        return {
-            "rows": table_rows,
-            "pending_teams": [],
-            "raw_text": "\n".join(raw_lines),
-            "method": "pdfplumber_table",
-        }
-
-    # ── Strategy 2: Free-text extraction (fallback) ──
-    LOGGER.warning("Injury report: table extraction returned no rows, falling back to text parsing")
+    # Text-only parsing path. Table extraction is intentionally skipped because
+    # the official injury report PDFs have been unreliable for structured table
+    # extraction in this app and only add noisy warnings to the logs.
     candidates = extract_injury_report_text_candidates(pdf_bytes)
     best_payload: dict[str, Any] = {"rows": [], "pending_teams": [], "raw_text": "", "method": "none"}
 
@@ -2620,46 +2951,79 @@ def fetch_recent_player_game_log(player_id: int, season: str, season_type: str, 
     return recent_rows
 
 
+def _team_roster_cache_is_reliable_stale(cached: dict[str, Any] | None, cache_timestamp: float | None = None) -> bool:
+    if not cached or not cached.get("rows"):
+        return False
+    cache_ts = float(cache_timestamp or cached.get("timestamp") or 0.0)
+    if not cache_ts:
+        return False
+    return max(0.0, time.time() - cache_ts) <= TEAM_ROSTER_MAX_STALE_SECONDS
+
+
 def fetch_team_roster(team_id: int, season: str) -> list[dict[str, Any]]:
     cache_key = (team_id, season)
     cached = ROSTER_CACHE.get(cache_key)
     now_ts = time.time()
+    cached_ts = float((cached or {}).get("timestamp") or 0.0)
 
-    if cached and now_ts - cached["timestamp"] < CACHE_TTL_SECONDS:
+    if cached and now_ts - cached_ts < TEAM_ROSTER_CACHE_TTL_SECONDS:
         return cached["rows"]
 
-    try:
-        response = call_nba_with_retries(
-            lambda: CommonTeamRoster(team_id=team_id, season=season, timeout=TEAM_ROSTER_TIMEOUT_SECONDS),
-            label="team roster request",
-            attempts=TEAM_ROSTER_RETRY_ATTEMPTS,
-            base_delay=TEAM_ROSTER_RETRY_BASE_DELAY,
-        )
-        df = response.get_data_frames()[0]
-    except Exception as exc:
-        if cached and cached.get("rows"):
-            return cached["rows"]
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Team roster request failed. This can happen when NBA stats throttles or times out. "
-                f"Details: {exc}"
-            ),
-        ) from exc
+    reliable_stale_exists = _team_roster_cache_is_reliable_stale(cached, cached_ts)
+    failure_meta = TEAM_ROSTER_FAILURE_META.get(cache_key) or {}
+    last_failure_ts = float(failure_meta.get("timestamp") or 0.0)
 
-    if df.empty:
-        raise HTTPException(status_code=404, detail="No roster found for this team and season.")
+    if reliable_stale_exists and last_failure_ts and (now_ts - last_failure_ts) < TEAM_ROSTER_FAILURE_COOLDOWN_SECONDS:
+        return cached["rows"]
 
-    rows = df.to_dict(orient="records")
+    budget_seconds = TEAM_ROSTER_FETCH_BUDGET_WITH_RELIABLE_STALE_SECONDS if reliable_stale_exists else TEAM_ROSTER_FETCH_BUDGET_NO_RELIABLE_STALE_SECONDS
+    attempts = TEAM_ROSTER_FETCH_ATTEMPTS_WITH_RELIABLE_STALE if reliable_stale_exists else TEAM_ROSTER_FETCH_ATTEMPTS_NO_RELIABLE_STALE
+    started_at = time.monotonic()
+    last_exc: Exception | None = None
 
-    def jersey_sort_key(row: dict[str, Any]) -> tuple[int, str]:
-        raw_num = str(row.get("NUM", "")).strip()
-        jersey_num = int(raw_num) if raw_num.isdigit() else 999
-        return jersey_num, str(row.get("PLAYER", "")).lower()
+    for _attempt_idx in range(max(1, attempts)):
+        elapsed = time.monotonic() - started_at
+        remaining = budget_seconds - elapsed
+        if remaining <= 0:
+            break
+        timeout_seconds = max(TEAM_ROSTER_FETCH_TIMEOUT_FLOOR_SECONDS, min(TEAM_ROSTER_FETCH_TIMEOUT_CAP_SECONDS, int(math.ceil(remaining))))
+        try:
+            response = call_nba_with_retries(
+                lambda timeout_seconds=timeout_seconds: CommonTeamRoster(team_id=team_id, season=season, timeout=timeout_seconds),
+                label="team roster request",
+                attempts=1,
+                base_delay=TEAM_ROSTER_RETRY_BASE_DELAY,
+            )
+            df = response.get_data_frames()[0]
+            if df.empty:
+                raise HTTPException(status_code=404, detail="No roster found for this team and season.")
 
-    rows.sort(key=jersey_sort_key)
-    ROSTER_CACHE[cache_key] = {"timestamp": time.time(), "rows": rows}
-    return rows
+            rows = df.to_dict(orient="records")
+
+            def jersey_sort_key(row: dict[str, Any]) -> tuple[int, str]:
+                raw_num = str(row.get("NUM", "")).strip()
+                jersey_num = int(raw_num) if raw_num.isdigit() else 999
+                return jersey_num, str(row.get("PLAYER", "")).lower()
+
+            rows.sort(key=jersey_sort_key)
+            payload = {"timestamp": time.time(), "rows": rows}
+            ROSTER_CACHE[cache_key] = payload
+            TEAM_ROSTER_FAILURE_META.pop(cache_key, None)
+            save_persistent_caches()
+            return rows
+        except HTTPException:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            TEAM_ROSTER_FAILURE_META[cache_key] = {"timestamp": time.time()}
+
+    if cached and cached.get("rows"):
+        return cached["rows"]
+
+    detail = "Team roster request failed. This can happen when NBA stats throttles or times out."
+    if last_exc is not None:
+        detail = f"{detail} Details: {last_exc}"
+    raise HTTPException(status_code=502, detail=detail)
 
 
 @timed_call("fetch_common_player_info")
@@ -2702,6 +3066,7 @@ def fetch_common_player_info(player_id: int) -> dict[str, Any]:
             row = df.to_dict(orient="records")[0]
             PLAYER_INFO_CACHE[player_id] = {"timestamp": time.time(), "row": row}
             PLAYER_INFO_FAILURE_META.pop(player_id, None)
+            save_persistent_caches()
             return row
         except HTTPException:
             raise
@@ -3233,12 +3598,35 @@ def build_prop_analysis_payload(
     cache_key = (player_id, stat, float(line), int(last_n), season, season_type, team_id, player_position or '', location, result, margin_min, margin_max, min_minutes, max_minutes, min_fga, max_fga, h2h_only, override_opponent_id)
     cached = ANALYSIS_CACHE.get(cache_key)
     now_ts = time.time()
-    if cached and now_ts - float(cached.get('timestamp') or 0.0) < ANALYSIS_CACHE_TTL_SECONDS:
+    analysis_cache_age = now_ts - float(cached.get('timestamp') or 0.0) if cached else None
+    if cached and analysis_cache_age is not None and analysis_cache_age < ANALYSIS_CACHE_TTL_SECONDS:
         payload = copy.deepcopy(cached['payload'])
+        freshness = {"analysis_cached_seconds_ago": round(analysis_cache_age, 2)}
+        if HYBRID_ANALYZER_ENABLED:
+            player_cache_rows, _ = get_player_game_log_hybrid(player_id=player_id, season=season, season_type=season_type)
+            cached_player = payload.get("player") or {}
+            cached_team_name = cached_player.get("team_name") or TEAM_LOOKUP.get(int(cached_player.get("team_id") or 0), {}).get("full_name")
+            payload, freshness_overlay = overlay_sensitive_analysis_sections(
+                payload=payload,
+                player_name=str(cached_player.get("full_name") or player.get("full_name") if 'player' in locals() else ""),
+                team_name=str(cached_team_name or "") or None,
+                analysis_source_rows=player_cache_rows,
+                resolved_team_id=int(cached_player.get("team_id") or 0) or None,
+                player_id=player_id,
+                season=season,
+                season_type=season_type,
+                stat=stat,
+                line=line,
+            )
+            freshness.update(freshness_overlay)
+            if analysis_cache_age >= ANALYSIS_CACHE_TTL_SECONDS * 0.5:
+                enqueue_hybrid_refresh("game_log", (player_id, season, season_type))
+                if payload.get("player", {}).get("team_id"):
+                    enqueue_hybrid_refresh("team_next_game", (int(payload["player"]["team_id"]), player_id, season, season_type))
         if debug and DEBUG_METADATA_ENABLED:
             payload["debug"] = build_debug_metadata(
                 cache_status={"analysis_cache": "hit"},
-                freshness={"analysis_cached_seconds_ago": round(now_ts - float(cached.get('timestamp') or 0.0), 2)},
+                freshness=freshness,
                 timings_enabled=NBA_TIMING_ENABLED,
             )
         return payload
@@ -3247,17 +3635,21 @@ def build_prop_analysis_payload(
     if not player:
         raise HTTPException(status_code=404, detail="Player not found.")
 
-    season_rows = fetch_player_game_log(player_id=player_id, season=season, season_type=season_type)
+    season_rows, game_log_meta = get_player_game_log_hybrid(player_id=player_id, season=season, season_type=season_type) if HYBRID_ANALYZER_ENABLED else (fetch_player_game_log(player_id=player_id, season=season, season_type=season_type), {"source": "live", "seconds_ago": None, "refresh_queued": False})
 
     profile_row = None
+    player_info_meta = {"source": "unused", "seconds_ago": None, "refresh_queued": False}
     resolved_team_id = team_id
     resolved_position = player_position
 
     if resolved_team_id is None or not resolved_position:
-        try:
-            profile_row = fetch_common_player_info(player_id)
-        except HTTPException:
-            profile_row = None
+        if HYBRID_ANALYZER_ENABLED:
+            profile_row, player_info_meta = get_player_info_hybrid(player_id)
+        else:
+            try:
+                profile_row = fetch_common_player_info(player_id)
+            except HTTPException:
+                profile_row = None
         if profile_row:
             if resolved_team_id is None:
                 raw_team_id = profile_row.get("TEAM_ID")
@@ -3285,19 +3677,29 @@ def build_prop_analysis_payload(
                 "is_override": True,
             }
         else:
-            next_game = resolve_team_next_game(
+            next_game, next_game_meta = get_team_next_game_hybrid(
                 team_id=resolved_team_id,
                 primary_player_id=player_id,
                 season=season,
                 season_type=season_type,
-            )
+            ) if HYBRID_ANALYZER_ENABLED else (resolve_team_next_game(
+                team_id=resolved_team_id,
+                primary_player_id=player_id,
+                season=season,
+                season_type=season_type,
+            ), {"source": "live", "seconds_ago": None, "refresh_queued": False})
     else:
-        next_game = resolve_team_next_game(
+        next_game, next_game_meta = get_team_next_game_hybrid(
             team_id=resolved_team_id,
             primary_player_id=player_id,
             season=season,
             season_type=season_type,
-        )
+        ) if HYBRID_ANALYZER_ENABLED else (resolve_team_next_game(
+            team_id=resolved_team_id,
+            primary_player_id=player_id,
+            season=season,
+            season_type=season_type,
+        ), {"source": "live", "seconds_ago": None, "refresh_queued": False})
 
     needs_margin_context = margin_min is not None or margin_max is not None
     if needs_margin_context:
@@ -3398,40 +3800,7 @@ def build_prop_analysis_payload(
         availability = _compute_availability()
         vs_position = _compute_vs_position()
 
-    h2h_payload = {
-        "opponent_name": next_game.get("opponent_name") if next_game else "",
-        "opponent_abbreviation": next_game.get("opponent_abbreviation") if next_game else "",
-        "games_count": 0,
-        "hit_count": 0,
-        "hit_rate": 0.0,
-        "average": 0.0,
-        "games": [],
-    }
-    if next_game and next_game.get("opponent_abbreviation"):
-        opponent_abbreviation = str(next_game.get("opponent_abbreviation") or "").upper().strip()
-        h2h_rows = [
-            row for row in (filtered_pool or enriched_rows)
-            if opponent_abbreviation and opponent_abbreviation in str(row.get("MATCHUP") or "").upper()
-        ]
-        h2h_games: list[dict[str, Any]] = []
-        h2h_values: list[float] = []
-        h2h_hits = 0
-        for row in h2h_rows:
-            game_entry = build_game_log_entry(row, stat, line)
-            if game_entry["hit"]:
-                h2h_hits += 1
-            h2h_values.append(game_entry["value"])
-            h2h_games.append(game_entry)
-        if h2h_games:
-            h2h_payload = {
-                "opponent_name": next_game.get("opponent_name") or "",
-                "opponent_abbreviation": opponent_abbreviation,
-                "games_count": len(h2h_games),
-                "hit_count": h2h_hits,
-                "hit_rate": round((h2h_hits / len(h2h_games)) * 100, 1),
-                "average": round(sum(h2h_values) / len(h2h_values), 2),
-                "games": list(reversed(h2h_games)),
-            }
+    h2h_payload = build_h2h_payload_from_rows(filtered_pool or enriched_rows, next_game, stat, line)
 
     analysis_source_rows = filtered_pool or enriched_rows or season_rows
 
@@ -3533,7 +3902,15 @@ def build_prop_analysis_payload(
         "game_log_seconds_ago": round(time.time() - float((GAME_LOG_CACHE.get((player_id, season, season_type)) or {}).get("timestamp") or 0.0), 2) if GAME_LOG_CACHE.get((player_id, season, season_type)) else None,
         "player_info_seconds_ago": round(time.time() - float((PLAYER_INFO_CACHE.get(player_id) or {}).get("timestamp") or 0.0), 2) if PLAYER_INFO_CACHE.get(player_id) else None,
         "next_game_seconds_ago": round(time.time() - float((TEAM_NEXT_GAME_CACHE.get((resolved_team_id, season, season_type)) or {}).get("timestamp") or 0.0), 2) if TEAM_NEXT_GAME_CACHE.get((resolved_team_id, season, season_type)) else None,
+        "game_log_source": game_log_meta.get("source") if 'game_log_meta' in locals() else None,
+        "game_log_refresh_queued": game_log_meta.get("refresh_queued") if 'game_log_meta' in locals() else False,
+        "player_info_source": player_info_meta.get("source") if 'player_info_meta' in locals() else None,
+        "player_info_refresh_queued": player_info_meta.get("refresh_queued") if 'player_info_meta' in locals() else False,
+        "next_game_source": next_game_meta.get("source") if 'next_game_meta' in locals() else None,
+        "next_game_refresh_queued": next_game_meta.get("refresh_queued") if 'next_game_meta' in locals() else False,
+        "injury_report_seconds_ago": round(time.time() - float(INJURY_REPORT_CACHE.get("timestamp") or 0.0), 2) if INJURY_REPORT_CACHE.get("timestamp") else None,
     }
+    payload["freshness"] = dict(freshness)
     ANALYSIS_CACHE[cache_key] = {"timestamp": time.time(), "payload": copy.deepcopy(payload)}
     if debug and DEBUG_METADATA_ENABLED:
         payload["debug"] = build_debug_metadata(cache_status=cache_status, freshness=freshness, timings_enabled=NBA_TIMING_ENABLED)
@@ -3731,6 +4108,7 @@ def resolve_team_next_game(
     if scoreboard_next_game:
         TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": time.time(), "row": scoreboard_next_game}
         NEXT_GAME_FAILURE_META.pop(cache_key, None)
+        save_persistent_caches()
         return scoreboard_next_game
 
     next_game_row = fetch_next_game(primary_player_id, season, season_type)
@@ -3738,6 +4116,7 @@ def resolve_team_next_game(
     if next_game:
         TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": time.time(), "row": next_game}
         NEXT_GAME_FAILURE_META.pop(cache_key, None)
+        save_persistent_caches()
         return next_game
 
     NEXT_GAME_FAILURE_META[cache_key] = {"timestamp": time.time()}
@@ -3745,6 +4124,7 @@ def resolve_team_next_game(
         return cached.get("row")
 
     TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": time.time(), "row": None}
+    save_persistent_caches()
     return None
 
 
@@ -3752,6 +4132,7 @@ def resolve_team_next_game(
 
 @app.on_event("startup")
 def _startup_warm_cache() -> None:
+    start_hybrid_refresh_workers()
     warm_cache_on_startup()
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -4638,6 +5019,10 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             "player_name": result.get("player_name") or "",
             "player_id": result.get("player_id"),
             "team_id": resolved_team_id_scored,
+            "team_name": player_info.get("team_name") or "",
+            "team_abbreviation": player_info.get("team_abbreviation") or "",
+            "player_position": player_info.get("position") or "",
+            "player_jersey": player_info.get("jersey") or "",
             "opponent_team_id": resolved_opponent_team_id,
             "opponent_abbreviation": resolved_opponent_abbr,
             "stat": stat,
@@ -4651,6 +5036,9 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             "bookmaker": orig_row.get("bookmaker_title") or "N/A",
             "market_key": orig_row.get("market_key") or "",
             "availability_label": availability.get("label") or "Active",
+            "availability": copy.deepcopy(availability),
+            "matchup": copy.deepcopy(analysis.get("matchup") or {}),
+            "environment": copy.deepcopy(analysis.get("environment") or {}),
             "event_id": orig_row.get("event_id") or "",
             "game_label": orig_row.get("game_label") or "",
         })
