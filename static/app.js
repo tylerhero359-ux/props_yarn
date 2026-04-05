@@ -4972,6 +4972,7 @@ function buildSparklineSvg(values, line, width, height) {
   const parlayBuildBtn        = document.getElementById('parlayBuildBtn');
   const parlayRebuildBtn      = document.getElementById('parlayRebuildBtn');
   const parlayRescrapeBtn     = document.getElementById('parlayRescrapeBtn');
+  let activeParlayJobToken = 0;
   const parlayStatusMeta      = document.getElementById('parlayStatusMeta');
   const parlayQuotaBar        = document.getElementById('parlayQuotaBar');
   const parlayQuotaList       = document.getElementById('parlayQuotaList');
@@ -5254,6 +5255,7 @@ function buildSparklineSvg(values, line, width, height) {
     const sport      = parlaySportSelect.value;
     const oddsFormat = parlayOddsFormatSel.value;
     const lastN      = parseInt(parlayLastNSelect.value) || 10;
+    const runToken   = ++activeParlayJobToken;
 
     saveSettings();
     show(parlayTicket, false); show(parlayAllPropsWrap, false);
@@ -5265,6 +5267,15 @@ function buildSparklineSvg(values, line, width, height) {
     if (parlayBuildBtn)    parlayBuildBtn.disabled    = true;
     if (parlayRebuildBtn)  parlayRebuildBtn.disabled  = true;
     if (parlayRescrapeBtn) parlayRescrapeBtn.disabled = true;
+
+    async function fetchCompletedResult(jobId) {
+      const resultResp = await fetch('/api/parlay-builder/jobs/' + encodeURIComponent(jobId) + '/result', { cache: 'no-store' });
+      if (!resultResp.ok) {
+        const err = await resultResp.json().catch(function(){ return {}; });
+        throw new Error(err.detail || 'Failed to fetch parlay results');
+      }
+      return resultResp.json();
+    }
 
     try {
       const createResp = await fetch('/api/parlay-builder/jobs', {
@@ -5292,8 +5303,9 @@ function buildSparklineSvg(values, line, width, height) {
       const maxPollMs = 9 * 60 * 1000;
       const startedAt = Date.now();
       let lastMessage = '';
+      let completedData = null;
 
-      while (true) {
+      while (runToken === activeParlayJobToken) {
         const pollResp = await fetch('/api/parlay-builder/jobs/' + encodeURIComponent(jobId), { cache: 'no-store' });
         if (!pollResp.ok) {
           const err = await pollResp.json().catch(function(){ return {}; });
@@ -5304,35 +5316,19 @@ function buildSparklineSvg(values, line, width, height) {
         const progress = Math.max(0, Math.min(100, parseInt(job.progress || 0, 10) || 0));
         const stage = job.stage || 'Processing';
         const message = job.message || (stage + '…');
-        setParlayProgress(progress > 0 ? progress : 4, stage + ' — ' + message);
+        const summary = job.result_summary || null;
+        const summaryText = summary && summary.props_found
+          ? (' · ' + summary.props_found + ' props found' + (summary.props_analyzed ? ' · ' + summary.props_analyzed + ' analyzed' : ''))
+          : '';
+        setParlayProgress(progress > 0 ? progress : 4, stage + ' — ' + message + summaryText);
         if (message !== lastMessage) {
-          setStatus('⏳ ' + message, false);
+          setStatus('⏳ ' + message + summaryText, false);
           lastMessage = message;
         }
 
         if (status === 'completed') {
-          const data = job.result || {};
-          cachedScoredProps = data.all_props_scored || [];
-          cachedQuotaLog    = data.quota_log || [];
-          cachedScrapeMeta  = { evCount: data.events_scraped||0, propCount: data.props_found||0, analyzed: data.props_analyzed||0, scrapedAt: Date.now() };
-
-          renderQuota(cachedQuotaLog);
-          const m = cachedScrapeMeta;
-          setStatus('✓ Done — ' + m.evCount + ' event(s) scraped · ' + m.propCount + ' props found · ' + m.analyzed + ' analyzed', false);
-          setParlayProgress(100, '✓ Complete!');
-          setTimeout(function() { setParlayProgress(0, ''); }, 1800);
-
-          if (!cachedScoredProps.length) {
-            show(parlayEmptyState, true);
-            const s = parlayEmptyState.querySelector('strong'), sp = parlayEmptyState.querySelector('span');
-            if (s) s.textContent = data.message || 'No props found for selected events.';
-            if (sp) sp.textContent = 'Try different events or check your API keys.';
-            if (typeof hideBanner === 'function') hideBanner();
-            break;
-          }
-          showCacheButtons(true);
-          rebuildFromCache();
-          if (typeof hideBanner === 'function') hideBanner();
+          setParlayProgress(97, 'Finalizing results…');
+          completedData = await fetchCompletedResult(jobId);
           break;
         }
 
@@ -5346,14 +5342,49 @@ function buildSparklineSvg(values, line, width, height) {
         }
         await new Promise(function(resolve) { setTimeout(resolve, pollDelayMs); });
       }
+
+      if (runToken !== activeParlayJobToken) return;
+      if (!completedData) throw new Error('Parlay job finished without a readable result.');
+
+      try {
+        cachedScoredProps = completedData.all_props_scored || [];
+        cachedQuotaLog    = completedData.quota_log || [];
+        cachedScrapeMeta  = { evCount: completedData.events_scraped||0, propCount: completedData.props_found||0, analyzed: completedData.props_analyzed||0, scrapedAt: Date.now() };
+
+        renderQuota(cachedQuotaLog);
+        const m = cachedScrapeMeta;
+        setStatus('✓ Done — ' + m.evCount + ' event(s) scraped · ' + m.propCount + ' props found · ' + m.analyzed + ' analyzed', false);
+        setParlayProgress(100, '✓ Complete!');
+        setTimeout(function() {
+          if (runToken === activeParlayJobToken) setParlayProgress(0, '');
+        }, 1800);
+
+        if (!cachedScoredProps.length) {
+          show(parlayEmptyState, true);
+          const s = parlayEmptyState.querySelector('strong'), sp = parlayEmptyState.querySelector('span');
+          if (s) s.textContent = completedData.message || 'No props found for selected events.';
+          if (sp) sp.textContent = 'Try different events or check your API keys.';
+          if (typeof hideBanner === 'function') hideBanner();
+          return;
+        }
+        showCacheButtons(true);
+        rebuildFromCache();
+        if (typeof hideBanner === 'function') hideBanner();
+      } catch (renderErr) {
+        console.error('Parlay render failed', renderErr);
+        throw new Error(renderErr && renderErr.message ? renderErr.message : 'Parlay finished but UI render failed.');
+      }
     } catch(err) {
+      if (runToken !== activeParlayJobToken) return;
       setParlayProgress(0, '');
       setStatus('❌ Error: ' + (err.message || 'Unknown'), true);
       show(parlayEmptyState, true);
     } finally {
-      if (parlayBuildBtn)    parlayBuildBtn.disabled    = false;
-      if (parlayRebuildBtn)  parlayRebuildBtn.disabled  = false;
-      if (parlayRescrapeBtn) parlayRescrapeBtn.disabled = false;
+      if (runToken === activeParlayJobToken) {
+        if (parlayBuildBtn)    parlayBuildBtn.disabled    = false;
+        if (parlayRebuildBtn)  parlayRebuildBtn.disabled  = false;
+        if (parlayRescrapeBtn) parlayRescrapeBtn.disabled = false;
+      }
     }
   }
 

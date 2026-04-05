@@ -7,6 +7,7 @@ import math
 import os
 import queue
 import uuid
+import hashlib
 
 import re
 import datetime as dt
@@ -103,6 +104,44 @@ PARLAY_JOB_MAX_AGE_SECONDS = max(300, int(os.getenv("PARLAY_JOB_MAX_AGE_SECONDS"
 PARLAY_JOB_MAX_WORKERS = max(1, int(os.getenv("PARLAY_JOB_MAX_WORKERS", "2")))
 PARLAY_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=PARLAY_JOB_MAX_WORKERS, thread_name_prefix="parlay_job")
 
+PARLAY_RESULT_CACHE_TTL_SECONDS = max(300, int(os.getenv("PARLAY_RESULT_CACHE_TTL_SECONDS", "1800")))
+PARLAY_REQUEST_DEDUP_WINDOW_SECONDS = max(60, int(os.getenv("PARLAY_REQUEST_DEDUP_WINDOW_SECONDS", "900")))
+PARLAY_HOSTED_SAFE_MODE = bool(os.getenv("RENDER")) or os.getenv("PARLAY_HOSTED_SAFE_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+PARLAY_HOSTED_PREWARM_PLAYER_CONTEXT = os.getenv("PARLAY_HOSTED_PREWARM_PLAYER_CONTEXT", "0" if PARLAY_HOSTED_SAFE_MODE else "1").strip().lower() in {"1", "true", "yes", "on"}
+PARLAY_HOSTED_PREFETCH_GAME_LOGS = os.getenv("PARLAY_HOSTED_PREFETCH_GAME_LOGS", "0" if PARLAY_HOSTED_SAFE_MODE else "1").strip().lower() in {"1", "true", "yes", "on"}
+PARLAY_MAX_UNIQUE_ANALYSES = max(12, int(os.getenv("PARLAY_MAX_UNIQUE_ANALYSES", "60" if PARLAY_HOSTED_SAFE_MODE else "120")))
+
+def _parlay_payload_fingerprint(payload: dict[str, Any]) -> str:
+    normalized = {
+        "api_keys_count": len([str(k).strip() for k in (payload.get("api_keys") or []) if str(k).strip()]),
+        "event_ids": sorted([str(e).strip() for e in (payload.get("event_ids") or []) if str(e).strip()]),
+        "legs": int(payload.get("legs") or 3),
+        "sport": str(payload.get("sport") or "basketball_nba"),
+        "regions": str(payload.get("regions") or "us"),
+        "odds_format": str(payload.get("odds_format") or "decimal"),
+        "last_n": int(payload.get("last_n") or 10),
+        "season": str(payload.get("season") or current_nba_season()),
+        "season_type": str(payload.get("season_type") or "Regular Season"),
+        "batch_size": max(1, int(payload.get("batch_size") or 3)),
+        "bookmaker": str(payload.get("bookmaker") or "draftkings").strip().lower(),
+    }
+    return hashlib.sha1(json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+def _find_existing_parlay_job_by_fingerprint(payload_fingerprint: str) -> dict[str, Any] | None:
+    now_ts = time.time()
+    with PARLAY_JOB_LOCK:
+        for job in PARLAY_JOB_STORE.values():
+            if job.get("payload_fingerprint") != payload_fingerprint:
+                continue
+            status = str(job.get("status") or "").lower()
+            updated_at = float(job.get("updated_at") or job.get("created_at") or now_ts)
+            if status in {"queued", "running"} and (now_ts - updated_at) <= PARLAY_REQUEST_DEDUP_WINDOW_SECONDS:
+                return copy.deepcopy(job)
+            if status == "completed" and (now_ts - updated_at) <= PARLAY_RESULT_CACHE_TTL_SECONDS:
+                return copy.deepcopy(job)
+    return None
+
+
 def _cleanup_parlay_jobs(now_ts: float | None = None) -> None:
     now_ts = now_ts or time.time()
     with PARLAY_JOB_LOCK:
@@ -126,6 +165,11 @@ def _set_parlay_job_fields(job_id: str, **fields: Any) -> None:
 
 def _create_parlay_job(payload: dict[str, Any]) -> dict[str, Any]:
     _cleanup_parlay_jobs()
+    payload_copy = copy.deepcopy(payload)
+    payload_fingerprint = _parlay_payload_fingerprint(payload_copy)
+    existing = _find_existing_parlay_job_by_fingerprint(payload_fingerprint)
+    if existing:
+        return existing
     now_ts = time.time()
     job_id = uuid.uuid4().hex
     job = {
@@ -136,7 +180,8 @@ def _create_parlay_job(payload: dict[str, Any]) -> dict[str, Any]:
         "message": "Queued for background processing.",
         "created_at": now_ts,
         "updated_at": now_ts,
-        "payload": copy.deepcopy(payload),
+        "payload": payload_copy,
+        "payload_fingerprint": payload_fingerprint,
         "result": None,
         "error": None,
     }
@@ -4922,46 +4967,42 @@ def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[s
             "message": "No props found across today's events. Check your API keys or try again later.",
         }
 
-    # ── Phase 3a: Pre-warm game-log cache with one bulk LeagueDash call ────
-    # This single call fetches season stats for ALL players, warming the cache
-    # so individual fetch_player_game_log calls hit cache instead of NBA API.
+    # ── Phase 3a: Optional player-context pre-warm ──────────────────────
     _emit_progress(48, "prewarm", "Pre-warming player context…")
-    try:
-        _bulk_dash = LeagueDashPlayerStats(
-            season=season,
-            season_type_all_star=season_type,
-            per_mode_detailed="PerGame",
-            timeout=15,
-        )
-        _bulk_df = _bulk_dash.get_data_frames()[0]
-        # Build a quick lookup so we can seed GAME_LOG_CACHE for each player
-        # (LeagueDash gives season averages, not per-game logs — we can't fully
-        # replace PlayerGameLog, but we CAN use it to pre-populate player info
-        # and skip fetch_common_player_info calls for every player.)
-        _bulk_rows = _bulk_df.to_dict(orient="records") if not _bulk_df.empty else []
-        _dash_lookup: dict[int, dict[str, Any]] = {
-            int(r.get("PLAYER_ID", 0)): r for r in _bulk_rows if r.get("PLAYER_ID")
-        }
-        # Seed PLAYER_INFO_CACHE for every player we're about to analyze
-        now_ts_bulk = time.time()
-        for row in _bulk_rows:
-            pid = int(row.get("PLAYER_ID", 0))
-            if not pid:
-                continue
-            if pid not in PLAYER_INFO_CACHE or (now_ts_bulk - float((PLAYER_INFO_CACHE.get(pid) or {}).get("timestamp", 0))) > PROFILE_TTL_SECONDS:
-                team_id_val = row.get("TEAM_ID")
-                PLAYER_INFO_CACHE[pid] = {
-                    "timestamp": now_ts_bulk,
-                    "row": {
-                        "TEAM_ID": team_id_val,
-                        "TEAM_ABBREVIATION": row.get("TEAM_ABBREVIATION", ""),
-                        "POSITION": row.get("PLAYER_POSITION", ""),
-                        "DISPLAY_FIRST_LAST": row.get("PLAYER_NAME", ""),
+    if PARLAY_HOSTED_PREWARM_PLAYER_CONTEXT:
+        try:
+            _bulk_dash = LeagueDashPlayerStats(
+                season=season,
+                season_type_all_star=season_type,
+                per_mode_detailed="PerGame",
+                timeout=15,
+            )
+            _bulk_df = _bulk_dash.get_data_frames()[0]
+            _bulk_rows = _bulk_df.to_dict(orient="records") if not _bulk_df.empty else []
+            _dash_lookup: dict[int, dict[str, Any]] = {
+                int(r.get("PLAYER_ID", 0)): r for r in _bulk_rows if r.get("PLAYER_ID")
+            }
+            now_ts_bulk = time.time()
+            for row in _bulk_rows:
+                pid = int(row.get("PLAYER_ID", 0))
+                if not pid:
+                    continue
+                if pid not in PLAYER_INFO_CACHE or (now_ts_bulk - float((PLAYER_INFO_CACHE.get(pid) or {}).get("timestamp", 0))) > PROFILE_TTL_SECONDS:
+                    team_id_val = row.get("TEAM_ID")
+                    PLAYER_INFO_CACHE[pid] = {
+                        "timestamp": now_ts_bulk,
+                        "row": {
+                            "TEAM_ID": team_id_val,
+                            "TEAM_ABBREVIATION": row.get("TEAM_ABBREVIATION", ""),
+                            "POSITION": row.get("PLAYER_POSITION", ""),
+                            "DISPLAY_FIRST_LAST": row.get("PLAYER_NAME", ""),
+                        }
                     }
-                }
-        LOGGER.info("Parlay pre-warm: seeded PLAYER_INFO_CACHE for %d players from LeagueDash", len(_dash_lookup))
-    except Exception as _bulk_exc:
-        LOGGER.warning("Parlay pre-warm LeagueDash failed (non-fatal): %s", _bulk_exc)
+            LOGGER.info("Parlay pre-warm: seeded PLAYER_INFO_CACHE for %d players from LeagueDash", len(_dash_lookup))
+        except Exception as _bulk_exc:
+            LOGGER.warning("Parlay pre-warm LeagueDash failed (non-fatal): %s", _bulk_exc)
+    else:
+        _emit_progress(48, "prewarm", "Hosted-safe mode: skipping heavy LeagueDash pre-warm.")
 
     # ── Phase 3: Bulk-analyze all props in one shot (free, parallel) ──
     defaults = {"last_n": last_n, "season": season, "season_type": season_type}
@@ -4996,6 +5037,10 @@ def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[s
             seen_analysis_keys.add(ak)
             deduped_prepared.append((bulk_row, orig_row))
 
+    if len(deduped_prepared) > PARLAY_MAX_UNIQUE_ANALYSES:
+        LOGGER.info("Parlay hosted-safe cap: trimming unique analyses from %d to %d", len(deduped_prepared), PARLAY_MAX_UNIQUE_ANALYSES)
+        deduped_prepared = deduped_prepared[:PARLAY_MAX_UNIQUE_ANALYSES]
+
     # Pre-warm game log cache concurrently for all unique player IDs
     # This fires off all PlayerGameLog requests in parallel with a short timeout
     # so the sequential analysis loop below hits cache instead of blocking 1-by-1.
@@ -5007,7 +5052,7 @@ def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[s
            (time.time() - float(GAME_LOG_CACHE[(pid, season, season_type)].get("timestamp", 0))) < CACHE_TTL_SECONDS
     }
     ids_to_fetch = unique_player_ids - already_cached_ids
-    if ids_to_fetch:
+    if ids_to_fetch and PARLAY_HOSTED_PREFETCH_GAME_LOGS:
         _emit_progress(62, "analysis", f"Pre-fetching game logs for {len(ids_to_fetch)} players…")
         LOGGER.info("Parlay pre-fetching game logs for %d uncached players", len(ids_to_fetch))
         def _prefetch_log(pid: int) -> None:
@@ -5019,6 +5064,8 @@ def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[s
         with ThreadPoolExecutor(max_workers=prewarm_workers) as _pre_ex:
             list(_pre_ex.map(_prefetch_log, ids_to_fetch))
         LOGGER.info("Parlay game-log pre-warm complete for %d players", len(ids_to_fetch))
+    elif ids_to_fetch:
+        _emit_progress(62, "analysis", f"Hosted-safe mode: skipping bulk game-log prefetch for {len(ids_to_fetch)} players.")
 
     _emit_progress(70, "analysis", "Running prop analysis engine…")
     max_workers = min(BULK_ANALYSIS_MAX_WORKERS, max(1, len(deduped_prepared)))
@@ -5160,6 +5207,7 @@ def get_parlay_builder_job(job_id: str) -> dict[str, Any]:
     job = _get_parlay_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Parlay job not found or expired.")
+    result = job.get("result") or {}
     return {
         "job_id": job["job_id"],
         "status": job.get("status") or "queued",
@@ -5168,9 +5216,28 @@ def get_parlay_builder_job(job_id: str) -> dict[str, Any]:
         "message": job.get("message") or "",
         "created_at": job.get("created_at"),
         "updated_at": job.get("updated_at"),
-        "result": copy.deepcopy(job.get("result")) if job.get("status") == "completed" else None,
+        "result_ready": (job.get("status") == "completed" and job.get("result") is not None),
+        "result_summary": {
+            "events_scraped": int(result.get("events_scraped") or 0),
+            "props_found": int(result.get("props_found") or 0),
+            "props_analyzed": int(result.get("props_analyzed") or 0),
+            "parlay_legs": len(result.get("parlay") or []),
+        } if job.get("status") == "completed" and result else None,
         "error": job.get("error"),
     }
+
+@app.get("/api/parlay-builder/jobs/{job_id}/result")
+def get_parlay_builder_job_result(job_id: str) -> dict[str, Any]:
+    job = _get_parlay_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Parlay job not found or expired.")
+    status = str(job.get("status") or "").lower()
+    if status != "completed":
+        raise HTTPException(status_code=409, detail="Parlay job is not completed yet.")
+    result = job.get("result")
+    if result is None:
+        raise HTTPException(status_code=404, detail="Parlay job result is not available.")
+    return copy.deepcopy(result)
 
 
 def _parlay_job_runner(job_id: str) -> None:
@@ -5195,6 +5262,17 @@ def _parlay_job_runner(job_id: str) -> None:
 
 @app.post("/api/parlay-builder/jobs")
 def create_parlay_builder_job(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    existing = _find_existing_parlay_job_by_fingerprint(_parlay_payload_fingerprint(copy.deepcopy(payload)))
+    if existing:
+        return {
+            "job_id": existing["job_id"],
+            "status": existing.get("status") or "queued",
+            "progress": int(existing.get("progress") or 0),
+            "stage": existing.get("stage") or "Queued",
+            "message": existing.get("message") or "Reusing existing parlay job.",
+            "reused": True,
+        }
+
     job = _create_parlay_job(payload)
     PARLAY_JOB_EXECUTOR.submit(_parlay_job_runner, job["job_id"])
     return {
@@ -5203,6 +5281,7 @@ def create_parlay_builder_job(payload: dict[str, Any] = Body(...)) -> dict[str, 
         "progress": 0,
         "stage": "Queued",
         "message": "Queued for background processing.",
+        "reused": False,
     }
 
 
