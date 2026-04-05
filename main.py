@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import queue
+import uuid
 
 import re
 import datetime as dt
@@ -95,6 +96,53 @@ PERSISTENT_CACHE_MAX_ROSTERS = max(30, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_R
 PERSISTENT_CACHE_MAX_PLAYER_INFO = max(100, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_PLAYER_INFO", "600")))
 PERSISTENT_CACHE_MAX_NEXT_GAMES = max(30, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_NEXT_GAMES", "240")))
 PERSISTENT_CACHE_LOCK = Lock()
+
+PARLAY_JOB_LOCK = Lock()
+PARLAY_JOB_STORE: dict[str, dict[str, Any]] = {}
+PARLAY_JOB_MAX_AGE_SECONDS = max(300, int(os.getenv("PARLAY_JOB_MAX_AGE_SECONDS", "3600")))
+PARLAY_JOB_MAX_WORKERS = max(1, int(os.getenv("PARLAY_JOB_MAX_WORKERS", "2")))
+PARLAY_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=PARLAY_JOB_MAX_WORKERS, thread_name_prefix="parlay_job")
+
+def _cleanup_parlay_jobs(now_ts: float | None = None) -> None:
+    now_ts = now_ts or time.time()
+    with PARLAY_JOB_LOCK:
+        stale_ids = [jid for jid, job in PARLAY_JOB_STORE.items() if (now_ts - float(job.get("updated_at") or job.get("created_at") or now_ts)) > PARLAY_JOB_MAX_AGE_SECONDS]
+        for jid in stale_ids:
+            PARLAY_JOB_STORE.pop(jid, None)
+
+def _get_parlay_job(job_id: str) -> dict[str, Any] | None:
+    with PARLAY_JOB_LOCK:
+        job = PARLAY_JOB_STORE.get(job_id)
+        return copy.deepcopy(job) if job else None
+
+def _set_parlay_job_fields(job_id: str, **fields: Any) -> None:
+    now_ts = time.time()
+    with PARLAY_JOB_LOCK:
+        job = PARLAY_JOB_STORE.get(job_id)
+        if not job:
+            return
+        job.update(fields)
+        job["updated_at"] = now_ts
+
+def _create_parlay_job(payload: dict[str, Any]) -> dict[str, Any]:
+    _cleanup_parlay_jobs()
+    now_ts = time.time()
+    job_id = uuid.uuid4().hex
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "progress": 0,
+        "stage": "Queued",
+        "message": "Queued for background processing.",
+        "created_at": now_ts,
+        "updated_at": now_ts,
+        "payload": copy.deepcopy(payload),
+        "result": None,
+        "error": None,
+    }
+    with PARLAY_JOB_LOCK:
+        PARLAY_JOB_STORE[job_id] = job
+    return copy.deepcopy(job)
 
 WARM_CACHE_START_LOCK = threading.Lock()
 WARM_CACHE_STARTED = False
@@ -4721,8 +4769,7 @@ def odds_player_props_import(payload: dict[str, Any] = Body(...)) -> dict[str, A
     }
 
 
-@app.post("/api/parlay-builder")
-def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[str, Any]:
     """
     Scrape selected NBA events + all markets in batches using rotating API keys,
     analyze every prop via the existing bulk engine, rank by hit rate, and build
@@ -4740,6 +4787,14 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
       season_type   str         – "Regular Season"
       batch_size    int         – events per batch (default 3, keeps credit bursts small)
     """
+    def _emit_progress(progress: int, stage: str, message: str) -> None:
+        if progress_cb:
+            try:
+                progress_cb(progress, stage, message)
+            except Exception:
+                pass
+
+    _emit_progress(2, "validation", "Validating parlay request…")
     # ── Validate inputs ─────────────────────────────────────────────────
     raw_keys = payload.get("api_keys") or []
     if isinstance(raw_keys, str):
@@ -4779,10 +4834,12 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         return key
 
     if requested_event_ids:
+        _emit_progress(8, "events", "Using selected events from the picker…")
         # User already selected specific events — build stub dicts directly
         # so we don't spend a credit on the events list
         events: list[dict[str, Any]] = [{"id": eid} for eid in requested_event_ids]
     else:
+        _emit_progress(8, "events", "Fetching today's events from The Odds API…")
         try:
             events_result = odds_api_fetch(
                 f"/sports/{sport}/events",
@@ -4795,6 +4852,7 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         events = events_result["data"] or []
         quota_log.append({"call": "events_list", "quota": events_result["quota"]})
 
+    _emit_progress(12, "events", f"Resolved {len(events)} event(s) to scrape.")
     if not events:
         return {
             "legs": legs,
@@ -4812,9 +4870,11 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     all_import_rows: list[dict[str, Any]] = []
     scrape_errors: list[dict[str, Any]] = []
 
+    total_events = max(1, len(events))
     for batch_start in range(0, len(events), batch_size):
         batch = events[batch_start: batch_start + batch_size]
-        for event in batch:
+        for event_idx, event in enumerate(batch, start=batch_start + 1):
+            _emit_progress(min(42, 12 + int((event_idx / total_events) * 28)), "odds", f"Fetching odds for event {event_idx} of {total_events}…")
             event_id = str(event.get("id") or "")
             if not event_id:
                 continue
@@ -4848,6 +4908,7 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             except Exception as exc:
                 scrape_errors.append({"event_id": event_id, "reason": str(exc)})
 
+    _emit_progress(45, "odds", f"Fetched odds rows for {len(all_import_rows)} props.")
     if not all_import_rows:
         return {
             "legs": legs,
@@ -4864,6 +4925,7 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     # ── Phase 3a: Pre-warm game-log cache with one bulk LeagueDash call ────
     # This single call fetches season stats for ALL players, warming the cache
     # so individual fetch_player_game_log calls hit cache instead of NBA API.
+    _emit_progress(48, "prewarm", "Pre-warming player context…")
     try:
         _bulk_dash = LeagueDashPlayerStats(
             season=season,
@@ -4937,6 +4999,7 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     # Pre-warm game log cache concurrently for all unique player IDs
     # This fires off all PlayerGameLog requests in parallel with a short timeout
     # so the sequential analysis loop below hits cache instead of blocking 1-by-1.
+    _emit_progress(58, "analysis", f"Preparing {len(deduped_prepared)} unique prop analyses…")
     unique_player_ids: set[int] = {int(br["player_id"]) for br, _ in deduped_prepared}
     already_cached_ids: set[int] = {
         pid for pid in unique_player_ids
@@ -4945,6 +5008,7 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     }
     ids_to_fetch = unique_player_ids - already_cached_ids
     if ids_to_fetch:
+        _emit_progress(62, "analysis", f"Pre-fetching game logs for {len(ids_to_fetch)} players…")
         LOGGER.info("Parlay pre-fetching game logs for %d uncached players", len(ids_to_fetch))
         def _prefetch_log(pid: int) -> None:
             try:
@@ -4956,6 +5020,7 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             list(_pre_ex.map(_prefetch_log, ids_to_fetch))
         LOGGER.info("Parlay game-log pre-warm complete for %d players", len(ids_to_fetch))
 
+    _emit_progress(70, "analysis", "Running prop analysis engine…")
     max_workers = min(BULK_ANALYSIS_MAX_WORKERS, max(1, len(deduped_prepared)))
 
     if max_workers <= 1:
@@ -4979,6 +5044,7 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
                     analysis_errors.append({"player_name": bulk_row["player_name"], "reason": str(exc)})
 
     # ── Phase 4: Score every prop by hit rate, pick best N legs ─────────
+    _emit_progress(88, "ranking", "Ranking props and building the final ticket…")
     scored: list[dict[str, Any]] = []
     for result, orig_row in analysis_rows:
         analysis = result.get("analysis") or {}
@@ -5075,6 +5141,7 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
     all_errors = scrape_errors + analysis_errors
 
+    _emit_progress(100, "complete", "Parlay build complete.")
     return {
         "legs": legs,
         "parlay": parlay_legs,
@@ -5087,6 +5154,61 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         "quota_log": quota_log,
     }
 
+
+@app.get("/api/parlay-builder/jobs/{job_id}")
+def get_parlay_builder_job(job_id: str) -> dict[str, Any]:
+    job = _get_parlay_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Parlay job not found or expired.")
+    return {
+        "job_id": job["job_id"],
+        "status": job.get("status") or "queued",
+        "progress": int(job.get("progress") or 0),
+        "stage": job.get("stage") or "Queued",
+        "message": job.get("message") or "",
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "result": copy.deepcopy(job.get("result")) if job.get("status") == "completed" else None,
+        "error": job.get("error"),
+    }
+
+
+def _parlay_job_runner(job_id: str) -> None:
+    job = _get_parlay_job(job_id)
+    if not job:
+        return
+    payload = copy.deepcopy(job.get("payload") or {})
+    _set_parlay_job_fields(job_id, status="running", progress=3, stage="Starting", message="Starting background parlay build…")
+
+    def _job_progress(progress: int, stage: str, message: str) -> None:
+        _set_parlay_job_fields(job_id, progress=max(0, min(100, int(progress))), stage=stage, message=message)
+
+    try:
+        result = _compute_parlay_builder(payload, progress_cb=_job_progress)
+        _set_parlay_job_fields(job_id, status="completed", progress=100, stage="Complete", message="Parlay build complete.", result=result, error=None)
+    except HTTPException as exc:
+        _set_parlay_job_fields(job_id, status="failed", stage="Failed", message=str(exc.detail), error={"detail": exc.detail, "status_code": exc.status_code})
+    except Exception as exc:
+        LOGGER.exception("Parlay background job %s failed", job_id)
+        _set_parlay_job_fields(job_id, status="failed", stage="Failed", message=str(exc), error={"detail": str(exc), "status_code": 500})
+
+
+@app.post("/api/parlay-builder/jobs")
+def create_parlay_builder_job(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    job = _create_parlay_job(payload)
+    PARLAY_JOB_EXECUTOR.submit(_parlay_job_runner, job["job_id"])
+    return {
+        "job_id": job["job_id"],
+        "status": "queued",
+        "progress": 0,
+        "stage": "Queued",
+        "message": "Queued for background processing.",
+    }
+
+
+@app.post("/api/parlay-builder")
+def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    return _compute_parlay_builder(payload)
 
 @app.get("/api/todays-games")
 @timed_call("todays_games_endpoint")

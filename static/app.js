@@ -5250,74 +5250,103 @@ function buildSparklineSvg(values, line, width, height) {
     if (!rawKeys) { setStatus('Enter at least one API key.', true); return; }
     const keys = rawKeys.split(',').map(function(k){ return k.trim(); }).filter(Boolean);
     if (selectedEventIds.size === 0) { setStatus('Select at least one event first.', true); return; }
-    const legs      = parseInt(parlayLegsSelect.value) || 2;
-    const sport     = parlaySportSelect.value;
+    const legs       = parseInt(parlayLegsSelect.value) || 2;
+    const sport      = parlaySportSelect.value;
     const oddsFormat = parlayOddsFormatSel.value;
-    const lastN     = parseInt(parlayLastNSelect.value) || 10;
+    const lastN      = parseInt(parlayLastNSelect.value) || 10;
 
     saveSettings();
     show(parlayTicket, false); show(parlayAllPropsWrap, false);
     show(parlayQuotaBar, false); show(parlayEmptyState, false);
     parlayQuotaList.innerHTML = '';
     const totalEvents = selectedEventIds.size;
-    setStatus('⏳ Step 1/3 — Fetching odds for ' + totalEvents + ' game(s)…', false);
-    setParlayProgress(5, 'Connecting to Odds API…');
-    if (parlayBuildBtn)   parlayBuildBtn.disabled   = true;
-    if (parlayRebuildBtn) parlayRebuildBtn.disabled = true;
+    setStatus('⏳ Queueing parlay build for ' + totalEvents + ' game(s)…', false);
+    setParlayProgress(3, 'Sending background job to server…');
+    if (parlayBuildBtn)    parlayBuildBtn.disabled    = true;
+    if (parlayRebuildBtn)  parlayRebuildBtn.disabled  = true;
     if (parlayRescrapeBtn) parlayRescrapeBtn.disabled = true;
 
-    // Simulate progress steps while waiting for the single fetch
-    var progressTimer = null;
-    var fakeStep = 5;
-    progressTimer = setInterval(function() {
-      fakeStep = Math.min(fakeStep + 3, 75);
-      if (fakeStep < 30)      setParlayProgress(fakeStep, '⏳ Scraping game odds… (' + totalEvents + ' events)');
-      else if (fakeStep < 55) setParlayProgress(fakeStep, '⏳ Analyzing ' + totalEvents * 15 + '+ props…');
-      else                    setParlayProgress(fakeStep, '⏳ Ranking by hit rate…');
-    }, 600);
-
     try {
-      const resp = await fetch('/api/parlay-builder', {
+      const createResp = await fetch('/api/parlay-builder/jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          api_keys: keys, legs: legs, sport: sport,
-          odds_format: oddsFormat, last_n: lastN,
+          api_keys: keys,
+          legs: legs,
+          sport: sport,
+          odds_format: oddsFormat,
+          last_n: lastN,
           event_ids: Array.from(selectedEventIds),
           bookmaker: parlayBookmakerSelect ? parlayBookmakerSelect.value : 'draftkings',
         }),
       });
-      if (!resp.ok) {
-        const err = await resp.json().catch(function(){ return {}; });
-        throw new Error(err.detail || 'Server error ' + resp.status);
+      if (!createResp.ok) {
+        const err = await createResp.json().catch(function(){ return {}; });
+        throw new Error(err.detail || 'Unable to start parlay builder');
       }
-      const data = await resp.json();
+      const created = await createResp.json();
+      if (!created || !created.job_id) throw new Error('Missing parlay job id from server.');
 
-      cachedScoredProps = data.all_props_scored || [];
-      cachedQuotaLog    = data.quota_log || [];
-      cachedScrapeMeta  = { evCount: data.events_scraped||0, propCount: data.props_found||0, analyzed: data.props_analyzed||0, scrapedAt: Date.now() };
+      const jobId = created.job_id;
+      const pollDelayMs = 1200;
+      const maxPollMs = 9 * 60 * 1000;
+      const startedAt = Date.now();
+      let lastMessage = '';
 
-      clearInterval(progressTimer);
-      setParlayProgress(90, '⏳ Building parlay ticket…');
-      renderQuota(cachedQuotaLog);
-      const m = cachedScrapeMeta;
-      setStatus('✓ Done — ' + m.evCount + ' event(s) scraped · ' + m.propCount + ' props found · ' + m.analyzed + ' analyzed', false);
-      setParlayProgress(100, '✓ Complete!');
-      setTimeout(function() { setParlayProgress(0, ''); }, 2000);
+      while (true) {
+        const pollResp = await fetch('/api/parlay-builder/jobs/' + encodeURIComponent(jobId), { cache: 'no-store' });
+        if (!pollResp.ok) {
+          const err = await pollResp.json().catch(function(){ return {}; });
+          throw new Error(err.detail || 'Failed to read parlay job status');
+        }
+        const job = await pollResp.json();
+        const status = String(job.status || 'queued').toLowerCase();
+        const progress = Math.max(0, Math.min(100, parseInt(job.progress || 0, 10) || 0));
+        const stage = job.stage || 'Processing';
+        const message = job.message || (stage + '…');
+        setParlayProgress(progress > 0 ? progress : 4, stage + ' — ' + message);
+        if (message !== lastMessage) {
+          setStatus('⏳ ' + message, false);
+          lastMessage = message;
+        }
 
-      if (!cachedScoredProps.length) {
-        show(parlayEmptyState, true);
-        const s = parlayEmptyState.querySelector('strong'), sp = parlayEmptyState.querySelector('span');
-        if (s) s.textContent = data.message || 'No props found for selected events.';
-        if (sp) sp.textContent = 'Try different events or check your API keys.';
-        if (typeof hideBanner === 'function') hideBanner();
-        return;
+        if (status === 'completed') {
+          const data = job.result || {};
+          cachedScoredProps = data.all_props_scored || [];
+          cachedQuotaLog    = data.quota_log || [];
+          cachedScrapeMeta  = { evCount: data.events_scraped||0, propCount: data.props_found||0, analyzed: data.props_analyzed||0, scrapedAt: Date.now() };
+
+          renderQuota(cachedQuotaLog);
+          const m = cachedScrapeMeta;
+          setStatus('✓ Done — ' + m.evCount + ' event(s) scraped · ' + m.propCount + ' props found · ' + m.analyzed + ' analyzed', false);
+          setParlayProgress(100, '✓ Complete!');
+          setTimeout(function() { setParlayProgress(0, ''); }, 1800);
+
+          if (!cachedScoredProps.length) {
+            show(parlayEmptyState, true);
+            const s = parlayEmptyState.querySelector('strong'), sp = parlayEmptyState.querySelector('span');
+            if (s) s.textContent = data.message || 'No props found for selected events.';
+            if (sp) sp.textContent = 'Try different events or check your API keys.';
+            if (typeof hideBanner === 'function') hideBanner();
+            break;
+          }
+          showCacheButtons(true);
+          rebuildFromCache();
+          if (typeof hideBanner === 'function') hideBanner();
+          break;
+        }
+
+        if (status === 'failed') {
+          const errorDetail = (job.error && (job.error.detail || job.error.message)) || message || 'Parlay build failed';
+          throw new Error(errorDetail);
+        }
+
+        if ((Date.now() - startedAt) > maxPollMs) {
+          throw new Error('Parlay build took too long on the host. Please try fewer games or retry.');
+        }
+        await new Promise(function(resolve) { setTimeout(resolve, pollDelayMs); });
       }
-      showCacheButtons(true);
-      rebuildFromCache();
-      if (typeof hideBanner === 'function') hideBanner();
     } catch(err) {
-      clearInterval(progressTimer);
       setParlayProgress(0, '');
       setStatus('❌ Error: ' + (err.message || 'Unknown'), true);
       show(parlayEmptyState, true);
