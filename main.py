@@ -139,8 +139,6 @@ def _trim_cache_dict(cache: dict[Any, dict[str, Any]], max_items: int) -> dict[A
 
 
 def save_persistent_caches() -> None:
-    """Write the persistent cache to disk synchronously. Prefer save_persistent_caches_async()
-    for call sites inside request handlers so the disk write never blocks a response."""
     if not PERSISTENT_CACHE_ENABLED:
         return
     try:
@@ -171,51 +169,6 @@ def save_persistent_caches() -> None:
             temp_path.replace(PERSISTENT_CACHE_PATH)
     except Exception as exc:
         LOGGER.warning("Persistent cache save failed: %s", exc)
-
-
-# Debounced background save: collapses rapid successive save requests into a
-# single disk write after PERSISTENT_CACHE_SAVE_DEBOUNCE_SECONDS of quiet time.
-# This prevents each roster/player-info fetch from blocking its caller with a
-# synchronous 300 KB JSON write.
-PERSISTENT_CACHE_SAVE_DEBOUNCE_SECONDS = float(
-    os.getenv("NBA_PERSISTENT_CACHE_SAVE_DEBOUNCE_SECONDS", "5")
-)
-_PERSISTENT_CACHE_SAVE_PENDING = threading.Event()
-_PERSISTENT_CACHE_SAVE_WORKER_STARTED = False
-_PERSISTENT_CACHE_SAVE_WORKER_LOCK = Lock()
-
-
-def _persistent_cache_save_worker() -> None:
-    """Background thread that flushes the persistent cache after a debounce window."""
-    while True:
-        _PERSISTENT_CACHE_SAVE_PENDING.wait()
-        _PERSISTENT_CACHE_SAVE_PENDING.clear()
-        time.sleep(PERSISTENT_CACHE_SAVE_DEBOUNCE_SECONDS)
-        # If another save was requested while we slept, keep draining.
-        if _PERSISTENT_CACHE_SAVE_PENDING.is_set():
-            continue
-        save_persistent_caches()
-
-
-def _ensure_persistent_cache_save_worker() -> None:
-    global _PERSISTENT_CACHE_SAVE_WORKER_STARTED
-    with _PERSISTENT_CACHE_SAVE_WORKER_LOCK:
-        if _PERSISTENT_CACHE_SAVE_WORKER_STARTED:
-            return
-        _PERSISTENT_CACHE_SAVE_WORKER_STARTED = True
-    threading.Thread(
-        target=_persistent_cache_save_worker,
-        name="persistent-cache-save",
-        daemon=True,
-    ).start()
-
-
-def save_persistent_caches_async() -> None:
-    """Schedule a debounced background save. Returns immediately; does not block."""
-    if not PERSISTENT_CACHE_ENABLED:
-        return
-    _ensure_persistent_cache_save_worker()
-    _PERSISTENT_CACHE_SAVE_PENDING.set()
 
 
 def _load_named_persistent_cache(entries: list[dict[str, Any]] | None, target: dict[Any, dict[str, Any]]) -> None:
@@ -3461,7 +3414,7 @@ def fetch_team_roster(team_id: int, season: str) -> list[dict[str, Any]]:
             payload = {"timestamp": time.time(), "rows": rows}
             ROSTER_CACHE[cache_key] = payload
             TEAM_ROSTER_FAILURE_META.pop(cache_key, None)
-            save_persistent_caches_async()
+            save_persistent_caches()
             return rows
         except HTTPException:
             raise
@@ -3518,7 +3471,7 @@ def fetch_common_player_info(player_id: int) -> dict[str, Any]:
             row = df.to_dict(orient="records")[0]
             PLAYER_INFO_CACHE[player_id] = {"timestamp": time.time(), "row": row}
             PLAYER_INFO_FAILURE_META.pop(player_id, None)
-            save_persistent_caches_async()
+            save_persistent_caches()
             return row
         except HTTPException:
             raise
@@ -4813,7 +4766,7 @@ def resolve_team_next_game(
     if scoreboard_next_game:
         TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": time.time(), "row": scoreboard_next_game}
         NEXT_GAME_FAILURE_META.pop(cache_key, None)
-        save_persistent_caches_async()
+        save_persistent_caches()
         return scoreboard_next_game
 
     next_game_row = fetch_next_game(primary_player_id, season, season_type)
@@ -4821,7 +4774,7 @@ def resolve_team_next_game(
     if next_game:
         TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": time.time(), "row": next_game}
         NEXT_GAME_FAILURE_META.pop(cache_key, None)
-        save_persistent_caches_async()
+        save_persistent_caches()
         return next_game
 
     NEXT_GAME_FAILURE_META[cache_key] = {"timestamp": time.time()}
@@ -4829,7 +4782,7 @@ def resolve_team_next_game(
         return cached.get("row")
 
     TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": time.time(), "row": None}
-    save_persistent_caches_async()
+    save_persistent_caches()
     return None
 
 
@@ -4838,11 +4791,7 @@ def resolve_team_next_game(
 @app.on_event("startup")
 def _startup_warm_cache() -> None:
     start_hybrid_refresh_workers()
-    # Run cache warming in a background thread so uvicorn can start serving
-    # immediately. This ensures Render's health check at /health passes right
-    # away instead of timing out while 30 roster fetches + injury PDF download
-    # block the startup event handler.
-    threading.Thread(target=warm_cache_on_startup, name="startup-warm-cache", daemon=True).start()
+    warm_cache_on_startup()
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def root() -> FileResponse:
@@ -6619,7 +6568,13 @@ def player_prop(
 BULK_ANALYSIS_ENABLED = os.getenv("NBA_BULK_ANALYSIS_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 BULK_ANALYSIS_MAX_WORKERS = max(1, int(os.getenv("NBA_BULK_ANALYSIS_MAX_WORKERS", "4")))
 BULK_ANALYSIS_MAX_ROWS = max(1, int(os.getenv("NBA_BULK_ANALYSIS_MAX_ROWS", "100")))
-# WARM_CACHE_* vars declared at module top (lines 82-89); removed duplicate declarations here.
+
+WARM_CACHE_ON_STARTUP_ENABLED = os.getenv("NBA_WARM_CACHE_ON_STARTUP_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+WARM_CACHE_STARTUP_MAX_WORKERS = max(1, int(os.getenv("NBA_WARM_CACHE_STARTUP_MAX_WORKERS", "4")))
+WARM_CACHE_PRELOAD_TODAYS_GAMES = os.getenv("NBA_WARM_CACHE_PRELOAD_TODAYS_GAMES", "1").strip().lower() not in {"0", "false", "no", "off"}
+WARM_CACHE_PRELOAD_INJURIES = os.getenv("NBA_WARM_CACHE_PRELOAD_INJURIES", "1").strip().lower() not in {"0", "false", "no", "off"}
+WARM_CACHE_PRELOAD_PLAYERS = os.getenv("NBA_WARM_CACHE_PRELOAD_PLAYERS", "1").strip().lower() not in {"0", "false", "no", "off"}
+WARM_CACHE_PRELOAD_TEAMS = os.getenv("NBA_WARM_CACHE_PRELOAD_TEAMS", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _build_bulk_prop_item(row_index: int, row: dict[str, Any], defaults: dict[str, Any], local_cache: dict[tuple[Any, ...], dict[str, Any]]) -> dict[str, Any]:
@@ -6825,61 +6780,16 @@ def debug_injury_report_raw() -> dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 # BACKTEST ENGINE
 # Logs predictions and actual results, computes ROI / hit-rate by bucket.
-# SQLite-backed backtest store — survives process restarts (ephemeral on Render
-# free tier unless a paid Disk is attached, but persists across hot-reloads and
-# short sleep/wake cycles within the same deployment).
+# In-memory store (resets on restart). Frontend can persist via localStorage.
 # ─────────────────────────────────────────────────────────────────────────────
 
-import sqlite3
-
 _BACKTEST_LOCK = threading.Lock()
-_BACKTEST_DB_PATH = PERSISTENT_CACHE_DIR / "backtest.sqlite3"
-
-
-def _backtest_db_connect() -> sqlite3.Connection:
-    con = sqlite3.connect(str(_BACKTEST_DB_PATH), check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def _init_backtest_db() -> None:
-    """Create the backtest table if it doesn't exist yet."""
-    _ensure_persistent_cache_dir()
-    with _backtest_db_connect() as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS backtest (
-                id               TEXT PRIMARY KEY,
-                player           TEXT,
-                stat             TEXT,
-                line             REAL,
-                side             TEXT,
-                confidence_score INTEGER,
-                confidence_tier  TEXT,
-                model_prob       REAL,
-                odds             REAL,
-                result           TEXT DEFAULT 'pending',
-                actual_value     REAL,
-                logged_at        TEXT,
-                resolved_at      TEXT
-            )
-        """)
-        con.commit()
-
-
-def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    return dict(row)
+_BACKTEST_LOG: list[dict[str, Any]] = []   # [{id, player, stat, line, side, confidence_score, confidence_tier, model_prob, result, hit, odds, ev, logged_at, resolved_at}]
 
 
 def _backtest_new_id() -> str:
     import uuid
     return str(uuid.uuid4())[:8]
-
-
-# Initialise DB at import time (fast – just a CREATE TABLE IF NOT EXISTS).
-try:
-    _init_backtest_db()
-except Exception as _e:
-    LOGGER.warning("Could not initialise backtest SQLite DB: %s", _e)
 
 
 def _compute_backtest_stats(entries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -6978,26 +6888,14 @@ def backtest_log_prediction(payload: dict = Body(...)) -> dict[str, Any]:
         "confidence_score": int(payload.get("confidence_score") or 0),
         "confidence_tier": str(payload.get("confidence_tier") or ""),
         "model_prob": float(payload.get("model_prob") or 0.5),
-        "odds": payload.get("odds"),
+        "odds": payload.get("odds"),  # decimal odds, optional
         "result": "pending",
         "actual_value": None,
         "logged_at": datetime.utcnow().isoformat() + "Z",
         "resolved_at": None,
     }
     with _BACKTEST_LOCK:
-        try:
-            with _backtest_db_connect() as con:
-                con.execute(
-                    """INSERT INTO backtest
-                       (id, player, stat, line, side, confidence_score, confidence_tier,
-                        model_prob, odds, result, actual_value, logged_at, resolved_at)
-                       VALUES (:id,:player,:stat,:line,:side,:confidence_score,:confidence_tier,
-                               :model_prob,:odds,:result,:actual_value,:logged_at,:resolved_at)""",
-                    entry,
-                )
-                con.commit()
-        except Exception as db_err:
-            LOGGER.warning("backtest SQLite insert failed: %s", db_err)
+        _BACKTEST_LOG.append(entry)
     return {"ok": True, "id": entry["id"], "entry": entry}
 
 
@@ -7014,83 +6912,47 @@ def backtest_resolve_prediction(payload: dict = Body(...)) -> dict[str, Any]:
     actual_value = float(actual_value)
 
     with _BACKTEST_LOCK:
-        try:
-            with _backtest_db_connect() as con:
-                row = con.execute("SELECT * FROM backtest WHERE id = ?", (pred_id,)).fetchone()
-                if row is None:
-                    raise HTTPException(status_code=404, detail=f"No prediction found with id={pred_id}")
-                entry = _row_to_dict(row)
+        for entry in _BACKTEST_LOG:
+            if entry["id"] == pred_id:
                 hit = (
                     actual_value > entry["line"] if entry["side"] == "OVER"
                     else actual_value < entry["line"]
                 )
-                result = "hit" if hit else "miss"
-                resolved_at = datetime.utcnow().isoformat() + "Z"
-                con.execute(
-                    "UPDATE backtest SET result=?, actual_value=?, resolved_at=? WHERE id=?",
-                    (result, actual_value, resolved_at, pred_id),
-                )
-                con.commit()
-                entry.update(result=result, actual_value=actual_value, resolved_at=resolved_at)
+                entry["result"] = "hit" if hit else "miss"
+                entry["actual_value"] = actual_value
+                entry["resolved_at"] = datetime.utcnow().isoformat() + "Z"
                 return {"ok": True, "entry": entry}
-        except HTTPException:
-            raise
-        except Exception as db_err:
-            LOGGER.warning("backtest SQLite resolve failed: %s", db_err)
-            raise HTTPException(status_code=500, detail="Database error")
+    raise HTTPException(status_code=404, detail=f"No prediction found with id={pred_id}")
 
 
 @app.get("/api/backtest/log")
 def backtest_get_log(limit: int = Query(200, ge=1, le=1000)) -> dict[str, Any]:
     """Return the backtest log and aggregate stats."""
     with _BACKTEST_LOCK:
-        try:
-            with _backtest_db_connect() as con:
-                rows = con.execute(
-                    "SELECT * FROM backtest ORDER BY logged_at DESC LIMIT ?", (limit,)
-                ).fetchall()
-                all_rows = con.execute("SELECT * FROM backtest").fetchall()
-            entries = [_row_to_dict(r) for r in rows]
-            all_entries = [_row_to_dict(r) for r in all_rows]
-            stats = _compute_backtest_stats(all_entries)
-            return {"stats": stats, "entries": entries}
-        except Exception as db_err:
-            LOGGER.warning("backtest SQLite get failed: %s", db_err)
-            return {"stats": {}, "entries": []}
+        entries = list(reversed(_BACKTEST_LOG))[:limit]
+        stats = _compute_backtest_stats(list(_BACKTEST_LOG))
+    return {"stats": stats, "entries": entries}
 
 
 @app.delete("/api/backtest/log/{entry_id}")
 def backtest_delete_entry(entry_id: str) -> dict[str, Any]:
     """Delete a single backtest entry by ID."""
     with _BACKTEST_LOCK:
-        try:
-            with _backtest_db_connect() as con:
-                cur = con.execute("DELETE FROM backtest WHERE id = ?", (entry_id,))
-                con.commit()
-                if cur.rowcount == 0:
-                    raise HTTPException(status_code=404, detail=f"No entry found with id={entry_id}")
-            return {"ok": True, "deleted": entry_id}
-        except HTTPException:
-            raise
-        except Exception as db_err:
-            LOGGER.warning("backtest SQLite delete failed: %s", db_err)
-            raise HTTPException(status_code=500, detail="Database error")
+        before = len(_BACKTEST_LOG)
+        _BACKTEST_LOG[:] = [e for e in _BACKTEST_LOG if e["id"] != entry_id]
+        after = len(_BACKTEST_LOG)
+    if before == after:
+        raise HTTPException(status_code=404, detail=f"No entry found with id={entry_id}")
+    return {"ok": True, "deleted": entry_id}
 
 
 @app.delete("/api/backtest/log")
 def backtest_clear_log() -> dict[str, Any]:
     """Clear all backtest entries."""
     with _BACKTEST_LOCK:
-        try:
-            with _backtest_db_connect() as con:
-                cur = con.execute("SELECT COUNT(*) FROM backtest")
-                count = cur.fetchone()[0]
-                con.execute("DELETE FROM backtest")
-                con.commit()
-            return {"ok": True, "cleared": count}
-        except Exception as db_err:
-            LOGGER.warning("backtest SQLite clear failed: %s", db_err)
-            raise HTTPException(status_code=500, detail="Database error")
+        count = len(_BACKTEST_LOG)
+        _BACKTEST_LOG.clear()
+    return {"ok": True, "cleared": count}
 
 
 @app.post("/api/odds/check-quota")

@@ -4,37 +4,8 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --timeout-keep-alive 75
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.11
-      # ── Startup warm-cache tuning ──────────────────────────────────────────
-      # Skip preloading all 30 team rosters on cold start (biggest bottleneck).
-      # Rosters are still fetched & cached on first real request.
-      - key: NBA_WARM_CACHE_PRELOAD_TEAM_ROSTERS
-        value: "0"
-      # Free tier has 1 shared CPU – reduce parallel threads to avoid thrashing
-      - key: NBA_WARM_CACHE_STARTUP_MAX_WORKERS
-        value: "2"
-      - key: NBA_WARM_CACHE_TEAM_ROSTERS_MAX_WORKERS
-        value: "1"
-      - key: NBA_HYBRID_REFRESH_WORKERS
-        value: "1"
-      - key: NBA_ANALYSIS_PARALLEL_MAX_WORKERS
-        value: "2"
-
-  # ── Keep-alive cron (prevents Render free tier spin-down) ─────────────────
-  # Pings /health every 14 minutes so the web service never goes to sleep.
-  # Uses ~3 000 cron-seconds/month — well within the shared 750-hour budget.
-  - type: cron
-    name: nba-props-keepalive
-    runtime: python
-    plan: free
-    schedule: "*/14 * * * *"
-    buildCommand: pip install requests
-    startCommand: python -c "import requests, os, sys; r = requests.get(os.environ['TARGET_URL'], timeout=15); print('ping', r.status_code); sys.exit(0 if r.ok else 1)"
-    envVars:
-      - key: TARGET_URL
-        # ⚠️  Replace this with your actual Render web service URL
-        value: https://nba-props-app.onrender.com/health
