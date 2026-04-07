@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import logging
 import math
 import os
@@ -11,20 +10,13 @@ import re
 import datetime as dt
 import time
 import threading
-import unicodedata
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from io import BytesIO
 from pathlib import Path
-from functools import wraps
 from threading import Lock
 from typing import Any
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from pypdf import PdfReader
-
 try:
     import pdfplumber  # type: ignore
 except Exception:
@@ -45,6 +37,23 @@ from nba_api.stats.endpoints import (
 from nba_api.stats.static import players as static_players
 from nba_api.stats.static import teams as static_teams
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from identity_utils import (
+    PlayerSearchIndex,
+    build_player_name_variants,
+    build_team_alias_lookup,
+    normalize_compact_text,
+    normalize_name,
+    normalize_report_person_name,
+)
+from injury_service import InjuryReportService
+from runtime_utils import (
+    build_timed_call,
+    call_with_retries,
+    create_retry_http_session,
+    is_transient_request_error,
+    load_persistent_caches as runtime_load_persistent_caches,
+    save_persistent_caches as runtime_save_persistent_caches,
+)
 
 LOGGER = logging.getLogger("nba_props_app")
 if not LOGGER.handlers:
@@ -57,24 +66,12 @@ NBA_TIMING_SLOW_MS = float(os.getenv("NBA_TIMING_SLOW_MS", "800"))
 ANALYSIS_PARALLEL_ENABLED = os.getenv("NBA_ANALYSIS_PARALLEL_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 ANALYSIS_PARALLEL_MAX_WORKERS = max(1, int(os.getenv("NBA_ANALYSIS_PARALLEL_MAX_WORKERS", "4")))
 
-
-def timed_call(label: str):
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            if not NBA_TIMING_ENABLED:
-                return func(*args, **kwargs)
-            started_at = time.perf_counter()
-            try:
-                return func(*args, **kwargs)
-            finally:
-                elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-                if NBA_TIMING_LOG_ALL or elapsed_ms >= NBA_TIMING_SLOW_MS:
-                    LOGGER.info("TIMING %s took %.1f ms", label, elapsed_ms)
-
-        return wrapper
-
-    return decorator
+timed_call = build_timed_call(
+    logger=LOGGER,
+    enabled=NBA_TIMING_ENABLED,
+    log_all=NBA_TIMING_LOG_ALL,
+    slow_ms=NBA_TIMING_SLOW_MS,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -113,86 +110,36 @@ def _today_scoreboard_date() -> str:
     return dt.datetime.now().strftime("%m/%d/%Y")
 
 
-def _ensure_persistent_cache_dir() -> None:
-    if not PERSISTENT_CACHE_ENABLED:
-        return
-    PERSISTENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _cache_key_to_jsonable(key: Any) -> Any:
-    if isinstance(key, tuple):
-        return [ _cache_key_to_jsonable(part) for part in key ]
-    return key
-
-
-def _cache_key_from_jsonable(value: Any) -> Any:
-    if isinstance(value, list):
-        return tuple(_cache_key_from_jsonable(part) for part in value)
-    return value
-
-
-def _trim_cache_dict(cache: dict[Any, dict[str, Any]], max_items: int) -> dict[Any, dict[str, Any]]:
-    if len(cache) <= max_items:
-        return dict(cache)
-    items = sorted(cache.items(), key=lambda item: float((item[1] or {}).get("timestamp") or 0.0), reverse=True)[:max_items]
-    return dict(items)
-
-
 def save_persistent_caches() -> None:
-    if not PERSISTENT_CACHE_ENABLED:
-        return
-    try:
-        _ensure_persistent_cache_dir()
-        with PERSISTENT_CACHE_LOCK:
-            payload = {
-                "version": 1,
-                "saved_at": time.time(),
-                "roster_cache": [
-                    {"key": _cache_key_to_jsonable(key), "value": value}
-                    for key, value in _trim_cache_dict(ROSTER_CACHE, PERSISTENT_CACHE_MAX_ROSTERS).items()
-                ],
-                "player_info_cache": [
-                    {"key": _cache_key_to_jsonable(key), "value": value}
-                    for key, value in _trim_cache_dict(PLAYER_INFO_CACHE, PERSISTENT_CACHE_MAX_PLAYER_INFO).items()
-                ],
-                "next_game_cache": [
-                    {"key": _cache_key_to_jsonable(key), "value": value}
-                    for key, value in _trim_cache_dict(NEXT_GAME_CACHE, PERSISTENT_CACHE_MAX_NEXT_GAMES).items()
-                ],
-                "team_next_game_cache": [
-                    {"key": _cache_key_to_jsonable(key), "value": value}
-                    for key, value in _trim_cache_dict(TEAM_NEXT_GAME_CACHE, PERSISTENT_CACHE_MAX_NEXT_GAMES).items()
-                ],
-            }
-            temp_path = PERSISTENT_CACHE_PATH.with_suffix(".tmp")
-            temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            temp_path.replace(PERSISTENT_CACHE_PATH)
-    except Exception as exc:
-        LOGGER.warning("Persistent cache save failed: %s", exc)
-
-
-def _load_named_persistent_cache(entries: list[dict[str, Any]] | None, target: dict[Any, dict[str, Any]]) -> None:
-    for entry in entries or []:
-        try:
-            key = _cache_key_from_jsonable(entry.get("key"))
-            value = entry.get("value")
-            if key is None or not isinstance(value, dict):
-                continue
-            target[key] = value
-        except Exception:
-            continue
+    runtime_save_persistent_caches(
+        enabled=PERSISTENT_CACHE_ENABLED,
+        cache_dir=PERSISTENT_CACHE_DIR,
+        cache_path=PERSISTENT_CACHE_PATH,
+        cache_lock=PERSISTENT_CACHE_LOCK,
+        named_caches={
+            "roster_cache": (ROSTER_CACHE, PERSISTENT_CACHE_MAX_ROSTERS),
+            "player_info_cache": (PLAYER_INFO_CACHE, PERSISTENT_CACHE_MAX_PLAYER_INFO),
+            "next_game_cache": (NEXT_GAME_CACHE, PERSISTENT_CACHE_MAX_NEXT_GAMES),
+            "team_next_game_cache": (TEAM_NEXT_GAME_CACHE, PERSISTENT_CACHE_MAX_NEXT_GAMES),
+        },
+        logger=LOGGER,
+    )
 
 
 def load_persistent_caches() -> None:
-    if not PERSISTENT_CACHE_ENABLED or not PERSISTENT_CACHE_PATH.exists():
-        return
-    try:
-        with PERSISTENT_CACHE_LOCK:
-            payload = json.loads(PERSISTENT_CACHE_PATH.read_text(encoding="utf-8"))
-        _load_named_persistent_cache(payload.get("roster_cache"), ROSTER_CACHE)
-        _load_named_persistent_cache(payload.get("player_info_cache"), PLAYER_INFO_CACHE)
-        _load_named_persistent_cache(payload.get("next_game_cache"), NEXT_GAME_CACHE)
-        _load_named_persistent_cache(payload.get("team_next_game_cache"), TEAM_NEXT_GAME_CACHE)
+    runtime_load_persistent_caches(
+        enabled=PERSISTENT_CACHE_ENABLED,
+        cache_path=PERSISTENT_CACHE_PATH,
+        cache_lock=PERSISTENT_CACHE_LOCK,
+        named_targets={
+            "roster_cache": ROSTER_CACHE,
+            "player_info_cache": PLAYER_INFO_CACHE,
+            "next_game_cache": NEXT_GAME_CACHE,
+            "team_next_game_cache": TEAM_NEXT_GAME_CACHE,
+        },
+        logger=LOGGER,
+    )
+    if PERSISTENT_CACHE_ENABLED and PERSISTENT_CACHE_PATH.exists():
         LOGGER.info(
             "Loaded persistent cache snapshot: %s rosters, %s player info, %s next games, %s team next games",
             len(ROSTER_CACHE),
@@ -200,8 +147,6 @@ def load_persistent_caches() -> None:
             len(NEXT_GAME_CACHE),
             len(TEAM_NEXT_GAME_CACHE),
         )
-    except Exception as exc:
-        LOGGER.warning("Persistent cache load failed: %s", exc)
 
 
 def preload_team_rosters_for_current_season() -> None:
@@ -309,24 +254,8 @@ PLAYER_POOL = static_players.get_players()
 TEAM_POOL = sorted(static_teams.get_teams(), key=lambda team: team["full_name"])
 TEAM_LOOKUP = {team["id"]: team for team in TEAM_POOL}
 PLAYER_LOOKUP = {int(player["id"]): player for player in PLAYER_POOL}
-
-
-def build_team_alias_lookup() -> dict[str, dict[str, Any]]:
-    lookup: dict[str, dict[str, Any]] = {}
-    for team in TEAM_POOL:
-        keys = {
-            str(team.get("abbreviation") or "").strip().lower(),
-            str(team.get("nickname") or "").strip().lower(),
-            str(team.get("city") or "").strip().lower(),
-            str(team.get("full_name") or "").strip().lower(),
-        }
-        for key in keys:
-            if key:
-                lookup[key] = team
-    return lookup
-
-
-TEAM_ALIAS_LOOKUP = build_team_alias_lookup()
+TEAM_ALIAS_LOOKUP = build_team_alias_lookup(TEAM_POOL)
+PLAYER_SEARCH_INDEX = PlayerSearchIndex.build(PLAYER_POOL)
 CACHE_TTL_SECONDS = 21600
 PROFILE_TTL_SECONDS = 86400
 POSITION_TTL_SECONDS = 43200
@@ -357,21 +286,8 @@ SCOREBOARD_CACHE: dict[str, dict[str, Any]] = {}
 ENRICHED_LOG_CACHE: dict[tuple[int, str, str, int | None], dict[str, Any]] = {}
 ANALYSIS_CACHE_TTL_SECONDS = 7200
 ANALYSIS_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
-AVAILABILITY_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
 TEAM_OPPORTUNITY_CACHE: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-INJURY_REPORT_PAGE_URL = "https://official.nba.com/nba-injury-report-2025-26-season/"
 INJURY_REPORT_TTL_SECONDS = 600
-INJURY_REPORT_CACHE: dict[str, Any] = {"timestamp": 0.0, "payload": None}
-INJURY_REPORT_LINKS_CACHE: dict[str, Any] = {"timestamp": 0.0, "links": []}
-INJURY_REPORT_URL_CACHE: dict[str, dict[str, Any]] = {}
-INJURY_REPORT_META: dict[str, float] = {"last_attempt": 0.0, "last_failure": 0.0}
-INJURY_MATCH_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
-INJURY_STATUS_ORDER = {"Out": 0, "Ineligible": 0, "Suspended": 0, "Doubtful": 1, "Questionable": 2, "Pending report": 2, "Not listed": 3, "Available": 4, "Probable": 4}
-UNAVAILABLE_STATUSES = {"Out", "Ineligible", "Suspended"}
-RISKY_STATUSES = {"Doubtful", "Questionable", "Pending report"}
-GOOD_STATUSES = {"Available", "Probable"}
-REPORT_STATUSES = ["Questionable", "Ineligible", "Suspended", "Doubtful", "Probable", "Available", "Out"]
-STATUS_PATTERN = "|".join(re.escape(status) for status in sorted(REPORT_STATUSES, key=len, reverse=True))
 REQUEST_LOCK = Lock()
 LAST_REQUEST_TIME = 0.0
 
@@ -668,65 +584,16 @@ def overlay_sensitive_analysis_sections(payload: dict[str, Any], player_name: st
     return refreshed, freshness_overlay
 
 
-def create_nba_http_session() -> requests.Session:
-    session = requests.Session()
-    retry = Retry(
-        total=NBA_RETRY_TOTAL,
-        connect=NBA_RETRY_TOTAL,
-        read=NBA_RETRY_TOTAL,
-        status=NBA_RETRY_TOTAL,
-        backoff_factor=NBA_BACKOFF_FACTOR,
-        status_forcelist=NBA_RETRY_STATUS_CODES,
-        allowed_methods=frozenset(["GET", "HEAD", "OPTIONS"]),
-        raise_on_status=False,
-        respect_retry_after_header=True,
-    )
-    adapter = HTTPAdapter(
-        max_retries=retry,
-        pool_connections=20,
-        pool_maxsize=20,
-    )
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    session.headers.update(
-        {
-            "User-Agent": NBA_USER_AGENT,
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.nba.com/",
-            "Origin": "https://www.nba.com",
-            "Connection": "keep-alive",
-        }
-    )
-    return session
-
-
-NBA_HTTP = create_nba_http_session()
+NBA_HTTP = create_retry_http_session(
+    user_agent=NBA_USER_AGENT,
+    retry_total=NBA_RETRY_TOTAL,
+    backoff_factor=NBA_BACKOFF_FACTOR,
+    retry_status_codes=NBA_RETRY_STATUS_CODES,
+)
 
 
 def is_transient_nba_error(exc: Exception) -> bool:
-    if isinstance(exc, (
-        requests.exceptions.Timeout,
-        requests.exceptions.ConnectionError,
-        requests.exceptions.ChunkedEncodingError,
-    )):
-        return True
-
-    text = str(exc).lower()
-    transient_tokens = (
-        "remote end closed connection without response",
-        "connection aborted",
-        "max retries exceeded",
-        "temporarily unavailable",
-        "read timed out",
-        "connect timeout",
-        "too many requests",
-        "429",
-        "502",
-        "503",
-        "504",
-    )
-    return any(token in text for token in transient_tokens)
+    return is_transient_request_error(exc)
 
 
 def nba_http_get(url: str, *, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None, timeout: tuple[int, int] | int | None = None) -> requests.Response:
@@ -735,20 +602,35 @@ def nba_http_get(url: str, *, params: dict[str, Any] | None = None, headers: dic
     return response
 
 
+INJURY_SERVICE = InjuryReportService(
+    team_pool=TEAM_POOL,
+    http_get=nba_http_get,
+    timed_call=timed_call,
+    pdfplumber_module=pdfplumber,
+    page_timeout=INJURY_REPORT_PAGE_TIMEOUT,
+    pdf_timeout=INJURY_REPORT_PDF_TIMEOUT,
+    report_ttl_seconds=INJURY_REPORT_TTL_SECONDS if 'INJURY_REPORT_TTL_SECONDS' in globals() else 600,
+    links_ttl_seconds=INJURY_REPORT_LINKS_TTL_SECONDS,
+    failure_cooldown_seconds=INJURY_REPORT_FAILURE_COOLDOWN_SECONDS,
+    max_stale_seconds=INJURY_REPORT_MAX_STALE_SECONDS,
+)
+INJURY_STATUS_ORDER = INJURY_SERVICE.status_order
+UNAVAILABLE_STATUSES = INJURY_SERVICE.unavailable_statuses
+RISKY_STATUSES = INJURY_SERVICE.risky_statuses
+GOOD_STATUSES = INJURY_SERVICE.good_statuses
+REPORT_STATUSES = INJURY_SERVICE.report_statuses
+STATUS_PATTERN = INJURY_SERVICE.status_pattern
+
+
 def call_nba_with_retries(factory, *, label: str, attempts: int = NBA_RETRY_TOTAL, base_delay: float = NBA_BACKOFF_FACTOR):
-    last_exc: Exception | None = None
-    for attempt in range(attempts):
-        throttle_request()
-        try:
-            return factory()
-        except Exception as exc:
-            last_exc = exc
-            if attempt >= attempts - 1 or not is_transient_nba_error(exc):
-                raise
-            time.sleep(base_delay * (2 ** attempt))
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError(f"{label} failed without a captured exception.")
+    return call_with_retries(
+        factory,
+        label=label,
+        attempts=attempts,
+        base_delay=base_delay,
+        retry_predicate=is_transient_nba_error,
+        before_attempt=throttle_request,
+    )
 
 
 def current_nba_season() -> str:
@@ -761,79 +643,6 @@ def current_nba_season() -> str:
     end_year_short = str(start_year + 1)[-2:]
     return f"{start_year}-{end_year_short}"
 
-
-def normalize_name(name: str) -> str:
-    return " ".join(name.lower().strip().split())
-
-
-def normalize_compact_text(value: str) -> str:
-    raw = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
-    raw = re.sub(r"[^A-Za-z0-9]", "", raw)
-    return raw.lower()
-
-
-def normalize_report_person_name(name: str) -> str:
-    raw = unicodedata.normalize("NFKD", str(name or "")).encode("ascii", "ignore").decode("ascii")
-    raw = raw.replace("-", " ")
-    raw = raw.replace("'", "")
-    raw = raw.replace(".", " ")
-    raw = raw.strip()
-
-    if "," in raw:
-        last, first = [part.strip() for part in raw.split(",", 1)]
-        # Handle CamelCase fused last names from PDF text extraction
-        # e.g. "JonesGarcia" -> "Jones Garcia", "MooreJr" -> "Moore Jr"
-        last = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", last)
-        raw = f"{first} {last}".strip()
-    else:
-        # Handle CamelCase in names without comma (rare but defensive)
-        raw = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", raw)
-
-    raw = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", " ", raw, flags=re.IGNORECASE)
-    raw = re.sub(r"[^A-Za-z\s]", " ", raw)
-    return " ".join(raw.lower().split())
-
-
-def build_player_name_variants(name: str) -> set[str]:
-    variants: set[str] = set()
-    raw = str(name or "").strip()
-    if not raw:
-        return variants
-
-    canonical = normalize_report_person_name(raw)
-    if canonical:
-        variants.add(canonical)
-
-    ascii_raw = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
-    cleaned = re.sub(r"[^A-Za-z,\s'-]", " ", ascii_raw)
-    cleaned = " ".join(cleaned.split())
-    if cleaned:
-        variants.add(normalize_report_person_name(cleaned))
-
-    if "," in ascii_raw:
-        parts = [part.strip() for part in ascii_raw.split(",", 1)]
-        if len(parts) == 2:
-            reversed_name = f"{parts[1]} {parts[0]}".strip()
-            if reversed_name:
-                variants.add(normalize_report_person_name(reversed_name))
-    else:
-        pieces = [piece for piece in re.split(r"\s+", ascii_raw.strip()) if piece]
-        if len(pieces) >= 2:
-            reversed_name = f"{pieces[-1]}, {' '.join(pieces[:-1])}".strip()
-            variants.add(normalize_report_person_name(reversed_name))
-
-    return {variant for variant in variants if variant}
-
-
-def build_player_variant_lookup() -> dict[int, set[str]]:
-    lookup: dict[int, set[str]] = {}
-    for player in PLAYER_POOL:
-        player_id = int(player["id"])
-        lookup[player_id] = build_player_name_variants(str(player.get("full_name", "")))
-    return lookup
-
-
-PLAYER_VARIANTS_LOOKUP = build_player_variant_lookup()
 
 ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4"
 ODDS_DEFAULT_MARKETS = [
@@ -861,6 +670,76 @@ ODDS_MARKET_TO_STAT = {
     "player_points_assists": "PA",
     "player_rebounds_assists": "RA",
 }
+ODDS_DEFAULT_BOOKMAKERS = ["draftkings", "fanduel", "betmgm"]
+
+
+def parse_requested_bookmakers(value: Any) -> list[str]:
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = str(value or "").split(",")
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in raw_items:
+        book = str(item or "").strip().lower()
+        if not book or book in seen:
+            continue
+        seen.add(book)
+        result.append(book)
+    return result
+
+
+def normalize_line_key(line_value: Any) -> str:
+    try:
+        numeric = float(line_value)
+    except (TypeError, ValueError):
+        return str(line_value)
+    if abs(numeric - round(numeric)) < 1e-9:
+        return str(int(round(numeric)))
+    return f"{numeric:.3f}".rstrip("0").rstrip(".")
+
+
+def safe_mean(values: list[float]) -> float | None:
+    cleaned = [float(v) for v in values if v is not None]
+    if not cleaned:
+        return None
+    return sum(cleaned) / len(cleaned)
+
+
+def devig_two_way_market(over_odds: float | None, under_odds: float | None) -> dict[str, float] | None:
+    if over_odds is None or under_odds is None:
+        return None
+    if over_odds <= 1.0 or under_odds <= 1.0:
+        return None
+    over_raw = 1.0 / float(over_odds)
+    under_raw = 1.0 / float(under_odds)
+    total = over_raw + under_raw
+    if total <= 0.0:
+        return None
+    return {
+        "over_raw_prob": over_raw,
+        "under_raw_prob": under_raw,
+        "over_fair_prob": over_raw / total,
+        "under_fair_prob": under_raw / total,
+        "hold": max(0.0, total - 1.0),
+    }
+
+
+def approximate_odds_api_region_equivalent(bookmakers: list[str]) -> int:
+    count = max(1, len(bookmakers or []))
+    return max(1, math.ceil(count / 10.0))
+
+
+def build_odds_api_cost_hint(markets: str, bookmakers: list[str]) -> dict[str, Any]:
+    market_count = len([item for item in str(markets or "").split(",") if str(item).strip()]) or 1
+    region_equivalent = approximate_odds_api_region_equivalent(bookmakers)
+    return {
+        "bookmakers_count": len(bookmakers),
+        "region_equivalent": region_equivalent,
+        "market_count": market_count,
+        "estimated_request_cost": market_count * region_equivalent,
+        "note": "Approximation based on The Odds API pricing model for markets x region-equivalent; up to 10 explicitly requested bookmakers is typically 1 region-equivalent.",
+    }
 
 def report_name_variants(name: str) -> set[str]:
     """Backward-compatible alias for player name variant generation."""
@@ -868,827 +747,63 @@ def report_name_variants(name: str) -> set[str]:
 
 
 def parse_injury_report_timestamp(url: str) -> datetime:
-    match = re.search(r"Injury-Report_(\d{4}-\d{2}-\d{2})_(\d{2})_(\d{2})(AM|PM)\.pdf", url)
-    if not match:
-        return datetime.min
-    date_part, hour, minute, meridiem = match.groups()
-    return datetime.strptime(f"{date_part} {hour}:{minute}{meridiem}", "%Y-%m-%d %I:%M%p")
+    return INJURY_SERVICE.parse_report_timestamp(url)
 
 
 def format_injury_report_timestamp(report_dt: datetime | None) -> str:
-    if not report_dt or report_dt == datetime.min:
-        return ""
-    return report_dt.strftime("%b %d, %Y %I:%M %p ET")
+    return INJURY_SERVICE.format_report_timestamp(report_dt)
 
 
 def extract_team_prefix(text_line: str) -> tuple[str | None, str]:
-    compact_line = normalize_compact_text(text_line)
-    for team in sorted(TEAM_POOL, key=lambda item: len(item["full_name"]), reverse=True):
-        team_name = str(team["full_name"])
-        if text_line.startswith(team_name):
-            return team_name, text_line[len(team_name):].strip()
-
-        compact_team = normalize_compact_text(team_name)
-        if compact_line.startswith(compact_team):
-            consumed = len(compact_team)
-            remainder_start = 0
-            alnum_seen = 0
-            for idx, ch in enumerate(text_line):
-                if ch.isalnum():
-                    alnum_seen += 1
-                if alnum_seen >= consumed:
-                    remainder_start = idx + 1
-                    break
-            return team_name, text_line[remainder_start:].strip()
-
-    return None, text_line
+    return INJURY_SERVICE.extract_team_prefix(text_line)
 
 
 def parse_injury_report_rows(report_text: str) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = []
-    pending_teams: set[str] = set()
-    current_team: str | None = None
-    last_row: dict[str, Any] | None = None
-    for raw_line in report_text.splitlines():
-        line = " ".join(str(raw_line or "").split())
-        if not line:
-            continue
-        compact_line = normalize_compact_text(line)
-        if line.startswith("Injury Report:") or line.startswith("Page ") or compact_line.startswith("page") or re.match(r"^page\d+of\d+$", compact_line):
-            continue
-        if line.startswith("Game Date ") or line.startswith("Current Status") or compact_line.startswith("gamedate") or compact_line.startswith("gamedategametimematchup"):
-            continue
-
-        full_row_match = re.match(r"^\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}\s*\(ET\)\s+[A-Z]{2,4}@[A-Z]{2,4}\s+(.*)$", line)
-        if full_row_match:
-            line = full_row_match.group(1).strip()
-        else:
-            # Strip "HH:MM(ET) AAA@BBB " prefix (time + matchup, no date)
-            time_matchup = re.match(r"^\d{2}:\d{2}\s*\(ET\)\s+[A-Z]{2,4}@[A-Z]{2,4}\s+(.*)$", line)
-            if time_matchup:
-                line = time_matchup.group(1).strip()
-            else:
-                # Strip bare "AAA@BBB " matchup prefix (no date, no time)
-                bare_matchup = re.match(r"^[A-Z]{2,4}@[A-Z]{2,4}\s+(.*)$", line)
-                if bare_matchup:
-                    line = bare_matchup.group(1).strip()
-
-        team_name, remainder = extract_team_prefix(line)
-        if team_name:
-            current_team = team_name
-        else:
-            remainder = line
-
-        if remainder == "NOT YET SUBMITTED":
-            if current_team:
-                pending_teams.add(current_team)
-            last_row = None
-            continue
-
-        row_match = re.match(
-            rf"^(?P<player>.+?)\s+(?P<status>{STATUS_PATTERN})\b(?:\s+(?P<reason>.*))?$",
-            remainder,
-        )
-        if row_match and current_team:
-            player_display = row_match.group("player").strip()
-            # Normalise display name: PDF text-extract can fuse "Last,First" with no space.
-            # Insert space after comma if missing so keys and display are consistent.
-            player_display = re.sub(r",(?!\s)", ", ", player_display)
-            status = row_match.group("status").strip()
-            reason = (row_match.group("reason") or "").strip()
-            row_payload = {
-                "team_name": current_team,
-                "player_display": player_display,
-                "player_key": normalize_report_person_name(player_display),
-                "status": status,
-                "reason": reason,
-            }
-            rows.append(row_payload)
-            last_row = row_payload
-            continue
-
-        if last_row and not extract_team_prefix(line)[0] and not re.match(r"^\d{2}/\d{2}/\d{4}", line):
-            continuation = line.strip()
-            if continuation and not continuation.startswith("Game Date"):
-                last_row["reason"] = f"{last_row.get('reason', '').strip()} {continuation}".strip()
-
-    return {"rows": rows, "pending_teams": sorted(pending_teams)}
+    return INJURY_SERVICE.parse_report_rows(report_text)
 
 
 def extract_injury_report_rows_from_table(pdf_bytes: bytes) -> list[dict[str, Any]] | None:
-    """Use pdfplumber's table extractor to read the NBA injury report PDF as a
-    structured table, giving us exact (team, player, status, reason) columns
-    without the column-interleaving bugs that plague free-text extraction."""
-    if pdfplumber is None:
-        return None
-    try:
-        rows: list[dict[str, Any]] = []
-        # Track the last valid team across rows — the PDF only names the team on
-        # the first row for that team; subsequent rows leave the team cell blank.
-        last_team_name: str | None = None
-        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:  # type: ignore[arg-type]
-            for page in pdf.pages:
-                tables = page.extract_tables() or []
-                for table in tables:
-                    for row in table:
-                        if not row:
-                            continue
-                        # NBA injury report table columns (0-indexed):
-                        # 0: Game Date  1: Game Time  2: Matchup  3: Team
-                        # 4: Player     5: Current Status  6: Reason
-                        cells = [str(c or "").strip() for c in row]
-                        if len(cells) < 5:
-                            continue
-                        # Skip header rows
-                        if cells[0].lower() in ("game date", "date") or cells[3].lower() in ("team",):
-                            continue
-                        # Skip totally empty rows
-                        if not any(cells):
-                            continue
-
-                        # Search for a team name in columns 2-5
-                        team_col_idx = None
-                        for ci in range(2, min(6, len(cells))):
-                            cell_compact = normalize_compact_text(cells[ci])
-                            for team in TEAM_POOL:
-                                if normalize_compact_text(team["full_name"]) == cell_compact:
-                                    team_col_idx = ci
-                                    break
-                            if team_col_idx is not None:
-                                break
-
-                        if team_col_idx is not None:
-                            # New team found in this row — resolve and carry forward
-                            tc = normalize_compact_text(cells[team_col_idx])
-                            for team in TEAM_POOL:
-                                if normalize_compact_text(team["full_name"]) == tc:
-                                    last_team_name = str(team["full_name"])
-                                    break
-                            player_col_idx = team_col_idx + 1
-                            status_col_idx = team_col_idx + 2
-                            reason_col_idx = team_col_idx + 3
-                        else:
-                            # No team cell — use carry-forward team (same team, next player)
-                            if not last_team_name:
-                                continue
-                            # Canonical column layout: col 4=player, 5=status, 6=reason
-                            player_col_idx = 4
-                            status_col_idx = 5
-                            reason_col_idx = 6
-
-                        team_full_name = last_team_name
-                        if not team_full_name:
-                            continue
-
-                        player_cell = cells[player_col_idx] if player_col_idx < len(cells) else ""
-                        status_cell = cells[status_col_idx] if status_col_idx < len(cells) else ""
-                        reason_cell = cells[reason_col_idx] if reason_col_idx < len(cells) else ""
-
-                        # Validate status
-                        status_cell = status_cell.strip()
-                        if status_cell not in REPORT_STATUSES:
-                            found = None
-                            for s in sorted(REPORT_STATUSES, key=len, reverse=True):
-                                if s.lower() in status_cell.lower():
-                                    found = s
-                                    break
-                            if not found:
-                                continue
-                            status_cell = found
-
-                        player_display = player_cell.strip()
-                        # Normalise: PDF text-extract can produce "Last,First" with no space.
-                        player_display = re.sub(r",(?!\s)", ", ", player_display)
-                        if not player_display:
-                            continue
-
-                        rows.append({
-                            "team_name": team_full_name,
-                            "player_display": player_display,
-                            "player_key": normalize_report_person_name(player_display),
-                            "status": status_cell,
-                            "reason": reason_cell.strip(),
-                        })
-        return rows if rows else None
-    except Exception:
-        return None
+    return INJURY_SERVICE.extract_report_rows_from_table(pdf_bytes)
 
 
 def extract_injury_report_text_candidates(pdf_bytes: bytes) -> list[dict[str, str]]:
-    candidates: list[dict[str, str]] = []
-
-    if pdfplumber is not None:
-        try:
-            plumber_pages: list[str] = []
-            with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:  # type: ignore[arg-type]
-                for page in pdf.pages:
-                    page_text = page.extract_text() or ""
-                    plumber_pages.append(page_text)
-            plumber_text = "\n".join(plumber_pages).strip()
-            if plumber_text:
-                candidates.append({"method": "pdfplumber", "text": plumber_text})
-        except Exception:
-            pass
-
-    try:
-        reader = PdfReader(BytesIO(pdf_bytes))
-        pypdf_text = "\n".join((page.extract_text() or "") for page in reader.pages).strip()
-        if pypdf_text:
-            candidates.append({"method": "pypdf", "text": pypdf_text})
-    except Exception:
-        pass
-
-    unique: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        text_value = candidate["text"]
-        if text_value not in seen:
-            seen.add(text_value)
-            unique.append(candidate)
-    return unique
+    return INJURY_SERVICE.extract_report_text_candidates(pdf_bytes)
 
 
 def choose_best_injury_report_parse(pdf_bytes: bytes) -> dict[str, Any]:
-    # Text-only parsing path. Table extraction is intentionally skipped because
-    # the official injury report PDFs have been unreliable for structured table
-    # extraction in this app and only add noisy warnings to the logs.
-    candidates = extract_injury_report_text_candidates(pdf_bytes)
-    best_payload: dict[str, Any] = {"rows": [], "pending_teams": [], "raw_text": "", "method": "none"}
-
-    for candidate in candidates:
-        parsed = parse_injury_report_rows(candidate["text"])
-        score = len(parsed.get("rows") or [])
-        best_score = len(best_payload.get("rows") or [])
-        if score > best_score:
-            best_payload = {
-                "rows": parsed.get("rows") or [],
-                "pending_teams": parsed.get("pending_teams") or [],
-                "raw_text": candidate["text"],
-                "method": candidate["method"],
-            }
-
-    if not best_payload["rows"] and candidates:
-        fallback = candidates[0]
-        parsed = parse_injury_report_rows(fallback["text"])
-        best_payload = {
-            "rows": parsed.get("rows") or [],
-            "pending_teams": parsed.get("pending_teams") or [],
-            "raw_text": fallback["text"],
-            "method": fallback["method"],
-        }
-
-    return best_payload
+    return INJURY_SERVICE.choose_best_report_parse(pdf_bytes)
 
 
 def list_recent_injury_report_links(limit: int = 12) -> list[str]:
-    now_ts = time.time()
-    cached_links = INJURY_REPORT_LINKS_CACHE.get("links") or []
-    cached_ts = float(INJURY_REPORT_LINKS_CACHE.get("timestamp") or 0.0)
-    if cached_links and now_ts - cached_ts < INJURY_REPORT_TTL_SECONDS:
-        return list(cached_links)[:limit]
-
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; NBAPropsTracker/1.0)"}
-    page_response = nba_http_get(INJURY_REPORT_PAGE_URL, headers=headers, timeout=INJURY_REPORT_PAGE_TIMEOUT)
-    page_response.raise_for_status()
-    html = page_response.text
-    links = set(re.findall(r"https://ak-static\.cms\.nba\.com/referee/injury/Injury-Report_\d{4}-\d{2}-\d{2}_\d{2}_\d{2}(?:AM|PM)\.pdf", html))
-    if not links:
-        relative_links = re.findall(r"/wp-content/uploads/.+?Injury-Report_\d{4}-\d{2}-\d{2}_\d{2}_\d{2}(?:AM|PM)\.pdf", html)
-        links = {f"https://official.nba.com{match}" for match in relative_links}
-    if not links:
-        raise RuntimeError("No injury report PDF links found on the official page.")
-
-    sorted_links = sorted(links, key=parse_injury_report_timestamp, reverse=True)
-    INJURY_REPORT_LINKS_CACHE["timestamp"] = now_ts
-    INJURY_REPORT_LINKS_CACHE["links"] = sorted_links
-    return sorted_links[:limit]
+    return INJURY_SERVICE.list_recent_report_links(limit=limit)
 
 
 def fetch_injury_report_payload_for_url(report_url: str) -> dict[str, Any]:
-    cached = INJURY_REPORT_URL_CACHE.get(report_url)
-    now_ts = time.time()
-    if cached and now_ts - float(cached.get("timestamp") or 0.0) < INJURY_REPORT_TTL_SECONDS:
-        return dict(cached.get("payload") or {})
-
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; NBAPropsTracker/1.0)"}
-    latest_dt = parse_injury_report_timestamp(report_url)
-    pdf_response = nba_http_get(report_url, headers=headers, timeout=(5, 30))
-    pdf_response.raise_for_status()
-    parsed_choice = choose_best_injury_report_parse(pdf_response.content)
-    payload = {
-        "ok": True,
-        "report_url": report_url,
-        "report_timestamp": latest_dt.isoformat() if latest_dt != datetime.min else "",
-        "report_label": format_injury_report_timestamp(latest_dt),
-        "rows": parsed_choice.get("rows") or [],
-        "pending_teams": parsed_choice.get("pending_teams") or [],
-        "raw_text": parsed_choice.get("raw_text") or "",
-        "parse_method": parsed_choice.get("method") or "unknown",
-        "error": None,
-    }
-    INJURY_REPORT_URL_CACHE[report_url] = {"timestamp": now_ts, "payload": payload}
-    return payload
+    return INJURY_SERVICE.fetch_report_payload_for_url(report_url)
 
 
 def search_report_payload_for_player(report_payload: dict[str, Any], player_name: str, team_name: str | None = None) -> dict[str, Any] | None:
-    player_key = normalize_report_person_name(player_name)
-    wanted_team = str(team_name or "").strip()
-    rows = report_payload.get("rows") or []
-    candidates = [row for row in rows if row.get("player_key") == player_key]
-
-    if wanted_team:
-        team_filtered = [row for row in candidates if row.get("team_name") == wanted_team]
-        if team_filtered:
-            candidates = team_filtered
-
-    if not candidates:
-        token_set = set(player_key.split())
-        fuzzy_matches = []
-        for row in rows:
-            row_tokens = set(str(row.get("player_key") or "").split())
-            if token_set and token_set.issubset(row_tokens):
-                fuzzy_matches.append(row)
-        if wanted_team:
-            team_fuzzy = [row for row in fuzzy_matches if row.get("team_name") == wanted_team]
-            if team_fuzzy:
-                fuzzy_matches = team_fuzzy
-        if fuzzy_matches:
-            candidates = fuzzy_matches
-
-    if not candidates:
-        direct_row = try_direct_report_match(
-            report_text=str(report_payload.get("raw_text") or ""),
-            player_name=player_name,
-            team_name=team_name or None,
-        )
-        if direct_row:
-            candidates = [direct_row]
-
-    if not candidates:
-        raw_text = str(report_payload.get("raw_text") or "")
-        name_variants = [
-            player_name.strip(),
-            " ".join(reversed(player_name.strip().split(" ", 1))) if " " in player_name.strip() else player_name.strip(),
-        ]
-        last_first = ""
-        parts = [part for part in player_name.strip().split() if part]
-        if len(parts) >= 2:
-            last_first = f"{parts[-1]}, {' '.join(parts[:-1])}"
-            name_variants.append(last_first)
-        lowered_lines = [" ".join(line.split()) for line in raw_text.splitlines() if str(line or "").strip()]
-        current_team: str | None = None
-        for line in lowered_lines:
-            team_hit, remainder = extract_team_prefix(line)
-            if team_hit:
-                current_team = team_hit
-            else:
-                remainder = line
-            if wanted_team and current_team != wanted_team:
-                continue
-            for variant in name_variants:
-                if variant and variant.lower() in remainder.lower():
-                    row_match = re.match(rf"^(?P<player>.+?)\s+(?P<status>{STATUS_PATTERN})\b(?:\s+(?P<reason>.*))?$", remainder)
-                    if row_match:
-                        raw_disp = re.sub(r",(?!\s)", ", ", row_match.group("player").strip())
-                        return {
-                            "team_name": current_team or wanted_team,
-                            "player_display": raw_disp,
-                            "player_key": normalize_report_person_name(raw_disp),
-                            "status": row_match.group("status").strip(),
-                            "reason": (row_match.group("reason") or "").strip(),
-                        }
-
-    return candidates[0] if candidates else None
+    return INJURY_SERVICE.search_report_payload_for_player(report_payload, player_name=player_name, team_name=team_name)
 
 
 def find_player_in_recent_reports(player_name: str, team_name: str | None = None, max_reports: int = 8) -> dict[str, Any] | None:
-    cache_key = (normalize_report_person_name(player_name), str(team_name or "").strip())
-    cached = INJURY_MATCH_CACHE.get(cache_key)
-    now_ts = time.time()
-    if cached and now_ts - float(cached.get("timestamp") or 0.0) < INJURY_REPORT_TTL_SECONDS:
-        result = cached.get("result")
-        return dict(result) if isinstance(result, dict) else None
-
-    try:
-        links = list_recent_injury_report_links(limit=max_reports)
-    except Exception:
-        return None
-
-    for link in links:
-        try:
-            payload = fetch_injury_report_payload_for_url(link)
-        except Exception:
-            continue
-        matched_row = search_report_payload_for_player(payload, player_name=player_name, team_name=team_name)
-        if matched_row:
-            result = {
-                "row": matched_row,
-                "report_label": payload.get("report_label") or "",
-                "report_url": payload.get("report_url") or link,
-                "pending_teams": payload.get("pending_teams") or [],
-            }
-            INJURY_MATCH_CACHE[cache_key] = {"timestamp": now_ts, "result": result}
-            return result
-
-    INJURY_MATCH_CACHE[cache_key] = {"timestamp": now_ts, "result": None}
-    return None
+    return INJURY_SERVICE.find_player_in_recent_reports(player_name=player_name, team_name=team_name, max_reports=max_reports)
 
 
 def try_direct_report_match(report_text: str, player_name: str, team_name: str | None = None) -> dict[str, Any] | None:
-    if not report_text.strip():
-        return None
-
-    parsed = parse_injury_report_rows(report_text)
-    rows = parsed.get("rows") or []
-    player_key = normalize_report_person_name(player_name)
-    wanted_team = str(team_name or "").strip()
-
-    exact = [row for row in rows if row.get("player_key") == player_key]
-    if wanted_team:
-        team_exact = [row for row in exact if row.get("team_name") == wanted_team]
-        if team_exact:
-            exact = team_exact
-    if exact:
-        return exact[0]
-
-    token_set = set(player_key.split())
-    fuzzy: list[dict[str, Any]] = []
-    for row in rows:
-        row_tokens = set(str(row.get("player_key") or "").split())
-        if token_set and token_set.issubset(row_tokens):
-            fuzzy.append(row)
-    if wanted_team:
-        team_fuzzy = [row for row in fuzzy if row.get("team_name") == wanted_team]
-        if team_fuzzy:
-            fuzzy = team_fuzzy
-    if fuzzy:
-        return fuzzy[0]
-
-    return None
-
-
-@timed_call("fetch_latest_injury_report_payload")
-def _parse_iso_datetime(value: Any) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(str(value))
-    except Exception:
-        return None
-
-
-def _injury_payload_is_reliable_stale(payload: dict[str, Any] | None, cache_timestamp: float | None = None) -> bool:
-    if not payload or not payload.get("ok"):
-        return False
-
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-    report_dt = _parse_iso_datetime(payload.get("report_timestamp"))
-    if report_dt is not None:
-        try:
-            report_dt = report_dt.astimezone(ZoneInfo("America/New_York")) if report_dt.tzinfo else report_dt.replace(tzinfo=ZoneInfo("America/New_York"))
-        except Exception:
-            pass
-        if report_dt.date() != now_et.date():
-            return False
-
-    fetched_at = payload.get("fetched_at")
-    fetched_dt = _parse_iso_datetime(fetched_at)
-    age_seconds = None
-    if fetched_dt is not None:
-        age_seconds = max(0.0, (datetime.now(fetched_dt.tzinfo or ZoneInfo("America/New_York")) - fetched_dt).total_seconds())
-    elif cache_timestamp:
-        age_seconds = max(0.0, time.time() - float(cache_timestamp))
-
-    if age_seconds is None:
-        return False
-    return age_seconds <= INJURY_REPORT_MAX_STALE_SECONDS
-
-
-def _build_injury_error_payload(exc: Exception) -> dict[str, Any]:
-    return {
-        "ok": False,
-        "report_url": "",
-        "report_timestamp": "",
-        "report_label": "",
-        "rows": [],
-        "pending_teams": [],
-        "raw_text": "",
-        "parse_method": "error",
-        "error": str(exc),
-        "source": "error",
-        "fetched_at": datetime.now(ZoneInfo("America/New_York")).isoformat(),
-    }
-
-
-def _fetch_injury_report_links(headers: dict[str, str]) -> list[str]:
-    now_ts = time.time()
-    cached_links = INJURY_REPORT_LINKS_CACHE.get("links") or []
-    cached_links_ts = float(INJURY_REPORT_LINKS_CACHE.get("timestamp") or 0.0)
-    if cached_links and now_ts - cached_links_ts < INJURY_REPORT_LINKS_TTL_SECONDS:
-        return list(cached_links)
-
-    page_response = requests.get(INJURY_REPORT_PAGE_URL, headers=headers, timeout=INJURY_REPORT_PAGE_TIMEOUT)
-    page_response.raise_for_status()
-    html = page_response.text
-    links = set(re.findall(r"https://ak-static\.cms\.nba\.com/referee/injury/Injury-Report_\d{4}-\d{2}-\d{2}_\d{2}_\d{2}(?:AM|PM)\.pdf", html))
-    if not links:
-        relative_links = re.findall(r"/wp-content/uploads/.+?Injury-Report_\d{4}-\d{2}-\d{2}_\d{2}_\d{2}(?:AM|PM)\.pdf", html)
-        links = {f"https://official.nba.com{match}" for match in relative_links}
-    if not links:
-        raise RuntimeError("No injury report PDF links found on the official page.")
-
-    result = sorted(links)
-    INJURY_REPORT_LINKS_CACHE["timestamp"] = now_ts
-    INJURY_REPORT_LINKS_CACHE["links"] = result
-    return result
-
-
-def _fetch_injury_report_pdf_payload(report_url: str, report_dt: datetime, headers: dict[str, str]) -> dict[str, Any]:
-    cached_url_payload = INJURY_REPORT_URL_CACHE.get(report_url)
-    if cached_url_payload and cached_url_payload.get("payload"):
-        return copy.deepcopy(cached_url_payload["payload"])
-
-    pdf_response = requests.get(report_url, headers=headers, timeout=INJURY_REPORT_PDF_TIMEOUT)
-    pdf_response.raise_for_status()
-    parsed_choice = choose_best_injury_report_parse(pdf_response.content)
-    payload = {
-        "ok": True,
-        "report_url": report_url,
-        "report_timestamp": report_dt.isoformat() if report_dt != datetime.min else "",
-        "report_label": format_injury_report_timestamp(report_dt),
-        "rows": parsed_choice.get("rows") or [],
-        "pending_teams": parsed_choice.get("pending_teams") or [],
-        "raw_text": parsed_choice.get("raw_text") or "",
-        "parse_method": parsed_choice.get("method") or "unknown",
-        "error": None,
-        "source": "fresh",
-        "fetched_at": datetime.now(ZoneInfo("America/New_York")).isoformat(),
-    }
-    INJURY_REPORT_URL_CACHE[report_url] = {"timestamp": time.time(), "payload": copy.deepcopy(payload)}
-    return payload
+    return INJURY_SERVICE.try_direct_report_match(report_text, player_name=player_name, team_name=team_name)
 
 
 def fetch_latest_injury_report_payload() -> dict[str, Any]:
-    now_ts = time.time()
-    cached = INJURY_REPORT_CACHE.get("payload")
-    cached_ts = float(INJURY_REPORT_CACHE.get("timestamp") or 0.0)
-    if cached and now_ts - cached_ts < INJURY_REPORT_TTL_SECONDS:
-        return cached
+    return INJURY_SERVICE.fetch_latest_report_payload()
 
-    if (
-        cached
-        and _injury_payload_is_reliable_stale(cached, cached_ts)
-        and now_ts - float(INJURY_REPORT_META.get("last_failure") or 0.0) < INJURY_REPORT_FAILURE_COOLDOWN_SECONDS
-    ):
-        stale_payload = dict(cached)
-        stale_payload["source"] = stale_payload.get("source") or "stale"
-        return stale_payload
-
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; NBAPropsTracker/1.0)"}
-    INJURY_REPORT_META["last_attempt"] = now_ts
-    try:
-        links = _fetch_injury_report_links(headers)
-        latest_url = max(links, key=parse_injury_report_timestamp)
-        latest_dt = parse_injury_report_timestamp(latest_url)
-
-        if cached and cached.get("ok") and cached.get("report_url") == latest_url:
-            verified_payload = dict(cached)
-            verified_payload["source"] = "verified-cache"
-            INJURY_REPORT_CACHE["timestamp"] = now_ts
-            INJURY_REPORT_CACHE["payload"] = verified_payload
-            return verified_payload
-
-        payload = _fetch_injury_report_pdf_payload(latest_url, latest_dt, headers)
-        INJURY_REPORT_CACHE["timestamp"] = now_ts
-        INJURY_REPORT_CACHE["payload"] = payload
-        return payload
-    except Exception as exc:
-        INJURY_REPORT_META["last_failure"] = now_ts
-        if cached and _injury_payload_is_reliable_stale(cached, cached_ts):
-            stale_payload = dict(cached)
-            stale_payload["source"] = "stale-fallback"
-            stale_payload["error"] = str(exc)
-            INJURY_REPORT_CACHE["timestamp"] = now_ts
-            INJURY_REPORT_CACHE["payload"] = stale_payload
-            return stale_payload
-
-        payload = _build_injury_error_payload(exc)
-        INJURY_REPORT_CACHE["timestamp"] = now_ts
-        INJURY_REPORT_CACHE["payload"] = payload
-        return payload
 
 def build_availability_payload(player_name: str, team_name: str | None = None) -> dict[str, Any]:
-    report_payload = fetch_latest_injury_report_payload()
-    report_label = str(report_payload.get("report_label") or "")
-    team_name = str(team_name or "").strip()
-    cache_key = (normalize_report_person_name(player_name), team_name, report_label)
-    cached = AVAILABILITY_CACHE.get(cache_key)
-    if cached:
-        return dict(cached)
+    return INJURY_SERVICE.build_availability_payload(player_name, team_name=team_name)
 
-    if not report_payload.get("ok"):
-        result = {
-            "status": "Unknown",
-            "tone": "neutral",
-            "reason": "Official injury report unavailable right now.",
-            "note": "Could not fetch the latest official injury report.",
-            "source": "Official NBA injury report",
-            "report_label": "",
-            "report_url": "",
-            "is_unavailable": False,
-            "is_risky": False,
-            "sort_rank": 3,
-        }
-        AVAILABILITY_CACHE[cache_key] = dict(result)
-        return result
-
-    player_key = normalize_report_person_name(player_name)
-    rows = report_payload.get("rows") or []
-    candidates = [row for row in rows if row.get("player_key") == player_key]
-
-    if team_name:
-        team_filtered = [row for row in candidates if row.get("team_name") == team_name]
-        if team_filtered:
-            candidates = team_filtered
-
-    if not candidates:
-        token_set = set(player_key.split())
-        fuzzy_matches = []
-        for row in rows:
-            row_tokens = set(str(row.get("player_key") or "").split())
-            if token_set and token_set.issubset(row_tokens):
-                fuzzy_matches.append(row)
-        if team_name:
-            team_fuzzy = [row for row in fuzzy_matches if row.get("team_name") == team_name]
-            if team_fuzzy:
-                fuzzy_matches = team_fuzzy
-        if fuzzy_matches:
-            candidates = fuzzy_matches
-
-    if not candidates:
-        direct_row = try_direct_report_match(
-            report_text=str(report_payload.get("raw_text") or ""),
-            player_name=player_name,
-            team_name=team_name or None,
-        )
-        if direct_row:
-            candidates = [direct_row]
-
-    if candidates:
-        row = candidates[0]
-        status = str(row.get("status") or "Unknown").strip()
-        if status in GOOD_STATUSES:
-            tone = "good"
-        elif status in UNAVAILABLE_STATUSES:
-            tone = "bad"
-        elif status in RISKY_STATUSES:
-            tone = "warning"
-        else:
-            tone = "neutral"
-
-        reason = str(row.get("reason") or "").strip()
-        note = reason or "Official status found on the latest NBA injury report."
-        result = {
-            "status": status,
-            "tone": tone,
-            "reason": reason,
-            "note": note,
-            "source": "Official NBA injury report",
-            "report_label": report_payload.get("report_label") or "",
-            "report_url": report_payload.get("report_url") or "",
-            "is_unavailable": status in UNAVAILABLE_STATUSES,
-            "is_risky": status in RISKY_STATUSES,
-            "sort_rank": INJURY_STATUS_ORDER.get(status, 3),
-        }
-        AVAILABILITY_CACHE[cache_key] = dict(result)
-        return result
-
-    if team_name and team_name in set(report_payload.get("pending_teams") or []):
-        result = {
-            "status": "Pending report",
-            "tone": "warning",
-            "reason": "Team report not yet submitted on the latest official injury report.",
-            "note": "The team has not yet submitted its latest official report.",
-            "source": "Official NBA injury report",
-            "report_label": report_payload.get("report_label") or "",
-            "report_url": report_payload.get("report_url") or "",
-            "is_unavailable": False,
-            "is_risky": True,
-            "sort_rank": INJURY_STATUS_ORDER.get("Pending report", 2),
-        }
-        AVAILABILITY_CACHE[cache_key] = dict(result)
-        return result
-
-    recent_match = find_player_in_recent_reports(player_name=player_name, team_name=team_name or None, max_reports=12)
-    if recent_match and recent_match.get("row"):
-        row = dict(recent_match["row"])
-        status = str(row.get("status") or "Unknown").strip()
-        if status in GOOD_STATUSES:
-            tone = "good"
-        elif status in UNAVAILABLE_STATUSES:
-            tone = "bad"
-        elif status in RISKY_STATUSES:
-            tone = "warning"
-        else:
-            tone = "neutral"
-
-        reason = str(row.get("reason") or "").strip()
-        note = reason or "Official status found on a recent NBA injury report."
-        result = {
-            "status": status,
-            "tone": tone,
-            "reason": reason,
-            "note": note,
-            "source": "Official NBA injury report",
-            "report_label": recent_match.get("report_label") or report_payload.get("report_label") or "",
-            "report_url": recent_match.get("report_url") or report_payload.get("report_url") or "",
-            "is_unavailable": status in UNAVAILABLE_STATUSES,
-            "is_risky": status in RISKY_STATUSES,
-            "sort_rank": INJURY_STATUS_ORDER.get(status, 3),
-        }
-        AVAILABILITY_CACHE[cache_key] = dict(result)
-        return result
-
-    result = {
-        "status": "Not listed",
-        "tone": "good",
-        "reason": "Player is not listed on the latest official injury report.",
-        "note": "No official injury designation found on the latest report.",
-        "source": "Official NBA injury report",
-        "report_label": report_payload.get("report_label") or "",
-        "report_url": report_payload.get("report_url") or "",
-        "is_unavailable": False,
-        "is_risky": False,
-        "sort_rank": INJURY_STATUS_ORDER.get("Not listed", 3),
-    }
-    AVAILABILITY_CACHE[cache_key] = dict(result)
-    return result
 
 def build_team_availability_summary(team_name: str | None, report_payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    team_name = str(team_name or "").strip()
-    payload = report_payload or fetch_latest_injury_report_payload()
-    if not payload.get("ok"):
-        return {
-            "team_name": team_name,
-            "headline": "Report unavailable",
-            "tone": "neutral",
-            "listed_count": 0,
-            "out_count": 0,
-            "questionable_count": 0,
-            "probable_count": 0,
-            "players": [],
-        }
-
-    pending_teams = set(payload.get("pending_teams") or [])
-    if team_name and team_name in pending_teams:
-        return {
-            "team_name": team_name,
-            "headline": "Pending report",
-            "tone": "warning",
-            "listed_count": 0,
-            "out_count": 0,
-            "questionable_count": 0,
-            "probable_count": 0,
-            "players": [],
-        }
-
-    rows = [row for row in (payload.get("rows") or []) if row.get("team_name") == team_name]
-    out_count = sum(1 for row in rows if str(row.get("status") or "") in UNAVAILABLE_STATUSES)
-    questionable_count = sum(1 for row in rows if str(row.get("status") or "") in RISKY_STATUSES)
-    probable_count = sum(1 for row in rows if str(row.get("status") or "") in GOOD_STATUSES)
-
-    if out_count:
-        headline = f"{out_count} out"
-        if questionable_count:
-            headline += f" • {questionable_count} questionable"
-        tone = "bad"
-    elif questionable_count:
-        headline = f"{questionable_count} questionable"
-        tone = "warning"
-    elif rows:
-        headline = f"{len(rows)} listed"
-        tone = "neutral"
-    else:
-        headline = "Clean report"
-        tone = "good"
-
-    return {
-        "team_name": team_name,
-        "headline": headline,
-        "tone": tone,
-        "listed_count": len(rows),
-        "out_count": out_count,
-        "questionable_count": questionable_count,
-        "probable_count": probable_count,
-        "players": [
-            {
-                "name": re.sub(r",(?!\s)", ", ", str(row.get("player_display") or "").strip()),
-                "status": str(row.get("status") or "").strip(),
-            }
-            for row in rows[:4]
-        ],
-    }
-
+    return INJURY_SERVICE.build_team_availability_summary(team_name, report_payload=report_payload)
 
 def build_confidence_engine(
     *,
@@ -3175,12 +2290,8 @@ def odds_api_fetch(endpoint: str, api_key: str, params: dict[str, Any] | None = 
 
 def build_odds_import_rows(event_payload: dict[str, Any], odds_format: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    # Keyed by (market_key, player_name, line_value) — bookmaker intentionally excluded
-    # so that duplicate props from different books collapse into a single row.
-    # The first bookmaker that supplies a complete over+under pair wins.
-    pair_map: dict[tuple[str, str, str], dict[str, Any]] = {}
+    pair_map: dict[tuple[str, str, str, str], dict[str, Any]] = {}
 
-    # Capture event-level metadata for same-game parlay prevention
     event_id = str(event_payload.get("id") or "")
     home_team = str(event_payload.get("home_team") or "")
     away_team = str(event_payload.get("away_team") or "")
@@ -3188,6 +2299,7 @@ def build_odds_import_rows(event_payload: dict[str, Any], odds_format: str) -> l
 
     for bookmaker in event_payload.get("bookmakers") or []:
         bookmaker_title = str(bookmaker.get("title") or bookmaker.get("key") or "Book")
+        bookmaker_key = str(bookmaker.get("key") or bookmaker_title).strip().lower()
         for market in bookmaker.get("markets") or []:
             market_key = str(market.get("key") or "")
             stat_code = ODDS_MARKET_TO_STAT.get(market_key)
@@ -3203,9 +2315,9 @@ def build_odds_import_rows(event_payload: dict[str, Any], odds_format: str) -> l
                 decimal_odds = normalize_decimal_price(outcome.get("price"), odds_format)
                 if not player_name or line_value in (None, "") or decimal_odds is None:
                     continue
-                # Dedup key: market + player + line only (no bookmaker)
-                pair_key = (market_key, player_name, str(line_value))
+                pair_key = (bookmaker_key, market_key, player_name, normalize_line_key(line_value))
                 bucket = pair_map.setdefault(pair_key, {
+                    "bookmaker_key": bookmaker_key,
                     "bookmaker_title": bookmaker_title,
                     "market_key": market_key,
                     "player_name": player_name,
@@ -3217,25 +2329,71 @@ def build_odds_import_rows(event_payload: dict[str, Any], odds_format: str) -> l
                     "event_id": event_id,
                     "game_label": game_label,
                 })
-                # Only fill in odds that haven't been set yet (first bookmaker wins)
-                if bucket[f"{side}_odds"] is None:
-                    bucket[f"{side}_odds"] = decimal_odds
+                bucket[f"{side}_odds"] = decimal_odds
+                if market_updated and not bucket.get("market_last_update"):
+                    bucket["market_last_update"] = market_updated
 
+    grouped_rows: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for bucket in pair_map.values():
         if bucket.get("over_odds") is None or bucket.get("under_odds") is None:
             continue
+        devig = devig_two_way_market(bucket.get("over_odds"), bucket.get("under_odds"))
+        if not devig:
+            continue
+        enriched = {
+            **bucket,
+            **devig,
+        }
+        group_key = (bucket["market_key"], bucket["player_name"], normalize_line_key(bucket["line"]))
+        grouped_rows.setdefault(group_key, []).append(enriched)
+
+    for grouped in grouped_rows.values():
+        if not grouped:
+            continue
+        representative = min(
+            grouped,
+            key=lambda item: (
+                float(item.get("hold") or 999.0),
+                -(float(item.get("over_odds") or 0.0) + float(item.get("under_odds") or 0.0)),
+            ),
+        )
+        best_over = max(grouped, key=lambda item: float(item.get("over_odds") or 0.0))
+        best_under = max(grouped, key=lambda item: float(item.get("under_odds") or 0.0))
+        consensus_over_fair = safe_mean([float(item.get("over_fair_prob") or 0.0) for item in grouped])
+        consensus_under_fair = safe_mean([float(item.get("under_fair_prob") or 0.0) for item in grouped])
+        consensus_hold = safe_mean([float(item.get("hold") or 0.0) for item in grouped])
+        books_count = len(grouped)
+        market_implied_line = float(representative["line"])
+
         rows.append({
-            "player_name": bucket["player_name"],
-            "stat": bucket["stat"],
-            "line": round(float(bucket["line"]), 1),
-            "over_odds": float(bucket["over_odds"]),
-            "under_odds": float(bucket["under_odds"]),
-            "bookmaker_title": bucket["bookmaker_title"],
-            "market_key": bucket["market_key"],
-            "market_last_update": bucket["market_last_update"],
-            "event_id": bucket.get("event_id", ""),
-            "game_label": bucket.get("game_label", ""),
-            "csv_row": f"{bucket['player_name']},{bucket['stat']},{round(float(bucket['line']),1)},{float(bucket['over_odds'])},{float(bucket['under_odds'])}",
+            "player_name": representative["player_name"],
+            "stat": representative["stat"],
+            "line": round(float(representative["line"]), 1),
+            "over_odds": float(representative["over_odds"]),
+            "under_odds": float(representative["under_odds"]),
+            "bookmaker_title": representative["bookmaker_title"],
+            "bookmaker_key": representative["bookmaker_key"],
+            "market_key": representative["market_key"],
+            "market_last_update": representative["market_last_update"],
+            "event_id": representative.get("event_id", ""),
+            "game_label": representative.get("game_label", ""),
+            "same_book_pair": True,
+            "over_raw_prob": round(float(representative["over_raw_prob"]), 6),
+            "under_raw_prob": round(float(representative["under_raw_prob"]), 6),
+            "over_fair_prob": round(float(representative["over_fair_prob"]), 6),
+            "under_fair_prob": round(float(representative["under_fair_prob"]), 6),
+            "hold_percent": round(float(representative["hold"]) * 100.0, 3),
+            "books_count": books_count,
+            "best_over_odds": float(best_over["over_odds"]),
+            "best_under_odds": float(best_under["under_odds"]),
+            "best_over_bookmaker": best_over["bookmaker_title"],
+            "best_under_bookmaker": best_under["bookmaker_title"],
+            "consensus_over_fair_prob": round(float(consensus_over_fair or representative["over_fair_prob"]), 6),
+            "consensus_under_fair_prob": round(float(consensus_under_fair or representative["under_fair_prob"]), 6),
+            "consensus_hold_percent": round(float(consensus_hold or representative["hold"]) * 100.0, 3),
+            "market_implied_line": round(market_implied_line, 1),
+            "market_implied_source": f"consensus_{books_count}_book" if books_count > 1 else "single_book",
+            "csv_row": f"{representative['player_name']},{representative['stat']},{round(float(representative['line']),1)},{float(representative['over_odds'])},{float(representative['under_odds'])}",
         })
     rows.sort(key=lambda item: (item["player_name"].lower(), item["stat"], item["line"]))
     return rows
@@ -3907,10 +3065,6 @@ def resolve_opponent_team_from_matchup(matchup: str, player_team_id: int | None)
 
 
 def find_player_by_name(player_name: str, team_id: int | None = None) -> dict[str, Any] | None:
-    needles = build_player_name_variants(player_name)
-    if not needles:
-        return None
-
     roster_ids: set[int] | None = None
     if team_id is not None:
         try:
@@ -3919,37 +3073,7 @@ def find_player_by_name(player_name: str, team_id: int | None = None) -> dict[st
         except HTTPException:
             roster_ids = None
 
-    def player_sort_key(item: dict[str, Any]) -> tuple[bool, str]:
-        return (not item.get("is_active", False), str(item.get("full_name", "")))
-
-    exact_matches: list[dict[str, Any]] = []
-    partial_matches: list[dict[str, Any]] = []
-
-    for player_id, player in PLAYER_LOOKUP.items():
-        player_variants = PLAYER_VARIANTS_LOOKUP.get(player_id, set())
-        if not player_variants:
-            continue
-        if needles & player_variants:
-            exact_matches.append(player)
-            continue
-        if any(
-            needle in candidate or candidate in needle
-            for needle in needles
-            for candidate in player_variants
-        ):
-            partial_matches.append(player)
-
-    if roster_ids is not None:
-        for collection in (exact_matches, partial_matches):
-            roster_matches = [player for player in collection if int(player["id"]) in roster_ids]
-            if roster_matches:
-                return sorted(roster_matches, key=player_sort_key)[0]
-
-    if exact_matches:
-        return sorted(exact_matches, key=player_sort_key)[0]
-    if partial_matches:
-        return sorted(partial_matches, key=player_sort_key)[0]
-    return None
+    return PLAYER_SEARCH_INDEX.find_player(player_name, roster_ids=roster_ids)
 
 
 def estimate_model_probabilities(
@@ -4566,7 +3690,7 @@ def build_prop_analysis_payload(
         "player_info_refresh_queued": player_info_meta.get("refresh_queued") if 'player_info_meta' in locals() else False,
         "next_game_source": next_game_meta.get("source") if 'next_game_meta' in locals() else None,
         "next_game_refresh_queued": next_game_meta.get("refresh_queued") if 'next_game_meta' in locals() else False,
-        "injury_report_seconds_ago": round(time.time() - float(INJURY_REPORT_CACHE.get("timestamp") or 0.0), 2) if INJURY_REPORT_CACHE.get("timestamp") else None,
+        "injury_report_seconds_ago": INJURY_SERVICE.report_cache_age_seconds(),
     }
     payload["freshness"] = dict(freshness)
     ANALYSIS_CACHE[cache_key] = {"timestamp": time.time(), "payload": copy.deepcopy(payload), "filtered_pool": [dict(r) for r in filtered_pool]}
@@ -4919,29 +4043,7 @@ def get_team_injury_report(team_id: int) -> dict[str, Any]:
 
 @app.get("/api/players/search")
 def search_players(q: str = Query(..., min_length=1, max_length=50)) -> dict[str, Any]:
-    needles = build_player_name_variants(q)
-    matches: list[dict[str, Any]] = []
-
-    for player_id, player in PLAYER_LOOKUP.items():
-        full_name = str(player.get("full_name", ""))
-        variants = PLAYER_VARIANTS_LOOKUP.get(player_id, set())
-        if not variants:
-            continue
-        if any(
-            needle in candidate or candidate in needle
-            for needle in needles
-            for candidate in variants
-        ):
-            matches.append(
-                {
-                    "id": player_id,
-                    "full_name": full_name,
-                    "is_active": player.get("is_active", False),
-                }
-            )
-
-    matches.sort(key=lambda item: (not item["is_active"], item["full_name"]))
-    return {"results": matches[:15]}
+    return {"results": PLAYER_SEARCH_INDEX.search(q, limit=15)}
 
 
 
@@ -5111,6 +4213,18 @@ def market_scan(
             "line": line,
             "team_id": team_id,
             "player_position": None,
+            "over_fair_prob": row.get("over_fair_prob"),
+            "under_fair_prob": row.get("under_fair_prob"),
+            "consensus_over_fair_prob": row.get("consensus_over_fair_prob"),
+            "consensus_under_fair_prob": row.get("consensus_under_fair_prob"),
+            "hold_percent": row.get("hold_percent"),
+            "books_count": row.get("books_count"),
+            "best_over_odds": row.get("best_over_odds"),
+            "best_under_odds": row.get("best_under_odds"),
+            "best_over_bookmaker": row.get("best_over_bookmaker"),
+            "best_under_bookmaker": row.get("best_under_bookmaker"),
+            "market_implied_line": row.get("market_implied_line"),
+            "bookmaker_title": row.get("bookmaker_title"),
         }
         prepared_rows.append((index, bulk_row, over_odds, under_odds, team_text, opponent_text, team, opponent, team_id))
 
@@ -5176,8 +4290,22 @@ def market_scan(
         )
         implied_over = decimal_implied_probability(over_odds)
         implied_under = decimal_implied_probability(under_odds)
-        over_edge = round((model_over - implied_over) * 100, 1) if implied_over is not None else None
-        under_edge = round((model_under - implied_under) * 100, 1) if implied_under is not None else None
+        fair_over = bulk_row.get("consensus_over_fair_prob")
+        fair_under = bulk_row.get("consensus_under_fair_prob")
+        if fair_over is None:
+            fair_over = bulk_row.get("over_fair_prob")
+        if fair_under is None:
+            fair_under = bulk_row.get("under_fair_prob")
+        try:
+            fair_over = float(fair_over) if fair_over is not None else implied_over
+        except (TypeError, ValueError):
+            fair_over = implied_over
+        try:
+            fair_under = float(fair_under) if fair_under is not None else implied_under
+        except (TypeError, ValueError):
+            fair_under = implied_under
+        over_edge = round((model_over - fair_over) * 100, 1) if fair_over is not None else None
+        under_edge = round((model_under - fair_under) * 100, 1) if fair_under is not None else None
         over_ev = round(model_over * over_odds - 1, 3)
         under_ev = round(model_under * under_odds - 1, 3)
 
@@ -5246,6 +4374,16 @@ def market_scan(
                 "line": float(bulk_row["line"]),
                 "over_odds": over_odds,
                 "under_odds": under_odds,
+                "over_fair_prob": round(fair_over, 6) if fair_over is not None else None,
+                "under_fair_prob": round(fair_under, 6) if fair_under is not None else None,
+                "hold_percent": bulk_row.get("hold_percent"),
+                "books_count": bulk_row.get("books_count"),
+                "best_over_odds": bulk_row.get("best_over_odds"),
+                "best_under_odds": bulk_row.get("best_under_odds"),
+                "best_over_bookmaker": bulk_row.get("best_over_bookmaker"),
+                "best_under_bookmaker": bulk_row.get("best_under_bookmaker"),
+                "market_implied_line": bulk_row.get("market_implied_line"),
+                "bookmaker_title": bulk_row.get("bookmaker_title"),
             },
             "analysis": {
                 "average": analysis["average"],
@@ -5271,6 +4409,8 @@ def market_scan(
                 "under_probability": round(model_under * 100, 1),
                 "over_implied": round(implied_over * 100, 1) if implied_over is not None else None,
                 "under_implied": round(implied_under * 100, 1) if implied_under is not None else None,
+                "over_fair_probability": round(fair_over * 100, 1) if fair_over is not None else None,
+                "under_fair_probability": round(fair_under * 100, 1) if fair_under is not None else None,
                 "over_edge": over_edge,
                 "under_edge": under_edge,
                 "over_ev": round(over_ev * 100, 1),
@@ -5353,6 +4493,7 @@ def odds_player_props_import(payload: dict[str, Any] = Body(...)) -> dict[str, A
     if not event_id:
         raise HTTPException(status_code=400, detail="Missing event_id.")
 
+    requested_bookmakers = parse_requested_bookmakers(payload.get("bookmakers") or payload.get("bookmaker") or ODDS_DEFAULT_BOOKMAKERS)
     result = odds_api_fetch(
         f"/sports/{sport}/events/{event_id}/odds",
         api_key,
@@ -5361,6 +4502,7 @@ def odds_player_props_import(payload: dict[str, Any] = Body(...)) -> dict[str, A
             "markets": markets,
             "oddsFormat": odds_format,
             "dateFormat": "iso",
+            "bookmakers": ",".join(requested_bookmakers),
         },
     )
     event_payload = result["data"] or {}
@@ -5383,6 +4525,8 @@ def odds_player_props_import(payload: dict[str, Any] = Body(...)) -> dict[str, A
         "regions": regions,
         "sport": sport,
         "markets": markets,
+        "bookmakers": requested_bookmakers,
+        "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
     }
 
 
@@ -5424,7 +4568,7 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     season       = str(payload.get("season") or current_nba_season())
     season_type  = str(payload.get("season_type") or "Regular Season")
     batch_size   = max(1, int(payload.get("batch_size") or 3))
-    bookmaker    = str(payload.get("bookmaker") or "draftkings").strip().lower()
+    requested_bookmakers = parse_requested_bookmakers(payload.get("bookmakers") or payload.get("bookmaker") or ODDS_DEFAULT_BOOKMAKERS)
     markets      = ",".join(ODDS_DEFAULT_MARKETS)
 
     # event_ids — if provided, skip fetching the events list entirely (saves 1 credit)
@@ -5470,6 +4614,8 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             "props_found": 0,
             "errors": [],
             "quota_log": quota_log,
+            "bookmakers": requested_bookmakers,
+            "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
             "message": "No events found for today.",
         }
 
@@ -5492,8 +4638,7 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
                         "markets": markets,
                         "oddsFormat": odds_format,
                         "dateFormat": "iso",
-                        # 1 bookmaker only — we deduplicate anyway, saves ~80% credits
-                        "bookmakers": bookmaker,
+                        "bookmakers": ",".join(requested_bookmakers),
                     },
                 )
                 quota_log.append({"call": f"event_{event_id[:8]}", "quota": result["quota"]})
@@ -5523,6 +4668,8 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             "props_found": 0,
             "errors": scrape_errors,
             "quota_log": quota_log,
+            "bookmakers": requested_bookmakers,
+            "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
             "message": "No props found across today's events. Check your API keys or try again later.",
         }
 
@@ -5676,12 +4823,19 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         next_game_info = matchup.get("next_game") or {}
         vs_position = matchup.get("vs_position") or {}
         matchup_delta_pct = vs_position.get("delta_pct") if isinstance(vs_position, dict) else None
+        fair_prob = orig_row.get("consensus_over_fair_prob") if side == "OVER" else orig_row.get("consensus_under_fair_prob")
+        if fair_prob is None:
+            fair_prob = orig_row.get("over_fair_prob") if side == "OVER" else orig_row.get("under_fair_prob")
+        try:
+            fair_prob = float(fair_prob) if fair_prob is not None else decimal_implied_probability(odds)
+        except (TypeError, ValueError):
+            fair_prob = decimal_implied_probability(odds)
         confidence_engine = build_confidence_engine(
             side=side,
             hit_rate=float(side_hit_rate),
             games_count=int(analysis.get("games_count") or 0),
-            edge=round(abs(avg - line), 1),
-            ev=max(0.0, (side_hit_rate / 100.0) - decimal_implied_probability(odds)),
+            edge=round((side_hit_rate / 100.0 - fair_prob) * 100.0, 1) if fair_prob is not None else round(abs(avg - line), 1),
+            ev=max(0.0, (side_hit_rate / 100.0) - fair_prob) if fair_prob is not None else max(0.0, (side_hit_rate / 100.0) - decimal_implied_probability(odds)),
             matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
             availability=availability,
             opportunity=analysis.get("opportunity") or {},
@@ -5732,6 +4886,13 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             "confidence_tags": confidence_engine.get("tags") or [],
             "event_id": orig_row.get("event_id") or "",
             "game_label": orig_row.get("game_label") or "",
+            "books_count": orig_row.get("books_count") or 1,
+            "hold_percent": orig_row.get("hold_percent"),
+            "fair_probability": round(fair_prob * 100.0, 1) if fair_prob is not None else None,
+            "best_over_odds": orig_row.get("best_over_odds"),
+            "best_under_odds": orig_row.get("best_under_odds"),
+            "best_over_bookmaker": orig_row.get("best_over_bookmaker"),
+            "best_under_bookmaker": orig_row.get("best_under_bookmaker"),
         })
 
     # Sort descending by hit rate (primary), then odds (prefer value)
@@ -5776,6 +4937,8 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         "props_analyzed": len(scored),
         "errors": all_errors,
         "quota_log": quota_log,
+        "bookmakers": requested_bookmakers,
+        "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
     }
 
 
@@ -5846,7 +5009,7 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
     season      = str(payload.get("season") or current_nba_season())
     season_type = str(payload.get("season_type") or "Regular Season")
     batch_size  = max(1, int(payload.get("batch_size") or 3))
-    bookmaker   = str(payload.get("bookmaker") or "draftkings").strip().lower()
+    requested_bookmakers = parse_requested_bookmakers(payload.get("bookmakers") or payload.get("bookmaker") or ODDS_DEFAULT_BOOKMAKERS)
     markets     = ",".join(ODDS_DEFAULT_MARKETS)
 
     requested_event_ids: set[str] = set()
@@ -5876,6 +5039,7 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
     if not events:
         return {"legs": legs, "parlay": [], "parlay_odds": None, "all_props_scored": [],
                 "events_scraped": 0, "props_found": 0, "errors": [], "quota_log": quota_log,
+                "bookmakers": requested_bookmakers, "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
                 "injury_summary": [], "message": "No events found for today."}
 
     all_import_rows: list[dict[str, Any]] = []
@@ -5891,7 +5055,7 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
                 result = odds_api_fetch(
                     f"/sports/{sport}/events/{event_id}/odds", next_key(),
                     {"regions": regions, "markets": markets, "oddsFormat": odds_format,
-                     "dateFormat": "iso", "bookmakers": bookmaker},
+                     "dateFormat": "iso", "bookmakers": ",".join(requested_bookmakers)},
                 )
                 quota_log.append({"call": f"event_{event_id[:8]}", "quota": result["quota"]})
                 rows = build_odds_import_rows(result["data"] or {}, odds_format)
@@ -5906,7 +5070,8 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
     if not all_import_rows:
         return {"legs": legs, "parlay": [], "parlay_odds": None, "all_props_scored": [],
                 "events_scraped": len(events), "props_found": 0, "errors": scrape_errors,
-                "quota_log": quota_log, "injury_summary": [],
+                "quota_log": quota_log, "bookmakers": requested_bookmakers,
+                "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers), "injury_summary": [],
                 "message": "No props found across today's events. Check your API keys or try again later."}
 
     # Pre-warm caches (same as regular parlay builder)
@@ -6122,10 +5287,17 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
         next_game_info = matchup.get("next_game") or {}
         vs_position = matchup.get("vs_position") or {}
         matchup_delta_pct = vs_position.get("delta_pct") if isinstance(vs_position, dict) else None
+        fair_prob = orig_row.get("consensus_over_fair_prob") if side == "OVER" else orig_row.get("consensus_under_fair_prob")
+        if fair_prob is None:
+            fair_prob = orig_row.get("over_fair_prob") if side == "OVER" else orig_row.get("under_fair_prob")
+        try:
+            fair_prob = float(fair_prob) if fair_prob is not None else decimal_implied_probability(odds)
+        except (TypeError, ValueError):
+            fair_prob = decimal_implied_probability(odds)
         confidence_engine = build_confidence_engine(
             side=side, hit_rate=float(side_hit_rate), games_count=base_games_count,
-            edge=round(abs(avg - line), 1),
-            ev=max(0.0, (side_hit_rate / 100.0) - decimal_implied_probability(odds)),
+            edge=round((side_hit_rate / 100.0 - fair_prob) * 100.0, 1) if fair_prob is not None else round(abs(avg - line), 1),
+            ev=max(0.0, (side_hit_rate / 100.0) - fair_prob) if fair_prob is not None else max(0.0, (side_hit_rate / 100.0) - decimal_implied_probability(odds)),
             matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
             availability=availability, opportunity=analysis.get("opportunity") or {},
             team_context=analysis.get("team_context") or {}, environment=analysis.get("environment") or {},
@@ -6171,6 +5343,13 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
             "injury_filter_player_ids": injury_filter_player_ids,
             "injury_filter_player_names": injury_filter_player_names,
             "team_injury_player_names": team_injury_player_names,
+            "books_count": orig_row.get("books_count") or 1,
+            "hold_percent": orig_row.get("hold_percent"),
+            "fair_probability": round(fair_prob * 100.0, 1) if fair_prob is not None else None,
+            "best_over_odds": orig_row.get("best_over_odds"),
+            "best_under_odds": orig_row.get("best_under_odds"),
+            "best_over_bookmaker": orig_row.get("best_over_bookmaker"),
+            "best_under_bookmaker": orig_row.get("best_under_bookmaker"),
         }
 
     scored: list[dict[str, Any]] = []
@@ -6229,6 +5408,8 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
         "props_analyzed": len(scored),
         "errors": all_errors,
         "quota_log": quota_log,
+        "bookmakers": requested_bookmakers,
+        "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
         "injury_summary": injury_summary,
     }
 
@@ -6968,4 +6149,3 @@ def odds_check_quota(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         "quota": result["quota"],
         "api_key_masked": mask_api_key_for_display(api_key),
     }
-
