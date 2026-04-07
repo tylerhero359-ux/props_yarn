@@ -6825,16 +6825,61 @@ def debug_injury_report_raw() -> dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 # BACKTEST ENGINE
 # Logs predictions and actual results, computes ROI / hit-rate by bucket.
-# In-memory store (resets on restart). Frontend can persist via localStorage.
+# SQLite-backed backtest store — survives process restarts (ephemeral on Render
+# free tier unless a paid Disk is attached, but persists across hot-reloads and
+# short sleep/wake cycles within the same deployment).
 # ─────────────────────────────────────────────────────────────────────────────
 
+import sqlite3
+
 _BACKTEST_LOCK = threading.Lock()
-_BACKTEST_LOG: list[dict[str, Any]] = []   # [{id, player, stat, line, side, confidence_score, confidence_tier, model_prob, result, hit, odds, ev, logged_at, resolved_at}]
+_BACKTEST_DB_PATH = PERSISTENT_CACHE_DIR / "backtest.sqlite3"
+
+
+def _backtest_db_connect() -> sqlite3.Connection:
+    con = sqlite3.connect(str(_BACKTEST_DB_PATH), check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def _init_backtest_db() -> None:
+    """Create the backtest table if it doesn't exist yet."""
+    _ensure_persistent_cache_dir()
+    with _backtest_db_connect() as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS backtest (
+                id               TEXT PRIMARY KEY,
+                player           TEXT,
+                stat             TEXT,
+                line             REAL,
+                side             TEXT,
+                confidence_score INTEGER,
+                confidence_tier  TEXT,
+                model_prob       REAL,
+                odds             REAL,
+                result           TEXT DEFAULT 'pending',
+                actual_value     REAL,
+                logged_at        TEXT,
+                resolved_at      TEXT
+            )
+        """)
+        con.commit()
+
+
+def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return dict(row)
 
 
 def _backtest_new_id() -> str:
     import uuid
     return str(uuid.uuid4())[:8]
+
+
+# Initialise DB at import time (fast – just a CREATE TABLE IF NOT EXISTS).
+try:
+    _init_backtest_db()
+except Exception as _e:
+    LOGGER.warning("Could not initialise backtest SQLite DB: %s", _e)
 
 
 def _compute_backtest_stats(entries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -6933,14 +6978,26 @@ def backtest_log_prediction(payload: dict = Body(...)) -> dict[str, Any]:
         "confidence_score": int(payload.get("confidence_score") or 0),
         "confidence_tier": str(payload.get("confidence_tier") or ""),
         "model_prob": float(payload.get("model_prob") or 0.5),
-        "odds": payload.get("odds"),  # decimal odds, optional
+        "odds": payload.get("odds"),
         "result": "pending",
         "actual_value": None,
         "logged_at": datetime.utcnow().isoformat() + "Z",
         "resolved_at": None,
     }
     with _BACKTEST_LOCK:
-        _BACKTEST_LOG.append(entry)
+        try:
+            with _backtest_db_connect() as con:
+                con.execute(
+                    """INSERT INTO backtest
+                       (id, player, stat, line, side, confidence_score, confidence_tier,
+                        model_prob, odds, result, actual_value, logged_at, resolved_at)
+                       VALUES (:id,:player,:stat,:line,:side,:confidence_score,:confidence_tier,
+                               :model_prob,:odds,:result,:actual_value,:logged_at,:resolved_at)""",
+                    entry,
+                )
+                con.commit()
+        except Exception as db_err:
+            LOGGER.warning("backtest SQLite insert failed: %s", db_err)
     return {"ok": True, "id": entry["id"], "entry": entry}
 
 
@@ -6957,47 +7014,83 @@ def backtest_resolve_prediction(payload: dict = Body(...)) -> dict[str, Any]:
     actual_value = float(actual_value)
 
     with _BACKTEST_LOCK:
-        for entry in _BACKTEST_LOG:
-            if entry["id"] == pred_id:
+        try:
+            with _backtest_db_connect() as con:
+                row = con.execute("SELECT * FROM backtest WHERE id = ?", (pred_id,)).fetchone()
+                if row is None:
+                    raise HTTPException(status_code=404, detail=f"No prediction found with id={pred_id}")
+                entry = _row_to_dict(row)
                 hit = (
                     actual_value > entry["line"] if entry["side"] == "OVER"
                     else actual_value < entry["line"]
                 )
-                entry["result"] = "hit" if hit else "miss"
-                entry["actual_value"] = actual_value
-                entry["resolved_at"] = datetime.utcnow().isoformat() + "Z"
+                result = "hit" if hit else "miss"
+                resolved_at = datetime.utcnow().isoformat() + "Z"
+                con.execute(
+                    "UPDATE backtest SET result=?, actual_value=?, resolved_at=? WHERE id=?",
+                    (result, actual_value, resolved_at, pred_id),
+                )
+                con.commit()
+                entry.update(result=result, actual_value=actual_value, resolved_at=resolved_at)
                 return {"ok": True, "entry": entry}
-    raise HTTPException(status_code=404, detail=f"No prediction found with id={pred_id}")
+        except HTTPException:
+            raise
+        except Exception as db_err:
+            LOGGER.warning("backtest SQLite resolve failed: %s", db_err)
+            raise HTTPException(status_code=500, detail="Database error")
 
 
 @app.get("/api/backtest/log")
 def backtest_get_log(limit: int = Query(200, ge=1, le=1000)) -> dict[str, Any]:
     """Return the backtest log and aggregate stats."""
     with _BACKTEST_LOCK:
-        entries = list(reversed(_BACKTEST_LOG))[:limit]
-        stats = _compute_backtest_stats(list(_BACKTEST_LOG))
-    return {"stats": stats, "entries": entries}
+        try:
+            with _backtest_db_connect() as con:
+                rows = con.execute(
+                    "SELECT * FROM backtest ORDER BY logged_at DESC LIMIT ?", (limit,)
+                ).fetchall()
+                all_rows = con.execute("SELECT * FROM backtest").fetchall()
+            entries = [_row_to_dict(r) for r in rows]
+            all_entries = [_row_to_dict(r) for r in all_rows]
+            stats = _compute_backtest_stats(all_entries)
+            return {"stats": stats, "entries": entries}
+        except Exception as db_err:
+            LOGGER.warning("backtest SQLite get failed: %s", db_err)
+            return {"stats": {}, "entries": []}
 
 
 @app.delete("/api/backtest/log/{entry_id}")
 def backtest_delete_entry(entry_id: str) -> dict[str, Any]:
     """Delete a single backtest entry by ID."""
     with _BACKTEST_LOCK:
-        before = len(_BACKTEST_LOG)
-        _BACKTEST_LOG[:] = [e for e in _BACKTEST_LOG if e["id"] != entry_id]
-        after = len(_BACKTEST_LOG)
-    if before == after:
-        raise HTTPException(status_code=404, detail=f"No entry found with id={entry_id}")
-    return {"ok": True, "deleted": entry_id}
+        try:
+            with _backtest_db_connect() as con:
+                cur = con.execute("DELETE FROM backtest WHERE id = ?", (entry_id,))
+                con.commit()
+                if cur.rowcount == 0:
+                    raise HTTPException(status_code=404, detail=f"No entry found with id={entry_id}")
+            return {"ok": True, "deleted": entry_id}
+        except HTTPException:
+            raise
+        except Exception as db_err:
+            LOGGER.warning("backtest SQLite delete failed: %s", db_err)
+            raise HTTPException(status_code=500, detail="Database error")
 
 
 @app.delete("/api/backtest/log")
 def backtest_clear_log() -> dict[str, Any]:
     """Clear all backtest entries."""
     with _BACKTEST_LOCK:
-        count = len(_BACKTEST_LOG)
-        _BACKTEST_LOG.clear()
-    return {"ok": True, "cleared": count}
+        try:
+            with _backtest_db_connect() as con:
+                cur = con.execute("SELECT COUNT(*) FROM backtest")
+                count = cur.fetchone()[0]
+                con.execute("DELETE FROM backtest")
+                con.commit()
+            return {"ok": True, "cleared": count}
+        except Exception as db_err:
+            LOGGER.warning("backtest SQLite clear failed: %s", db_err)
+            raise HTTPException(status_code=500, detail="Database error")
 
 
 @app.post("/api/odds/check-quota")
