@@ -57,6 +57,8 @@ const oddsRegionsInput = document.getElementById('oddsRegionsInput');
 const oddsFormatSelect = document.getElementById('oddsFormatSelect');
 const oddsMarketsInput = document.getElementById('oddsMarketsInput');
 const oddsEventSelect = document.getElementById('oddsEventSelect');
+const oddsSaveKeyBtn    = document.getElementById('oddsSaveKeyBtn');
+const oddsCheckBalBtn   = document.getElementById('oddsCheckBalanceBtn');
 const oddsLoadEventsBtn = document.getElementById('oddsLoadEventsBtn');
 const oddsImportScanBtn = document.getElementById('oddsImportScanBtn');
 const oddsQuotaMeta = document.getElementById('oddsQuotaMeta');
@@ -85,6 +87,8 @@ const opportunityTone = document.getElementById('opportunityTone');
 const opportunityBody = document.getElementById('opportunityBody');
 const environmentTone = document.getElementById('environmentTone');
 const environmentBody = document.getElementById('environmentBody');
+const varianceTone = document.getElementById('varianceTone');
+const varianceBody = document.getElementById('varianceBody');
 
 const RECENT_PLAYERS_KEY = 'nba-props-recent-players';
 const THEME_KEY = 'nba-props-theme';
@@ -94,7 +98,7 @@ const MARKET_EXPERT_FILTERS_KEY = 'nba-props-market-expert-filters';
 const ODDS_API_KEY_STORAGE = 'nba-props-odds-api-key';
 const ODDS_API_SETTINGS_STORAGE = 'nba-props-odds-api-settings';
 const LAST_PLAYER_KEY = 'nba-props-last-player';
-const LAST_STAT_KEY   = 'nba-props-last-stat';
+const LAST_STAT_KEY = 'nba-props-last-stat';
 const FALLBACK_HEADSHOT = encodeURIComponent(`
   <svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240">
     <defs>
@@ -162,6 +166,15 @@ let currentMarketFilter = localStorage.getItem('nba-props-market-filter') || 'al
 let currentExpertFilters = loadStoredExpertFilters();
 const currentExpertSettings = { min_minutes: 22, min_fga: 10, min_h2h_games: 2, min_h2h_hit_rate: 60 };
 
+// ── Market advanced filters (bookmaker + odds range) ──────────────────
+let currentMarketBookFilter = '';
+let currentMarketMinOdds = null;
+let currentMarketMaxOdds = null;
+
+// ── Key Vault ─────────────────────────────────────────────────────────
+const KEY_VAULT_STORAGE = 'nba-props-key-vault';
+const KEY_VAULT_ACTIVE_STORAGE = 'nba-props-key-vault-active';
+
 const VIEW_META = {
   overview: {
     eyebrow: 'Dashboard workspace',
@@ -197,8 +210,50 @@ const VIEW_META = {
     eyebrow: 'Live tracking',
     title: 'Prop Tracker',
     subtitle: 'Add your active bets and watch each bar fill toward the line in real time.'
+  },
+  keyvault: {
+    eyebrow: 'API key management',
+    title: 'Key Vault',
+    subtitle: 'Store, activate, and check credits for your API keys — used automatically across all pages.'
   }
 };
+
+// ── Global app toast ─────────────────────────────────────────────────
+function showAppToast(msg, type = 'default') {
+  let el = document.getElementById('_appToast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = '_appToast';
+    el.style.cssText = [
+      'position:fixed', 'bottom:32px', 'left:50%',
+      'transform:translateX(-50%) translateY(24px)',
+      'padding:11px 26px', 'border-radius:40px',
+      'font-size:.875rem', 'font-weight:700', 'z-index:99999',
+      'opacity:0', 'transition:opacity .22s,transform .22s',
+      'pointer-events:none', 'white-space:nowrap',
+      'display:flex', 'align-items:center', 'gap:8px',
+      'box-shadow:0 8px 32px rgba(0,0,0,0.4)'
+    ].join(';');
+    document.body.appendChild(el);
+  }
+  const colors = {
+    default:  { bg:'#7c6ef5', text:'#fff' },
+    success:  { bg:'#22c55e', text:'#fff' },
+    info:     { bg:'#38bdf8', text:'#0f172a' },
+    warning:  { bg:'#f59e0b', text:'#1a1a1a' },
+  };
+  const c = colors[type] || colors.default;
+  el.style.background = c.bg;
+  el.style.color = c.text;
+  el.innerHTML = msg;
+  el.style.opacity = '1';
+  el.style.transform = 'translateX(-50%) translateY(0)';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => {
+    el.style.opacity = '0';
+    el.style.transform = 'translateX(-50%) translateY(24px)';
+  }, 2800);
+}
 
 function switchView(view, options = {}) {
   if (!VIEW_META[view]) return;
@@ -256,14 +311,6 @@ function loadStoredMarketResults() {
   } catch {
     return null;
   }
-}
-
-function saveLatestMarketResults(payload) {
-  const snapshot = {
-    updated_at: new Date().toISOString(),
-    results: (payload.results || []).slice(0, 8)
-  };
-  localStorage.setItem(MARKET_RESULTS_KEY, JSON.stringify(snapshot));
 }
 
 /**
@@ -866,13 +913,6 @@ function getActivePropChip() {
   return propButtonsWrap.querySelector(`.prop-chip[data-stat="${selectedStat}"]`);
 }
 
-function setActiveProp(stat) {
-  selectedStat = stat;
-  propButtonsWrap.querySelectorAll('.prop-chip').forEach(chip => {
-    chip.classList.toggle('active', chip.dataset.stat === stat);
-  });
-}
-
 function loadRecentPlayers() {
   try {
     return JSON.parse(localStorage.getItem(RECENT_PLAYERS_KEY) || '[]');
@@ -957,208 +997,6 @@ function updateSelectedCardStyles() {
   });
 }
 
-function getSelectedPlayerContextData() {
-  const payload = lastPayload && String(lastPayload?.player?.id || '') === String(selectedPlayer?.id || '') ? lastPayload : null;
-  return {
-    matchup: selectedPlayer?.matchup || payload?.matchup || null,
-    environment: selectedPlayer?.environment || payload?.environment || null,
-    availability: selectedPlayer?.availability || payload?.availability || null
-  };
-}
-
-function renderSelectedPlayerContext() {
-  if (!selectedPlayer) return '';
-  const { matchup, environment, availability } = getSelectedPlayerContextData();
-  const nextGame = matchup?.next_game || null;
-  const vsPosition = matchup?.vs_position || null;
-  if (!nextGame && !vsPosition && !environment) return '';
-
-  const matchupLabel = nextGame?.matchup_label || nextGame?.opponent_name || 'Upcoming game';
-  const opponentContext = vsPosition
-    ? `${vsPosition.lean || 'Neutral'} • ${vsPosition.position_label || 'Position'} • ${typeof vsPosition.opponent_value === 'number' ? vsPosition.opponent_value.toFixed(2) : (vsPosition.opponent_value ?? '—')} ${getStatLabel(vsPosition.stat).toLowerCase()}`
-    : 'Defense-vs-position pending';
-  const venueLabel = environment?.venue_label || (nextGame ? (nextGame.is_home ? 'Home game' : 'Away game') : 'TBD');
-  const scheduleLabel = environment?.schedule_summary || (nextGame?.game_date ? formatNextGameDate(nextGame.game_date) : 'Upcoming spot');
-  const restDays = environment?.rest_days ?? nextGame?.rest_days;
-  const gamesIn7 = environment?.games_in_7 ?? nextGame?.games_in_last_7;
-  const backToBack = environment?.is_back_to_back ?? nextGame?.is_back_to_back;
-  const availabilityNote = availability?.reason || availability?.note || '';
-  const restStrong = restDays === null || restDays === undefined ? '—' : `${restDays} day${Number(restDays) === 1 ? '' : 's'} rest`;
-  const loadSmall = backToBack ? 'Back-to-back spot' : `Games in last 7: ${gamesIn7 ?? '—'}`;
-
-  return `
-    <div class="selected-player-context">
-      <div class="selected-player-context-header">
-        <span class="selected-player-section-label">Next Matchup</span>
-        <strong>${escapeHtml(matchupLabel)}</strong>
-        <small>${escapeHtml(nextGame?.game_date ? formatNextGameDate(nextGame.game_date) : 'Date TBA')}${nextGame?.game_time ? ` • ${escapeHtml(nextGame.game_time)}` : ''}</small>
-      </div>
-      <div class="selected-player-context-grid">
-        <div class="selected-player-context-chip">
-          <span class="small-label">Opponent context</span>
-          <strong>${escapeHtml(nextGame?.opponent_name || nextGame?.opponent_abbreviation || 'Unavailable')}</strong>
-          <small>${escapeHtml(opponentContext)}</small>
-        </div>
-        <div class="selected-player-context-chip">
-          <span class="small-label">Venue</span>
-          <strong>${escapeHtml(venueLabel)}</strong>
-          <small>${escapeHtml(scheduleLabel)}</small>
-        </div>
-        <div class="selected-player-context-chip">
-          <span class="small-label">Rest / Load</span>
-          <strong>${escapeHtml(restStrong)}</strong>
-          <small>${escapeHtml(loadSmall)}</small>
-        </div>
-      </div>
-      ${availabilityNote ? `<div class="selected-player-meta-row context-availability-row">${renderAvailabilityBadge(availability, true)}<small>${escapeHtml(availabilityNote)}</small></div>` : ''}
-    </div>
-  `;
-}
-
-function renderSelectedPlayer() {
-  if (!selectedPlayer) {
-    selectedPlayerBadge.className = 'selected-player selected-player-empty';
-    selectedPlayerBadge.innerHTML = `
-      <div class="selected-player-avatar placeholder-avatar">NBA</div>
-      <div class="selected-player-copy">
-        <span class="selected-player-label">Waiting for a selection</span>
-        <strong>No player selected</strong>
-        <small>Choose a team, then click a player card to start.</small>
-      </div>
-    `;
-    renderOverviewSelection();
-    return;
-  }
-
-  const subLine = [
-    selectedPlayer.team_name || selectedPlayer.team_abbreviation || '',
-    selectedPlayer.position || '',
-    selectedPlayer.jersey ? `#${selectedPlayer.jersey}` : ''
-  ].filter(Boolean).join(' • ');
-  const contextData = getSelectedPlayerContextData();
-  const availabilitySource = contextData.availability || selectedPlayer.availability;
-  const availabilityHtml = availabilitySource
-    ? `<div class="selected-player-meta-row">${renderAvailabilityBadge(availabilitySource)}<small>${escapeHtml(availabilitySource.reason || availabilitySource.note || '')}</small></div>`
-    : '';
-
-  selectedPlayerBadge.className = 'selected-player';
-  selectedPlayerBadge.innerHTML = `
-    <img src="${getPlayerImage(selectedPlayer.id)}" alt="${escapeHtml(selectedPlayer.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
-    <div class="selected-player-copy">
-      <span class="selected-player-label">Selected player</span>
-      <strong>${escapeHtml(selectedPlayer.full_name)}</strong>
-      <small>${escapeHtml(subLine || (selectedPlayer.is_active ? 'Active player' : 'Player'))}</small>
-      ${availabilityHtml}
-      ${renderSelectedPlayerContext()}
-    </div>
-  `;
-  renderOverviewSelection();
-}
-
-function clearAnalysisForNewSelection() {
-  resetDashboardForNoSelection();
-
-  if (interpretationTone) {
-    interpretationTone.className = 'spotlight-pill neutral';
-    interpretationTone.textContent = 'Waiting for analysis';
-  }
-
-  if (opportunityTone) {
-    opportunityTone.className = 'spotlight-pill neutral';
-    opportunityTone.textContent = 'Waiting for analysis';
-  }
-
-  if (environmentTone) {
-    environmentTone.className = 'spotlight-pill neutral';
-    environmentTone.textContent = 'Waiting for analysis';
-  }
-
-  if (interpretationBody) {
-    interpretationBody.className = 'interpretation-body';
-    interpretationBody.innerHTML = `
-      <div class="insight-summary neutral">
-        <span class="insight-summary-label">Quick read</span>
-        <strong>Waiting for analysis</strong>
-        <p>Select a player and run the analyzer to generate a simple interpretation.</p>
-      </div>
-      <ul class="insight-bullet-list compact-bullets">
-        <li>Recent trend, matchup, and opportunity notes will appear here.</li>
-      </ul>
-    `;
-  }
-
-  if (opportunityBody) {
-    opportunityBody.className = 'opportunity-body';
-    opportunityBody.innerHTML = `
-      <div class="opportunity-chip-grid refined-opportunity-grid">
-        <div class="opportunity-chip">
-          <span class="small-label">Minutes</span>
-          <strong>—</strong>
-          <small>Waiting for analysis</small>
-        </div>
-        <div class="opportunity-chip">
-          <span class="small-label">FGA</span>
-          <strong>—</strong>
-          <small>Waiting for analysis</small>
-        </div>
-        <div class="opportunity-chip">
-          <span class="small-label">3PA</span>
-          <strong>—</strong>
-          <small>Waiting for analysis</small>
-        </div>
-        <div class="opportunity-chip">
-          <span class="small-label">FTA</span>
-          <strong>—</strong>
-          <small>Waiting for analysis</small>
-        </div>
-      </div>
-      <div class="opportunity-summary-wrap refined-opportunity-wrap">
-        <div class="insight-summary neutral compact-summary">
-          <span class="insight-summary-label">Opportunity read</span>
-          <p class="opportunity-summary">Analyze a player prop to load minutes, attempts, and team context.</p>
-        </div>
-        <div class="team-context-box neutral">
-          <strong>Team context</strong>
-          <p>No team-availability context yet.</p>
-          <small>Latest same-team absences will appear here after analysis.</small>
-        </div>
-      </div>
-    `;
-  }
-
-  if (environmentBody) {
-    environmentBody.className = 'environment-body';
-    environmentBody.innerHTML = `
-      <div class="environment-chip-grid">
-        <div class="environment-chip">
-          <span class="small-label">Venue</span>
-          <strong>—</strong>
-          <small>Waiting for analysis</small>
-        </div>
-        <div class="environment-chip">
-          <span class="small-label">Rest</span>
-          <strong>—</strong>
-          <small>Waiting for analysis</small>
-        </div>
-        <div class="environment-chip">
-          <span class="small-label">Back-to-back</span>
-          <strong>—</strong>
-          <small>Waiting for analysis</small>
-        </div>
-        <div class="environment-chip">
-          <span class="small-label">Games in 7</span>
-          <strong>—</strong>
-          <small>Waiting for analysis</small>
-        </div>
-      </div>
-      <div class="insight-summary neutral compact-summary">
-        <span class="insight-summary-label">Schedule read</span>
-        <p class="opportunity-summary">Analyze a player prop to see rest, back-to-back risk, and the upcoming spot.</p>
-      </div>
-    `;
-  }
-}
-
 function setSelectedPlayer(player) {
   const previousId = selectedPlayer?.id ?? null;
   const nextId = player?.id ?? null;
@@ -1172,6 +1010,8 @@ function setSelectedPlayer(player) {
   }
 
   renderSelectedPlayer();
+  populateAnalyzerWithoutPlayerFilter(true).catch(() => { });
+  loadInjuryBoostChips(player).catch(() => { });
   playerSearchInput.value = player.full_name;
   searchResults.classList.add('hidden');
   updateSelectedCardStyles();
@@ -1182,11 +1022,13 @@ function setSelectedPlayer(player) {
   }
 
   // Persist last player across refreshes
-  try { localStorage.setItem(LAST_PLAYER_KEY, JSON.stringify({
-    id: player.id, full_name: player.full_name, is_active: player.is_active,
-    team_abbreviation: player.team_abbreviation || '', team_name: player.team_name || '',
-    team_id: player.team_id || null, position: player.position || '', jersey: player.jersey || ''
-  })); } catch { /* ignore */ }
+  try {
+    localStorage.setItem(LAST_PLAYER_KEY, JSON.stringify({
+      id: player.id, full_name: player.full_name, is_active: player.is_active,
+      team_abbreviation: player.team_abbreviation || '', team_name: player.team_name || '',
+      team_id: player.team_id || null, position: player.position || '', jersey: player.jersey || ''
+    }));
+  } catch { /* ignore */ }
 }
 
 function renderRosterSkeleton() {
@@ -1284,10 +1126,10 @@ async function loadRoster(teamId) {
 
 function renderRoster(team, season, players) {
   rosterTitle.textContent = team.full_name + ' roster';
-  const outCnt  = players.filter(p => p.is_unavailable).length;
+  const outCnt = players.filter(p => p.is_unavailable).length;
   const riskCnt = players.filter(p => p.is_risky && !p.is_unavailable).length;
   let injNote = '';
-  if (outCnt)  injNote += ' • ' + outCnt + ' out';
+  if (outCnt) injNote += ' • ' + outCnt + ' out';
   if (riskCnt) injNote += (outCnt ? ', ' : ' • ') + riskCnt + ' questionable';
   rosterMeta.innerHTML =
     players.length + ' players • ' + season + injNote +
@@ -1308,11 +1150,11 @@ function renderRoster(team, season, players) {
 
   playerGrid.classList.remove('empty-grid');
   playerGrid.innerHTML = players.map(player => {
-    const injSt  = player.injury_status || '';
-    const isOut  = !!player.is_unavailable;
+    const injSt = player.injury_status || '';
+    const isOut = !!player.is_unavailable;
     const isRisk = !!player.is_risky && !isOut;
     const cardCls = isOut ? 'player-card player-card--out' : isRisk ? 'player-card player-card--risk' : 'player-card';
-    const badge   = isOut
+    const badge = isOut
       ? `<span class="inj-badge out">${escapeHtml(injSt)}</span>`
       : isRisk
         ? `<span class="inj-badge risk">${escapeHtml(injSt)}</span>`
@@ -1371,19 +1213,19 @@ async function toggleInjuryPanel(teamId) {
     }
     panel.innerHTML =
       '<div class="inj-panel-header">' +
-        '<strong>' + escapeHtml(d.team_name) + ' Injury Report</strong>' + rl +
+      '<strong>' + escapeHtml(d.team_name) + ' Injury Report</strong>' + rl +
       '</div>' +
       '<div class="inj-panel-rows">' +
-        ps.map(function(p) {
-          const cls = p.is_unavailable ? 'out' : p.is_risky ? 'risk' : 'ok';
-          return '<div class="inj-panel-row ' + cls + '">' +
-            '<span class="ipn">' + escapeHtml(formatPlayerName(p.name)) + '</span>' +
-            '<span class="ips inj-badge ' + cls + '">' + escapeHtml(p.status) + '</span>' +
-            '<span class="ipr">' + escapeHtml(p.reason || '') + '</span>' +
+      ps.map(function (p) {
+        const cls = p.is_unavailable ? 'out' : p.is_risky ? 'risk' : 'ok';
+        return '<div class="inj-panel-row ' + cls + '">' +
+          '<span class="ipn">' + escapeHtml(formatPlayerName(p.name)) + '</span>' +
+          '<span class="ips inj-badge ' + cls + '">' + escapeHtml(p.status) + '</span>' +
+          '<span class="ipr">' + escapeHtml(p.reason || '') + '</span>' +
           '</div>';
-        }).join('') +
+      }).join('') +
       '</div>';
-  } catch(e) {
+  } catch (e) {
     panel.innerHTML = '<div class="inj-panel-loading">Could not load injury report.</div>';
   }
 }
@@ -1428,50 +1270,6 @@ function renderSearchResults(results) {
   });
 }
 
-function renderOverviewBestBets() {
-  if (!overviewBestBets || !overviewBestBetsMeta) return;
-
-  const stored = loadStoredMarketResults();
-  const results = stored?.results || [];
-  overviewBestBetsMeta.textContent = results.length ? formatStoredTime(stored.updated_at) : 'Populated by your latest Market Scanner run.';
-
-  if (!results.length) {
-    overviewBestBets.className = 'overview-best-bets-list empty-state-panel compact';
-    overviewBestBets.innerHTML = `
-      <div class="empty-icon">⭐</div>
-      <strong>No best bets saved yet.</strong>
-      <span>Run Market Scanner to pin the strongest current board edges here.</span>
-    `;
-    return;
-  }
-
-  overviewBestBets.className = 'overview-best-bets-list';
-  overviewBestBets.innerHTML = results.slice(0, 4).map((item, index) => `
-    <button class="overview-best-bet-card ${item.best_bet.confidence_tone || ''}" data-index="${index}" type="button">
-      <div class="overview-best-bet-head">
-        <span class="overview-rank">#${index + 1}</span>
-        <span class="finder-badge ${item.best_bet.confidence_tone || ''}">${item.best_bet.display_side || item.best_bet.side} • ${item.best_bet.confidence}${item.best_bet.confidence_score ? ` ${item.best_bet.confidence_score}` : ''}</span>
-      </div>
-      <strong>${escapeHtml(item.player.full_name)}</strong>
-      <small>${escapeHtml(item.market.stat)} ${item.market.line} • ${escapeHtml(item.player.team || '')}${item.player.opponent ? ` vs ${escapeHtml(item.player.opponent)}` : ''}</small>
-      <div class="overview-best-bet-metrics">
-        <span>Edge ${item.best_bet.edge ?? '—'}%</span>
-        <span>EV ${item.best_bet.ev ?? '—'}%</span>
-        <span>${item.analysis.hit_rate}% hit</span>
-      </div>
-      <p>${escapeHtml(item.best_bet.confidence_summary || 'Latest scanner leader.')}</p>
-    </button>
-  `).join('');
-
-  overviewBestBets.querySelectorAll('.overview-best-bet-card').forEach(card => {
-    card.addEventListener('click', async () => {
-      const item = results[Number(card.dataset.index)];
-      if (!item) return;
-      await focusMarketPlayer(item);
-    });
-  });
-}
-
 function buildTodayGameCard(game, compact = false) {
   const statusClass = game.status_category || 'scheduled';
   const homeSummary = game.home.availability?.headline || 'Clean report';
@@ -1484,16 +1282,16 @@ function buildTodayGameCard(game, compact = false) {
   function injChips(teamData) {
     const players = teamData.injury_players || [];
     if (!players.length) return '<span class="today-inj-clean">\u2713 Clean</span>';
-    return players.slice(0, 4).map(function(p) {
+    return players.slice(0, 4).map(function (p) {
       const cls = p.is_unavailable ? 'out' : 'risky';
       return '<span class="today-inj-chip ' + cls + '" title="' + escapeHtml(p.injury_reason || '') + '">'
         + escapeHtml(p.short_name || formatPlayerName(p.full_name)) + '</span>';
     }).join('') + (players.length > 4 ? '<span class="today-inj-more">+' + (players.length - 4) + '</span>' : '');
   }
 
-  const awayInj  = injChips(game.away);
-  const homeInj  = injChips(game.home);
-  const gameKey  = (game.away.team_id || '') + '-' + (game.home.team_id || '');
+  const awayInj = injChips(game.away);
+  const homeInj = injChips(game.home);
+  const gameKey = (game.away.team_id || '') + '-' + (game.home.team_id || '');
 
   return `
     <article class="today-game-card ${compact ? 'compact' : ''} ${statusClass}" data-game-key="${gameKey}">
@@ -1557,89 +1355,15 @@ function bindSlateTeamButtons(root) {
 
   // Injury toggle button per game card
   root.querySelectorAll('.today-inj-toggle-btn').forEach(btn => {
-    btn.addEventListener('click', function() {
+    btn.addEventListener('click', function () {
       const gameKey = btn.dataset.gameKey;
-      const panel   = document.getElementById('inj-panel-' + gameKey);
+      const panel = document.getElementById('inj-panel-' + gameKey);
       if (!panel) return;
       const open = panel.style.display !== 'none';
       panel.style.display = open ? 'none' : '';
       btn.textContent = open ? '\uD83E\uDE79 Injuries' : '\u25B2 Hide';
     });
   });
-}
-
-function renderTodayGames(payload) {
-  latestTodayGamesPayload = payload;
-  const games = payload.games || [];
-  if (todayGamesMeta) {
-    todayGamesMeta.textContent = payload.fallback_used
-      ? `No games on ${payload.requested_date}. Showing next slate on ${payload.resolved_date}. ${payload.report_label ? `• Report ${payload.report_label}` : ''}`
-      : `${games.length} game${games.length === 1 ? '' : 's'} on ${payload.resolved_date}${payload.report_label ? ` • Report ${payload.report_label}` : ''}`;
-  }
-  if (overviewTodayMeta) {
-    overviewTodayMeta.textContent = payload.fallback_used
-      ? `Next slate: ${payload.resolved_date}`
-      : `${games.length} game${games.length === 1 ? '' : 's'} on ${payload.resolved_date}`;
-  }
-
-  if (!games.length) {
-    const emptyHtml = `
-      <div class="empty-state-panel compact today-game-empty">
-        <div class="empty-icon">🗓️</div>
-        <strong>No games on the active slate.</strong>
-        <span>When the NBA schedule posts games, they will appear here with report context.</span>
-      </div>`;
-    if (todayGamesBoard) todayGamesBoard.innerHTML = emptyHtml;
-    if (overviewTodayGames) overviewTodayGames.innerHTML = emptyHtml;
-    return;
-  }
-
-  if (todayGamesBoard) {
-    todayGamesBoard.innerHTML = games.map(game => buildTodayGameCard(game, false)).join('');
-    bindSlateTeamButtons(todayGamesBoard);
-  }
-
-  if (overviewTodayGames) {
-    overviewTodayGames.className = 'today-overview-list';
-    overviewTodayGames.innerHTML = games.slice(0, 4).map(game => buildTodayGameCard(game, true)).join('');
-  }
-}
-
-async function loadTodayGames(force = false) {
-  if (latestTodayGamesPayload && !force) {
-    renderTodayGames(latestTodayGamesPayload);
-    return;
-  }
-
-  if (todayGamesMeta) todayGamesMeta.textContent = "Loading today's NBA slate...";
-  if (overviewTodayMeta) overviewTodayMeta.textContent = "Fetching today's slate...";
-  try {
-    const response = await fetch('/api/todays-games');
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.detail || "Failed to load today's games.");
-    }
-    renderTodayGames(payload);
-  } catch (error) {
-    console.error(error);
-    const fallbackMessage = error.message || "Failed to load today's slate.";
-    if (todayGamesBoard) {
-      todayGamesBoard.innerHTML = `
-        <div class="empty-state-panel compact today-game-empty">
-          <div class="empty-icon">⚠️</div>
-          <strong>Could not load today&#39;s games.</strong>
-          <span>${escapeHtml(fallbackMessage)}</span>
-        </div>`;
-    }
-    if (overviewTodayGames) {
-      overviewTodayGames.innerHTML = `
-        <div class="empty-state-panel compact today-game-empty">
-          <div class="empty-icon">⚠️</div>
-          <strong>Could not load the slate.</strong>
-          <span>${escapeHtml(fallbackMessage)}</span>
-        </div>`;
-    }
-  }
 }
 
 function renderBetFinderEmpty(message = 'Choose a team, set your prop line, then click Bet Finder.') {
@@ -1672,27 +1396,6 @@ function getFinderLabel(hitRate) {
 }
 
 /* ── Mini sparkline SVG ─────────────────────────────────────────────── */
-function buildSparklineSvg(values, line, width = 80, height = 28) {
-  if (!values || values.length < 2) return '';
-  const min = Math.min(...values, line) * 0.9;
-  const max = Math.max(...values, line) * 1.1 || 1;
-  const toX = (i) => (i / (values.length - 1)) * width;
-  const toY = (v) => height - ((v - min) / (max - min)) * height;
-  const pts = values.map((v, i) => `${toX(i).toFixed(1)},${toY(v).toFixed(1)}`).join(' ');
-  const lineY = toY(line).toFixed(1);
-  const dots = values.map((v, i) => {
-    const hit = v >= line;
-    const cx = toX(i).toFixed(1);
-    const cy = toY(v).toFixed(1);
-    return `<circle cx="${cx}" cy="${cy}" r="2.5" fill="${hit ? 'var(--good)' : 'var(--bad)'}" />`;
-  }).join('');
-  return `<svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" class="sparkline-svg" xmlns="http://www.w3.org/2000/svg">
-    <line x1="0" y1="${lineY}" x2="${width}" y2="${lineY}" stroke="var(--warning)" stroke-width="1" stroke-dasharray="3,2" opacity="0.7"/>
-    <polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linejoin="round"/>
-    ${dots}
-  </svg>`;
-}
-
 function renderBetFinderResults(payload) {
   const results = payload.results || [];
 
@@ -1806,6 +1509,7 @@ async function runBetFinder() {
   `;
 
   try {
+    await populateAnalyzerWithoutPlayerFilter();
     const params = new URLSearchParams({
       team_id: teamId,
       stat: selectedStat,
@@ -2006,7 +1710,7 @@ function renderMatchup(payload) {
 
   let summaryText = 'Defense-vs-position data unavailable for this player and stat.';
   if (vsPosition) {
-    summaryText = `${nextGame?.opponent_name || 'This opponent'} allows ${vsPosition.opponent_value.toFixed(2)} ${getStatLabel(vsPosition.stat).toLowerCase()} per player-game to ${vsPosition.position_label.toLowerCase()}, versus a league baseline of ${vsPosition.league_average.toFixed(2)} (${formatDelta(vsPosition.delta_pct)}%).`;
+    summaryText = `${nextGame?.opponent_name || 'This opponent'} allows ${vsPosition.opponent_value.toFixed(2)} ${(getStatLabel(vsPosition.stat) || '').toLowerCase()} per player-game to ${(vsPosition.position_label || 'this position').toLowerCase()}, versus a league baseline of ${vsPosition.league_average.toFixed(2)} (${formatDelta(vsPosition.delta_pct)}%).`;
   }
 
   const bodyHtml = `
@@ -2060,121 +1764,6 @@ function renderMatchup(payload) {
   });
 }
 
-function renderInterpretationPanels(payload) {
-  const interpretation = payload?.interpretation || {};
-  const opportunity = payload?.opportunity || {};
-  const teamContext = payload?.team_context || {};
-  const environment = payload?.environment || {};
-  const toneMap = { good: 'good', warning: 'warning', bad: 'bad', neutral: 'neutral' };
-  const interpretationToneClass = toneMap[interpretation.tone] || 'neutral';
-  const opportunityToneClass = opportunity.minutes_trend === 'up' || opportunity.volume_trend === 'up'
-    ? 'good'
-    : (teamContext.impact_count ? 'warning' : 'neutral');
-  const environmentToneClass = toneMap[environment.tone] || 'neutral';
-
-  if (interpretationTone) {
-    interpretationTone.className = `spotlight-pill ${interpretationToneClass}`;
-    interpretationTone.textContent = interpretation.headline || 'Quick read';
-  }
-  if (opportunityTone) {
-    opportunityTone.className = `spotlight-pill ${opportunityToneClass}`;
-    opportunityTone.textContent = opportunity.minutes_label || 'Opportunity';
-  }
-  if (environmentTone) {
-    environmentTone.className = `spotlight-pill ${environmentToneClass}`;
-    environmentTone.textContent = environment.headline || 'Schedule spot';
-  }
-
-  if (interpretationBody) {
-    const bullets = Array.isArray(interpretation.bullets) ? interpretation.bullets : [];
-    interpretationBody.className = 'interpretation-body';
-    interpretationBody.innerHTML = `
-      <div class="insight-summary ${interpretationToneClass}">
-        <span class="insight-summary-label">Quick read</span>
-        <strong>${escapeHtml(interpretation.headline || 'Quick read unavailable')}</strong>
-        <p>${escapeHtml(interpretation.summary || 'Analyze a player prop to generate a simple read.')}</p>
-      </div>
-      <ul class="insight-bullet-list compact-bullets">
-        ${bullets.length ? bullets.map(item => `<li>${escapeHtml(item)}</li>`).join('') : '<li>Analyze a player prop to fill this section.</li>'}
-      </ul>
-    `;
-  }
-
-  if (opportunityBody) {
-    const listedPlayers = (teamContext.players || []).map(item => `${formatPlayerName(item.name)} (${item.status})`);
-    opportunityBody.className = 'opportunity-body';
-    opportunityBody.innerHTML = `
-      <div class="opportunity-chip-grid refined-opportunity-grid">
-        <div class="opportunity-chip">
-          <span class="small-label">Minutes</span>
-          <strong>${Number(opportunity.minutes_last5 || 0).toFixed(1)}</strong>
-          <small>${escapeHtml(opportunity.minutes_label || 'Minutes trend')}</small>
-        </div>
-        <div class="opportunity-chip">
-          <span class="small-label">FGA</span>
-          <strong>${Number(opportunity.fga_last5 || 0).toFixed(1)}</strong>
-          <small>${escapeHtml(opportunity.volume_label || 'Shot volume trend')}</small>
-        </div>
-        <div class="opportunity-chip">
-          <span class="small-label">3PA</span>
-          <strong>${Number(opportunity.fg3a_last5 || 0).toFixed(1)}</strong>
-          <small>Three-point volume</small>
-        </div>
-        <div class="opportunity-chip">
-          <span class="small-label">FTA</span>
-          <strong>${Number(opportunity.fta_last5 || 0).toFixed(1)}</strong>
-          <small>Free-throw trips</small>
-        </div>
-      </div>
-      <div class="opportunity-summary-wrap refined-opportunity-wrap">
-        <div class="insight-summary neutral compact-summary">
-          <span class="insight-summary-label">Opportunity read</span>
-          <p class="opportunity-summary">${escapeHtml(opportunity.summary || 'Opportunity trends will appear after analysis.')}</p>
-        </div>
-        <div class="team-context-box ${teamContext.impact_count ? 'warning' : 'neutral'}">
-          <strong>${escapeHtml(teamContext.headline || 'Team context')}</strong>
-          <p>${escapeHtml(teamContext.summary || 'No team-availability context yet.')}</p>
-          ${listedPlayers.length ? `<small>${escapeHtml(listedPlayers.join(' • '))}</small>` : '<small>No major same-team absences flagged on the latest report.</small>'}
-        </div>
-      </div>
-    `;
-  }
-
-  if (environmentBody) {
-    const restValue = Number.isInteger(environment.rest_days) ? `${environment.rest_days} day${environment.rest_days === 1 ? '' : 's'}` : 'Unknown';
-    environmentBody.className = 'environment-body';
-    environmentBody.innerHTML = `
-      <div class="environment-chip-grid">
-        <div class="environment-chip">
-          <span class="small-label">Venue</span>
-          <strong>${escapeHtml(environment.venue_label || 'TBD')}</strong>
-          <small>${escapeHtml(environment.next_opponent ? `Next ${environment.next_opponent}` : 'Upcoming game')}</small>
-        </div>
-        <div class="environment-chip">
-          <span class="small-label">Rest</span>
-          <strong>${escapeHtml(restValue)}</strong>
-          <small>${escapeHtml(environment.headline || 'Schedule spot')}</small>
-        </div>
-        <div class="environment-chip ${environment.is_back_to_back ? 'warning' : ''}">
-          <span class="small-label">Back-to-back</span>
-          <strong>${environment.is_back_to_back ? 'Yes' : 'No'}</strong>
-          <small>${environment.is_back_to_back ? 'More fatigue risk' : 'No immediate fatigue flag'}</small>
-        </div>
-        <div class="environment-chip">
-          <span class="small-label">Games in 7</span>
-          <strong>${Number(environment.games_last7 || 0)}</strong>
-          <small>${Number(environment.games_last7 || 0) >= 4 ? 'Busy recent schedule' : 'Normal recent load'}</small>
-        </div>
-      </div>
-      <div class="insight-summary ${environmentToneClass} compact-summary">
-        <span class="insight-summary-label">Schedule read</span>
-        <strong>${escapeHtml(environment.headline || 'Schedule spot')}</strong>
-        <p class="opportunity-summary">${escapeHtml(environment.summary || 'Schedule context will appear after analysis.')}</p>
-      </div>
-    `;
-  }
-}
-
 function createLinePlugin(lineValue) {
   return {
     id: 'propLinePlugin',
@@ -2198,147 +1787,6 @@ function createLinePlugin(lineValue) {
       ctx.restore();
     }
   };
-}
-
-function renderChart(payload) {
-  lastPayload = payload;
-  const chartGames = payload.games || [];
-  const labels = chartGames.map(game => game.game_date || game.matchup || '');
-  const values = chartGames.map(game => game.value);
-  const hits = chartGames.map(game => game.hit);
-  const accent = getCssVar('--accent');
-  const good = getCssVar('--good');
-  const bad = getCssVar('--bad');
-  const text = getChartTextColor();
-  const muted = getMutedColor();
-  const linePlugin = createLinePlugin(payload.line);
-
-  if (chart) {
-    chart.destroy();
-  }
-
-  chart = new Chart(document.getElementById('propsChart'), {
-    type: 'bar',
-    data: {
-      labels,
-      datasets: [{
-        label: getStatLabel(payload.stat),
-        data: values,
-        backgroundColor: hits.map(hit => hit ? `${good}CC` : `${bad}CC`),
-        borderColor: hits.map(hit => hit ? good : bad),
-        borderWidth: 1.4,
-        borderRadius: 12,
-        borderSkipped: false,
-        hoverBackgroundColor: hits.map(hit => hit ? good : bad),
-        maxBarThickness: 42
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: { duration: 700 },
-      layout: {
-        padding: {
-          bottom: 12
-        }
-      },
-      plugins: {
-        legend: { display: false },
-        tooltip: {
-          backgroundColor: document.body.classList.contains('light-theme')
-            ? 'rgba(255,255,255,0.96)'
-            : 'rgba(10,16,31,0.95)',
-          titleColor: text,
-          bodyColor: text,
-          borderColor: `${accent}55`,
-          borderWidth: 1,
-          padding: 12,
-          displayColors: false,
-          callbacks: {
-            title(items) {
-              const item = items?.[0];
-              const game = item ? chartGames[item.dataIndex] : null;
-              return game?.game_date || item?.label || '';
-            },
-            label(context) {
-              const value = context.raw;
-              const game = chartGames[context.dataIndex] || null;
-              const verdict = value >= payload.line ? 'Over ✓' : 'Under ✗';
-              const lines = [`${getStatLabel(payload.stat)}: ${value} (${verdict})`];
-              if (game?.matchup) lines.push(`vs ${game.matchup}`);
-              if (game?.is_home === true) lines.push('Home game');
-              else if (game?.is_home === false) lines.push('Away game');
-              return lines;
-            }
-          }
-        }
-      },
-      scales: {
-        x: {
-          ticks: {
-            color: muted,
-            autoSkip: false,
-            minRotation: 35,
-            maxRotation: 35,
-            padding: 8,
-            callback(value, index) {
-              return labels[index] || '';
-            }
-          },
-          grid: { display: false },
-          border: { display: false }
-        },
-        y: {
-          beginAtZero: true,
-          ticks: { color: muted },
-          grid: {
-            color: document.body.classList.contains('light-theme')
-              ? 'rgba(17,33,63,0.08)'
-              : 'rgba(255,255,255,0.08)'
-          },
-          border: { display: false }
-        }
-      }
-    },
-    plugins: [linePlugin, valueLabelPlugin]
-  });
-}
-
-function renderSummary(payload) {
-  const streak = computeOverStreak(payload.games);
-  const lastGame = payload.games[payload.games.length - 1];
-
-  avgValue.textContent = payload.average.toFixed(1);
-  hitRateValue.textContent = `${payload.hit_rate.toFixed(1)}%`;
-  hitCountValue.textContent = `${payload.hit_count}/${payload.games_count}`;
-  seasonValue.textContent = payload.season;
-  streakValue.textContent = streak ? `${streak} straight` : '0';
-  lastGameValue.textContent = lastGame ? `${lastGame.value}` : '—';
-
-  const nextGame = payload.matchup?.next_game;
-  const vsPosition = payload.matchup?.vs_position;
-  const environment = payload.environment || {};
-  const h2h = payload.h2h || {};
-  chartTitle.textContent = `${payload.player.full_name} • ${getStatLabel(payload.stat)}`;
-  chartSubtitle.textContent = nextGame
-    ? `Line ${payload.line} across the last ${payload.last_n} games • Next ${nextGame.matchup_label}`
-    : `Line ${payload.line} across the last ${payload.last_n} games.`;
-
-  chartChips.innerHTML = `
-    <span class="chart-chip">Avg ${payload.average.toFixed(1)}</span>
-    <span class="chart-chip">${payload.hit_count}/${payload.games_count} overs</span>
-    <span class="chart-chip">${payload.hit_rate.toFixed(1)}% hit rate</span>
-    <span class="chart-chip">Season ${payload.season}</span>
-    <span class="chart-chip">Current streak ${streak}</span>
-    <span class="chart-chip">Stat ${payload.stat}</span>
-    ${payload.availability ? `<span class="chart-chip">Status ${escapeHtml(payload.availability.status)}</span>` : ''}
-    ${nextGame ? `<span class="chart-chip">Next ${escapeHtml(nextGame.matchup_label)}</span>` : ''}
-    ${vsPosition ? `<span class="chart-chip">Vs ${escapeHtml(vsPosition.position_label)} ${formatDelta(vsPosition.delta_pct)}%</span>` : ''}
-    ${h2h.games_count ? `<span class="chart-chip">H2H ${h2h.hit_count}/${h2h.games_count} vs ${escapeHtml(h2h.opponent_abbreviation || h2h.opponent_name || 'opponent')}</span>` : ''}
-  `;
-
-  renderMatchup(payload);
-  renderInterpretationPanels(payload);
 }
 
 const gamesTableHeadRow = document.querySelector('#gameLogContent thead tr');
@@ -2723,12 +2171,11 @@ async function focusMarketPlayer(item) {
     try {
       await loadRoster(teamId);
     } catch (rosterErr) {
-      // Roster load failed (NBA API throttle/timeout) — continue anyway.
-      // The player is already known from the market scan result so analysis
-      // can still run; the roster panel will just be empty/stale.
       console.warn('Roster load failed, continuing with player from market scan:', rosterErr.message || rosterErr);
     }
   }
+
+  const analysis = item.analysis || {};
 
   setSelectedPlayer({
     id: item.player.id,
@@ -2739,14 +2186,65 @@ async function focusMarketPlayer(item) {
     team_id: item.player.team_id || null,
     position: item.player.position || '',
     jersey: item.player.jersey || '',
-    availability: item.analysis?.availability || item.availability || null,
-    matchup: item.analysis?.matchup || item.matchup || null,
-    environment: item.analysis?.environment || item.environment || null
+    availability: analysis.availability || item.availability || null,
+    matchup: analysis.matchup || item.matchup || null,
+    environment: analysis.environment || item.environment || null
   });
 
   setActiveProp(item.market.stat);
   lineInput.value = item.market.line;
   switchView('analyzer');
+
+  // Hydrate the analyzer immediately from the already-fetched market scan data.
+  // No network request needed — all the data is already in item.analysis.
+  if (analysis && analysis.games && analysis.games.length) {
+    // Build a full payload matching the shape renderSummary/renderChart expect
+    const hydratedPayload = Object.assign({}, analysis, {
+      player: Object.assign({}, analysis.player || {}, {
+        id: item.player.id,
+        full_name: item.player.full_name,
+        team_id: item.player.team_id || null,
+        position: item.player.position || '',
+      }),
+      stat: item.market.stat,
+      line: item.market.line,
+      availability: analysis.availability || item.availability || null,
+      matchup: analysis.matchup || item.matchup || null,
+      environment: analysis.environment || item.environment || null,
+    });
+
+    // Store full game list and slice to selected window
+    const _allGames = (hydratedPayload.games || []).slice();
+    const _n = parseInt(gamesSelect ? gamesSelect.value : '10', 10);
+    const _sliced = _allGames.length > _n ? _allGames.slice(-_n) : _allGames;
+    const _hits = _sliced.filter(g => g.hit).length;
+    const _vals = _sliced.map(g => g.value);
+    const _avg = _vals.length ? Math.round((_vals.reduce((a, b) => a + b, 0) / _vals.length) * 10) / 10 : 0;
+
+    const displayPayload = Object.assign({}, hydratedPayload, {
+      games: _sliced,
+      games_count: _sliced.length,
+      hit_count: _hits,
+      hit_rate: _sliced.length ? Math.round((_hits / _sliced.length) * 1000) / 10 : 0,
+      average: _avg,
+      last_n: _n,
+      _allGames: _allGames,
+    });
+
+    renderSelectedPlayer();
+    renderSummary(displayPayload);
+    renderChart(displayPayload);
+    renderTable(displayPayload);
+    setStatus('Ready');
+
+    // Silently refresh in background to get latest data (next game, injury status, etc.)
+    analyzePlayerProp({ preserveScroll: true, forceRefresh: true }).catch(err => {
+      console.warn('Background refresh failed:', err.message || err);
+    });
+    return;
+  }
+
+  // Fallback: no pre-fetched analysis, do a full fetch
   await analyzePlayerProp();
 }
 
@@ -2756,6 +2254,7 @@ function renderMarketResults(payload) {
   const filterKey = currentMarketFilter || 'all';
   const results = [...filterMarketRows(payload.results || [], filterKey)]
     .filter(item => passesExpertFilters(item))
+    .filter(item => passesAdvancedMarketFilters(item))
     .sort((a, b) => compareMarketRows(a, b, sortKey, currentMarketSortDirection));
 
   if (!results.length) {
@@ -2780,15 +2279,15 @@ function renderMarketResults(payload) {
     </div>
     <div class="market-slips-grid">
       ${featured.map((item, index) => {
-        const tone = getConfidenceTone(item.best_bet.confidence);
-        const availability = item.availability || item.analysis?.availability || { status: 'Unknown', tone: 'neutral', reason: 'No report found', note: '' };
-        const matchupData = item.analysis?.matchup || item.matchup || {};
-        const matchupLean = matchupData?.vs_position?.lean || 'No matchup';
-        const matchupDetail = matchupData?.next_game?.matchup_label || 'No next opponent';
-        const expertAngles = getMarketExpertAngles(item).slice(0, 3);
-        const side = (item.best_bet.display_side || item.best_bet.side || 'Lean').toUpperCase();
-        const sideClass = side.toLowerCase().includes('under') ? 'under' : 'over';
-        return `
+    const tone = getConfidenceTone(item.best_bet.confidence);
+    const availability = item.availability || item.analysis?.availability || { status: 'Unknown', tone: 'neutral', reason: 'No report found', note: '' };
+    const matchupData = item.analysis?.matchup || item.matchup || {};
+    const matchupLean = matchupData?.vs_position?.lean || 'No matchup';
+    const matchupDetail = matchupData?.next_game?.matchup_label || 'No next opponent';
+    const expertAngles = getMarketExpertAngles(item).slice(0, 3);
+    const side = (item.best_bet.display_side || item.best_bet.side || 'Lean').toUpperCase();
+    const sideClass = side.toLowerCase().includes('under') ? 'under' : 'over';
+    return `
           <article class="market-slip-card" data-index="${index}">
             <div class="market-slip-head">
               <div class="market-slip-player">
@@ -2842,7 +2341,7 @@ function renderMarketResults(payload) {
             </div>
           </article>
         `;
-      }).join('')}
+  }).join('')}
     </div>
     <div class="market-results-table-wrap">
       <table class="market-results-table">
@@ -2860,17 +2359,18 @@ function renderMarketResults(payload) {
             <th>Average</th>
             <th>Expert angles</th>
             <th>Matchup</th>
+            <th>🏥 Team injuries</th>
           </tr>
         </thead>
         <tbody>
           ${results.map((item, index) => {
-            const tone = getConfidenceTone(item.best_bet.confidence);
-            const availability = item.availability || item.analysis?.availability || { status: 'Unknown', tone: 'neutral', reason: 'No report found', note: '' };
-            const matchupData = item.analysis?.matchup || item.matchup || {};
-            const matchupLean = matchupData?.vs_position?.lean || 'No matchup';
-            const matchupDetail = matchupData?.next_game?.matchup_label || 'No next opponent';
-            const expertAngles = getMarketExpertAngles(item);
-            return `
+    const tone = getConfidenceTone(item.best_bet.confidence);
+    const availability = item.availability || item.analysis?.availability || { status: 'Unknown', tone: 'neutral', reason: 'No report found', note: '' };
+    const matchupData = item.analysis?.matchup || item.matchup || {};
+    const matchupLean = matchupData?.vs_position?.lean || 'No matchup';
+    const matchupDetail = matchupData?.next_game?.matchup_label || 'No next opponent';
+    const expertAngles = getMarketExpertAngles(item);
+    return `
               <tr class="market-row" data-index="${index}">
                 <td>
                   <div class="market-player-cell">
@@ -2906,13 +2406,35 @@ function renderMarketResults(payload) {
                     <small>${escapeHtml(matchupDetail)}</small>
                   </div>
                 </td>
+                <td><div class="parlay-inj-cell" id="market-inj-${index}"><span style="opacity:0.3">—</span></div></td>
               </tr>
             `;
-          }).join('')}
+  }).join('')}
         </tbody>
       </table>
     </div>
   `;
+
+  // Async-populate injury cells for market scanner rows
+  results.forEach((item, index) => {
+    const teamName = item.player?.team_name || item.player?.team || '';
+    if (!teamName) return;
+    fetch('/api/team-injuries?team_name=' + encodeURIComponent(teamName))
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        const cell = document.getElementById('market-inj-' + index);
+        if (!cell || !data) return;
+        const injured = (data.players || []);
+        if (!injured.length) { cell.innerHTML = '<span style="opacity:0.35">Clean</span>'; return; }
+        const outPlayers = injured.filter(p => p.is_unavailable);
+        const riskyPlayers = injured.filter(p => !p.is_unavailable);
+        let html = '';
+        if (outPlayers.length) html += '<span style="color:rgba(255,100,80,0.85);font-weight:600">' + outPlayers.map(p => escapeHtml(p.lookup_name || p.display_name)).join(', ') + ' OUT</span><br>';
+        if (riskyPlayers.length) html += '<span style="opacity:0.6">' + riskyPlayers.map(p => escapeHtml(p.lookup_name || p.display_name)).join(', ') + ' Q</span>';
+        cell.innerHTML = html || '<span style="opacity:0.35">Clean</span>';
+      })
+      .catch(() => {});
+  });
 
   marketResults.querySelectorAll('.market-row, .market-slip-card').forEach(row => {
     row.addEventListener('click', async () => {
@@ -3043,62 +2565,6 @@ function resetDashboardForNoSelection() {
   lastPayload = null;
 }
 
-async function analyzePlayerProp(options = {}) {
-  switchView('analyzer', { scroll: !options.preserveScroll });
-  if (!selectedPlayer) {
-    alert('Please select a player first.');
-    return;
-  }
-
-  setStatus('Loading');
-  analyzeBtn.disabled = true;
-
-  try {
-    const params = new URLSearchParams({
-      player_id: selectedPlayer.id,
-      stat: selectedStat,
-      line: lineInput.value,
-      last_n: gamesSelect.value
-    });
-
-    if (selectedPlayer.team_id) params.set('team_id', selectedPlayer.team_id);
-    if (selectedPlayer.position) params.set('player_position', selectedPlayer.position);
-
-    const season = seasonInput.value.trim();
-    if (season) params.set('season', season);
-
-    const overrideOppId = oppSelect?.value;
-    if (overrideOppId) params.set('override_opponent_id', overrideOppId);
-
-    const response = await fetch(`/api/player-prop?${params.toString()}`);
-    const payload = await response.json();
-
-    if (!response.ok) {
-      throw new Error(payload.detail || 'Failed to analyze player prop.');
-    }
-
-    selectedPlayer = {
-      ...selectedPlayer,
-      team_id: payload.player.team_id || selectedPlayer.team_id,
-      position: payload.player.position || selectedPlayer.position,
-      availability: payload.availability || null,
-      matchup: payload.matchup || null,
-      environment: payload.environment || null
-    };
-    renderSelectedPlayer();
-    renderSummary(payload);
-    renderChart(payload);
-    renderTable(payload);
-    setStatus('Ready');
-  } catch (error) {
-    console.error(error);
-    alert(error.message);
-    setStatus('Error');
-  } finally {
-    analyzeBtn.disabled = false;
-  }
-}
-
 teamSelect.addEventListener('change', async () => {
   const teamId = teamSelect.value;
   const selectedOption = teamSelect.options[teamSelect.selectedIndex];
@@ -3217,6 +2683,45 @@ marketClearBtn.addEventListener('click', () => { marketTextarea.value = ''; rend
 marketScanBtn.addEventListener('click', runMarketScan);
 oddsLoadEventsBtn?.addEventListener('click', loadOddsEvents);
 oddsImportScanBtn?.addEventListener('click', importOddsPropsAndScan);
+
+// Save Key button — persist key + settings, show confirmation
+oddsSaveKeyBtn?.addEventListener('click', () => {
+  const settings = getOddsApiSettings();
+  if (!settings.api_key) { alert('Please enter an Odds API key first.'); return; }
+  persistOddsApiSettings();
+  setOddsApiKeyMeta(settings.api_key);
+  const orig = oddsSaveKeyBtn.textContent;
+  oddsSaveKeyBtn.textContent = '✓ Key Saved!';
+  oddsSaveKeyBtn.disabled = true;
+  setTimeout(() => { oddsSaveKeyBtn.textContent = orig; oddsSaveKeyBtn.disabled = false; }, 2000);
+});
+
+// Check Balance button — hits /api/odds/check-quota (costs 0 credits)
+oddsCheckBalBtn?.addEventListener('click', async () => {
+  const settings = getOddsApiSettings();
+  if (!settings.api_key) { alert('Please enter an Odds API key first.'); return; }
+  const orig = oddsCheckBalBtn.textContent;
+  oddsCheckBalBtn.textContent = 'Checking…';
+  oddsCheckBalBtn.disabled = true;
+  try {
+    const r = await fetch('/api/odds/check-quota', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: settings.api_key })
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || 'Failed');
+    setOddsQuotaMeta(data.quota);
+    setOddsApiKeyMeta(settings.api_key);
+    setOddsApiStatus('Balance checked', 'good');
+  } catch (err) {
+    alert('Could not check balance: ' + err.message);
+    setOddsApiStatus('Check failed', 'bad');
+  } finally {
+    oddsCheckBalBtn.textContent = orig;
+    oddsCheckBalBtn.disabled = false;
+  }
+});
 [oddsApiKeyInput, oddsSportSelect, oddsRegionsInput, oddsFormatSelect, oddsMarketsInput].forEach(el => {
   el?.addEventListener('change', persistOddsApiSettings);
   el?.addEventListener('input', persistOddsApiSettings);
@@ -3270,6 +2775,21 @@ themeToggle.addEventListener('click', () => {
   const nextTheme = document.body.classList.contains('light-theme') ? 'dark' : 'light';
   setTheme(nextTheme);
 });
+
+// ── User Guide modal ──────────────────────────────────────────────────
+(function () {
+  const modal    = document.getElementById('userGuideModal');
+  const openBtn  = document.getElementById('openUserGuideBtn');
+  const closeTop = document.getElementById('closeUserGuideBtn');
+  const closeBot = document.getElementById('closeUserGuideBtnBottom');
+  function openGuide()  { if (modal) modal.style.display = 'block'; document.body.style.overflow = 'hidden'; }
+  function closeGuide() { if (modal) modal.style.display = 'none';  document.body.style.overflow = ''; }
+  openBtn?.addEventListener('click', openGuide);
+  closeTop?.addEventListener('click', closeGuide);
+  closeBot?.addEventListener('click', closeGuide);
+  modal?.addEventListener('click', e => { if (e.target === modal) closeGuide(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && modal?.style.display === 'block') closeGuide(); });
+})();
 
 if (sidebarToggle) {
   sidebarToggle.addEventListener('click', () => {
@@ -3618,6 +3138,16 @@ function renderInterpretationPanels(payload) {
     recommendationToneEl.textContent = recommendation.label || 'Recommendation';
   }
   if (recommendationBodyEl) {
+    const sampleWarning = payload?.sample_warning || null;
+    const variance = payload?.variance || {};
+    const chosenSide = payload?.recommended_side || 'LEAN';
+    const consistencyScore = Number(variance.consistency_score ?? -1);
+    const consistencyHtml = consistencyScore >= 0
+      ? `<span style="font-size:11px;opacity:0.65;margin-left:8px">Consistency ${consistencyScore.toFixed(0)}/100</span>`
+      : '';
+    const warningHtml = sampleWarning
+      ? `<div style="margin-top:10px;padding:8px 12px;border-radius:10px;background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.25);font-size:12px;color:var(--warning,#f59e0b)">⚠ ${escapeHtml(sampleWarning)}</div>`
+      : '';
     recommendationBodyEl.className = 'interpretation-body';
     recommendationBodyEl.innerHTML = `
       <div class="insight-summary ${trafficToneClass}">
@@ -3626,9 +3156,15 @@ function renderInterpretationPanels(payload) {
         <p>${escapeHtml(recommendation.summary || 'Analyze a player prop to generate a clearer read.')}</p>
       </div>
       <div class="traffic-light-row">
-        <span class="traffic-pill ${trafficToneClass}">${escapeHtml(payload?.recommended_side || 'LEAN')}</span>
+        <span class="traffic-pill ${trafficToneClass}">${escapeHtml(chosenSide)}</span>
         <span class="traffic-meta">${escapeHtml(confidence.grade || '—')} ${escapeHtml(String(confidence.score || ''))} • ${escapeHtml(confidence.summary || '')}</span>
-      </div>`;
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;margin-top:8px;flex-wrap:wrap">
+        ${consistencyScore >= 0 ? `<span style="font-size:11px;padding:3px 10px;border-radius:12px;background:rgba(255,255,255,0.07);opacity:0.8">Consistency <strong>${consistencyScore.toFixed(0)}/100</strong></span>` : ''}
+        ${variance.std_dev !== undefined ? `<span style="font-size:11px;padding:3px 10px;border-radius:12px;background:rgba(255,255,255,0.07);opacity:0.7">σ <strong>${Number(variance.std_dev).toFixed(1)}</strong></span>` : ''}
+        ${variance.median !== undefined ? `<span style="font-size:11px;padding:3px 10px;border-radius:12px;background:rgba(255,255,255,0.07);opacity:0.7">Median <strong>${Number(variance.median).toFixed(1)}</strong></span>` : ''}
+      </div>
+      ${warningHtml}`;
   }
   if (interpretationTone) {
     interpretationTone.className = `spotlight-pill ${interpretationToneClass}`;
@@ -3685,6 +3221,111 @@ function renderInterpretationPanels(payload) {
         <div class="environment-chip"><span class="small-label">Games in 7</span><strong>${Number(environment.games_last7 || 0)}</strong><small>${Number(environment.games_last7 || 0) >= 4 ? 'Busy recent schedule' : 'Normal recent load'}</small></div>
       </div>
       <div class="insight-summary ${environmentToneClass} compact-summary"><span class="insight-summary-label">Schedule read</span><strong>${escapeHtml(environment.headline || 'Schedule spot')}</strong><p class="opportunity-summary">${escapeHtml(environment.summary || 'Schedule context will appear after analysis.')}</p></div>`;
+  }
+
+  // ── Variance / distribution panel ────────────────────────────────────
+  const variance = payload?.variance || {};
+  const sampleWarning = payload?.sample_warning || null;
+  if (varianceTone) {
+    const cs = Number(variance.consistency_score ?? -1);
+    let vtLabel = 'No data';
+    let vtClass = 'neutral';
+    if (cs >= 0) {
+      if (cs >= 72) { vtLabel = 'Consistent'; vtClass = 'good'; }
+      else if (cs >= 48) { vtLabel = 'Mixed'; vtClass = 'warning'; }
+      else { vtLabel = 'Volatile'; vtClass = 'bad'; }
+    }
+    varianceTone.className = `spotlight-pill ${vtClass}`;
+    varianceTone.textContent = cs >= 0 ? `${vtLabel} • ${cs.toFixed(0)}` : 'Waiting for analysis';
+  }
+  if (varianceBody) {
+    if (!variance || Object.keys(variance).length === 0) {
+      varianceBody.innerHTML = `<div class="empty-state-panel compact matchup-empty"><div class="empty-icon">📊</div><strong>No distribution data yet.</strong><span>Analyze a player prop to see consistency, median, floor and ceiling.</span></div>`;
+    } else {
+      const cs = Number(variance.consistency_score ?? 0);
+      const csColor = cs >= 72 ? 'var(--good)' : cs >= 48 ? 'var(--warning,#f59e0b)' : 'var(--bad)';
+      const csLabel = cs >= 72 ? 'Consistent' : cs >= 48 ? 'Mixed signals' : 'Volatile';
+      const statLabel = payload?.stat || 'stat';
+      const line = Number(payload?.line || 0);
+
+      // Build percentile bar: show p25 / median / p75 relative to floor-ceiling range
+      const floor = Number(variance.floor ?? 0);
+      const ceiling = Number(variance.ceiling ?? 1);
+      const rangeSpan = ceiling - floor || 1;
+      const p25Pct  = Math.round(((Number(variance.p25  ?? floor) - floor) / rangeSpan) * 100);
+      const medPct  = Math.round(((Number(variance.median ?? (floor+ceiling)/2) - floor) / rangeSpan) * 100);
+      const p75Pct  = Math.round(((Number(variance.p75  ?? ceiling) - floor) / rangeSpan) * 100);
+      const linePct = Math.round(((line - floor) / rangeSpan) * 100);
+      const linePctClamped = Math.max(0, Math.min(100, linePct));
+
+      const warningHtml = sampleWarning
+        ? `<div class="insight-summary warning compact-summary" style="margin-bottom:10px"><span class="insight-summary-label">⚠ Small sample</span><p>${escapeHtml(sampleWarning)}</p></div>`
+        : '';
+
+      varianceBody.className = 'environment-body';
+      varianceBody.innerHTML = `
+        ${warningHtml}
+        <div class="opportunity-chip-grid" style="grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px;padding:16px 20px 10px">
+          <div class="opportunity-chip">
+            <span class="small-label">Consistency</span>
+            <strong style="color:${csColor}">${cs.toFixed(0)}/100</strong>
+            <small>${csLabel}</small>
+          </div>
+          <div class="opportunity-chip">
+            <span class="small-label">Std Dev</span>
+            <strong>${Number(variance.std_dev ?? 0).toFixed(1)}</strong>
+            <small>${statLabel} variation</small>
+          </div>
+          <div class="opportunity-chip">
+            <span class="small-label">Median</span>
+            <strong>${Number(variance.median ?? 0).toFixed(1)}</strong>
+            <small>vs avg ${Number(payload?.average ?? 0).toFixed(1)}</small>
+          </div>
+          <div class="opportunity-chip">
+            <span class="small-label">Floor</span>
+            <strong>${Number(variance.floor ?? 0).toFixed(1)}</strong>
+            <small>worst recent</small>
+          </div>
+          <div class="opportunity-chip">
+            <span class="small-label">Ceiling</span>
+            <strong>${Number(variance.ceiling ?? 0).toFixed(1)}</strong>
+            <small>best recent</small>
+          </div>
+          <div class="opportunity-chip">
+            <span class="small-label">P25 / P75</span>
+            <strong>${Number(variance.p25 ?? 0).toFixed(1)} – ${Number(variance.p75 ?? 0).toFixed(1)}</strong>
+            <small>middle band</small>
+          </div>
+        </div>
+        <div style="padding:0 20px 16px">
+          <div class="insight-summary-label" style="margin-bottom:6px">Distribution range</div>
+          <div style="position:relative;height:28px;background:var(--surface2,rgba(255,255,255,0.06));border-radius:14px;overflow:hidden">
+            <!-- P25–P75 band -->
+            <div style="position:absolute;top:0;bottom:0;left:${p25Pct}%;width:${p75Pct - p25Pct}%;background:rgba(99,179,237,0.22);border-radius:4px"></div>
+            <!-- Median marker -->
+            <div style="position:absolute;top:3px;bottom:3px;left:${medPct}%;width:3px;background:#63b3ed;border-radius:2px" title="Median ${Number(variance.median ?? 0).toFixed(1)}"></div>
+            <!-- Prop line marker -->
+            <div style="position:absolute;top:0;bottom:0;left:${linePctClamped}%;width:2px;background:var(--bad,#f87171);opacity:0.9" title="Line ${line}"></div>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:10px;opacity:0.55">
+            <span>Floor ${Number(variance.floor ?? 0).toFixed(1)}</span>
+            <span style="color:#63b3ed">◆ Median</span>
+            <span style="color:var(--bad)">┃ Line ${line}</span>
+            <span>Ceiling ${Number(variance.ceiling ?? 0).toFixed(1)}</span>
+          </div>
+          <div class="insight-summary neutral compact-summary" style="margin-top:10px">
+            <span class="insight-summary-label">What this means</span>
+            <p>${variance.p25 > line
+              ? `Floor (${Number(variance.p25).toFixed(1)}) sits above the line — player has barely dipped below in recent games. Strong OVER indicator.`
+              : variance.p75 < line
+              ? `Ceiling (${Number(variance.p75).toFixed(1)}) is under the line — even good games recently fall short. Strong UNDER indicator.`
+              : cs < 48
+              ? `High variance (std dev ${Number(variance.std_dev ?? 0).toFixed(1)}) — player output swings widely. Probability model applies a volatility discount.`
+              : `Stable output with ${cs.toFixed(0)}/100 consistency. Model edge is more reliable when consistency is high.`
+            }</p>
+          </div>
+        </div>`;
+    }
   }
 }
 
@@ -3874,7 +3515,32 @@ chartHighlightBtnEl?.addEventListener('click', () => { upgradedChartPrefs.highli
 chartSampleBtnsEl.forEach(btn => btn.addEventListener('click', async () => {
   gamesSelect.value = btn.dataset.sample;
   updateChartSampleButtonsUpgrade();
-  if (selectedPlayer) await analyzePlayerProp({ preserveScroll: true });
+  if (!selectedPlayer) return;
+
+  // Slice client-side instantly from the stored full game list — no fetch needed.
+  if (lastPayload && lastPayload._allGames) {
+    const n = parseInt(btn.dataset.sample, 10);
+    const sliced = lastPayload._allGames.slice(-n);
+    const hits = sliced.filter(g => g.hit).length;
+    const values = sliced.map(g => g.value);
+    const avg = values.length ? Math.round((values.reduce((a, b) => a + b, 0) / values.length) * 10) / 10 : 0;
+    const slicedPayload = Object.assign({}, lastPayload, {
+      games: sliced,
+      games_count: sliced.length,
+      hit_count: hits,
+      hit_rate: sliced.length ? Math.round((hits / sliced.length) * 1000) / 10 : 0,
+      average: avg,
+      last_n: n,
+      _allGames: lastPayload._allGames,
+    });
+    renderSummary(slicedPayload);
+    renderChart(slicedPayload);
+    renderTable(slicedPayload);
+    return;
+  }
+
+  // Fallback: full fetch (no payload loaded yet)
+  await analyzePlayerProp({ preserveScroll: true });
 }));
 collapseButtonsEl.forEach(btn => btn.addEventListener('click', () => toggleSectionByIdUpgrade(btn.dataset.collapseTarget)));
 favoritePlayerBtnEl?.addEventListener('click', () => {
@@ -3883,7 +3549,14 @@ favoritePlayerBtnEl?.addEventListener('click', () => {
 });
 savePropBtnEl?.addEventListener('click', () => {
   if (!selectedPlayer) return;
-  toggleFavoriteUpgrade({ type: 'prop', key: `${selectedPlayer.id}:${selectedStat}:${lineInput.value}`, title: `${selectedPlayer.full_name} • ${selectedStat} ${lineInput.value}`, subtitle: lastPayload?.traffic_light?.summary || lastPayload?.interpretation?.summary || 'Saved from analyzer', stat: selectedStat, line: Number(lineInput.value || 0), player: selectedPlayer });
+  const propKey = `${selectedPlayer.id}:${selectedStat}:${lineInput.value}`;
+  const existing = loadFavoritesUpgrade().some(e => `${e.type}:${e.key}` === `prop:${propKey}`);
+  toggleFavoriteUpgrade({ type: 'prop', key: propKey, title: `${selectedPlayer.full_name} • ${selectedStat} ${lineInput.value}`, subtitle: lastPayload?.traffic_light?.summary || lastPayload?.interpretation?.summary || 'Saved from analyzer', stat: selectedStat, line: Number(lineInput.value || 0), player: selectedPlayer });
+  if (existing) {
+    showAppToast('❌ Prop removed from Saved Props', 'warning');
+  } else {
+    showAppToast('✅ Prop saved to Saved Props!', 'success');
+  }
 });
 analyzeBtn?.addEventListener('click', () => {
   getMatchupTargets().forEach(target => renderPanelSkeletonUpgrade(target.body, '🛡️', 'Loading matchup...', 'Fetching the next opponent context.'));
@@ -3970,7 +3643,7 @@ function renderSelectedPlayerContext() {
 
   let summaryText = 'Defense-vs-position data unavailable for this player and stat.';
   if (vsPosition) {
-    summaryText = `${nextGame?.opponent_name || 'This opponent'} allows ${oppVal} ${getStatLabel(vsPosition.stat).toLowerCase()} per player-game to ${String(vsPosition.position_label || 'this position').toLowerCase()}, versus a league baseline of ${lgVal} (${delta}).`;
+    summaryText = `${nextGame?.opponent_name || 'This opponent'} allows ${oppVal} ${(getStatLabel(vsPosition.stat) || '').toLowerCase()} per player-game to ${String(vsPosition.position_label || 'this position').toLowerCase()}, versus a league baseline of ${lgVal} (${delta}).`;
   }
 
   matchupSection.classList.remove('hidden');
@@ -4310,9 +3983,154 @@ const filterMinMinutesEl = document.getElementById('filterMinMinutes');
 const filterMaxMinutesEl = document.getElementById('filterMaxMinutes');
 const filterMinFgaEl = document.getElementById('filterMinFga');
 const filterMaxFgaEl = document.getElementById('filterMaxFga');
+const filterOpponentRankRangeEl = document.getElementById('filterOpponentRankRange');
+const filterWithoutPlayerEl = document.getElementById('filterWithoutPlayer');
+const withoutChipPickerEl = document.getElementById('withoutChipPicker');
 const filterH2HOnlyEl = document.getElementById('filterH2HOnly');
 const applyFiltersBtnEl = document.getElementById('applyFiltersBtn');
 const resetFiltersBtnEl = document.getElementById('resetFiltersBtn');
+
+function _syncHiddenSelectFromChips() {
+  if (!filterWithoutPlayerEl || !withoutChipPickerEl) return;
+  const selectedIds = new Set(
+    Array.from(withoutChipPickerEl.querySelectorAll('.without-chip.selected'))
+      .map(chip => chip.dataset.playerId)
+  );
+  Array.from(filterWithoutPlayerEl.options).forEach(opt => {
+    opt.selected = selectedIds.has(opt.value);
+  });
+  filterWithoutPlayerEl.dispatchEvent(new Event('change'));
+}
+
+function _renderWithoutChips(players, selectedIds = new Set()) {
+  if (!withoutChipPickerEl) return;
+  if (!players || !players.length) {
+    withoutChipPickerEl.innerHTML = '<span class="without-chip-placeholder">No teammates found</span>';
+    return;
+  }
+  withoutChipPickerEl.innerHTML = players.map(player => {
+    const isSelected = selectedIds.has(String(player.id));
+    return `<button type="button" class="without-chip${isSelected ? ' selected' : ''}" data-player-id="${player.id}" data-player-name="${escapeHtml(player.full_name || '')}">${escapeHtml(player.full_name || 'Unknown')}</button>`;
+  }).join('');
+  withoutChipPickerEl.querySelectorAll('.without-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      chip.classList.toggle('selected');
+      _syncHiddenSelectFromChips();
+      refreshFilterChipStates();
+      updateFilterSummaryUpgrade();
+    });
+  });
+}
+
+async function loadInjuryBoostChips(player) {
+  const injuryBoostGroup = document.getElementById('injuryBoostGroup');
+  const injuryBoostChips = document.getElementById('injuryBoostChips');
+  if (!injuryBoostGroup || !injuryBoostChips) return;
+
+  const teamName = player?.team_name || '';
+  if (!teamName) {
+    injuryBoostGroup.style.display = 'none';
+    return;
+  }
+
+  try {
+    const resp = await fetch('/api/team-injuries?team_name=' + encodeURIComponent(teamName));
+    if (!resp.ok) { injuryBoostGroup.style.display = 'none'; return; }
+    const data = await resp.json();
+    const players = (data.players || []).filter(p => String(p.player_id) !== String(player?.id || ''));
+
+    if (!players.length) {
+      injuryBoostGroup.style.display = 'none';
+      return;
+    }
+
+    injuryBoostGroup.style.display = '';
+    injuryBoostChips.innerHTML = players.map(p => {
+      const isOut = p.is_unavailable;
+      const statusLabel = isOut ? 'OUT' : (p.status || 'Q');
+      return '<button class="inj-boost-chip' + (isOut ? ' out-chip' : '') + '" ' +
+        'data-player-id="' + escapeHtml(String(p.player_id || '')) + '" ' +
+        'data-player-name="' + escapeHtml(p.lookup_name || p.display_name || '') + '" ' +
+        'title="Apply without-' + escapeHtml(p.lookup_name || p.display_name || '') + ' filter (' + escapeHtml(p.status) + ')">' +
+        '<span class="inj-status-dot"></span>' +
+        escapeHtml(p.lookup_name || p.display_name || '') + ' <span style="opacity:0.6;font-size:0.65rem">(' + escapeHtml(statusLabel) + ')</span>' +
+        '</button>';
+    }).join('');
+
+    // Wire up chip clicks → add to without-teammate filter
+    injuryBoostChips.querySelectorAll('.inj-boost-chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        const pid = chip.dataset.playerId;
+        if (!pid || !filterWithoutPlayerEl) return;
+        const opt = Array.from(filterWithoutPlayerEl.options).find(o => o.value === pid);
+        if (opt) {
+          opt.selected = !opt.selected;
+          // Re-render the without chips to reflect new selection
+          const currentSelectedIds = new Set(
+            Array.from(filterWithoutPlayerEl.selectedOptions || []).map(o => String(o.value))
+          );
+          const allPlayers = Array.from(filterWithoutPlayerEl.options).map(o => ({
+            id: o.value, full_name: o.text
+          }));
+          _renderWithoutChips(allPlayers, currentSelectedIds);
+          chip.style.outline = opt.selected ? '2px solid rgba(255,160,40,0.6)' : '';
+          chip.style.background = opt.selected ? 'rgba(255,160,40,0.18)' : '';
+        }
+      });
+    });
+
+  } catch (e) {
+    console.warn('loadInjuryBoostChips failed:', e);
+    injuryBoostGroup.style.display = 'none';
+  }
+}
+
+async function populateAnalyzerWithoutPlayerFilter(force = false) {
+  if (!filterWithoutPlayerEl) return;
+  const teamId = Number(selectedPlayer?.team_id || 0);
+  if (!teamId) {
+    if (withoutChipPickerEl) withoutChipPickerEl.innerHTML = '<span class="without-chip-placeholder">Select a player first</span>';
+    filterWithoutPlayerEl.innerHTML = '';
+    return;
+  }
+  if (!force && Number(filterWithoutPlayerEl.dataset.teamId || 0) === teamId && filterWithoutPlayerEl.options.length > 1) return;
+  try {
+    let players = Array.isArray(rosterPlayers) ? rosterPlayers.filter(player => Number(player.team_id || 0) === teamId) : [];
+    if (!players.length) {
+      const season = seasonInput?.value?.trim();
+      const query = season ? `?season=${encodeURIComponent(season)}` : '';
+      const response = await fetch(`/api/teams/${teamId}/roster${query}`);
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || 'Failed to load roster filter');
+      players = Array.isArray(payload.results) ? payload.results : [];
+    }
+
+    const currentSelectedIds = new Set(
+      Array.from(filterWithoutPlayerEl.selectedOptions || []).map(o => String(o.value))
+    );
+
+    const filteredPlayers = players
+      .filter(player => String(player.id) !== String(selectedPlayer?.id || ''))
+      .sort((a, b) => String(a.full_name || '').localeCompare(String(b.full_name || '')));
+
+    // Sync hidden select
+    filterWithoutPlayerEl.innerHTML = filteredPlayers.map(player =>
+      `<option value="${player.id}">${escapeHtml(player.full_name || 'Unknown teammate')}</option>`
+    ).join('');
+    filterWithoutPlayerEl.dataset.teamId = String(teamId);
+    Array.from(filterWithoutPlayerEl.options).forEach(option => {
+      option.selected = currentSelectedIds.has(String(option.value));
+    });
+
+    _renderWithoutChips(filteredPlayers, currentSelectedIds);
+
+  } catch (error) {
+    console.warn('Unable to populate teammate absence filter:', error.message || error);
+    if (withoutChipPickerEl) withoutChipPickerEl.innerHTML = '<span class="without-chip-placeholder">Could not load roster</span>';
+    filterWithoutPlayerEl.innerHTML = '';
+    delete filterWithoutPlayerEl.dataset.teamId;
+  }
+}
 
 function parseNullableNumber(value) {
   if (value === null || value === undefined) return null;
@@ -4322,7 +4140,20 @@ function parseNullableNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function getSelectedWithoutPlayers() {
+  if (!filterWithoutPlayerEl) return { ids: [], names: [] };
+  const selectedOptions = Array.from(filterWithoutPlayerEl.selectedOptions || []);
+  const ids = selectedOptions
+    .map(option => Number(option.value))
+    .filter(value => Number.isFinite(value) && value > 0);
+  const names = selectedOptions
+    .map(option => String(option.textContent || '').trim())
+    .filter(Boolean);
+  return { ids, names };
+}
+
 function getAnalyzerFiltersState() {
+  const withoutTeammates = getSelectedWithoutPlayers();
   return {
     location: filterLocationSelectEl?.value || 'all',
     result: filterResultSelectEl?.value || 'all',
@@ -4332,6 +4163,11 @@ function getAnalyzerFiltersState() {
     max_minutes: parseNullableNumber(filterMaxMinutesEl?.value),
     min_fga: parseNullableNumber(filterMinFgaEl?.value),
     max_fga: parseNullableNumber(filterMaxFgaEl?.value),
+    opponent_rank_range: filterOpponentRankRangeEl?.value || 'all',
+    without_player_id: withoutTeammates.ids[0] || null,
+    without_player_ids: withoutTeammates.ids,
+    without_player_name: withoutTeammates.names[0] || '',
+    without_player_names: withoutTeammates.names,
     h2h_only: !!filterH2HOnlyEl?.checked,
   };
 }
@@ -4345,13 +4181,26 @@ function setAnalyzerFiltersState(state = {}) {
   if (filterMaxMinutesEl) filterMaxMinutesEl.value = state.max_minutes ?? '';
   if (filterMinFgaEl) filterMinFgaEl.value = state.min_fga ?? '';
   if (filterMaxFgaEl) filterMaxFgaEl.value = state.max_fga ?? '';
+  if (filterOpponentRankRangeEl) filterOpponentRankRangeEl.value = state.opponent_rank_range || 'all';
+  if (filterWithoutPlayerEl) {
+    const selectedIds = new Set((Array.isArray(state.without_player_ids) ? state.without_player_ids : (state.without_player_id ? [state.without_player_id] : [])).map(value => String(value)));
+    Array.from(filterWithoutPlayerEl.options || []).forEach(option => {
+      option.selected = selectedIds.has(String(option.value));
+    });
+    // Sync chip UI
+    if (withoutChipPickerEl) {
+      withoutChipPickerEl.querySelectorAll('.without-chip').forEach(chip => {
+        chip.classList.toggle('selected', selectedIds.has(chip.dataset.playerId));
+      });
+    }
+  }
   if (filterH2HOnlyEl) filterH2HOnlyEl.checked = !!state.h2h_only;
   refreshFilterChipStates();
   updateFilterSummaryUpgrade();
 }
 
 function resetAnalyzerFiltersState() {
-  [filterLocationSelectEl, filterResultSelectEl, filterMarginMinEl, filterMarginMaxEl, filterMinMinutesEl, filterMaxMinutesEl, filterMinFgaEl, filterMaxFgaEl, filterH2HOnlyEl].forEach(el => {
+  [filterLocationSelectEl, filterResultSelectEl, filterMarginMinEl, filterMarginMaxEl, filterMinMinutesEl, filterMaxMinutesEl, filterMinFgaEl, filterMaxFgaEl, filterOpponentRankRangeEl, filterWithoutPlayerEl, filterH2HOnlyEl].forEach(el => {
     el?.addEventListener('input', () => { refreshFilterChipStates(); updateFilterSummaryUpgrade(); });
     el?.addEventListener('change', () => { refreshFilterChipStates(); updateFilterSummaryUpgrade(); });
   });
@@ -4380,6 +4229,15 @@ function buildFilterSummaryCopy(filters) {
     else if (filters.min_fga !== null) chips.push(`FGA ≥ ${filters.min_fga}`);
     else chips.push(`FGA ≤ ${filters.max_fga}`);
   }
+  if (filters.opponent_rank_range && filters.opponent_rank_range !== 'all') {
+    const map = { top10: 'Opp rank 1-10', top5: 'Opp rank 1-5', mid10: 'Opp rank 11-20', bottom10: 'Opp rank 21-30', bottom5: 'Opp rank 26-30' };
+    chips.push(map[filters.opponent_rank_range] || `Opp rank ${filters.opponent_rank_range}`);
+  }
+  if ((filters.without_player_ids && filters.without_player_ids.length) || filters.without_player_id) {
+    const teammateNames = Array.isArray(filters.without_player_names) ? filters.without_player_names.filter(Boolean) : [];
+    const teammate = teammateNames.length ? teammateNames.join(', ') : String(filters.without_player_name || '').trim();
+    chips.push(teammate ? `Without ${teammate}` : 'Without teammate');
+  }
   if (filters.h2h_only) chips.push('H2H only');
   return { label: chips.length ? chips.join(' • ') : 'All games', hasFilters: chips.length > 0, chips };
 }
@@ -4406,14 +4264,14 @@ function detectPresetMatch(filters) {
     all: !buildFilterSummaryCopy(filters).hasFilters,
     home: filters.location === 'home' && !filters.result && false,
   };
-  if (filters.location === 'home' && filters.result === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && !filters.h2h_only) return 'home';
-  if (filters.location === 'away' && filters.result === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && !filters.h2h_only) return 'away';
-  if (filters.result === 'win' && filters.location === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && !filters.h2h_only) return 'wins';
-  if (filters.result === 'loss' && filters.location === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && !filters.h2h_only) return 'losses';
-  if (filters.h2h_only && filters.location === 'all' && filters.result === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null) return 'h2h';
-  if (filters.min_minutes === 30 && filters.max_minutes === null && filters.location === 'all' && filters.result === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_fga === null && filters.max_fga === null && !filters.h2h_only) return 'min30';
-  if (filters.margin_min === 0 && filters.margin_max === 5 && filters.location === 'all' && filters.result === 'all' && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && !filters.h2h_only) return 'close';
-  if (filters.margin_min === 11 && filters.margin_max === null && filters.location === 'all' && filters.result === 'all' && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && !filters.h2h_only) return 'blowout';
+  if (filters.location === 'home' && filters.result === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && (filters.opponent_rank_range || 'all') === 'all' && !((filters.without_player_ids && filters.without_player_ids.length) || filters.without_player_id) && !filters.h2h_only) return 'home';
+  if (filters.location === 'away' && filters.result === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && (filters.opponent_rank_range || 'all') === 'all' && !((filters.without_player_ids && filters.without_player_ids.length) || filters.without_player_id) && !filters.h2h_only) return 'away';
+  if (filters.result === 'win' && filters.location === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && (filters.opponent_rank_range || 'all') === 'all' && !((filters.without_player_ids && filters.without_player_ids.length) || filters.without_player_id) && !filters.h2h_only) return 'wins';
+  if (filters.result === 'loss' && filters.location === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && (filters.opponent_rank_range || 'all') === 'all' && !((filters.without_player_ids && filters.without_player_ids.length) || filters.without_player_id) && !filters.h2h_only) return 'losses';
+  if (filters.h2h_only && filters.location === 'all' && filters.result === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && (filters.opponent_rank_range || 'all') === 'all' && !((filters.without_player_ids && filters.without_player_ids.length) || filters.without_player_id)) return 'h2h';
+  if (filters.min_minutes === 30 && filters.max_minutes === null && filters.location === 'all' && filters.result === 'all' && filters.margin_min === null && filters.margin_max === null && filters.min_fga === null && filters.max_fga === null && (filters.opponent_rank_range || 'all') === 'all' && !((filters.without_player_ids && filters.without_player_ids.length) || filters.without_player_id) && !filters.h2h_only) return 'min30';
+  if (filters.margin_min === 0 && filters.margin_max === 5 && filters.location === 'all' && filters.result === 'all' && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && (filters.opponent_rank_range || 'all') === 'all' && !((filters.without_player_ids && filters.without_player_ids.length) || filters.without_player_id) && !filters.h2h_only) return 'close';
+  if (filters.margin_min === 11 && filters.margin_max === null && filters.location === 'all' && filters.result === 'all' && filters.min_minutes === null && filters.max_minutes === null && filters.min_fga === null && filters.max_fga === null && (filters.opponent_rank_range || 'all') === 'all' && !((filters.without_player_ids && filters.without_player_ids.length) || filters.without_player_id) && !filters.h2h_only) return 'blowout';
   return buildFilterSummaryCopy(filters).hasFilters ? '' : 'all';
 }
 
@@ -4537,6 +4395,10 @@ function renderSummary(payload) {
   renderMatchup(payload);
   renderInterpretationPanels(payload);
   updateFilterSummaryUpgrade(payload);
+  // Prefill the backtest log form with current analysis results
+  if (typeof window._backtestPrefillFromPayload === 'function') {
+    window._backtestPrefillFromPayload(payload);
+  }
 }
 
 async function analyzePlayerProp(options = {}) {
@@ -4550,11 +4412,12 @@ async function analyzePlayerProp(options = {}) {
   analyzeBtn.disabled = true;
 
   try {
+    await populateAnalyzerWithoutPlayerFilter();
     const params = new URLSearchParams({
       player_id: selectedPlayer.id,
       stat: selectedStat,
       line: lineInput.value,
-      last_n: gamesSelect.value
+      last_n: 20  // always fetch 20 so switching between 5/10/15 is instant client-side
     });
     if (selectedPlayer.team_id) params.set('team_id', selectedPlayer.team_id);
     if (selectedPlayer.position) params.set('player_position', selectedPlayer.position);
@@ -4570,6 +4433,14 @@ async function analyzePlayerProp(options = {}) {
     if (filters.max_minutes !== null) params.set('max_minutes', String(filters.max_minutes));
     if (filters.min_fga !== null) params.set('min_fga', String(filters.min_fga));
     if (filters.max_fga !== null) params.set('max_fga', String(filters.max_fga));
+    if (filters.opponent_rank_range && filters.opponent_rank_range !== 'all') params.set('opponent_rank_range', filters.opponent_rank_range);
+    if (Array.isArray(filters.without_player_ids) && filters.without_player_ids.length) {
+      filters.without_player_ids.forEach(id => params.append('without_player_ids', String(id)));
+      if (Array.isArray(filters.without_player_names) && filters.without_player_names.length) params.set('without_player_name', filters.without_player_names.join(', '));
+    } else if (filters.without_player_id) {
+      params.set('without_player_id', String(filters.without_player_id));
+      if (filters.without_player_name) params.set('without_player_name', filters.without_player_name);
+    }
     if (filters.h2h_only) params.set('h2h_only', 'true');
 
     const overrideOppId = oppSelect?.value;
@@ -4588,14 +4459,47 @@ async function analyzePlayerProp(options = {}) {
       environment: payload.environment || null
     };
     renderSelectedPlayer();
-    renderSummary(payload);
-    if (payload.games && payload.games.length) {
-      renderChart(payload);
-      renderTable(payload);
+    await populateAnalyzerWithoutPlayerFilter();
+    if (filterWithoutPlayerEl) {
+      const selectedIds = new Set((payload.filter_options?.without_player_ids || (payload.filter_options?.without_player_id ? [payload.filter_options.without_player_id] : [])).map(value => String(value)));
+      Array.from(filterWithoutPlayerEl.options || []).forEach(option => {
+        option.selected = selectedIds.has(String(option.value));
+      });
+      if (withoutChipPickerEl) {
+        withoutChipPickerEl.querySelectorAll('.without-chip').forEach(chip => {
+          chip.classList.toggle('selected', selectedIds.has(chip.dataset.playerId));
+        });
+      }
+    }
+    // Store the full 20-game list and slice down to the selected window for display
+    const _allGames = (payload.games || []).slice();
+    const _selectedN = parseInt(gamesSelect ? gamesSelect.value : '10', 10);
+    let displayPayload;
+    if (_allGames.length > _selectedN) {
+      const _sliced = _allGames.slice(-_selectedN);
+      const _hits = _sliced.filter(g => g.hit).length;
+      const _values = _sliced.map(g => g.value);
+      const _avg = _values.length ? Math.round((_values.reduce((a, b) => a + b, 0) / _values.length) * 10) / 10 : 0;
+      displayPayload = Object.assign({}, payload, {
+        games: _sliced,
+        games_count: _sliced.length,
+        hit_count: _hits,
+        hit_rate: _sliced.length ? Math.round((_hits / _sliced.length) * 1000) / 10 : 0,
+        average: _avg,
+        last_n: _selectedN,
+        _allGames: _allGames,
+      });
+    } else {
+      displayPayload = Object.assign({}, payload, { _allGames: _allGames });
+    }
+    renderSummary(displayPayload);
+    if (displayPayload.games && displayPayload.games.length) {
+      renderChart(displayPayload);
+      renderTable(displayPayload);
     } else {
       renderEmptyFilterStatesUpgrade();
-      renderInterpretationPanels(payload);
-      updateFilterSummaryUpgrade(payload);
+      renderInterpretationPanels(displayPayload);
+      updateFilterSummaryUpgrade(displayPayload);
     }
     setStatus('Ready');
     if (options.preserveSection) {
@@ -4644,7 +4548,12 @@ setAnalyzerFiltersState({ location: 'all', result: 'all', h2h_only: false });
 
 /* ── Session cache helpers ─────────────────────────────────────── */
 function getPropCacheKey(playerId, stat, line, lastN, filters) {
+  // lastN excluded — backend slices from shared filtered_pool, all windows share one cache entry.
+  // without_player_ids included — filtered/unfiltered results must not collide.
   const state = filters || (typeof getAnalyzerFiltersState === 'function' ? getAnalyzerFiltersState() : {});
+  const withoutIds = Array.isArray(state.without_player_ids) && state.without_player_ids.length
+    ? state.without_player_ids.slice().sort().join(',')
+    : (state.without_player_id ? String(state.without_player_id) : '');
   const filterKey = [
     state.location || 'all',
     state.result || 'all',
@@ -4654,9 +4563,10 @@ function getPropCacheKey(playerId, stat, line, lastN, filters) {
     state.max_minutes ?? '',
     state.min_fga ?? '',
     state.max_fga ?? '',
-    state.h2h_only ? '1' : '0'
+    state.h2h_only ? '1' : '0',
+    withoutIds
   ].join(':');
-  return `prop:${playerId}:${stat}:${line}:${lastN}:${filterKey}`;
+  return `prop:${playerId}:${stat}:${line}:${filterKey}`;
 }
 function readPropCache(key) {
   try {
@@ -4702,9 +4612,9 @@ function buildSparklineSvg(values, line, width, height) {
   const range = max - min || 1;
   function toX(i) { return (i / (values.length - 1)) * width; }
   function toY(v) { return height - ((v - min) / range) * height; }
-  const pts = values.map(function(v, i) { return toX(i).toFixed(1) + ',' + toY(v).toFixed(1); }).join(' ');
+  const pts = values.map(function (v, i) { return toX(i).toFixed(1) + ',' + toY(v).toFixed(1); }).join(' ');
   const lineY = toY(line).toFixed(1);
-  const dots = values.map(function(v, i) {
+  const dots = values.map(function (v, i) {
     const hit = v >= line;
     return '<circle cx="' + toX(i).toFixed(1) + '" cy="' + toY(v).toFixed(1) + '" r="2.2" fill="' + (hit ? 'var(--good)' : 'var(--bad)') + '" opacity="0.9"/>';
   }).join('');
@@ -4718,13 +4628,13 @@ function buildSparklineSvg(values, line, width, height) {
 /* ── Inject sparklines + grade into Bet Finder results ─────────── */
 (function patchBetFinderSparklines() {
   const _orig = renderBetFinderResults;
-  renderBetFinderResults = function(payload) {
+  renderBetFinderResults = function (payload) {
     _orig.call(this, payload);
     const results = payload.results || [];
-    document.querySelectorAll('.finder-card').forEach(function(card, idx) {
+    document.querySelectorAll('.finder-card').forEach(function (card, idx) {
       const item = results[idx];
       if (!item) return;
-      const values = (item.games || []).map(function(g) { return Number(g.value || 0); });
+      const values = (item.games || []).map(function (g) { return Number(g.value || 0); });
       const grade = computeConfidenceGrade(item.hit_rate, item.avg_edge || 0, item.games_count || 0);
       const footer = card.querySelector('.finder-footer');
       // Sparkline
@@ -4750,12 +4660,12 @@ function buildSparklineSvg(values, line, width, height) {
 /* ── Session cache: intercept analyzePlayerProp ─────────────────── */
 (function patchAnalyzeCache() {
   const _orig = analyzePlayerProp;
-  analyzePlayerProp = async function(options) {
+  analyzePlayerProp = async function (options) {
     options = options || {};
     if (!selectedPlayer) { alert('Please select a player first.'); return; }
 
     // Remove stale error overlay
-    document.querySelectorAll('.chart-error-overlay').forEach(function(el) { el.remove(); });
+    document.querySelectorAll('.chart-error-overlay').forEach(function (el) { el.remove(); });
 
     if (!options.forceRefresh) {
       const cacheKey = getPropCacheKey(selectedPlayer.id, selectedStat, lineInput ? lineInput.value : '', gamesSelect ? gamesSelect.value : '', typeof getAnalyzerFiltersState === 'function' ? getAnalyzerFiltersState() : null);
@@ -4767,10 +4677,28 @@ function buildSparklineSvg(values, line, width, height) {
           selectedPlayer = Object.assign({}, selectedPlayer, cached._playerMeta);
         }
         renderSelectedPlayer();
-        renderSummary(cached);
-        if (cached.games && cached.games.length) {
-          renderChart(cached);
-          renderTable(cached);
+        // Re-slice from _allGames to the currently selected window
+        let cachedDisplay = cached;
+        if (cached._allGames && cached._allGames.length) {
+          const _n = parseInt(gamesSelect ? gamesSelect.value : '10', 10);
+          const _sliced = cached._allGames.slice(-_n);
+          const _hits = _sliced.filter(function (g) { return g.hit; }).length;
+          const _vals = _sliced.map(function (g) { return g.value; });
+          const _avg = _vals.length ? Math.round((_vals.reduce(function (a, b) { return a + b; }, 0) / _vals.length) * 10) / 10 : 0;
+          cachedDisplay = Object.assign({}, cached, {
+            games: _sliced,
+            games_count: _sliced.length,
+            hit_count: _hits,
+            hit_rate: _sliced.length ? Math.round((_hits / _sliced.length) * 1000) / 10 : 0,
+            average: _avg,
+            last_n: _n,
+            _allGames: cached._allGames,
+          });
+        }
+        renderSummary(cachedDisplay);
+        if (cachedDisplay.games && cachedDisplay.games.length) {
+          renderChart(cachedDisplay);
+          renderTable(cachedDisplay);
         }
         setStatus('Ready');
         return;
@@ -4785,7 +4713,7 @@ function buildSparklineSvg(values, line, width, height) {
 (function patchPostAnalysis() {
   // Hook into renderChart to write cache after real fetch
   const _origRenderChart = renderChart;
-  renderChart = function(payload) {
+  renderChart = function (payload) {
     _origRenderChart.apply(this, arguments);
     if (!selectedPlayer || !payload) return;
     const cacheKey = getPropCacheKey(selectedPlayer.id, selectedStat, lineInput ? lineInput.value : '', gamesSelect ? gamesSelect.value : '', typeof getAnalyzerFiltersState === 'function' ? getAnalyzerFiltersState() : null);
@@ -4804,10 +4732,10 @@ function buildSparklineSvg(values, line, width, height) {
 /* ── Debounced line input re-analyze ────────────────────────────── */
 (function patchLineInputDebounce() {
   if (!lineInput) return;
-  lineInput.addEventListener('input', function() {
+  lineInput.addEventListener('input', function () {
     if (typeof updateStickyAnalyzerSummary === 'function') updateStickyAnalyzerSummary();
     clearTimeout(window._propLineDebounce);
-    window._propLineDebounce = setTimeout(function() {
+    window._propLineDebounce = setTimeout(function () {
       if (selectedPlayer && lastPayload) analyzePlayerProp({ preserveScroll: true });
     }, 800);
   });
@@ -4815,7 +4743,7 @@ function buildSparklineSvg(values, line, width, height) {
 
 /* ── Keyboard shortcuts: J/K cycle players, ←/→ cycle stats ──── */
 (function bindKeyboardShortcuts() {
-  document.addEventListener('keydown', function(e) {
+  document.addEventListener('keydown', function (e) {
     const tag = (document.activeElement || {}).tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
     if (e.metaKey || e.ctrlKey || e.altKey) return;
@@ -4824,7 +4752,7 @@ function buildSparklineSvg(values, line, width, height) {
       e.preventDefault();
       const cards = Array.from(document.querySelectorAll('.player-card'));
       if (!cards.length) return;
-      const curIdx = selectedPlayer ? cards.findIndex(function(c) { return Number(c.dataset.id) === selectedPlayer.id; }) : -1;
+      const curIdx = selectedPlayer ? cards.findIndex(function (c) { return Number(c.dataset.id) === selectedPlayer.id; }) : -1;
       const nextIdx = e.key === 'j' ? Math.min(curIdx + 1, cards.length - 1) : Math.max(curIdx - 1, 0);
       if (cards[nextIdx]) {
         cards[nextIdx].click();
@@ -4837,7 +4765,7 @@ function buildSparklineSvg(values, line, width, height) {
       e.preventDefault();
       const chips = Array.from(propButtonsWrap.querySelectorAll('.prop-chip'));
       if (!chips.length) return;
-      const curIdx = chips.findIndex(function(c) { return c.dataset.stat === selectedStat; });
+      const curIdx = chips.findIndex(function (c) { return c.dataset.stat === selectedStat; });
       const nextIdx = e.key === 'ArrowRight' ? Math.min(curIdx + 1, chips.length - 1) : Math.max(curIdx - 1, 0);
       if (chips[nextIdx]) chips[nextIdx].click();
     }
@@ -4848,7 +4776,7 @@ function buildSparklineSvg(values, line, width, height) {
 (function restoreLastSession() {
   const lastStat = localStorage.getItem(LAST_STAT_KEY);
   if (lastStat && propButtonsWrap) {
-    try { setActiveProp(lastStat); } catch(e) { /* ignore */ }
+    try { setActiveProp(lastStat); } catch (e) { /* ignore */ }
   }
   const raw = localStorage.getItem(LAST_PLAYER_KEY);
   if (raw) {
@@ -4857,16 +4785,16 @@ function buildSparklineSvg(values, line, width, height) {
       if (player && player.id) {
         setSelectedPlayer(player);
       }
-    } catch(e) { /* ignore */ }
+    } catch (e) { /* ignore */ }
   }
 })();
 
 /* ── Patch setActiveProp to persist stat ────────────────────────── */
 (function patchSetActivePropPersist() {
   const _orig = setActiveProp;
-  setActiveProp = function(stat) {
+  setActiveProp = function (stat) {
     _orig.call(this, stat);
-    try { localStorage.setItem(LAST_STAT_KEY, stat); } catch(e) { /* ignore */ }
+    try { localStorage.setItem(LAST_STAT_KEY, stat); } catch (e) { /* ignore */ }
   };
 })();
 
@@ -4940,70 +4868,71 @@ function buildSparklineSvg(values, line, width, height) {
    PARLAY BUILDER
 ═══════════════════════════════════════════════════════════════════════ */
 (function initParlayBuilder() {
-  const PARLAY_KEYS_STORAGE     = 'nba-props-parlay-keys';
+  const PARLAY_KEYS_STORAGE = 'nba-props-parlay-keys';
   const PARLAY_SETTINGS_STORAGE = 'nba-props-parlay-settings';
 
   // ── DOM refs ──────────────────────────────────────────────────────────
-  const parlayApiKeys         = document.getElementById('parlayApiKeys');
-  const parlaySportSelect     = document.getElementById('parlaySportSelect');
-  const parlayOddsFormatSel   = document.getElementById('parlayOddsFormatSelect');
-  const parlayLegsSelect      = document.getElementById('parlayLegsSelect');
-  const parlayLastNSelect     = document.getElementById('parlayLastNSelect');
+  const parlayApiKeys = document.getElementById('parlayApiKeys');
+  const parlaySportSelect = document.getElementById('parlaySportSelect');
+  const parlayOddsFormatSel = document.getElementById('parlayOddsFormatSelect');
+  const parlayLegsSelect = document.getElementById('parlayLegsSelect');
+  const parlayLastNSelect = document.getElementById('parlayLastNSelect');
   const parlayBookmakerSelect = document.getElementById('parlayBookmakerSelect');
-  const parlayLoadEventsBtn   = document.getElementById('parlayLoadEventsBtn');
+  const parlayLoadEventsBtn = document.getElementById('parlayLoadEventsBtn');
 
   // ── Progress bar helper ───────────────────────────────────────────────
   function setParlayProgress(pct, label) {
-    var bar  = document.getElementById('parlayProgressBar');
-    var lbl  = document.getElementById('parlayProgressLabel');
+    var bar = document.getElementById('parlayProgressBar');
+    var lbl = document.getElementById('parlayProgressLabel');
     var wrap = document.getElementById('parlayProgressWrap');
     if (!wrap) return;
     if (pct <= 0) { wrap.style.display = 'none'; return; }
     wrap.style.display = '';
-    if (bar)  { bar.style.width = pct + '%'; bar.setAttribute('aria-valuenow', pct); }
+    if (bar) { bar.style.width = pct + '%'; bar.setAttribute('aria-valuenow', pct); }
     if (lbl && label) lbl.textContent = label;
   }
   const parlayEventPickerWrap = document.getElementById('parlayEventPickerWrap');
-  const parlayEventList       = document.getElementById('parlayEventList');
-  const parlaySelectAllBtn    = document.getElementById('parlaySelectAllBtn');
-  const parlaySelectNoneBtn   = document.getElementById('parlaySelectNoneBtn');
-  const parlayEventSelMeta    = document.getElementById('parlayEventSelectionMeta');
-  const parlayBuildWrap       = document.getElementById('parlayBuildWrap');
-  const parlayBuildBtn        = document.getElementById('parlayBuildBtn');
-  const parlayRebuildBtn      = document.getElementById('parlayRebuildBtn');
-  const parlayRescrapeBtn     = document.getElementById('parlayRescrapeBtn');
-  let activeParlayJobToken = 0;
-  const parlayStatusMeta      = document.getElementById('parlayStatusMeta');
-  const parlayQuotaBar        = document.getElementById('parlayQuotaBar');
-  const parlayQuotaList       = document.getElementById('parlayQuotaList');
-  const parlayTicket          = document.getElementById('parlayTicket');
-  const parlayTicketOdds      = document.getElementById('parlayTicketOdds');
-  const parlayAllPropsWrap    = document.getElementById('parlayAllPropsWrap');
-  const parlayAllPropsTitle   = document.getElementById('parlayAllPropsTitle');
-  const parlayPropCount       = document.getElementById('parlayPropCount');
-  const parlayAllPropsBody    = document.getElementById('parlayAllPropsBody');
-  const parlayEmptyState      = document.getElementById('parlayEmptyState');
+  const parlayEventList = document.getElementById('parlayEventList');
+  const parlaySelectAllBtn = document.getElementById('parlaySelectAllBtn');
+  const parlaySelectNoneBtn = document.getElementById('parlaySelectNoneBtn');
+  const parlayEventSelMeta = document.getElementById('parlayEventSelectionMeta');
+  const parlayBuildWrap = document.getElementById('parlayBuildWrap');
+  const parlayBuildBtn = document.getElementById('parlayBuildBtn');
+  const parlayRebuildBtn = document.getElementById('parlayRebuildBtn');
+  const parlayRescrapeBtn = document.getElementById('parlayRescrapeBtn');
+  const parlayStatusMeta = document.getElementById('parlayStatusMeta');
+  const parlayQuotaBar = document.getElementById('parlayQuotaBar');
+  const parlayQuotaList = document.getElementById('parlayQuotaList');
+  const parlayTicket = document.getElementById('parlayTicket');
+  const parlayTicketOdds = document.getElementById('parlayTicketOdds');
+  const parlayAllPropsWrap = document.getElementById('parlayAllPropsWrap');
+  const parlayAllPropsTitle = document.getElementById('parlayAllPropsTitle');
+  const parlayPropCount = document.getElementById('parlayPropCount');
+  const parlayAllPropsBody = document.getElementById('parlayAllPropsBody');
+  const parlayEmptyState = document.getElementById('parlayEmptyState');
+  const parlayInjuryAware = document.getElementById('parlayInjuryAware');
+  const parlayInjurySummaryEl = document.getElementById('parlayInjurySummary');
 
   if (!parlayLoadEventsBtn) return;
 
   // ── State ─────────────────────────────────────────────────────────────
-  let allEvents        = [];       // events returned by /api/odds/events
+  let allEvents = [];       // events returned by /api/odds/events
   let selectedEventIds = new Set();
-  let cachedScoredProps  = null;
-  let cachedQuotaLog     = null;
-  let cachedScrapeMeta   = null;
+  let cachedScoredProps = null;
+  let cachedQuotaLog = null;
+  let cachedScrapeMeta = null;
 
   // ── Persist / restore ─────────────────────────────────────────────────
   try {
     const k = localStorage.getItem(PARLAY_KEYS_STORAGE);
     if (k && parlayApiKeys) parlayApiKeys.value = k;
     const s = JSON.parse(localStorage.getItem(PARLAY_SETTINGS_STORAGE) || '{}');
-    if (s.sport       && parlaySportSelect)   parlaySportSelect.value   = s.sport;
+    if (s.sport && parlaySportSelect) parlaySportSelect.value = s.sport;
     if (s.odds_format && parlayOddsFormatSel) parlayOddsFormatSel.value = s.odds_format;
-    if (s.legs        && parlayLegsSelect)    parlayLegsSelect.value    = String(s.legs);
-    if (s.last_n      && parlayLastNSelect)   parlayLastNSelect.value   = String(s.last_n);
-    if (s.bookmaker   && parlayBookmakerSelect) parlayBookmakerSelect.value = s.bookmaker;
-  } catch(e) {}
+    if (s.legs && parlayLegsSelect) parlayLegsSelect.value = String(s.legs);
+    if (s.last_n && parlayLastNSelect) parlayLastNSelect.value = String(s.last_n);
+    if (s.bookmaker && parlayBookmakerSelect) parlayBookmakerSelect.value = s.bookmaker;
+  } catch (e) { }
 
   function saveSettings() {
     try {
@@ -5013,11 +4942,11 @@ function buildSparklineSvg(values, line, width, height) {
         legs: parseInt(parlayLegsSelect.value), last_n: parseInt(parlayLastNSelect.value),
         bookmaker: parlayBookmakerSelect ? parlayBookmakerSelect.value : 'draftkings',
       }));
-    } catch(e) {}
+    } catch (e) { }
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────
-  function escHtml(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function escHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
   function fmtOdds(v) { return v != null ? Number(v).toFixed(2) : '—'; }
   function show(el, v) { if (el) el.style.display = v ? '' : 'none'; }
   function setStatus(msg, err) {
@@ -5035,7 +4964,7 @@ function buildSparklineSvg(values, line, width, height) {
       const datePart = d.toLocaleDateString('en-PH', { timeZone: 'Asia/Manila', month: 'short', day: 'numeric' });
       const timePart = d.toLocaleTimeString('en-PH', { timeZone: 'Asia/Manila', hour: '2-digit', minute: '2-digit' });
       return datePart + ' ' + timePart + ' PHT';
-    } catch(e) { return ''; }
+    } catch (e) { return ''; }
   }
 
   // ── Update legs dropdown to match selected event count ─────────────────
@@ -5066,19 +4995,19 @@ function buildSparklineSvg(values, line, width, height) {
 
   // ── Render event picker chips ──────────────────────────────────────────
   function renderEventPicker(events) {
-    parlayEventList.innerHTML = events.map(function(ev) {
+    parlayEventList.innerHTML = events.map(function (ev) {
       const time = formatEventTime(ev.commence_time);
       return '<div class="parlay-event-chip" data-event-id="' + escHtml(ev.id) + '">' +
         '<span class="parlay-chip-check">✓</span>' +
         '<div>' +
-          '<div class="parlay-chip-teams">' + escHtml(ev.away_team) + ' @ ' + escHtml(ev.home_team) + '</div>' +
-          (time ? '<div class="parlay-chip-time">' + time + '</div>' : '') +
+        '<div class="parlay-chip-teams">' + escHtml(ev.away_team) + ' @ ' + escHtml(ev.home_team) + '</div>' +
+        (time ? '<div class="parlay-chip-time">' + time + '</div>' : '') +
         '</div>' +
-      '</div>';
+        '</div>';
     }).join('');
 
-    parlayEventList.querySelectorAll('.parlay-event-chip').forEach(function(chip) {
-      chip.addEventListener('click', function() {
+    parlayEventList.querySelectorAll('.parlay-event-chip').forEach(function (chip) {
+      chip.addEventListener('click', function () {
         const id = chip.dataset.eventId;
         if (selectedEventIds.has(id)) {
           selectedEventIds.delete(id);
@@ -5101,7 +5030,7 @@ function buildSparklineSvg(values, line, width, height) {
   }
 
   function showCacheButtons(hasCache) {
-    show(parlayRebuildBtn,  hasCache);
+    show(parlayRebuildBtn, hasCache);
     show(parlayRescrapeBtn, hasCache);
     if (parlayBuildBtn) parlayBuildBtn.style.display = hasCache ? 'none' : '';
   }
@@ -5110,9 +5039,9 @@ function buildSparklineSvg(values, line, width, height) {
   function renderQuota(log) {
     if (!log || !log.length) return;
     show(parlayQuotaBar, true);
-    parlayQuotaList.innerHTML = log.map(function(e) {
+    parlayQuotaList.innerHTML = log.map(function (e) {
       const q = e.quota || {};
-      return '<span class="parlay-quota-pill"><strong>' + escHtml(e.call||'?') + '</strong>' +
+      return '<span class="parlay-quota-pill"><strong>' + escHtml(e.call || '?') + '</strong>' +
         (q.remaining != null ? ' · rem: ' + q.remaining : '') +
         (q.last != null ? ' · cost: ' + q.last : '') + '</span>';
     }).join('');
@@ -5135,7 +5064,7 @@ function buildSparklineSvg(values, line, width, height) {
   }
   function calcOdds(legs) {
     if (!legs.length) return null;
-    return Math.round(legs.reduce(function(a,l){ return a * l.odds; }, 1) * 100) / 100;
+    return Math.round(legs.reduce(function (a, l) { return a * l.odds; }, 1) * 100) / 100;
   }
 
   // ── Render ticket ──────────────────────────────────────────────────────
@@ -5147,36 +5076,45 @@ function buildSparklineSvg(values, line, width, height) {
     if (parlayTicketOdds) parlayTicketOdds.textContent = parlayOdds != null ? fmtOdds(parlayOdds) + 'x' : '—';
     const grid = parlayTicket.querySelector('.parlay-legs-grid');
     if (!grid) return;
-    grid.innerHTML = parlay.map(function(leg, i) {
+    grid.innerHTML = parlay.map(function (leg, i) {
       const sc = leg.side === 'OVER' ? 'over' : 'under';
       const fp = Math.min(100, leg.hit_rate || 0);
+      const tone = getConfidenceTone(leg.confidence);
+      const tags = Array.isArray(leg.confidence_tags) ? leg.confidence_tags.slice(0, 2) : [];
       return '<div class="parlay-leg-card" data-leg-idx="' + i + '" title="Analyze ' + escHtml(leg.player_name) + '" style="cursor:pointer">' +
-        '<span class="parlay-leg-rank">#' + (i+1) + '</span>' +
+        '<span class="parlay-leg-rank">#' + (i + 1) + '</span>' +
         '<div class="parlay-leg-player">' + escHtml(leg.player_name) + '</div>' +
         '<div class="parlay-leg-market">' +
-          '<span class="parlay-leg-stat">' + escHtml(leg.stat) + '</span>' +
-          '<span class="parlay-leg-line">' + leg.line + '</span>' +
-          '<span class="parlay-leg-side ' + sc + '">' + leg.side + '</span>' +
+        '<span class="parlay-leg-stat">' + escHtml(leg.stat) + '</span>' +
+        '<span class="parlay-leg-line">' + leg.line + '</span>' +
+        '<span class="parlay-leg-side ' + sc + '">' + leg.side + '</span>' +
         '</div>' +
+        '<div style="display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 2px">' +
+        '<span class="finder-badge ' + tone + '">' + escHtml(leg.confidence || 'C') + ' ' + escHtml(String(leg.confidence_score || '')) + '</span>' +
+        (leg.confidence_tier ? '<span class="finder-badge">' + escHtml(leg.confidence_tier) + '</span>' : '') +
+        (leg.injury_boost ? '<span class="parlay-leg-inj-boost">🏥 +' + Math.round((leg.hit_rate || 0) - (leg.base_hit_rate || leg.hit_rate || 0)) + '% inj. boost</span>' : '') +
+        tags.map(function (tag) { return '<span class="finder-chip">' + escHtml(tag) + '</span>'; }).join('') +
+        '</div>' +
+        (leg.injury_filter_player_names && leg.injury_filter_player_names.length ? '<div class="parlay-leg-inj-context">w/o ' + leg.injury_filter_player_names.map(escHtml).join(', ') + '</div>' : '') +
         '<div class="parlay-leg-stats-row">' +
-          '<div class="parlay-leg-stat-item"><span class="slabel">Hit %</span><span class="sval">' + leg.hit_rate + '%</span></div>' +
-          '<div class="parlay-leg-stat-item"><span class="slabel">Avg</span><span class="sval">'   + (leg.average||'—')     + '</span></div>' +
-          '<div class="parlay-leg-stat-item"><span class="slabel">Games</span><span class="sval">' + (leg.games_count||'—') + '</span></div>' +
-          '<div class="parlay-leg-stat-item"><span class="slabel">Odds</span><span class="sval">'  + fmtOdds(leg.odds)      + '</span></div>' +
+        '<div class="parlay-leg-stat-item"><span class="slabel">Hit %</span><span class="sval">' + leg.hit_rate + '%</span></div>' +
+        '<div class="parlay-leg-stat-item"><span class="slabel">Avg</span><span class="sval">' + (leg.average || '—') + '</span></div>' +
+        '<div class="parlay-leg-stat-item"><span class="slabel">Games</span><span class="sval">' + (leg.games_count || '—') + '</span></div>' +
+        '<div class="parlay-leg-stat-item"><span class="slabel">Odds</span><span class="sval">' + fmtOdds(leg.odds) + '</span></div>' +
         '</div>' +
         '<div class="parlay-leg-hit-bar"><div class="parlay-leg-hit-fill" style="width:' + fp + '%"></div></div>' +
-        '<div class="parlay-leg-analyze-hint" style="font-size:0.72rem;color:var(--muted);margin-top:6px;text-align:center">Click to analyze →</div>' +
-      '</div>';
+        '<div class="parlay-leg-analyze-hint" style="font-size:0.72rem;color:var(--muted);margin-top:6px;text-align:center">' + escHtml(leg.confidence_summary || 'Click to analyze →') + '</div>' +
+        '</div>';
     }).join('');
 
     // Wire up click → analyzer with full auto-populate
-    grid.querySelectorAll('.parlay-leg-card[data-leg-idx]').forEach(function(card) {
-      card.addEventListener('click', async function() {
+    grid.querySelectorAll('.parlay-leg-card[data-leg-idx]').forEach(function (card) {
+      card.addEventListener('click', async function () {
         const leg = parlay[parseInt(card.dataset.legIdx)];
         if (!leg || !leg.player_id) return;
         try {
           await hydrateAnalyzerFromPropSelection(leg);
-        } catch(err) { console.warn('Parlay ticket leg nav failed:', err); }
+        } catch (err) { console.warn('Parlay ticket leg nav failed:', err); }
       });
     });
   }
@@ -5185,38 +5123,42 @@ function buildSparklineSvg(values, line, width, height) {
   function renderAllProps(all, selectedIds) {
     if (!all || !all.length) return;
     show(parlayAllPropsWrap, true);
-    if (parlayPropCount)     parlayPropCount.textContent     = all.length + ' props — click any row to analyze';
+    if (parlayPropCount) parlayPropCount.textContent = all.length + ' props — click any row to analyze';
     if (parlayAllPropsTitle) parlayAllPropsTitle.textContent = all.length + ' props ranked by hit rate';
-    const sel = new Set((selectedIds||[]).map(Number));
-    parlayAllPropsBody.innerHTML = all.map(function(p, idx) {
+    const sel = new Set((selectedIds || []).map(Number));
+    parlayAllPropsBody.innerHTML = all.map(function (p, idx) {
       const isSel = sel.has(Number(p.player_id));
-      const imgSrc = 'https://cdn.nba.com/headshots/nba/latest/1040x760/' + (p.player_id||'') + '.png';
+      const imgSrc = 'https://cdn.nba.com/headshots/nba/latest/1040x760/' + (p.player_id || '') + '.png';
       const gameTag = p.game_label ? '<span class="parlay-game-label">' + escHtml(p.game_label) + '</span>' : '';
-      return '<tr class="' + (isSel ? 'parlay-selected-row' : '') + '" data-prop-idx="' + idx + '" title="Analyze ' + escHtml(p.player_name) + '">' +
+      const tone = getConfidenceTone(p.confidence);
+      const confText = p.confidence ? ('<div class="parlay-conf-cell"><span class="finder-badge ' + tone + '">' + escHtml(p.confidence) + ' ' + escHtml(String(p.confidence_score || '')) + '</span><small>' + escHtml(p.confidence_summary || '') + '</small></div>') : '<span style="opacity:0.35">—</span>';
+      return '<tr class="' + (isSel ? 'parlay-selected-row' : '') + '" data-prop-idx="' + idx + '" data-player-id="' + (p.player_id || '') + '" data-player-name="' + escHtml(p.player_name || '') + '" data-stat="' + escHtml(p.stat || '') + '" data-line="' + (p.line || 0) + '" data-side="' + escHtml(p.side || 'OVER') + '" title="Analyze ' + escHtml(p.player_name) + '">' +
         '<td><span style="display:flex;align-items:center;gap:8px"><img src="' + imgSrc + '" style="width:26px;height:26px;border-radius:50%;object-fit:cover;object-position:top" onerror="this.hidden=true">' +
-          '<span style="display:flex;flex-direction:column;gap:2px">' +
-            '<span>' + escHtml(p.player_name) + (isSel ? ' ⭐' : '') + '</span>' + gameTag +
-          '</span></span></td>' +
+        '<span style="display:flex;flex-direction:column;gap:2px">' +
+        '<span>' + escHtml(p.player_name) + (isSel ? ' ⭐' : '') + '</span>' + gameTag +
+        '</span></span></td>' +
         '<td>' + escHtml(p.stat) + '</td><td>' + p.line + '</td>' +
-        '<td class="' + (p.side==='OVER'?'side-over':'side-under') + '">' + p.side + '</td>' +
+        '<td class="' + (p.side === 'OVER' ? 'side-over' : 'side-under') + '">' + p.side + '</td>' +
         '<td class="hit-pct-cell ' + hitClass(p.hit_rate) + '">' + p.hit_rate + '%</td>' +
-        '<td>' + (p.average||'—') + '</td><td>' + (p.games_count||'—') + '</td>' +
+        '<td>' + (p.average || '—') + '</td><td>' + (p.games_count || '—') + '</td>' +
+        '<td>' + confText + '</td>' +
         '<td>' + fmtOdds(p.odds) + '</td>' +
-        '<td><button class="parlay-track-btn" data-track-idx="' + idx + '">+ Track</button></td>' +
+        '<td><div class="parlay-inj-cell">' + renderInjuryCell(p) + '</div></td>' +
+        '<td><div class="parlay-action-cell"><button class="parlay-track-btn" data-track-idx="' + idx + '">+ Track</button></div></td>' +
         '</tr>';
     }).join('');
-    parlayAllPropsBody.querySelectorAll('tr[data-prop-idx]').forEach(function(row) {
-      row.addEventListener('click', async function(e) {
+    parlayAllPropsBody.querySelectorAll('tr[data-prop-idx]').forEach(function (row) {
+      row.addEventListener('click', async function (e) {
         if (e.target.closest('.parlay-track-btn')) return;
         const prop = all[parseInt(row.dataset.propIdx)];
         if (!prop || !prop.player_id) return;
         try {
           await hydrateAnalyzerFromPropSelection(prop);
-        } catch(e) { console.warn('Parlay row nav failed:', e); }
+        } catch (e) { console.warn('Parlay row nav failed:', e); }
       });
     });
-    parlayAllPropsBody.querySelectorAll('.parlay-track-btn').forEach(function(btn) {
-      btn.addEventListener('click', function(e) {
+    parlayAllPropsBody.querySelectorAll('.parlay-track-btn').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
         e.stopPropagation();
         var prop = all[parseInt(btn.dataset.trackIdx)];
         if (typeof window._trackerAddProp === 'function') {
@@ -5235,164 +5177,152 @@ function buildSparklineSvg(values, line, width, height) {
   // ── Rebuild from cache (zero API calls) ───────────────────────────────
   function rebuildFromCache() {
     if (!cachedScoredProps || !cachedScoredProps.length) return;
-    const n    = parseInt(parlayLegsSelect.value) || 3;
+    const n = parseInt(parlayLegsSelect.value) || 3;
     const legs = pickLegs(cachedScoredProps, n);
     const odds = calcOdds(legs);
     renderTicket(legs, n, odds);
-    renderAllProps(cachedScoredProps, legs.map(function(l){ return l.player_id; }));
+    renderAllProps(cachedScoredProps, legs.map(function (l) { return l.player_id; }));
     const m = cachedScrapeMeta || {};
-    const ago = m.scrapedAt ? ' · cached ' + Math.round((Date.now()-m.scrapedAt)/60000) + 'm ago' : '';
-    setStatus((m.evCount||0) + ' events · ' + (m.analyzed||0) + ' props analyzed' + ago + ' — no credits used', false);
+    const ago = m.scrapedAt ? ' · cached ' + Math.round((Date.now() - m.scrapedAt) / 60000) + 'm ago' : '';
+    setStatus((m.evCount || 0) + ' events · ' + (m.analyzed || 0) + ' props analyzed' + ago + ' — no credits used', false);
+  }
+
+  // ── Render injury summary panel ──────────────────────────────────────
+  function renderInjurySummary(injurySummary) {
+    if (!parlayInjurySummaryEl) return;
+    if (!injurySummary || !injurySummary.length) {
+      parlayInjurySummaryEl.style.display = 'none';
+      return;
+    }
+    parlayInjurySummaryEl.style.display = '';
+    parlayInjurySummaryEl.innerHTML =
+      '<div class="parlay-inj-summary-label">🏥 Today\'s injury context used in analysis</div>' +
+      injurySummary.map(function(t) {
+        return '<div class="parlay-inj-team-chip">' +
+          '<span class="inj-team-name">' + escHtml(t.team_name) + '</span>' +
+          '<span class="inj-player-list">' + (t.injured_player_names || []).map(escHtml).join('<br>') + '</span>' +
+          '</div>';
+      }).join('');
+  }
+
+  // ── Render single injury cell for all-props table ─────────────────────
+  function renderInjuryCell(p) {
+    if (!p) return '<span style="opacity:0.3">—</span>';
+    const teamInjured = p.team_injury_player_names || [];
+    const filterUsed = p.injury_filter_player_names || [];
+    const boost = p.injury_boost;
+    if (!teamInjured.length && !filterUsed.length) return '<span style="opacity:0.3">—</span>';
+    var parts = [];
+    if (boost) {
+      const diff = Math.round((p.hit_rate || 0) - (p.base_hit_rate || p.hit_rate || 0));
+      parts.push('<span class="inj-boost-tag">🏥' + (diff > 0 ? ' +' + diff + '%' : '') + ' boost</span>');
+    }
+    if (filterUsed.length) {
+      parts.push('<span class="inj-names">w/o ' + filterUsed.map(escHtml).join(', ') + '</span>');
+    } else if (teamInjured.length) {
+      const shown = teamInjured.slice(0, 2).map(escHtml).join(', ');
+      const extra = teamInjured.length > 2 ? ' <span style="opacity:0.5">+' + (teamInjured.length - 2) + '</span>' : '';
+      parts.push('<span class="inj-names">' + shown + extra + '</span>');
+    }
+    return parts.length ? parts.join('') : '<span style="opacity:0.3">—</span>';
   }
 
   // ── Full scrape selected events → analyze → render ───────────────────
   async function runScrape() {
     const rawKeys = (parlayApiKeys.value || '').trim();
     if (!rawKeys) { setStatus('Enter at least one API key.', true); return; }
-    const keys = rawKeys.split(',').map(function(k){ return k.trim(); }).filter(Boolean);
+    const keys = rawKeys.split(',').map(function (k) { return k.trim(); }).filter(Boolean);
     if (selectedEventIds.size === 0) { setStatus('Select at least one event first.', true); return; }
-    const legs       = parseInt(parlayLegsSelect.value) || 2;
-    const sport      = parlaySportSelect.value;
+    const legs = parseInt(parlayLegsSelect.value) || 2;
+    const sport = parlaySportSelect.value;
     const oddsFormat = parlayOddsFormatSel.value;
-    const lastN      = parseInt(parlayLastNSelect.value) || 10;
-    const runToken   = ++activeParlayJobToken;
+    const lastN = parseInt(parlayLastNSelect.value) || 10;
 
     saveSettings();
     show(parlayTicket, false); show(parlayAllPropsWrap, false);
     show(parlayQuotaBar, false); show(parlayEmptyState, false);
+    if (parlayInjurySummaryEl) parlayInjurySummaryEl.style.display = 'none';
     parlayQuotaList.innerHTML = '';
+    const useInjuryAware = parlayInjuryAware && parlayInjuryAware.checked;
+    const parlayEndpoint = useInjuryAware ? '/api/parlay-builder-injury-aware' : '/api/parlay-builder';
     const totalEvents = selectedEventIds.size;
-    setStatus('⏳ Queueing parlay build for ' + totalEvents + ' game(s)…', false);
-    setParlayProgress(3, 'Sending background job to server…');
-    if (parlayBuildBtn)    parlayBuildBtn.disabled    = true;
-    if (parlayRebuildBtn)  parlayRebuildBtn.disabled  = true;
+    setStatus('⏳ Step 1/3 — Fetching odds for ' + totalEvents + ' game(s)…', false);
+    setParlayProgress(5, 'Connecting to Odds API…');
+    if (parlayBuildBtn) parlayBuildBtn.disabled = true;
+    if (parlayRebuildBtn) parlayRebuildBtn.disabled = true;
     if (parlayRescrapeBtn) parlayRescrapeBtn.disabled = true;
 
-    async function fetchCompletedResult(jobId) {
-      const resultResp = await fetch('/api/parlay-builder/jobs/' + encodeURIComponent(jobId) + '/result', { cache: 'no-store' });
-      if (!resultResp.ok) {
-        const err = await resultResp.json().catch(function(){ return {}; });
-        throw new Error(err.detail || 'Failed to fetch parlay results');
-      }
-      return resultResp.json();
-    }
+    // Simulate progress steps while waiting for the single fetch
+    var progressTimer = null;
+    var fakeStep = 5;
+    progressTimer = setInterval(function () {
+      fakeStep = Math.min(fakeStep + 3, 75);
+      if (fakeStep < 30) setParlayProgress(fakeStep, '⏳ Scraping game odds… (' + totalEvents + ' events)');
+      else if (fakeStep < 55) setParlayProgress(fakeStep, useInjuryAware ? '⏳ Checking injury report & re-analyzing…' : '⏳ Analyzing ' + totalEvents * 15 + '+ props…');
+      else setParlayProgress(fakeStep, useInjuryAware ? '⏳ Applying injury boosts…' : '⏳ Ranking by hit rate…');
+    }, 600);
 
     try {
-      const createResp = await fetch('/api/parlay-builder/jobs', {
+      const resp = await fetch(parlayEndpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          api_keys: keys,
-          legs: legs,
-          sport: sport,
-          odds_format: oddsFormat,
-          last_n: lastN,
+          api_keys: keys, legs: legs, sport: sport,
+          odds_format: oddsFormat, last_n: lastN,
           event_ids: Array.from(selectedEventIds),
           bookmaker: parlayBookmakerSelect ? parlayBookmakerSelect.value : 'draftkings',
         }),
       });
-      if (!createResp.ok) {
-        const err = await createResp.json().catch(function(){ return {}; });
-        throw new Error(err.detail || 'Unable to start parlay builder');
+      if (!resp.ok) {
+        const err = await resp.json().catch(function () { return {}; });
+        throw new Error(err.detail || 'Server error ' + resp.status);
       }
-      const created = await createResp.json();
-      if (!created || !created.job_id) throw new Error('Missing parlay job id from server.');
+      const data = await resp.json();
 
-      const jobId = created.job_id;
-      const pollDelayMs = 1200;
-      const maxPollMs = 9 * 60 * 1000;
-      const startedAt = Date.now();
-      let lastMessage = '';
-      let completedData = null;
+      cachedScoredProps = data.all_props_scored || [];
+      cachedQuotaLog = data.quota_log || [];
+      cachedScrapeMeta = { evCount: data.events_scraped || 0, propCount: data.props_found || 0, analyzed: data.props_analyzed || 0, scrapedAt: Date.now() };
 
-      while (runToken === activeParlayJobToken) {
-        const pollResp = await fetch('/api/parlay-builder/jobs/' + encodeURIComponent(jobId), { cache: 'no-store' });
-        if (!pollResp.ok) {
-          const err = await pollResp.json().catch(function(){ return {}; });
-          throw new Error(err.detail || 'Failed to read parlay job status');
-        }
-        const job = await pollResp.json();
-        const status = String(job.status || 'queued').toLowerCase();
-        const progress = Math.max(0, Math.min(100, parseInt(job.progress || 0, 10) || 0));
-        const stage = job.stage || 'Processing';
-        const message = job.message || (stage + '…');
-        const summary = job.result_summary || null;
-        const summaryText = summary && summary.props_found
-          ? (' · ' + summary.props_found + ' props found' + (summary.props_analyzed ? ' · ' + summary.props_analyzed + ' analyzed' : ''))
-          : '';
-        setParlayProgress(progress > 0 ? progress : 4, stage + ' — ' + message + summaryText);
-        if (message !== lastMessage) {
-          setStatus('⏳ ' + message + summaryText, false);
-          lastMessage = message;
-        }
+      clearInterval(progressTimer);
+      setParlayProgress(90, '⏳ Building parlay ticket…');
+      renderQuota(cachedQuotaLog);
+      const m = cachedScrapeMeta;
+      const injBoostCount = (cachedScoredProps || []).filter(function(p){ return p.injury_boost; }).length;
+      const injStatusMsg = useInjuryAware ? (' · 🏥 ' + injBoostCount + ' injury boost' + (injBoostCount !== 1 ? 's' : '')) : '';
+      setStatus('✓ Done — ' + m.evCount + ' event(s) scraped · ' + m.propCount + ' props found · ' + m.analyzed + ' analyzed' + injStatusMsg, false);
+      // Render injury summary panel
+      if (useInjuryAware && parlayInjurySummaryEl) renderInjurySummary(data.injury_summary || []);
+      setParlayProgress(100, '✓ Complete!');
+      setTimeout(function () { setParlayProgress(0, ''); }, 2000);
 
-        if (status === 'completed') {
-          setParlayProgress(97, 'Finalizing results…');
-          completedData = await fetchCompletedResult(jobId);
-          break;
-        }
-
-        if (status === 'failed') {
-          const errorDetail = (job.error && (job.error.detail || job.error.message)) || message || 'Parlay build failed';
-          throw new Error(errorDetail);
-        }
-
-        if ((Date.now() - startedAt) > maxPollMs) {
-          throw new Error('Parlay build took too long on the host. Please try fewer games or retry.');
-        }
-        await new Promise(function(resolve) { setTimeout(resolve, pollDelayMs); });
-      }
-
-      if (runToken !== activeParlayJobToken) return;
-      if (!completedData) throw new Error('Parlay job finished without a readable result.');
-
-      try {
-        cachedScoredProps = completedData.all_props_scored || [];
-        cachedQuotaLog    = completedData.quota_log || [];
-        cachedScrapeMeta  = { evCount: completedData.events_scraped||0, propCount: completedData.props_found||0, analyzed: completedData.props_analyzed||0, scrapedAt: Date.now() };
-
-        renderQuota(cachedQuotaLog);
-        const m = cachedScrapeMeta;
-        setStatus('✓ Done — ' + m.evCount + ' event(s) scraped · ' + m.propCount + ' props found · ' + m.analyzed + ' analyzed', false);
-        setParlayProgress(100, '✓ Complete!');
-        setTimeout(function() {
-          if (runToken === activeParlayJobToken) setParlayProgress(0, '');
-        }, 1800);
-
-        if (!cachedScoredProps.length) {
-          show(parlayEmptyState, true);
-          const s = parlayEmptyState.querySelector('strong'), sp = parlayEmptyState.querySelector('span');
-          if (s) s.textContent = completedData.message || 'No props found for selected events.';
-          if (sp) sp.textContent = 'Try different events or check your API keys.';
-          if (typeof hideBanner === 'function') hideBanner();
-          return;
-        }
-        showCacheButtons(true);
-        rebuildFromCache();
+      if (!cachedScoredProps.length) {
+        show(parlayEmptyState, true);
+        const s = parlayEmptyState.querySelector('strong'), sp = parlayEmptyState.querySelector('span');
+        if (s) s.textContent = data.message || 'No props found for selected events.';
+        if (sp) sp.textContent = 'Try different events or check your API keys.';
         if (typeof hideBanner === 'function') hideBanner();
-      } catch (renderErr) {
-        console.error('Parlay render failed', renderErr);
-        throw new Error(renderErr && renderErr.message ? renderErr.message : 'Parlay finished but UI render failed.');
+        return;
       }
-    } catch(err) {
-      if (runToken !== activeParlayJobToken) return;
+      showCacheButtons(true);
+      rebuildFromCache();
+      if (typeof hideBanner === 'function') hideBanner();
+    } catch (err) {
+      clearInterval(progressTimer);
       setParlayProgress(0, '');
       setStatus('❌ Error: ' + (err.message || 'Unknown'), true);
       show(parlayEmptyState, true);
     } finally {
-      if (runToken === activeParlayJobToken) {
-        if (parlayBuildBtn)    parlayBuildBtn.disabled    = false;
-        if (parlayRebuildBtn)  parlayRebuildBtn.disabled  = false;
-        if (parlayRescrapeBtn) parlayRescrapeBtn.disabled = false;
-      }
+      if (parlayBuildBtn) parlayBuildBtn.disabled = false;
+      if (parlayRebuildBtn) parlayRebuildBtn.disabled = false;
+      if (parlayRescrapeBtn) parlayRescrapeBtn.disabled = false;
     }
   }
 
   // ── Step 1: Load today's events ───────────────────────────────────────
-  parlayLoadEventsBtn.addEventListener('click', async function() {
+  parlayLoadEventsBtn.addEventListener('click', async function () {
     const rawKeys = (parlayApiKeys.value || '').trim();
     if (!rawKeys) { setStatus('Enter at least one API key first.', true); return; }
-    const keys = rawKeys.split(',').map(function(k){ return k.trim(); }).filter(Boolean);
+    const keys = rawKeys.split(',').map(function (k) { return k.trim(); }).filter(Boolean);
     saveSettings();
     parlayLoadEventsBtn.disabled = true;
     parlayLoadEventsBtn.textContent = 'Loading…';
@@ -5406,11 +5336,11 @@ function buildSparklineSvg(values, line, width, height) {
         body: JSON.stringify({ api_key: keys[0], sport: parlaySportSelect.value }),
       });
       if (!resp.ok) {
-        const err = await resp.json().catch(function(){ return {}; });
+        const err = await resp.json().catch(function () { return {}; });
         throw new Error(err.detail || 'Failed to load events');
       }
       const data = await resp.json();
-      allEvents = (data.events || []).filter(function(e){ return e.id && e.home_team; });
+      allEvents = (data.events || []).filter(function (e) { return e.id && e.home_team; });
 
       if (!allEvents.length) {
         setStatus('No events found for today. Try again later.', true);
@@ -5427,7 +5357,7 @@ function buildSparklineSvg(values, line, width, height) {
       show(parlayEventPickerWrap, true);
       syncLegsToEventCount();
       setStatus(allEvents.length + ' events loaded. Pick your games.', false);
-    } catch(err) {
+    } catch (err) {
       setStatus('Error loading events: ' + err.message, true);
     } finally {
       parlayLoadEventsBtn.disabled = false;
@@ -5437,8 +5367,8 @@ function buildSparklineSvg(values, line, width, height) {
 
   // Select all / none
   if (parlaySelectAllBtn) {
-    parlaySelectAllBtn.addEventListener('click', function() {
-      parlayEventList.querySelectorAll('.parlay-event-chip').forEach(function(c) {
+    parlaySelectAllBtn.addEventListener('click', function () {
+      parlayEventList.querySelectorAll('.parlay-event-chip').forEach(function (c) {
         selectedEventIds.add(c.dataset.eventId);
         c.classList.add('selected');
       });
@@ -5446,19 +5376,19 @@ function buildSparklineSvg(values, line, width, height) {
     });
   }
   if (parlaySelectNoneBtn) {
-    parlaySelectNoneBtn.addEventListener('click', function() {
+    parlaySelectNoneBtn.addEventListener('click', function () {
       selectedEventIds.clear();
-      parlayEventList.querySelectorAll('.parlay-event-chip').forEach(function(c) { c.classList.remove('selected'); });
+      parlayEventList.querySelectorAll('.parlay-event-chip').forEach(function (c) { c.classList.remove('selected'); });
       syncLegsToEventCount();
     });
   }
 
   // Scrape & Build
-  if (parlayBuildBtn) parlayBuildBtn.addEventListener('click', function() { runScrape(); });
+  if (parlayBuildBtn) parlayBuildBtn.addEventListener('click', function () { runScrape(); });
 
   // Reshuffle (re-pick from cache, zero credits)
   if (parlayRebuildBtn) {
-    parlayRebuildBtn.addEventListener('click', function() {
+    parlayRebuildBtn.addEventListener('click', function () {
       if (!cachedScoredProps || !cachedScoredProps.length) { setStatus('No cached data. Run Scrape & Build first.', true); return; }
       // Rotate the cached props so a different combination surfaces
       if (cachedScoredProps.length > 1) cachedScoredProps.push(cachedScoredProps.shift());
@@ -5468,7 +5398,7 @@ function buildSparklineSvg(values, line, width, height) {
 
   // Re-scrape (clear cache, burn credits)
   if (parlayRescrapeBtn) {
-    parlayRescrapeBtn.addEventListener('click', function() {
+    parlayRescrapeBtn.addEventListener('click', function () {
       cachedScoredProps = null; cachedQuotaLog = null; cachedScrapeMeta = null;
       showCacheButtons(false);
       runScrape();
@@ -5477,7 +5407,7 @@ function buildSparklineSvg(values, line, width, height) {
 
   // Leg change → instant local rebuild
   if (parlayLegsSelect) {
-    parlayLegsSelect.addEventListener('change', function() {
+    parlayLegsSelect.addEventListener('change', function () {
       if (cachedScoredProps && cachedScoredProps.length) rebuildFromCache();
     });
   }
@@ -5491,16 +5421,16 @@ function buildSparklineSvg(values, line, width, height) {
   const TRACKER_STORAGE_KEY = 'nba-props-tracker-bets';
 
   const trackerPlayerInput = document.getElementById('trackerPlayerInput');
-  const trackerStatSelect  = document.getElementById('trackerStatSelect');
-  const trackerLineInput   = document.getElementById('trackerLineInput');
-  const trackerSideSelect  = document.getElementById('trackerSideSelect');
-  const trackerOddsInput   = document.getElementById('trackerOddsInput');
-  const trackerBookInput   = document.getElementById('trackerBookInput');
-  const trackerAddBtn      = document.getElementById('trackerAddBtn');
-  const trackerAddError    = document.getElementById('trackerAddError');
-  const trackerRefreshBtn  = document.getElementById('trackerRefreshBtn');
-  const trackerCards       = document.getElementById('trackerCards');
-  const trackerEmpty       = document.getElementById('trackerEmpty');
+  const trackerStatSelect = document.getElementById('trackerStatSelect');
+  const trackerLineInput = document.getElementById('trackerLineInput');
+  const trackerSideSelect = document.getElementById('trackerSideSelect');
+  const trackerOddsInput = document.getElementById('trackerOddsInput');
+  const trackerBookInput = document.getElementById('trackerBookInput');
+  const trackerAddBtn = document.getElementById('trackerAddBtn');
+  const trackerAddError = document.getElementById('trackerAddError');
+  const trackerRefreshBtn = document.getElementById('trackerRefreshBtn');
+  const trackerCards = document.getElementById('trackerCards');
+  const trackerEmpty = document.getElementById('trackerEmpty');
 
   if (!trackerAddBtn) return;
 
@@ -5523,17 +5453,17 @@ function buildSparklineSvg(values, line, width, height) {
   function openDropdown(results) {
     if (!trackerPlayerDropdown) return;
     if (!results.length) { closeDropdown(); return; }
-    trackerPlayerDropdown.innerHTML = results.map(function(p) {
+    trackerPlayerDropdown.innerHTML = results.map(function (p) {
       return '<li role="option" class="tracker-player-option" data-id="' + p.id + '" data-name="' + esc(p.full_name) + '" style="padding:8px 12px;cursor:pointer;list-style:none;border-bottom:1px solid var(--border,#333)">'
         + esc(p.full_name) + (p.is_active ? '' : ' <small style="opacity:.5">(inactive)</small>') + '</li>';
     }).join('');
     trackerPlayerDropdown.style.display = 'block';
     if (trackerPlayerInput) trackerPlayerInput.setAttribute('aria-expanded', 'true');
 
-    trackerPlayerDropdown.querySelectorAll('.tracker-player-option').forEach(function(li) {
-      li.addEventListener('mousedown', function(e) {
+    trackerPlayerDropdown.querySelectorAll('.tracker-player-option').forEach(function (li) {
+      li.addEventListener('mousedown', function (e) {
         e.preventDefault(); // prevent blur before click
-        _selectedPlayerId   = li.dataset.id ? Number(li.dataset.id) : null;
+        _selectedPlayerId = li.dataset.id ? Number(li.dataset.id) : null;
         _selectedPlayerName = li.dataset.name || '';
         trackerPlayerInput.value = _selectedPlayerName;
         closeDropdown();
@@ -5542,27 +5472,27 @@ function buildSparklineSvg(values, line, width, height) {
   }
 
   if (trackerPlayerInput) {
-    trackerPlayerInput.addEventListener('input', function() {
+    trackerPlayerInput.addEventListener('input', function () {
       const q = trackerPlayerInput.value.trim();
       _selectedPlayerId = null; // reset cached selection on new typing
       clearTimeout(_autocompleteDebounce);
       if (q.length < 2) { closeDropdown(); return; }
-      _autocompleteDebounce = setTimeout(async function() {
+      _autocompleteDebounce = setTimeout(async function () {
         try {
           const r = await fetch('/api/players/search?q=' + encodeURIComponent(q));
           if (!r.ok) return;
           const data = await r.json();
           openDropdown((data.results || []).slice(0, 8));
-        } catch(e) { closeDropdown(); }
+        } catch (e) { closeDropdown(); }
       }, 220);
     });
 
-    trackerPlayerInput.addEventListener('blur', function() {
+    trackerPlayerInput.addEventListener('blur', function () {
       // Slight delay so mousedown on option fires first
       setTimeout(closeDropdown, 200);
     });
 
-    trackerPlayerInput.addEventListener('keydown', function(e) {
+    trackerPlayerInput.addEventListener('keydown', function (e) {
       if (e.key === 'Escape') closeDropdown();
     });
   }
@@ -5574,16 +5504,16 @@ function buildSparklineSvg(values, line, width, height) {
 
   // ── Persist ───────────────────────────────────────────────────────────
   function saveBets() {
-    try { localStorage.setItem(TRACKER_STORAGE_KEY, JSON.stringify(bets)); } catch(e) {}
+    try { localStorage.setItem(TRACKER_STORAGE_KEY, JSON.stringify(bets)); } catch (e) { }
   }
   function loadBets() {
-    try { return JSON.parse(localStorage.getItem(TRACKER_STORAGE_KEY) || '[]'); } catch(e) { return []; }
+    try { return JSON.parse(localStorage.getItem(TRACKER_STORAGE_KEY) || '[]'); } catch (e) { return []; }
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────
-  function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
   function escapeHtmlT(s) { return esc(s); }
-  function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2,6); }
+  function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
   function showErr(msg) {
     if (!trackerAddError) return;
     trackerAddError.textContent = msg;
@@ -5596,18 +5526,24 @@ function buildSparklineSvg(values, line, width, height) {
 
   // ── Compute status from current val vs line ────────────────────────────
   function computeStatus(bet) {
-    const val  = bet.current_val;
+    const val = bet.current_val;
     const line = parseFloat(bet.line);
     if (val === null || val === undefined) return 'pending';
     const v = parseFloat(val);
-    if (bet.side === 'OVER')  return v >= line ? 'hit'    : v >= line * 0.85 ? 'close' : 'progress';
-    if (bet.side === 'UNDER') return v <= line ? 'hit'    : v <= line * 1.15 ? 'close' : 'busted';
+    const isLive = bet.source === 'LIVE' || bet.game_status === 'live';
+    if (bet.side === 'OVER') return v >= line ? 'hit' : v >= line * 0.85 ? 'close' : 'progress';
+    if (bet.side === 'UNDER') {
+      // During live games, an UNDER can't be confirmed — player can still score more.
+      // Only mark HIT when the game is finished (FINAL source).
+      if (isLive) return v > line ? 'busted' : v > line * 0.85 ? 'close' : 'progress';
+      return v <= line ? 'hit' : v <= line * 1.15 ? 'close' : 'busted';
+    }
     return 'progress';
   }
 
   // For UNDER, the bar fills inversely: more value = worse
   function computeBarPct(bet) {
-    const val  = bet.current_val;
+    const val = bet.current_val;
     const line = parseFloat(bet.line);
     if (val === null || val === undefined) return 0;
     const v = parseFloat(val);
@@ -5622,39 +5558,39 @@ function buildSparklineSvg(values, line, width, height) {
 
   // ── Render a single card ───────────────────────────────────────────────
   function renderCard(bet) {
-    const status  = computeStatus(bet);
-    const barPct  = computeBarPct(bet);
-    const val     = bet.current_val !== null && bet.current_val !== undefined
-                    ? parseFloat(bet.current_val).toFixed(1) : '—';
-    const line    = parseFloat(bet.line).toFixed(1);
-    const imgSrc  = bet.player_id
-                    ? 'https://cdn.nba.com/headshots/nba/latest/1040x760/' + bet.player_id + '.png'
-                    : '';
+    const status = computeStatus(bet);
+    const barPct = computeBarPct(bet);
+    const val = bet.current_val !== null && bet.current_val !== undefined
+      ? parseFloat(bet.current_val).toFixed(1) : '—';
+    const line = parseFloat(bet.line).toFixed(1);
+    const imgSrc = bet.player_id
+      ? 'https://cdn.nba.com/headshots/nba/latest/1040x760/' + bet.player_id + '.png'
+      : '';
 
     // Card gets extra class when injured — must be declared before cardClass uses it
     const extraCardCls = bet.is_injured ? ' injured' : '';
 
     // Card-level class
     const cardClass = (status === 'hit' ? 'tracker-card hit'
-                    : status === 'busted' ? 'tracker-card busted'
-                    : 'tracker-card') + extraCardCls;
+      : status === 'busted' ? 'tracker-card busted'
+        : 'tracker-card') + extraCardCls;
 
     // Bar track class
-    const barClass  = status === 'hit'     ? 'tracker-bar-track hit'
-                    : status === 'close'   ? 'tracker-bar-track close'
-                    : status === 'busted'  ? 'tracker-bar-track busted'
-                    : status === 'pending' ? 'tracker-bar-track pending'
-                    :                        'tracker-bar-track progress';
+    const barClass = status === 'hit' ? 'tracker-bar-track hit'
+      : status === 'close' ? 'tracker-bar-track close'
+        : status === 'busted' ? 'tracker-bar-track busted'
+          : status === 'pending' ? 'tracker-bar-track pending'
+            : 'tracker-bar-track progress';
 
     // Status badge
-    const badgeLabel = status === 'hit'     ? '✓ HIT'
-                     : status === 'busted'  ? '✗ BUST'
-                     : status === 'close'   ? 'CLOSE'
-                     : status === 'pending' ? 'PENDING'
-                     :                        'IN PROGRESS';
+    const badgeLabel = status === 'hit' ? '✓ HIT'
+      : status === 'busted' ? '✗ BUST'
+        : status === 'close' ? 'CLOSE'
+          : status === 'pending' ? 'PENDING'
+            : 'IN PROGRESS';
     const badgeClass = status === 'hit' || status === 'close' ? 'hit'
-                     : status === 'busted' ? 'busted'
-                     : status === 'pending' ? 'pending' : 'active';
+      : status === 'busted' ? 'busted'
+        : status === 'pending' ? 'pending' : 'active';
 
     // Injury pill
     const injPill = bet.is_injured
@@ -5665,10 +5601,10 @@ function buildSparklineSvg(values, line, width, height) {
     const src = bet.source || '';
     const srcPill = src === 'LIVE'
       ? '<span class="tracker-source-pill live">LIVE</span>'
-      : src === 'FINAL'    ? '<span class="tracker-source-pill final">FINAL</span>'
-      : src === 'UPCOMING' ? '<span class="tracker-source-pill upcoming">UPCOMING</span>'
-      : src === 'NO GAME TODAY' ? '<span class="tracker-source-pill nogame">NO GAME</span>'
-      : '';
+      : src === 'FINAL' ? '<span class="tracker-source-pill final">FINAL</span>'
+        : src === 'UPCOMING' ? '<span class="tracker-source-pill upcoming">UPCOMING</span>'
+          : src === 'NO GAME TODAY' ? '<span class="tracker-source-pill nogame">NO GAME</span>'
+            : '';
 
     // Period/clock
     const gameCtx = bet.game_label
@@ -5676,9 +5612,9 @@ function buildSparklineSvg(values, line, width, height) {
       : '';
 
     const sideClass = bet.side === 'OVER' ? 'over' : 'under';
-    const lastUpd   = bet.last_updated
-                    ? new Date(bet.last_updated).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})
-                    : '—';
+    const lastUpd = bet.last_updated
+      ? new Date(bet.last_updated).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      : '—';
 
     // Line tick position — where the line marker sits on the bar
     const tickPct = bet.side === 'OVER' ? 100 : Math.round(((parseFloat(bet.line)) / (parseFloat(bet.line) * 1.5)) * 100);
@@ -5712,7 +5648,7 @@ function buildSparklineSvg(values, line, width, height) {
       </div>
 
       <div class="tracker-card-meta">
-        <div class="tracker-meta-item"><span class="ml">Odds</span><span class="mv">${parseFloat(bet.odds||1.91).toFixed(2)}</span></div>
+        <div class="tracker-meta-item"><span class="ml">Odds</span><span class="mv">${parseFloat(bet.odds || 1.91).toFixed(2)}</span></div>
         <div class="tracker-meta-item"><span class="ml">Line</span><span class="mv">${line}</span></div>
         <div class="tracker-meta-item"><span class="ml">Source</span><span class="mv">${esc(bet.source || '—')}</span></div>
         <div class="tracker-meta-item"><span class="ml">Updated</span><span class="mv">${lastUpd}</span></div>
@@ -5729,18 +5665,18 @@ function buildSparklineSvg(values, line, width, height) {
     // Animate bars after render using rAF
     trackerCards.innerHTML = bets.map(renderCard).join('');
     // Wire remove buttons
-    trackerCards.querySelectorAll('[data-remove-id]').forEach(function(btn) {
-      btn.addEventListener('click', function(e) {
+    trackerCards.querySelectorAll('[data-remove-id]').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
         e.stopPropagation();
         const id = btn.dataset.removeId;
-        bets = bets.filter(function(b) { return b.id !== id; });
+        bets = bets.filter(function (b) { return b.id !== id; });
         saveBets();
         renderAll();
       });
     });
     // Trigger bar animation on next frame (bars start at 0 via CSS, then widen)
-    requestAnimationFrame(function() {
-      trackerCards.querySelectorAll('.tracker-bar-track').forEach(function(bar) {
+    requestAnimationFrame(function () {
+      trackerCards.querySelectorAll('.tracker-bar-track').forEach(function (bar) {
         bar.style.transition = 'width 1.1s cubic-bezier(0.34,1.56,0.64,1), background 0.5s';
       });
     });
@@ -5754,31 +5690,31 @@ function buildSparklineSvg(values, line, width, height) {
       const lr = await fetch('/api/tracker/live-stat?' + lp.toString());
       if (!lr.ok) return;
       const d = await lr.json();
-      bet.is_injured    = d.is_injured    || false;
+      bet.is_injured = d.is_injured || false;
       bet.injury_status = d.injury_status || '';
       const gs = d.game_status;
       if ((gs === 'live' || gs === 'final') && d.live_val !== null && d.live_val !== undefined) {
-        bet.current_val  = d.live_val;
-        bet.game_status  = gs;
-        bet.game_label   = d.game_label || '';
-        bet.period       = d.period || '';
-        bet.clock        = d.clock  || '';
-        bet.source       = gs === 'live' ? 'LIVE' : 'FINAL';
+        bet.current_val = d.live_val;
+        bet.game_status = gs;
+        bet.game_label = d.game_label || '';
+        bet.period = d.period || '';
+        bet.clock = d.clock || '';
+        bet.source = gs === 'live' ? 'LIVE' : 'FINAL';
         bet.last_updated = new Date().toISOString();
         return;
       }
       if (gs === 'scheduled') {
-        bet.game_status  = 'scheduled';
-        bet.game_label   = d.game_label || '';
-        bet.source       = 'UPCOMING';
-        bet.current_val  = null;
+        bet.game_status = 'scheduled';
+        bet.game_label = d.game_label || '';
+        bet.source = 'UPCOMING';
+        bet.current_val = null;
         bet.last_updated = new Date().toISOString();
         return;
       }
-      bet.game_status  = 'no_game';
-      bet.source       = 'NO GAME TODAY';
+      bet.game_status = 'no_game';
+      bet.source = 'NO GAME TODAY';
       bet.last_updated = new Date().toISOString();
-    } catch(e) {
+    } catch (e) {
       console.warn('Refresh failed for', bet.player_name, e);
     }
   }
@@ -5791,14 +5727,14 @@ function buildSparklineSvg(values, line, width, height) {
     }
     try {
       const ctrl = new AbortController();
-      const timer = setTimeout(function() { ctrl.abort(); }, 4000);
+      const timer = setTimeout(function () { ctrl.abort(); }, 4000);
       const resp = await fetch('/api/players/search?q=' + encodeURIComponent(name), { signal: ctrl.signal });
       clearTimeout(timer);
       if (!resp.ok) return null;
       const data = await resp.json();
       const results = data.results || [];
       if (Array.isArray(results) && results.length) return results[0].id || null;
-    } catch(e) {}
+    } catch (e) { }
     return null;
   }
 
@@ -5810,35 +5746,35 @@ function buildSparklineSvg(values, line, width, height) {
     if (!parsedLine || parsedLine <= 0) return false;
 
     const newBet = {
-      id:           Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-      player_name:  String(prop.player_name),
-      player_id:    prop.player_id || null,
-      stat:         prop.stat || 'PTS',
-      line:         parsedLine,
-      side:         prop.side || 'OVER',
-      odds:         parseFloat(prop.odds) || 1.91,
-      book:         prop.bookmaker || prop.book || '',
-      game_label:   prop.game_label || '',
-      current_val:  null,
-      game_status:  null,
-      source:       null,
-      is_injured:   false,
-      injury_status:'',
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      player_name: String(prop.player_name),
+      player_id: prop.player_id || null,
+      stat: prop.stat || 'PTS',
+      line: parsedLine,
+      side: prop.side || 'OVER',
+      odds: parseFloat(prop.odds) || 1.91,
+      book: prop.bookmaker || prop.book || '',
+      game_label: prop.game_label || '',
+      current_val: null,
+      game_status: null,
+      source: null,
+      is_injured: false,
+      injury_status: '',
       last_updated: null,
     };
 
     let stored = [];
-    try { stored = JSON.parse(localStorage.getItem('nba-props-tracker-bets') || '[]'); } catch(e) { stored = []; }
+    try { stored = JSON.parse(localStorage.getItem('nba-props-tracker-bets') || '[]'); } catch (e) { stored = []; }
     if (!Array.isArray(stored)) stored = [];
 
     // Dupe check: prefer player_id match when both sides have one, else fall back
     // to name match — prevents null-id props from all blocking each other.
-    const isDupe = stored.some(function(b) {
+    const isDupe = stored.some(function (b) {
       const idMatch = newBet.player_id && b.player_id
         ? String(b.player_id) === String(newBet.player_id)
         : (b.player_name || '').toLowerCase() === newBet.player_name.toLowerCase();
       return idMatch && b.stat === newBet.stat &&
-             parseFloat(b.line) === newBet.line && b.side === newBet.side;
+        parseFloat(b.line) === newBet.line && b.side === newBet.side;
     });
 
     if (isDupe) {
@@ -5847,7 +5783,7 @@ function buildSparklineSvg(values, line, width, height) {
     }
 
     stored.unshift(newBet);
-    try { localStorage.setItem('nba-props-tracker-bets', JSON.stringify(stored)); } catch(e) {}
+    try { localStorage.setItem('nba-props-tracker-bets', JSON.stringify(stored)); } catch (e) { }
 
     // Keep the IIFE-scoped bets in sync so renderAll sees the new entry
     bets = stored;
@@ -5855,6 +5791,9 @@ function buildSparklineSvg(values, line, width, height) {
     _showTrackerToast(prop.player_name + ' added to Tracker');
     return true;
   }
+
+  // Expose so Analyzer 'Send to Tracker' button (outside this IIFE) can call it
+  window._trackerAddProp = addPropToTracker;
 
   function _showTrackerToast(msg) {
     let el = document.getElementById('_trackerToast');
@@ -5869,20 +5808,20 @@ function buildSparklineSvg(values, line, width, height) {
     el.textContent = msg;
     el.style.opacity = '1'; el.style.transform = 'translateX(-50%) translateY(0)';
     clearTimeout(el._t);
-    el._t = setTimeout(function() {
+    el._t = setTimeout(function () {
       el.style.opacity = '0'; el.style.transform = 'translateX(-50%) translateY(20px)';
     }, 2600);
   }
 
   // ── Add bet handler ────────────────────────────────────────────────────
-  trackerAddBtn.addEventListener('click', async function() {
+  trackerAddBtn.addEventListener('click', async function () {
     showErr('');
     const playerName = (trackerPlayerInput.value || '').trim();
-    const stat       = trackerStatSelect.value;
-    const line       = parseFloat(trackerLineInput.value);
-    const side       = trackerSideSelect.value;
-    const odds       = parseFloat(trackerOddsInput.value) || 1.91;
-    const book       = (trackerBookInput.value || '').trim();
+    const stat = trackerStatSelect.value;
+    const line = parseFloat(trackerLineInput.value);
+    const side = trackerSideSelect.value;
+    const odds = parseFloat(trackerOddsInput.value) || 1.91;
+    const book = (trackerBookInput.value || '').trim();
 
     if (!playerName) return showErr('Enter a player name.');
     if (isNaN(line) || line <= 0) return showErr('Enter a valid line (e.g. 25.5).');
@@ -5910,14 +5849,14 @@ function buildSparklineSvg(values, line, width, height) {
 
       bets.unshift(bet);
       saveBets();
-      try { renderAll(); } catch(e) { console.error('Tracker renderAll error:', e); }
+      try { renderAll(); } catch (e) { console.error('Tracker renderAll error:', e); }
 
       // Clear inputs and reset autocomplete state
       trackerPlayerInput.value = '';
-      trackerLineInput.value   = '';
-      trackerOddsInput.value   = '';
-      trackerBookInput.value   = '';
-      _selectedPlayerId   = null;
+      trackerLineInput.value = '';
+      trackerOddsInput.value = '';
+      trackerBookInput.value = '';
+      _selectedPlayerId = null;
       _selectedPlayerName = '';
       closeDropdown();
 
@@ -5926,33 +5865,33 @@ function buildSparklineSvg(values, line, width, height) {
         try {
           await refreshBet(bet);
           saveBets();
-          try { renderAll(); } catch(e) { /* non-fatal */ }
-        } catch(e) { /* non-fatal */ }
+          try { renderAll(); } catch (e) { /* non-fatal */ }
+        } catch (e) { /* non-fatal */ }
       }
-    } catch(e) {
+    } catch (e) {
       console.error('Add prop error:', e);
       showErr('Failed to add prop. Please try again.');
     } finally {
-      trackerAddBtn.disabled   = false;
+      trackerAddBtn.disabled = false;
       trackerAddBtn.textContent = 'Add Prop';
     }
   });
 
   // ── Refresh all handler ────────────────────────────────────────────────
-  trackerRefreshBtn.addEventListener('click', async function() {
+  trackerRefreshBtn.addEventListener('click', async function () {
     if (!bets.length) return;
     trackerRefreshBtn.classList.add('spinning');
     trackerRefreshBtn.disabled = true;
 
-    const refreshable = bets.filter(function(b) { return b.player_id; });
+    const refreshable = bets.filter(function (b) { return b.player_id; });
     await Promise.allSettled(refreshable.map(refreshBet));
     saveBets();
 
     // Pulse any newly-hit cards
     renderAll();
-    trackerCards.querySelectorAll('.tracker-card.hit').forEach(function(card) {
+    trackerCards.querySelectorAll('.tracker-card.hit').forEach(function (card) {
       card.classList.add('hit-new');
-      setTimeout(function() { card.classList.remove('hit-new'); }, 2000);
+      setTimeout(function () { card.classList.remove('hit-new'); }, 2000);
     });
 
     trackerRefreshBtn.classList.remove('spinning');
@@ -5964,18 +5903,1332 @@ function buildSparklineSvg(values, line, width, height) {
   renderAll();
 
   // Auto-refresh every 30s when live/upcoming game
-  setInterval(async function() {
-    const active = bets.some(function(b) { return b.game_status === 'live' || b.game_status === 'scheduled'; });
+  setInterval(async function () {
+    const active = bets.some(function (b) { return b.game_status === 'live' || b.game_status === 'scheduled'; });
     if (!bets.length || !active) return;
-    await Promise.allSettled(bets.filter(function(b){ return b.player_id; }).map(refreshBet));
+    await Promise.allSettled(bets.filter(function (b) { return b.player_id; }).map(refreshBet));
     saveBets(); renderAll();
   }, 30000);
 
   // ── Expose globally so parlay builder (different IIFE) can call in ────
-  window._trackerAddProp = function(prop) {
+  window._trackerAddProp = function (prop) {
     const added = addPropToTracker(prop);
-    try { renderAll(); } catch(e) { console.error('Tracker renderAll failed:', e); }
+    try { renderAll(); } catch (e) { console.error('Tracker renderAll failed:', e); }
     if (typeof switchView === 'function') switchView('tracker');
   };
 
+})();
+
+/* === Cross-page prop slip / insight upgrade pass === */
+(function () {
+  const SLIP_STORAGE_KEY = 'nba-props-slip-drawer-v1';
+  let slipDrawerMounted = false;
+
+  function safeNumber(value, fallback = null) {
+    const num = Number(value);
+    return Number.isFinite(num) ? num : fallback;
+  }
+
+  function parsePercentLike(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string') {
+      const num = Number(value.replace(/[^\d.-]/g, ''));
+      return Number.isFinite(num) ? num : 0;
+    }
+    return 0;
+  }
+
+  function loadSlipProps() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(SLIP_STORAGE_KEY) || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveSlipProps(items) {
+    localStorage.setItem(SLIP_STORAGE_KEY, JSON.stringify(items.slice(0, 12)));
+  }
+
+  function getSlipKey(prop) {
+    return [prop.player_id || prop.player_name, prop.stat, prop.line, prop.side].join(':');
+  }
+
+  function clamp(n, min, max) {
+    return Math.max(min, Math.min(max, n));
+  }
+
+  function computeConfidenceScoreFromParts(parts = {}) {
+    const hitRate = parsePercentLike(parts.hit_rate);
+    const ev = parsePercentLike(parts.ev);
+    const edge = parsePercentLike(parts.edge);
+    const games = safeNumber(parts.games_count, 0) || 0;
+    const h2hHitRate = parsePercentLike(parts.h2h_hit_rate);
+    const h2hGames = safeNumber(parts.h2h_games, 0) || 0;
+    const minutes = safeNumber(parts.minutes_last5, 0) || 0;
+    let score = 42;
+    score += clamp((hitRate - 50) * 0.55, -18, 25);
+    score += clamp(ev * 0.55, -10, 18);
+    score += clamp(edge * 0.35, -8, 12);
+    score += clamp((games - 5) * 1.1, 0, 12);
+    score += clamp((h2hHitRate - 50) * 0.18, -6, 8);
+    score += clamp(h2hGames * 1.2, 0, 6);
+    score += clamp((minutes - 26) * 0.45, -6, 8);
+    return Math.round(clamp(score, 18, 97));
+  }
+
+  function getConfidenceBucket(score) {
+    if (score >= 86) return { label: 'Elite', tone: 'elite' };
+    if (score >= 72) return { label: 'High', tone: 'good' };
+    if (score >= 56) return { label: 'Medium', tone: 'warm' };
+    return { label: 'Low', tone: 'neutral' };
+  }
+
+  function makeInsightChips(source = {}) {
+    const chips = [];
+    const hitRate = parsePercentLike(source.hit_rate);
+    const ev = parsePercentLike(source.ev);
+    const edge = parsePercentLike(source.edge);
+    const avg = safeNumber(source.average);
+    const line = safeNumber(source.line);
+    const h2hHitRate = parsePercentLike(source.h2h_hit_rate);
+    const h2hGames = safeNumber(source.h2h_games, 0) || 0;
+    const deltaPct = safeNumber(source.vs_position_delta_pct);
+    const b2b = !!source.is_back_to_back;
+    const impactCount = safeNumber(source.impact_count, 0) || 0;
+    const minutesTrend = String(source.minutes_trend || '').toLowerCase();
+    const volumeTrend = String(source.volume_trend || '').toLowerCase();
+    const availability = String(source.availability_status || '').toLowerCase();
+    const recommendation = String(source.recommended_side || source.side || '').toUpperCase();
+
+    if (hitRate >= 75) chips.push({ label: 'Hot streak', tone: 'good' });
+    else if (hitRate <= 40 && hitRate > 0) chips.push({ label: 'Cold sample', tone: 'bad' });
+
+    if (ev >= 6) chips.push({ label: 'Positive EV', tone: 'good' });
+    else if (ev <= -4) chips.push({ label: 'Negative EV', tone: 'bad' });
+
+    if (edge >= 5) chips.push({ label: 'Strong edge', tone: 'good' });
+    else if (edge <= -5) chips.push({ label: 'Thin edge', tone: 'warning' });
+
+    if (avg !== null && line !== null) {
+      const diff = avg - line;
+      if (recommendation.includes('UNDER') && diff <= -2) chips.push({ label: 'Line inflated', tone: 'warning' });
+      if (recommendation.includes('OVER') && diff >= 2) chips.push({ label: 'Line within reach', tone: 'good' });
+    }
+
+    if (deltaPct !== null) {
+      if (deltaPct >= 8) chips.push({ label: 'Soft matchup', tone: 'good' });
+      else if (deltaPct <= -8) chips.push({ label: 'Tough matchup', tone: 'bad' });
+    }
+
+    if (h2hGames >= 2 && h2hHitRate >= 65) chips.push({ label: 'Good H2H', tone: 'good' });
+    else if (h2hGames >= 2 && h2hHitRate <= 35) chips.push({ label: 'Poor H2H', tone: 'warning' });
+
+    if (minutesTrend === 'up' || volumeTrend === 'up') chips.push({ label: 'Opportunity boost', tone: 'good' });
+    if (b2b) chips.push({ label: 'Fatigue spot', tone: 'warning' });
+    if (impactCount >= 1) chips.push({ label: 'Injury boost', tone: 'good' });
+    if (availability.includes('out') || availability.includes('questionable')) chips.push({ label: 'Status risk', tone: 'bad' });
+
+    return chips.slice(0, 4);
+  }
+
+  function flashSlipToast(message) {
+    let el = document.getElementById('_slipToast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = '_slipToast';
+      el.className = 'slip-toast';
+      document.body.appendChild(el);
+    }
+    el.textContent = message;
+    el.classList.add('show');
+    clearTimeout(el._timer);
+    el._timer = setTimeout(() => el.classList.remove('show'), 2200);
+  }
+
+  function buildSlipProp(input = {}) {
+    const confidenceScore = safeNumber(input.confidenceScore, null) ?? computeConfidenceScoreFromParts(input.metrics || input);
+    const bucket = getConfidenceBucket(confidenceScore);
+    const odds = safeNumber(input.odds, 1.91) || 1.91;
+    return {
+      key: getSlipKey(input),
+      player_id: input.player_id ? Number(input.player_id) : null,
+      player_name: input.player_name || 'Unknown Player',
+      team: input.team || '',
+      stat: input.stat || 'PTS',
+      line: safeNumber(input.line, 0) || 0,
+      side: String(input.side || 'OVER').toUpperCase(),
+      odds,
+      source: input.source || 'manual',
+      confidenceScore,
+      confidenceLabel: bucket.label,
+      tone: bucket.tone,
+      insightChips: Array.isArray(input.insightChips) ? input.insightChips.slice(0, 4) : [],
+    };
+  }
+
+  function addToSlip(input, options = {}) {
+    const items = loadSlipProps();
+    const prop = buildSlipProp(input);
+    const idx = items.findIndex(item => item.key === prop.key);
+    if (idx >= 0) {
+      items.splice(idx, 1);
+      saveSlipProps(items);
+      renderSlipDrawer();
+      if (!options.silent) flashSlipToast('Removed from slip');
+      return false;
+    }
+    items.unshift(prop);
+    saveSlipProps(items);
+    renderSlipDrawer();
+    document.getElementById('propSlipDrawer')?.classList.remove('minimized');
+    document.getElementById('propSlipDrawer')?.classList.add('open');
+    if (!options.silent) flashSlipToast('Added to slip');
+    return true;
+  }
+
+  function removeFromSlip(key) {
+    const items = loadSlipProps().filter(item => item.key !== key);
+    saveSlipProps(items);
+    renderSlipDrawer();
+  }
+
+  function clearSlip() {
+    saveSlipProps([]);
+    renderSlipDrawer();
+  }
+
+  function getSlipTotals(items) {
+    const odds = items.reduce((acc, item) => acc * (safeNumber(item.odds, 1.91) || 1.91), 1);
+    const conf = items.length ? Math.round(items.reduce((acc, item) => acc + (safeNumber(item.confidenceScore, 0) || 0), 0) / items.length) : 0;
+    return { odds, conf, bucket: getConfidenceBucket(conf) };
+  }
+
+  function mountSlipDrawer() {
+    if (slipDrawerMounted) return;
+    slipDrawerMounted = true;
+    const drawer = document.createElement('aside');
+    drawer.id = 'propSlipDrawer';
+    drawer.className = 'prop-slip-drawer';
+    drawer.innerHTML = `
+      <div class="prop-slip-shell">
+        <button class="prop-slip-toggle" id="propSlipToggle" type="button" aria-label="Toggle slip drawer">
+          <span class="prop-slip-toggle-count" id="propSlipToggleCount">0</span>
+          <span>Slip</span>
+        </button>
+        <div class="prop-slip-panel" id="propSlipPanel">
+          <div class="prop-slip-head">
+            <div>
+              <span class="section-kicker">Quick slip</span>
+              <h3>Parlay staging</h3>
+            </div>
+            <div class="prop-slip-head-actions">
+              <button class="text-btn" id="propSlipHideBtn" type="button">Hide</button>
+              <button class="text-btn" id="propSlipToTrackerBtn" type="button">Send to tracker</button>
+              <button class="text-btn" id="propSlipClearBtn" type="button">Clear</button>
+            </div>
+          </div>
+          <div class="prop-slip-summary" id="propSlipSummary"></div>
+          <div class="prop-slip-list" id="propSlipList"></div>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(drawer);
+
+    drawer.querySelector('#propSlipToggle')?.addEventListener('click', () => {
+      drawer.classList.remove('minimized');
+      drawer.classList.toggle('open');
+    });
+    drawer.querySelector('#propSlipHideBtn')?.addEventListener('click', () => {
+      drawer.classList.remove('open');
+      drawer.classList.add('minimized');
+    });
+    drawer.querySelector('#propSlipClearBtn')?.addEventListener('click', () => clearSlip());
+    drawer.querySelector('#propSlipToTrackerBtn')?.addEventListener('click', () => {
+      const items = loadSlipProps();
+      if (!items.length || typeof window._trackerAddProp !== 'function') {
+        flashSlipToast(items.length ? 'Tracker is not ready yet' : 'Slip is empty');
+        return;
+      }
+      items.forEach(item => {
+        window._trackerAddProp({
+          player_name: item.player_name,
+          player_id: item.player_id ? Number(item.player_id) : null,
+          stat: item.stat,
+          line: item.line,
+          side: item.side,
+          odds: item.odds,
+          book: item.source
+        });
+      });
+      flashSlipToast('Slip sent to tracker');
+      if (typeof switchView === 'function') switchView('tracker');
+    });
+  }
+
+  function renderSlipDrawer() {
+    mountSlipDrawer();
+    const drawer = document.getElementById('propSlipDrawer');
+    const list = document.getElementById('propSlipList');
+    const summary = document.getElementById('propSlipSummary');
+    const count = document.getElementById('propSlipToggleCount');
+    const items = loadSlipProps();
+    const totals = getSlipTotals(items);
+    if (count) count.textContent = String(items.length);
+    drawer?.classList.toggle('has-items', items.length > 0);
+    if (!items.length) drawer?.classList.remove('minimized');
+
+    if (summary) {
+      summary.innerHTML = items.length ? `
+        <div class="prop-slip-summary-card">
+          <span class="small-label">Legs</span>
+          <strong>${items.length}</strong>
+          <small>Ready for review</small>
+        </div>
+        <div class="prop-slip-summary-card">
+          <span class="small-label">Combined odds</span>
+          <strong>${totals.odds.toFixed(2)}x</strong>
+          <small>Approximate decimal</small>
+        </div>
+        <div class="prop-slip-summary-card ${totals.bucket.tone}">
+          <span class="small-label">Avg confidence</span>
+          <strong>${totals.conf}</strong>
+          <small>${totals.bucket.label} read</small>
+        </div>
+      ` : `
+        <div class="empty-state-panel compact" style="grid-column:1/-1">
+          <div class="empty-icon">🎟️</div>
+          <strong>No props in the slip yet.</strong>
+          <span>Use Add to Slip from the analyzer, market, bet finder, or parlay board.</span>
+        </div>
+      `;
+    }
+
+    if (list) {
+      list.innerHTML = items.map(item => `
+        <article class="prop-slip-item">
+          <div class="prop-slip-item-top">
+            <strong>${escapeHtml(item.player_name)}</strong>
+            <button class="prop-slip-remove" data-slip-remove="${escapeHtml(item.key)}" type="button">✕</button>
+          </div>
+          <div class="prop-slip-item-line">
+            <span>${escapeHtml(item.stat)} ${item.line}</span>
+            <span class="finder-badge ${escapeHtml(item.tone)}">${escapeHtml(item.side)}</span>
+            <span class="slip-confidence-pill ${escapeHtml(item.tone)}">${item.confidenceScore}</span>
+          </div>
+          <div class="prop-slip-meta">
+            <span>${escapeHtml(item.team || item.source || 'Saved')}</span>
+            <span>${(safeNumber(item.odds, 1.91) || 1.91).toFixed(2)}x</span>
+          </div>
+          <div class="prop-slip-chip-row">
+            ${(item.insightChips || []).map(chip => `<span class="smart-chip tone-${escapeHtml(chip.tone || 'neutral')}">${escapeHtml(chip.label)}</span>`).join('')}
+          </div>
+        </article>
+      `).join('');
+      list.querySelectorAll('[data-slip-remove]').forEach(btn => {
+        btn.addEventListener('click', () => removeFromSlip(btn.dataset.slipRemove));
+      });
+    }
+  }
+
+  function injectAnalyzerSlipButton() {
+    const saveBtn = document.getElementById('savePropBtn');
+    if (!saveBtn || document.getElementById('addToSlipBtn')) return;
+
+    // ── Add to Slip ──────────────────────────────────────────────────────
+    const slipBtn = document.createElement('button');
+    slipBtn.id = 'addToSlipBtn';
+    slipBtn.className = 'secondary-btn secondary-btn-glow';
+    slipBtn.type = 'button';
+    slipBtn.textContent = 'Add to Slip';
+    saveBtn.insertAdjacentElement('afterend', slipBtn);
+    slipBtn.addEventListener('click', () => {
+      if (!selectedPlayer) return;
+      const payload = lastPayload || {};
+      const side = String(payload.recommended_side || payload.best_side || (parsePercentLike(payload.hit_rate) >= 50 ? 'OVER' : 'UNDER')).toUpperCase();
+      const insightChips = makeInsightChips({
+        hit_rate: payload.hit_rate,
+        average: payload.average,
+        line: payload.line,
+        h2h_hit_rate: payload.h2h?.hit_rate,
+        h2h_games: payload.h2h?.games_count,
+        vs_position_delta_pct: payload.matchup?.vs_position?.delta_pct,
+        is_back_to_back: payload.environment?.is_back_to_back,
+        impact_count: payload.team_context?.impact_count,
+        minutes_trend: payload.opportunity?.minutes_trend,
+        volume_trend: payload.opportunity?.volume_trend,
+        availability_status: payload.availability?.status,
+        recommended_side: side
+      });
+      const confidenceScore = computeConfidenceScoreFromParts({
+        hit_rate: payload.hit_rate,
+        games_count: payload.games_count,
+        h2h_hit_rate: payload.h2h?.hit_rate,
+        h2h_games: payload.h2h?.games_count,
+        minutes_last5: payload.opportunity?.minutes_last5
+      });
+      addToSlip({
+        player_id: selectedPlayer.id,
+        player_name: selectedPlayer.full_name,
+        team: selectedPlayer.team_abbreviation || '',
+        stat: selectedStat,
+        line: safeNumber(lineInput?.value, 0) || payload.line || 0,
+        side,
+        odds: 1.91,
+        source: 'Analyzer',
+        confidenceScore,
+        insightChips
+      });
+      refreshSlipButtons();
+    });
+
+    // ── Send to Tracker ──────────────────────────────────────────────────
+    if (!document.getElementById('analyzerToTrackerBtn')) {
+      const toTrackerBtn = document.createElement('button');
+      toTrackerBtn.id = 'analyzerToTrackerBtn';
+      toTrackerBtn.className = 'secondary-btn';
+      toTrackerBtn.type = 'button';
+      toTrackerBtn.title = 'Send this prop to Live Tracker for real-time monitoring';
+      toTrackerBtn.textContent = '\u{1F4E1} Send to Tracker';
+      slipBtn.insertAdjacentElement('afterend', toTrackerBtn);
+      toTrackerBtn.addEventListener('click', () => {
+        if (!selectedPlayer) { alert('Please select and analyze a player first.'); return; }
+        const payload = lastPayload || {};
+        const side = String(payload.recommended_side || payload.best_side || (parsePercentLike(payload.hit_rate) >= 50 ? 'OVER' : 'UNDER')).toUpperCase();
+        const prop = {
+          player_id: selectedPlayer.id,
+          player_name: selectedPlayer.full_name,
+          stat: selectedStat,
+          line: safeNumber(lineInput?.value, 0) || payload.line || 0,
+          side,
+          odds: 1.91,
+          source: 'Analyzer'
+        };
+        // addPropToTracker is exposed on window._trackerAddProp from the tracker IIFE
+        const trackerFn = window._trackerAddProp;
+        if (typeof trackerFn !== 'function') {
+          alert('Tracker not available. Please scroll to the Live Tracker section first to initialize it.');
+          return;
+        }
+        const added = trackerFn(prop);
+        if (added !== false) {
+          showAppToast('✅ Sent to Live Tracker!', 'success');
+          switchView && switchView('tracker', { scroll: true });
+        }
+      });
+    }
+
+    // ── Send to Backtest ─────────────────────────────────────────────────
+    if (!document.getElementById('analyzerToBacktestBtn')) {
+      const toBacktestBtn = document.createElement('button');
+      toBacktestBtn.id = 'analyzerToBacktestBtn';
+      toBacktestBtn.className = 'secondary-btn';
+      toBacktestBtn.type = 'button';
+      toBacktestBtn.title = 'Pre-fill the Backtest log form with current analysis results';
+      toBacktestBtn.textContent = '\u{1F4CA} Send to Backtest';
+      const trackerBtnEl = document.getElementById('analyzerToTrackerBtn');
+      (trackerBtnEl || slipBtn).insertAdjacentElement('afterend', toBacktestBtn);
+      toBacktestBtn.addEventListener('click', () => {
+        if (!selectedPlayer) { alert('Please select and analyze a player first.'); return; }
+        if (typeof window._backtestPrefillFromPayload === 'function') {
+          window._backtestPrefillFromPayload(lastPayload);
+          showAppToast('✅ Sent to Backtest — form pre-filled below!', 'info');
+          const btSection = document.getElementById('backtestSection');
+          if (btSection) btSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          else switchView && switchView('backtest', { scroll: true });
+        } else {
+          alert('Backtest section not loaded yet. Please scroll to the Backtest Performance section first.');
+        }
+      });
+    }
+  }
+
+  function buildMarketSlipPropFromItem(item) {
+    const side = String(item?.best_bet?.display_side || item?.best_bet?.side || 'OVER').toUpperCase();
+    const odds = safeNumber(item?.best_bet?.best_odds, null)
+      || safeNumber(item?.best_bet?.odds, null)
+      || (side.includes('UNDER') ? safeNumber(item?.market?.under_odds, 1.91) : safeNumber(item?.market?.over_odds, 1.91))
+      || 1.91;
+    return {
+      player_id: item?.player?.id,
+      player_name: item?.player?.full_name,
+      team: item?.player?.team || item?.player?.team_abbreviation || '',
+      stat: item?.market?.stat,
+      line: item?.market?.line,
+      side,
+      odds,
+      source: 'Scanner',
+      confidenceScore: safeNumber(item?.best_bet?.confidence_score, null) || computeConfidenceScoreFromParts({
+        hit_rate: item?.analysis?.hit_rate,
+        edge: item?.best_bet?.edge,
+        ev: item?.best_bet?.ev,
+        games_count: item?.analysis?.games_count,
+        h2h_hit_rate: item?.analysis?.h2h?.hit_rate,
+        h2h_games: item?.analysis?.h2h?.games_count,
+        minutes_last5: item?.analysis?.opportunity?.minutes_last5
+      }),
+      insightChips: makeInsightChips({
+        hit_rate: item?.analysis?.hit_rate,
+        edge: item?.best_bet?.edge,
+        ev: item?.best_bet?.ev,
+        average: item?.analysis?.average,
+        line: item?.market?.line,
+        h2h_hit_rate: item?.analysis?.h2h?.hit_rate,
+        h2h_games: item?.analysis?.h2h?.games_count,
+        vs_position_delta_pct: item?.analysis?.matchup?.vs_position?.delta_pct,
+        is_back_to_back: item?.analysis?.environment?.is_back_to_back,
+        impact_count: item?.analysis?.team_context?.impact_count,
+        minutes_trend: item?.analysis?.opportunity?.minutes_trend,
+        volume_trend: item?.analysis?.opportunity?.volume_trend,
+        availability_status: item?.availability?.status,
+        recommended_side: side
+      })
+    };
+  }
+
+  function enhanceMarketUI() {
+    const root = document.getElementById('marketResults');
+    if (!root || !currentMarketResultsPayload?.results?.length) return;
+    const results = [...filterMarketRows(currentMarketResultsPayload.results || [], currentMarketFilter || 'all')]
+      .filter(item => passesExpertFilters(item))
+      .filter(item => passesAdvancedMarketFilters(item))
+      .sort((a, b) => compareMarketRows(a, b, currentMarketSort || 'best_ev', currentMarketSortDirection));
+
+    root.querySelectorAll('.market-slip-card').forEach((card, index) => {
+      const item = results[index];
+      if (!item || card.querySelector('.market-slip-cta-row')) return;
+      const prop = buildMarketSlipPropFromItem(item);
+      const cta = document.createElement('div');
+      cta.className = 'market-slip-cta-row';
+      cta.innerHTML = `
+        <span class="smart-confidence ${getConfidenceBucket(prop.confidenceScore).tone}">Confidence ${prop.confidenceScore}</span>
+        <button class="secondary-btn compact-slip-btn" type="button">${loadSlipProps().some(x => x.key === getSlipKey(prop)) ? 'In Slip' : 'Add to Slip'}</button>
+      `;
+      card.querySelector('.market-slip-footer')?.insertAdjacentElement('beforebegin', cta);
+      cta.querySelector('button')?.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        addToSlip(prop);
+        refreshSlipButtons();
+      });
+    });
+
+    root.querySelectorAll('.market-row').forEach((row, index) => {
+      const item = results[index];
+      if (!item || row.querySelector('.market-inline-actions')) return;
+      const prop = buildMarketSlipPropFromItem(item);
+      const cell = document.createElement('div');
+      cell.className = 'market-inline-actions';
+      cell.innerHTML = `
+        <span class="smart-confidence ${getConfidenceBucket(prop.confidenceScore).tone}">${prop.confidenceScore}</span>
+        <button class="text-btn compact-inline-btn" type="button">${loadSlipProps().some(x => x.key === getSlipKey(prop)) ? 'In Slip' : 'Add to Slip'}</button>
+      `;
+      const target = row.querySelector('.market-confidence-cell');
+      target?.appendChild(cell);
+      cell.querySelector('button')?.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        addToSlip(prop);
+        refreshSlipButtons();
+      });
+    });
+  }
+
+  function enhanceBetFinderUI() {
+    const root = document.getElementById('betFinderResults');
+    if (!root || !root.querySelectorAll('.finder-card').length) return;
+    const cards = root.querySelectorAll('.finder-card');
+    cards.forEach(card => {
+      if (card.querySelector('.finder-slip-row')) return;
+      const hitChip = card.querySelector('.finder-chip');
+      const hitRate = hitChip ? parsePercentLike(hitChip.textContent) : 0;
+      const lineText = card.querySelector('.market-slip-subtext')?.textContent || '';
+      const lineMatch = lineText.match(/line\s+([0-9.]+)/i);
+      const line = lineMatch ? Number(lineMatch[1]) : safeNumber(lineInput?.value, 0) || 0;
+      const stat = selectedStat || 'PTS';
+      const side = card.querySelector('.finder-side-pill')?.textContent?.trim()?.toUpperCase() || 'OVER';
+      const confidenceScore = computeConfidenceScoreFromParts({ hit_rate: hitRate, games_count: Number((card.querySelectorAll('.finder-chip')[1]?.textContent || '0/0').split('/')[1] || 0) });
+      const insightChips = makeInsightChips({ hit_rate: hitRate, line, recommended_side: side, average: safeNumber(card.querySelector('.finder-ticket-stat strong')?.textContent, 0) });
+      const prop = {
+        player_id: card.dataset.id,
+        player_name: card.dataset.name,
+        team: card.dataset.teamAbbr || '',
+        stat,
+        line,
+        side,
+        odds: 1.91,
+        source: 'Bet Finder',
+        confidenceScore,
+        insightChips
+      };
+      const row = document.createElement('div');
+      row.className = 'finder-slip-row';
+      row.innerHTML = `
+        <span class="smart-confidence ${getConfidenceBucket(confidenceScore).tone}">Confidence ${confidenceScore}</span>
+        <button class="secondary-btn compact-slip-btn" type="button">${loadSlipProps().some(x => x.key === getSlipKey(prop)) ? 'In Slip' : 'Add to Slip'}</button>
+      `;
+      card.querySelector('.finder-ticket-footer')?.insertAdjacentElement('beforebegin', row);
+      row.querySelector('button')?.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        addToSlip(prop);
+        refreshSlipButtons();
+      });
+    });
+  }
+
+  function enhanceParlayUI() {
+    const ticketGrid = document.querySelector('#parlayTicket .parlay-legs-grid');
+    ticketGrid?.querySelectorAll('.parlay-leg-card').forEach(card => {
+      if (card.querySelector('.parlay-slip-row')) return;
+      const player = card.querySelector('.parlay-leg-player')?.textContent?.trim() || 'Unknown Player';
+      const stat = card.querySelector('.parlay-leg-stat')?.textContent?.trim() || 'PTS';
+      const line = safeNumber(card.querySelector('.parlay-leg-line')?.textContent, 0) || 0;
+      const side = card.querySelector('.parlay-leg-side')?.textContent?.trim()?.toUpperCase() || 'OVER';
+      const hitRateText = card.querySelector('.parlay-leg-stat-item .sval')?.textContent || '0';
+      const confidenceScore = computeConfidenceScoreFromParts({ hit_rate: parsePercentLike(hitRateText), line });
+      const prop = { player_name: player, stat, line, side, odds: 1.91, source: 'Parlay Builder', confidenceScore, insightChips: makeInsightChips({ hit_rate: parsePercentLike(hitRateText), line, recommended_side: side }) };
+      const row = document.createElement('div');
+      row.className = 'parlay-slip-row';
+      row.innerHTML = `<button class="secondary-btn compact-slip-btn" type="button">${loadSlipProps().some(x => x.key === getSlipKey(prop)) ? 'In Slip' : 'Add to Slip'}</button>`;
+      card.appendChild(row);
+      row.querySelector('button')?.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        addToSlip(prop);
+        refreshSlipButtons();
+      });
+    });
+
+    document.querySelectorAll('#parlayAllPropsBody tr[data-prop-idx]').forEach(row => {
+      if (row.querySelector('.parlay-slip-inline')) return;
+      const player = row.dataset.playerName || row.children[0]?.querySelector('span > span')?.textContent?.trim() || 'Unknown Player';
+      const playerId = row.dataset.playerId ? Number(row.dataset.playerId) : null;
+      const stat = row.dataset.stat || row.children[1]?.textContent?.trim() || 'PTS';
+      const line = safeNumber(row.dataset.line || row.children[2]?.textContent, 0) || 0;
+      const side = (row.dataset.side || row.children[3]?.textContent?.trim() || 'OVER').toUpperCase();
+      const confidenceScore = computeConfidenceScoreFromParts({ hit_rate: parsePercentLike(row.children[4]?.textContent), line });
+      const prop = { player_name: player, player_id: playerId, stat, line, side, odds: 1.91, source: 'Parlay Board', confidenceScore };
+      const cell = document.createElement('div');
+      cell.className = 'parlay-slip-inline';
+      cell.innerHTML = `<button class="parlay-slip-btn" type="button">${loadSlipProps().some(x => x.key === getSlipKey(prop)) ? '✓ Slip' : '+ Slip'}</button>`;
+      const actionCell = row.lastElementChild?.querySelector('.parlay-action-cell') || row.lastElementChild;
+      actionCell?.appendChild(cell);
+      cell.querySelector('button')?.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        addToSlip(prop);
+        refreshSlipButtons();
+      });
+    });
+  }
+
+  function enhanceTrackerUI() {
+    document.querySelectorAll('.tracker-card').forEach(card => {
+      if (card.querySelector('.tracker-slip-row')) return;
+      const player = card.querySelector('.tracker-player-name')?.textContent?.trim() || 'Unknown Player';
+      const stat = card.querySelector('.tracker-stat-pill')?.textContent?.trim() || 'PTS';
+      const lineLabel = card.querySelector('.tracker-line-label')?.textContent || '';
+      const lineMatch = lineLabel.match(/\/\s*([0-9.]+)/);
+      const line = lineMatch ? Number(lineMatch[1]) : 0;
+      const side = card.querySelector('.tracker-side-pill')?.textContent?.trim()?.toUpperCase() || 'OVER';
+      const currentVal = safeNumber(card.querySelector('.tracker-current-val')?.textContent, 0) || 0;
+      const confidenceScore = computeConfidenceScoreFromParts({ average: currentVal, line, recommended_side: side, hit_rate: currentVal >= line ? 65 : 45 });
+      const insightChips = makeInsightChips({ average: currentVal, line, recommended_side: side });
+      const meta = document.createElement('div');
+      meta.className = 'tracker-slip-row';
+      meta.innerHTML = `
+        <span class="smart-confidence ${getConfidenceBucket(confidenceScore).tone}">${confidenceScore}</span>
+        <button class="text-btn compact-inline-btn" type="button">${loadSlipProps().some(x => x.key === getSlipKey({ player_name: player, stat, line, side })) ? 'In Slip' : 'Add to Slip'}</button>
+      `;
+      card.querySelector('.tracker-card-meta')?.appendChild(meta);
+      meta.querySelector('button')?.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        addToSlip({ player_name: player, stat, line, side, odds: 1.91, source: 'Tracker', confidenceScore, insightChips });
+        refreshSlipButtons();
+      });
+    });
+  }
+
+  function renderAnalyzerSummaryUpgrade(payload) {
+    const chartArea = document.getElementById('chartChips');
+    if (!chartArea) return;
+    let summary = document.getElementById('smartAnalyzerSummary');
+    if (!summary) {
+      summary = document.createElement('div');
+      summary.id = 'smartAnalyzerSummary';
+      summary.className = 'smart-analyzer-summary';
+      chartArea.insertAdjacentElement('afterend', summary);
+    }
+    const confidenceScore = computeConfidenceScoreFromParts({
+      hit_rate: payload?.hit_rate,
+      games_count: payload?.games_count,
+      h2h_hit_rate: payload?.h2h?.hit_rate,
+      h2h_games: payload?.h2h?.games_count,
+      minutes_last5: payload?.opportunity?.minutes_last5
+    });
+    const bucket = getConfidenceBucket(confidenceScore);
+    const side = String(payload?.recommended_side || (parsePercentLike(payload?.hit_rate) >= 50 ? 'OVER' : 'UNDER')).toUpperCase();
+    const chips = makeInsightChips({
+      hit_rate: payload?.hit_rate,
+      average: payload?.average,
+      line: payload?.line,
+      h2h_hit_rate: payload?.h2h?.hit_rate,
+      h2h_games: payload?.h2h?.games_count,
+      vs_position_delta_pct: payload?.matchup?.vs_position?.delta_pct,
+      is_back_to_back: payload?.environment?.is_back_to_back,
+      impact_count: payload?.team_context?.impact_count,
+      minutes_trend: payload?.opportunity?.minutes_trend,
+      volume_trend: payload?.opportunity?.volume_trend,
+      availability_status: payload?.availability?.status,
+      recommended_side: side
+    });
+
+    const bullets = [
+      `${side} lean on ${payload?.line} ${payload?.stat || selectedStat}`,
+      `${payload?.hit_count || 0}/${payload?.games_count || 0} at the current line`,
+      payload?.matchup?.next_game?.matchup_label ? `Next matchup: ${payload.matchup.next_game.matchup_label}` : 'Next matchup pending',
+      payload?.environment?.is_back_to_back ? 'Back-to-back risk is active' : 'No back-to-back fatigue flag'
+    ];
+
+    summary.innerHTML = `
+      <div class="smart-analyzer-header">
+        <span class="smart-confidence ${bucket.tone}">Confidence ${confidenceScore}</span>
+        <span class="smart-summary-side ${side.includes('UNDER') ? 'under' : 'over'}">${escapeHtml(side)}</span>
+      </div>
+      <div class="smart-chip-row">
+        ${chips.map(chip => `<span class="smart-chip tone-${escapeHtml(chip.tone || 'neutral')}">${escapeHtml(chip.label)}</span>`).join('')}
+      </div>
+      <ul class="smart-summary-list">
+        ${bullets.map(item => `<li>${escapeHtml(item)}</li>`).join('')}
+      </ul>
+    `;
+  }
+
+  function refreshSlipButtons() {
+    renderSlipDrawer();
+    enhanceMarketUI();
+    enhanceBetFinderUI();
+    enhanceParlayUI();
+    enhanceTrackerUI();
+  }
+
+  const _renderMarketResults = renderMarketResults;
+  renderMarketResults = function (payload) {
+    _renderMarketResults(payload);
+    enhanceMarketUI();
+    renderSlipDrawer();
+  };
+
+  const _renderBetFinderResults = renderBetFinderResults;
+  renderBetFinderResults = function (payload) {
+    _renderBetFinderResults(payload);
+    enhanceBetFinderUI();
+    renderSlipDrawer();
+  };
+
+  const _renderSummary = renderSummary;
+  renderSummary = function (payload) {
+    _renderSummary(payload);
+    renderAnalyzerSummaryUpgrade(payload);
+    renderSlipDrawer();
+  };
+
+  const observer = new MutationObserver(() => {
+    enhanceParlayUI();
+    enhanceTrackerUI();
+  });
+
+  window.addEventListener('DOMContentLoaded', () => {
+    mountSlipDrawer();
+    renderSlipDrawer();
+    injectAnalyzerSlipButton();
+    observer.observe(document.body, { childList: true, subtree: true });
+    setTimeout(() => {
+      refreshSlipButtons();
+      renderSlipDrawer();
+    }, 200);
+  });
+
+  mountSlipDrawer();
+  renderSlipDrawer();
+  injectAnalyzerSlipButton();
+  setTimeout(() => {
+    refreshSlipButtons();
+    renderSlipDrawer();
+  }, 400);
+})();
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   BACKTEST PERFORMANCE DASHBOARD
+   Logs predictions to the server, resolves results, shows ROI / win-rate.
+   ═══════════════════════════════════════════════════════════════════════════ */
+(function () {
+  'use strict';
+
+  // ── Element refs ──────────────────────────────────────────────────────
+  const btPlayerInput  = document.getElementById('btPlayerInput');
+  const btStatSelect   = document.getElementById('btStatSelect');
+  const btLineInput    = document.getElementById('btLineInput');
+  const btSideSelect   = document.getElementById('btSideSelect');
+  const btTierSelect   = document.getElementById('btTierSelect');
+  const btOddsInput    = document.getElementById('btOddsInput');
+  const btLogBtn       = document.getElementById('btLogBtn');
+  const btLogError     = document.getElementById('btLogError');
+  const btRefreshBtn   = document.getElementById('btRefreshBtn');
+  const btClearBtn     = document.getElementById('btClearBtn');
+  const backtestLog    = document.getElementById('backtestLog');
+  const backtestStats  = document.getElementById('backtestStats');
+  const backtestSummaryPill = document.getElementById('backtestSummaryPill');
+
+  if (!btLogBtn) return; // backtest section not mounted
+
+  // ── Helpers ───────────────────────────────────────────────────────────
+  function esc(s) {
+    return String(s || '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function showBtError(msg) {
+    if (!btLogError) return;
+    btLogError.textContent = msg;
+    btLogError.style.display = msg ? '' : 'none';
+  }
+
+  function tierColor(tier) {
+    if (!tier) return 'var(--neutral,#9ca3af)';
+    const t = tier.toLowerCase();
+    if (t === 'elite') return 'var(--good,#4ade80)';
+    if (t === 'high')  return '#60a5fa';
+    if (t === 'medium') return 'var(--warning,#f59e0b)';
+    return 'var(--bad,#f87171)';
+  }
+
+  // ── Render aggregate stats row ────────────────────────────────────────
+  function renderStats(stats) {
+    if (!stats || stats.total === 0) {
+      if (backtestStats) backtestStats.style.display = 'none';
+      if (backtestSummaryPill) {
+        backtestSummaryPill.className = 'spotlight-pill neutral';
+        backtestSummaryPill.textContent = 'No results yet';
+      }
+      return;
+    }
+    if (backtestStats) backtestStats.style.display = '';
+
+    // Summary pill
+    if (backtestSummaryPill) {
+      const wr = stats.win_rate;
+      const pillClass = wr >= 57 ? 'good' : wr >= 52 ? 'warning' : 'bad';
+      backtestSummaryPill.className = `spotlight-pill ${pillClass}`;
+      backtestSummaryPill.textContent = `${wr}% hit • ROI ${stats.roi_pct > 0 ? '+' : ''}${stats.roi_pct}%`;
+    }
+
+    // Stat chips
+    const setChip = (id, main, sub) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.querySelector('strong').textContent = main;
+      el.querySelector('small').textContent  = sub;
+    };
+    setChip('btStatTotal',   stats.total,              `${stats.pending} pending`);
+    setChip('btStatWin',     `${stats.win_rate}%`,     `${stats.hits}/${stats.hits + stats.misses} resolved`);
+    const roiSign = stats.roi_pct > 0 ? '+' : '';
+    setChip('btStatROI',     `${roiSign}${stats.roi_pct}%`, 'vs -110 odds');
+    setChip('btStatPending', stats.pending,            'unresolved');
+
+    // Tier breakdown table
+    const tierBreakdown = document.getElementById('btTierBreakdown');
+    if (tierBreakdown && stats.by_tier && Object.keys(stats.by_tier).length) {
+      const rows = Object.entries(stats.by_tier)
+        .sort((a, b) => b[1].win_rate - a[1].win_rate)
+        .map(([tier, d]) => {
+          const barW = Math.round(d.win_rate);
+          const col = tierColor(tier);
+          return `<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;font-size:12px">
+            <span style="width:70px;color:${col};font-weight:600">${esc(tier)}</span>
+            <div style="flex:1;height:8px;background:rgba(255,255,255,0.07);border-radius:4px;overflow:hidden">
+              <div style="width:${barW}%;height:100%;background:${col};border-radius:4px;transition:width 0.6s ease"></div>
+            </div>
+            <span style="width:52px;text-align:right;opacity:0.75">${d.win_rate}% (${d.total})</span>
+          </div>`;
+        }).join('');
+      tierBreakdown.innerHTML = `<div class="insight-summary-label" style="margin-bottom:6px">By confidence tier</div>${rows}`;
+    }
+
+    // Stat-type breakdown
+    const statBreakdown = document.getElementById('btStatBreakdown');
+    if (statBreakdown && stats.by_stat && Object.keys(stats.by_stat).length) {
+      const pills = Object.entries(stats.by_stat)
+        .sort((a, b) => b[1].win_rate - a[1].win_rate)
+        .map(([st, d]) => {
+          const col = d.win_rate >= 57 ? 'var(--good)' : d.win_rate >= 52 ? '#60a5fa' : d.win_rate >= 48 ? 'var(--warning)' : 'var(--bad)';
+          return `<span style="display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:20px;background:rgba(255,255,255,0.06);font-size:11px;margin:2px">
+            <strong style="color:${col}">${esc(st)}</strong>
+            <span style="opacity:0.65">${d.win_rate}% · ${d.total}g</span>
+          </span>`;
+        }).join('');
+      statBreakdown.innerHTML = `<div class="insight-summary-label" style="margin-bottom:5px">By stat type</div><div>${pills}</div>`;
+    }
+  }
+
+  // ── Render log table ──────────────────────────────────────────────────
+  function renderLog(entries) {
+    if (!backtestLog) return;
+    if (!entries || entries.length === 0) {
+      backtestLog.innerHTML = `<div style="opacity:0.45;font-size:13px;padding:8px 0">No predictions logged yet. Use the form above to start tracking.</div>`;
+      return;
+    }
+
+    const rows = entries.map(e => {
+      const isPending = e.result === 'pending';
+      const isHit     = e.result === 'hit';
+      const resultColor = isPending ? 'var(--neutral,#9ca3af)' : isHit ? 'var(--good,#4ade80)' : 'var(--bad,#f87171)';
+      const resultIcon  = isPending ? '⏳' : isHit ? '✓' : '✗';
+      const resultLabel = isPending ? 'Pending' : isHit ? 'Hit' : 'Miss';
+      const dateStr = e.logged_at ? new Date(e.logged_at).toLocaleDateString(undefined, { month:'short', day:'numeric' }) : '—';
+
+      return `<tr data-bt-id="${esc(e.id)}" style="border-bottom:1px solid rgba(255,255,255,0.05)">
+        <td style="padding:7px 8px;font-weight:600;font-size:12px">${esc(e.player)}</td>
+        <td style="padding:7px 6px;font-size:11px;opacity:0.75">${esc(e.stat)}</td>
+        <td style="padding:7px 6px;font-size:11px">${esc(String(e.line))}</td>
+        <td style="padding:7px 6px">
+          <span style="font-size:10px;font-weight:700;padding:2px 7px;border-radius:10px;background:${e.side==='OVER'?'rgba(74,222,128,0.15)':'rgba(248,113,113,0.15)'};color:${e.side==='OVER'?'var(--good)':'var(--bad)'}">${esc(e.side)}</span>
+        </td>
+        <td style="padding:7px 6px;font-size:11px;color:${tierColor(e.confidence_tier)}">${esc(e.confidence_tier||'—')}</td>
+        <td style="padding:7px 6px;font-size:11px;color:${resultColor};font-weight:700">${resultIcon} ${resultLabel}${e.actual_value !== null && e.actual_value !== undefined ? ` (${Number(e.actual_value).toFixed(1)})` : ''}</td>
+        <td style="padding:7px 6px;font-size:11px;opacity:0.5">${dateStr}</td>
+        <td style="padding:7px 6px">
+          ${isPending
+            ? `<div style="display:flex;gap:4px;align-items:center">
+                <input type="number" step="0.1" min="0" placeholder="Actual" class="market-api-input bt-actual-input" style="width:70px;padding:3px 6px;font-size:11px" data-bt-resolve-id="${esc(e.id)}"/>
+                <button class="secondary-btn bt-resolve-btn" data-bt-resolve-id="${esc(e.id)}" style="font-size:10px;padding:3px 8px">✓</button>
+              </div>`
+            : `<button class="bt-delete-btn" data-bt-id="${esc(e.id)}" style="background:none;border:none;cursor:pointer;opacity:0.4;font-size:13px;padding:2px 6px" title="Remove">✕</button>`
+          }
+        </td>
+      </tr>`;
+    }).join('');
+
+    backtestLog.innerHTML = `
+      <div style="overflow-x:auto">
+        <table style="width:100%;border-collapse:collapse;font-size:12px">
+          <thead>
+            <tr style="opacity:0.45;font-size:10px;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid rgba(255,255,255,0.1)">
+              <th style="padding:5px 8px;text-align:left;font-weight:600">Player</th>
+              <th style="padding:5px 6px;text-align:left;font-weight:600">Stat</th>
+              <th style="padding:5px 6px;text-align:left;font-weight:600">Line</th>
+              <th style="padding:5px 6px;text-align:left;font-weight:600">Side</th>
+              <th style="padding:5px 6px;text-align:left;font-weight:600">Tier</th>
+              <th style="padding:5px 6px;text-align:left;font-weight:600">Result</th>
+              <th style="padding:5px 6px;text-align:left;font-weight:600">Date</th>
+              <th style="padding:5px 6px;text-align:left;font-weight:600">Action</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+
+    // Wire resolve buttons
+    backtestLog.querySelectorAll('.bt-resolve-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.btResolveId;
+        const inputEl = backtestLog.querySelector(`.bt-actual-input[data-bt-resolve-id="${id}"]`);
+        const actualVal = inputEl ? parseFloat(inputEl.value) : NaN;
+        if (!id || isNaN(actualVal)) {
+          showBtError('Enter the actual stat value before resolving.');
+          return;
+        }
+        try {
+          const r = await fetch('/api/backtest/resolve', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id, actual_value: actualVal }),
+          });
+          if (!r.ok) throw new Error(await r.text());
+          showBtError('');
+          await loadAndRender();
+        } catch (err) {
+          showBtError('Resolve failed: ' + err.message);
+        }
+      });
+    });
+
+    // Wire delete buttons
+    backtestLog.querySelectorAll('.bt-delete-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.btId;
+        if (!id) return;
+        // Optimistically remove the row immediately for instant feedback
+        const row = btn.closest('tr');
+        if (row) row.remove();
+        try {
+          const r = await fetch(`/api/backtest/log/${encodeURIComponent(id)}`, { method: 'DELETE' });
+          if (!r.ok) throw new Error(await r.text());
+          // Reload stats only (log is already visually updated)
+          await loadAndRender();
+        } catch (err) {
+          showBtError('Delete failed: ' + err.message);
+          await loadAndRender(); // re-render to restore consistent state
+        }
+      });
+    });
+  }
+
+  // ── Load from server and render ───────────────────────────────────────
+  async function loadAndRender() {
+    try {
+      const r = await fetch('/api/backtest/log?limit=200');
+      if (!r.ok) throw new Error('Fetch failed');
+      const data = await r.json();
+      renderStats(data.stats || {});
+      renderLog(data.entries || []);
+    } catch (err) {
+      if (backtestLog) backtestLog.innerHTML = `<div style="opacity:0.45;font-size:12px;padding:8px 0">Could not load backtest log: ${esc(err.message)}</div>`;
+    }
+  }
+
+  // ── Log prediction ────────────────────────────────────────────────────
+  btLogBtn.addEventListener('click', async () => {
+    const player = btPlayerInput ? btPlayerInput.value.trim() : '';
+    const stat   = btStatSelect  ? btStatSelect.value   : 'PTS';
+    const line   = btLineInput   ? parseFloat(btLineInput.value) : NaN;
+    const side   = btSideSelect  ? btSideSelect.value   : 'OVER';
+    const tier   = btTierSelect  ? btTierSelect.value   : 'Medium';
+    const odds   = btOddsInput   ? parseFloat(btOddsInput.value) : 1.91;
+
+    if (!player) { showBtError('Enter a player name.'); return; }
+    if (isNaN(line) || line <= 0) { showBtError('Enter a valid line.'); return; }
+
+    showBtError('');
+    btLogBtn.disabled = true;
+    btLogBtn.textContent = 'Logging…';
+
+    try {
+      const r = await fetch('/api/backtest/log', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          player, stat, line, side,
+          confidence_tier: tier,
+          confidence_score: tier === 'Elite' ? 87 : tier === 'High' ? 76 : tier === 'Medium' ? 64 : 52,
+          model_prob: 0.55,
+          odds: isNaN(odds) ? 1.91 : odds,
+        }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      if (btPlayerInput) btPlayerInput.value = '';
+      if (btLineInput)   btLineInput.value   = '';
+      if (btOddsInput)   btOddsInput.value   = '';
+      await loadAndRender();
+    } catch (err) {
+      showBtError('Log failed: ' + err.message);
+    } finally {
+      btLogBtn.disabled = false;
+      btLogBtn.textContent = 'Log Prediction';
+    }
+  });
+
+  // ── Auto-fill from analyzer payload ──────────────────────────────────
+  // When the analyzer runs, expose a hook so we can pre-fill the log form
+  window._backtestPrefillFromPayload = function (payload) {
+    if (!payload) return;
+    try {
+      const playerName = payload.player?.full_name || '';
+      const stat       = payload.stat || 'PTS';
+      const side       = payload.recommended_side || 'OVER';
+      const tier       = payload.confidence?.tier || 'Medium';
+      const score      = payload.confidence?.score || 0;
+
+      if (btPlayerInput) btPlayerInput.value = playerName;
+      if (btStatSelect)  btStatSelect.value  = stat;
+      if (btSideSelect)  btSideSelect.value  = side;
+      if (btLineInput)   btLineInput.value   = payload.line || '';
+      if (btTierSelect)  btTierSelect.value  = tier;
+
+      // Scroll to backtest section smoothly
+      const section = document.getElementById('backtestSection');
+      if (section) section.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    } catch (e) { /* silent */ }
+  };
+
+  // ── Refresh button ────────────────────────────────────────────────────
+  if (btRefreshBtn) {
+    btRefreshBtn.addEventListener('click', loadAndRender);
+  }
+
+  // ── Clear all ─────────────────────────────────────────────────────────
+  if (btClearBtn) {
+    btClearBtn.addEventListener('click', async () => {
+      if (!confirm('Clear all backtest predictions? This cannot be undone.')) return;
+      try {
+        await fetch('/api/backtest/log', { method: 'DELETE' });
+        await loadAndRender();
+      } catch (err) {
+        showBtError('Clear failed: ' + err.message);
+      }
+    });
+  }
+
+  // ── Initial load ──────────────────────────────────────────────────────
+  loadAndRender();
+
+})();
+
+// ══════════════════════════════════════════════════════════════════════
+// ── MARKET ADVANCED FILTERS (Bookmaker + Min/Max Odds) ────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+(function initMarketAdvancedFilters() {
+  const bookFilter   = document.getElementById('marketBookFilter');
+  const minOddsInput = document.getElementById('marketMinOdds');
+  const maxOddsInput = document.getElementById('marketMaxOdds');
+  const resetBtn     = document.getElementById('marketAdvFilterResetBtn');
+
+  if (!bookFilter && !minOddsInput) return;
+
+  function applyAndRerender() {
+    currentMarketBookFilter = (bookFilter?.value || '').toLowerCase().trim();
+    currentMarketMinOdds    = minOddsInput?.value ? parseFloat(minOddsInput.value) : null;
+    currentMarketMaxOdds    = maxOddsInput?.value ? parseFloat(maxOddsInput.value) : null;
+    if (currentMarketResultsPayload) renderMarketResults(currentMarketResultsPayload);
+  }
+
+  bookFilter?.addEventListener('change', applyAndRerender);
+  minOddsInput?.addEventListener('input', applyAndRerender);
+  maxOddsInput?.addEventListener('input', applyAndRerender);
+
+  resetBtn?.addEventListener('click', () => {
+    if (bookFilter) bookFilter.value = '';
+    if (minOddsInput) minOddsInput.value = '';
+    if (maxOddsInput) maxOddsInput.value = '';
+    currentMarketBookFilter = '';
+    currentMarketMinOdds = null;
+    currentMarketMaxOdds = null;
+    if (currentMarketResultsPayload) renderMarketResults(currentMarketResultsPayload);
+  });
+})();
+
+// Called in the filter chain inside renderMarketResults
+function passesAdvancedMarketFilters(item) {
+  // ── Bookmaker filter ──
+  if (currentMarketBookFilter) {
+    const itemBook = String(
+      item?.market?.bookmaker || item?.bookmaker || item?.source || ''
+    ).toLowerCase();
+    if (itemBook && itemBook !== currentMarketBookFilter) return false;
+  }
+
+  // ── Odds range filter — use best odds available on the winning side ──
+  const side = String(item?.best_bet?.side || item?.best_bet?.display_side || '').toUpperCase();
+  const bestOdds = item?.best_bet?.best_odds != null
+    ? Number(item.best_bet.best_odds)
+    : side.includes('UNDER')
+      ? Number(item?.market?.under_odds ?? 0)
+      : Number(item?.market?.over_odds ?? 0);
+
+  if (currentMarketMinOdds != null && bestOdds > 0 && bestOdds < currentMarketMinOdds) return false;
+  if (currentMarketMaxOdds != null && bestOdds > 0 && bestOdds > currentMarketMaxOdds) return false;
+
+  return true;
+}
+
+
+// ══════════════════════════════════════════════════════════════════════
+// ── KEY VAULT ─────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+(function initKeyVault() {
+  const kvLabelInput    = document.getElementById('kvLabelInput');
+  const kvKeyInput      = document.getElementById('kvKeyInput');
+  const kvProviderSelect = document.getElementById('kvProviderSelect');
+  const kvAddBtn        = document.getElementById('kvAddBtn');
+  const kvKeyList       = document.getElementById('kvKeyList');
+  const kvActiveLabel   = document.getElementById('kvActiveLabel');
+  const kvStatus        = document.getElementById('keyVaultStatus');
+
+  if (!kvKeyList) return;
+
+  // ── Helpers ───────────────────────────────────────────────────────────
+  function loadVault() {
+    try { return JSON.parse(localStorage.getItem(KEY_VAULT_STORAGE) || '[]'); } catch { return []; }
+  }
+  function saveVault(vault) {
+    localStorage.setItem(KEY_VAULT_STORAGE, JSON.stringify(vault));
+  }
+  function getActiveId() {
+    return localStorage.getItem(KEY_VAULT_ACTIVE_STORAGE) || '';
+  }
+  function setActiveId(id) {
+    localStorage.setItem(KEY_VAULT_ACTIVE_STORAGE, id);
+  }
+  function maskKey(key) {
+    if (!key || key.length < 8) return '••••••••';
+    return key.slice(0, 4) + '••••••••' + key.slice(-4);
+  }
+  function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+
+  // Push active key into Market Scanner + Parlay Builder inputs
+  function syncActiveKeyToPages(key) {
+    const oddsInput = document.getElementById('oddsApiKeyInput');
+    if (oddsInput && key) { oddsInput.value = key; oddsInput.dispatchEvent(new Event('input')); }
+    const parlayInput = document.getElementById('parlayApiKeys');
+    if (parlayInput && key) {
+      // Parlay uses comma-separated multi-keys. Prepend as primary if not already present.
+      const existing = parlayInput.value.split(',').map(s => s.trim()).filter(Boolean);
+      if (!existing.includes(key)) { parlayInput.value = [key, ...existing].join(','); }
+      parlayInput.dispatchEvent(new Event('input'));
+    }
+  }
+
+  function setKvStatus(msg, tone = 'neutral') {
+    if (!kvStatus) return;
+    kvStatus.textContent = msg;
+    kvStatus.dataset.tone = tone;
+  }
+
+  // ── Render key list ───────────────────────────────────────────────────
+  function renderVault() {
+    const vault = loadVault();
+    const activeId = getActiveId();
+
+    if (kvActiveLabel) {
+      const active = vault.find(k => k.id === activeId);
+      kvActiveLabel.textContent = active ? `Active: ${esc(active.label)}` : 'No active key selected';
+    }
+
+    if (!vault.length) {
+      kvKeyList.innerHTML = `
+        <div class="bet-finder-state empty-state-panel compact" style="padding:32px 0">
+          <div class="empty-icon">🔑</div>
+          <strong>No keys saved yet.</strong>
+          <span>Add a key above to get started.</span>
+        </div>`;
+      return;
+    }
+
+    kvKeyList.innerHTML = vault.map(entry => {
+      const isActive = entry.id === activeId;
+      return `
+        <div class="kv-key-row ${isActive ? 'kv-active' : ''}" data-id="${esc(entry.id)}" style="
+          display:flex;align-items:center;gap:12px;padding:12px 16px;
+          border-radius:14px;margin-bottom:8px;border:1px solid var(--border);
+          background:${isActive ? 'rgba(var(--accent-rgb),0.10)' : 'var(--panel-strong)'};
+          transition:background 0.2s,border-color 0.2s;
+          ${isActive ? 'border-color:rgba(var(--accent-rgb),0.35)' : ''}
+        ">
+          <div style="flex:1;min-width:0">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">
+              <strong style="font-size:.9rem">${esc(entry.label)}</strong>
+              ${isActive ? '<span class="small-badge" style="background:rgba(var(--accent-rgb),0.18);color:var(--accent)">● Active</span>' : ''}
+              <span class="small-badge">${esc(entry.provider === 'odds_api' ? 'Odds API' : entry.provider)}</span>
+            </div>
+            <code style="font-size:.78rem;opacity:0.55;letter-spacing:.05em">${esc(maskKey(entry.key))}</code>
+          </div>
+          <div style="display:flex;gap:8px;flex-shrink:0">
+            ${!isActive ? `<button class="secondary-btn kv-activate-btn" data-id="${esc(entry.id)}" style="padding:6px 14px;font-size:.8rem" type="button">Use this key</button>` : ''}
+            <button class="secondary-btn kv-credits-btn" data-id="${esc(entry.id)}" style="padding:6px 14px;font-size:.8rem" type="button" title="Check remaining credits">💳 Credits</button>
+            <button class="text-btn kv-delete-btn" data-id="${esc(entry.id)}" style="padding:6px 10px;font-size:.8rem;color:var(--bad);opacity:0.7" type="button" title="Remove key">✕</button>
+          </div>
+        </div>`;
+    }).join('');
+
+    // Bind buttons
+    kvKeyList.querySelectorAll('.kv-activate-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const id = btn.dataset.id;
+        setActiveId(id);
+        const vault = loadVault();
+        const entry = vault.find(k => k.id === id);
+        if (entry) {
+          syncActiveKeyToPages(entry.key);
+          setKvStatus(`"${entry.label}" is now active`, 'good');
+          setTimeout(() => setKvStatus('Ready'), 2500);
+        }
+        renderVault();
+      });
+    });
+
+    kvKeyList.querySelectorAll('.kv-delete-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        if (!confirm('Remove this key from the vault?')) return;
+        const vault = loadVault().filter(k => k.id !== btn.dataset.id);
+        saveVault(vault);
+        if (getActiveId() === btn.dataset.id) setActiveId('');
+        renderVault();
+      });
+    });
+
+    kvKeyList.querySelectorAll('.kv-credits-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const vault = loadVault();
+        const entry = vault.find(k => k.id === btn.dataset.id);
+        if (!entry) return;
+        const orig = btn.textContent;
+        btn.textContent = 'Checking…';
+        btn.disabled = true;
+        try {
+          const r = await fetch('/api/odds/check-quota', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ api_key: entry.key })
+          });
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.detail || 'Failed');
+          const used = data.quota?.used ?? '?';
+          const remaining = data.quota?.remaining ?? '?';
+          setKvStatus(`"${entry.label}" — Used: ${used} • Remaining: ${remaining}`, 'good');
+          setTimeout(() => setKvStatus('Ready'), 5000);
+        } catch (err) {
+          setKvStatus('Credits check failed: ' + (err.message || 'Unknown error'), 'bad');
+          setTimeout(() => setKvStatus('Ready'), 4000);
+        } finally {
+          btn.textContent = orig;
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+
+  // ── Add key ───────────────────────────────────────────────────────────
+  kvAddBtn?.addEventListener('click', () => {
+    const label = (kvLabelInput?.value || '').trim();
+    const key   = (kvKeyInput?.value || '').trim();
+    const provider = kvProviderSelect?.value || 'odds_api';
+
+    if (!label) { setKvStatus('Please enter a label for this key.', 'bad'); return; }
+    if (!key)   { setKvStatus('Please enter the API key value.', 'bad'); return; }
+
+    const vault = loadVault();
+    if (vault.some(k => k.key === key)) {
+      setKvStatus('That key is already saved.', 'bad');
+      return;
+    }
+
+    const newEntry = { id: uid(), label, key, provider, added: new Date().toISOString() };
+    vault.push(newEntry);
+    saveVault(vault);
+
+    // Auto-activate if first key
+    if (vault.length === 1) {
+      setActiveId(newEntry.id);
+      syncActiveKeyToPages(newEntry.key);
+    }
+
+    if (kvLabelInput) kvLabelInput.value = '';
+    if (kvKeyInput) kvKeyInput.value = '';
+    setKvStatus(`"${label}" saved!`, 'good');
+    setTimeout(() => setKvStatus('Ready'), 2500);
+    renderVault();
+  });
+
+  // ── Init: render vault and sync active key on load ────────────────────
+  renderVault();
+  const vault = loadVault();
+  const activeId = getActiveId();
+  const activeEntry = vault.find(k => k.id === activeId);
+  if (activeEntry) syncActiveKeyToPages(activeEntry.key);
 })();

@@ -95,6 +95,13 @@ tailwind.config = {
 <small>Live bar tracking for active bets</small>
 </span>
 </button>
+<button class="nav-item w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition duration-200" data-view="keyvault" type="button">
+<span class="nav-icon">🔑</span>
+<span>
+<strong>Key Vault</strong>
+<small>Store and manage your API keys</small>
+</span>
+</button>
 </nav>
 <div class="sidebar-summary card rounded-3xl border border-white/10 bg-white/5 p-4 rounded-[28px]">
 <div class="sidebar-summary-head">
@@ -113,6 +120,9 @@ tailwind.config = {
 <button aria-label="Toggle theme" class="theme-toggle inline-flex items-center justify-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 font-semibold" id="themeToggle" type="button">
 <span class="theme-icon">☀</span>
 <span class="theme-text">Light</span>
+</button>
+<button class="inline-flex items-center justify-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 font-semibold w-full" id="openUserGuideBtn" type="button" title="Open the full user guide">
+<span>📖</span><span>User Guide</span>
 </button>
 <p class="sidebar-footnote">Professional workflow for player props, matchup analysis, availability, and market scanning.</p>
 </div>
@@ -438,6 +448,21 @@ tailwind.config = {
 <label for="filterMaxFga">FGA max</label>
 <div class="input-shell"><input id="filterMaxFga" min="0" placeholder="25" step="1" type="number"/></div>
 </div>
+<div class="control-group compact-filter-group">
+<label for="filterOpponentRankRange">Opponent tier</label>
+<div class="input-shell"><select id="filterOpponentRankRange"><option value="all">All teams</option><option value="top10">Top 1-10</option><option value="top5">Top 1-5</option><option value="mid10">Middle 11-20</option><option value="bottom10">Bottom 21-30</option><option value="bottom5">Bottom 26-30</option></select></div>
+</div>
+<div class="control-group compact-filter-group without-teammate-group">
+<label>Without teammate(s)</label>
+<div class="without-chip-picker" id="withoutChipPicker" aria-label="Without teammates">
+  <span class="without-chip-placeholder">Select a player first</span>
+</div>
+<select id="filterWithoutPlayer" multiple aria-hidden="true" style="display:none"></select>
+</div>
+<div class="control-group compact-filter-group injury-boost-group" id="injuryBoostGroup" style="display:none">
+<label>🏥 Injury boost <span class="small-meta" style="font-weight:400;opacity:0.7">— Today's injured teammates</span></label>
+<div class="injury-boost-chips" id="injuryBoostChips"></div>
+</div>
 </div>
 <label class="filter-checkbox-row"><input id="filterH2HOnly" type="checkbox"/><span>Only show games against the next opponent</span></label>
 <div class="filter-action-row">
@@ -576,6 +601,24 @@ tailwind.config = {
 <div class="empty-icon">📅</div>
 <strong>No schedule read yet.</strong>
 <span>Analyze a player prop to see rest, back-to-back risk, and next-game setup.</span>
+</div>
+</article>
+
+<article class="card glass insight-card analyzer-detail-only rounded-[28px] border border-white/10 backdrop-blur-xl">
+<div class="section-head collapsible-head">
+<div>
+<p class="section-kicker">Distribution</p>
+<h2>Variance profile</h2>
+</div>
+<div class="section-head-actions">
+<span class="spotlight-pill neutral" id="varianceTone">Waiting for analysis</span>
+<button aria-label="Toggle variance profile" class="collapse-btn" data-collapse-target="varianceBody" type="button">−</button>
+</div>
+</div>
+<div class="empty-state-panel compact matchup-empty" id="varianceBody">
+<div class="empty-icon">📊</div>
+<strong>No distribution data yet.</strong>
+<span>Analyze a player prop to see consistency score, median, floor, ceiling and percentile bands.</span>
 </div>
 </article>
 </section>
@@ -758,6 +801,8 @@ tailwind.config = {
 </label>
 </div>
 <div class="market-api-actions flex flex-wrap items-end gap-3">
+<button class="secondary-btn" id="oddsSaveKeyBtn" type="button" title="Save API key to browser storage">💾 Save Key</button>
+<button class="secondary-btn" id="oddsCheckBalanceBtn" type="button" title="Check remaining API credits without loading events">💳 Check Balance</button>
 <button class="secondary-btn" id="oddsLoadEventsBtn" type="button">Load Events</button>
 <label class="field-inline field-grow">
 <span class="small-label">Event</span>
@@ -795,6 +840,34 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 <li>Teams and opponents are auto-detected from the player.</li>
 <li>The scanner ranks by EV first, then edge, then recent hit rate.</li>
 </ul>
+</div>
+</div>
+<div class="market-filter-group market-advanced-filters">
+<span class="small-label market-filter-label">Narrow results</span>
+<div class="market-advanced-filter-row">
+<label class="field-inline market-adv-field">
+<span class="small-label">Bookmaker</span>
+<select class="market-api-input" id="marketBookFilter">
+<option value="">All bookmakers</option>
+<option value="draftkings">DraftKings</option>
+<option value="fanduel">FanDuel</option>
+<option value="betmgm">BetMGM</option>
+<option value="caesars">Caesars</option>
+<option value="pointsbet">PointsBet</option>
+<option value="betrivers">BetRivers</option>
+<option value="bovada">Bovada</option>
+<option value="mybookie">MyBookie</option>
+</select>
+</label>
+<label class="field-inline market-adv-field">
+<span class="small-label">Min odds (decimal)</span>
+<input class="market-api-input" id="marketMinOdds" type="number" min="1.01" max="50" step="0.05" placeholder="e.g. 1.80"/>
+</label>
+<label class="field-inline market-adv-field">
+<span class="small-label">Max odds (decimal)</span>
+<input class="market-api-input" id="marketMaxOdds" type="number" min="1.01" max="50" step="0.05" placeholder="e.g. 2.50"/>
+</label>
+<button class="secondary-btn" id="marketAdvFilterResetBtn" type="button">Reset</button>
 </div>
 </div>
 <div class="market-filter-group">
@@ -894,6 +967,10 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 <option value="6">6-Leg</option>
 </select>
 </label>
+<label class="field-inline parlay-injury-toggle-wrap" title="Re-analyze props using today's injury report — considers who is OUT or Questionable">
+<input id="parlayInjuryAware" type="checkbox">
+<span class="small-label">🏥 Injury-Aware</span>
+</label>
 <button class="primary-btn parlay-build-btn" id="parlayBuildBtn" type="button">
 <span class="parlay-btn-icon">🎰</span> Scrape &amp; Build
               </button>
@@ -906,6 +983,8 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 <div class="small-meta parlay-status-meta" id="parlayStatusMeta"></div>
 </div>
 </div>
+<!-- Injury summary panel (shown after injury-aware build) -->
+<div id="parlayInjurySummary" style="display:none" class="parlay-injury-summary-panel"></div>
 <!-- Quota tracker -->
 <div class="parlay-quota-bar" id="parlayQuotaBar" style="display:none">
 <div class="parlay-quota-inner">
@@ -943,8 +1022,21 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 </div>
 <span class="small-badge" id="parlayPropCount">0 props</span>
 </div>
-<div class="parlay-all-props-table-wrap overflow-x-auto">
+<div class="parlay-all-props-table-wrap">
 <table class="parlay-all-props-table">
+<colgroup>
+<col style="width:17%"><!-- Player -->
+<col style="width:5%"> <!-- Stat -->
+<col style="width:5%"> <!-- Line -->
+<col style="width:6%"> <!-- Side -->
+<col style="width:6%"> <!-- Hit % -->
+<col style="width:5%"> <!-- Avg -->
+<col style="width:5%"> <!-- Games -->
+<col style="width:21%"><!-- Confidence -->
+<col style="width:6%"> <!-- Odds -->
+<col style="width:11%"><!-- Injury -->
+<col style="width:8%"> <!-- Actions -->
+</colgroup>
 <thead>
 <tr>
 <th>Player</th>
@@ -954,7 +1046,9 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 <th>Hit %</th>
 <th>Avg</th>
 <th>Games</th>
+<th>Confidence</th>
 <th>Odds</th>
+<th class="parlay-inj-col" title="Injury Context — shows injured teammates and hit rate boosts (requires Injury-Aware mode)">🏥 Injuries</th>
 <th></th>
 </tr>
 </thead>
@@ -1037,7 +1131,143 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 <strong>No props tracked yet.</strong>
 <span>Add a prop above to start watching it fill toward the line.</span>
 </div>
+
+<!-- ── Backtest Performance Dashboard ─────────────────────────────────── -->
+<section class="card glass rounded-[28px] border border-white/10 backdrop-blur-xl" id="backtestSection" style="margin-top:8px">
+  <div class="section-head collapsible-head">
+    <div>
+      <p class="section-kicker">Win Rate Engine</p>
+      <h2>Backtest performance</h2>
+    </div>
+    <div class="section-head-actions">
+      <span class="spotlight-pill neutral" id="backtestSummaryPill">No results yet</span>
+      <button aria-label="Toggle backtest panel" class="collapse-btn" data-collapse-target="backtestBody" type="button">−</button>
+    </div>
+  </div>
+  <div id="backtestBody">
+    <!-- Log prediction form -->
+    <div class="tracker-add-panel" style="padding:16px 20px 0">
+      <div class="parlay-step-label"><span class="parlay-step-num">+</span> Log a Prediction</div>
+      <div class="tracker-add-grid" style="grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px 14px;padding-top:10px">
+        <label class="field-inline">
+          <span class="small-label">Player</span>
+          <input class="market-api-input" id="btPlayerInput" placeholder="e.g. LeBron James" type="text"/>
+        </label>
+        <label class="field-inline">
+          <span class="small-label">Stat</span>
+          <select class="market-api-input" id="btStatSelect">
+            <option value="PTS">PTS</option><option value="REB">REB</option><option value="AST">AST</option>
+            <option value="3PM">3PM</option><option value="STL">STL</option><option value="BLK">BLK</option>
+            <option value="PRA">PRA</option><option value="PR">PR</option><option value="PA">PA</option>
+          </select>
+        </label>
+        <label class="field-inline">
+          <span class="small-label">Line</span>
+          <input class="market-api-input" id="btLineInput" min="0" placeholder="25.5" step="0.5" type="number"/>
+        </label>
+        <label class="field-inline">
+          <span class="small-label">Side</span>
+          <select class="market-api-input" id="btSideSelect">
+            <option value="OVER">OVER</option><option value="UNDER">UNDER</option>
+          </select>
+        </label>
+        <label class="field-inline">
+          <span class="small-label">Confidence tier</span>
+          <select class="market-api-input" id="btTierSelect">
+            <option value="Elite">Elite (A)</option>
+            <option value="High">High (B)</option>
+            <option value="Medium" selected>Medium (C)</option>
+            <option value="Low">Low (D)</option>
+          </select>
+        </label>
+        <label class="field-inline">
+          <span class="small-label">Odds (decimal)</span>
+          <input class="market-api-input" id="btOddsInput" min="1" placeholder="1.91" step="0.01" type="number"/>
+        </label>
+        <div class="field-inline tracker-add-btn-wrap" style="align-self:flex-end">
+          <button class="secondary-btn" id="btLogBtn" type="button">Log Prediction</button>
+        </div>
+      </div>
+      <div class="small-meta" id="btLogError" style="color:var(--bad);display:none;padding:6px 0"></div>
+    </div>
+
+    <!-- Stats summary row -->
+    <div id="backtestStats" style="display:none;padding:16px 20px 8px">
+      <div class="opportunity-chip-grid" style="grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px">
+        <div class="opportunity-chip" id="btStatTotal"><span class="small-label">Logged</span><strong>—</strong><small>predictions</small></div>
+        <div class="opportunity-chip" id="btStatWin"><span class="small-label">Win rate</span><strong>—</strong><small>resolved bets</small></div>
+        <div class="opportunity-chip" id="btStatROI"><span class="small-label">ROI</span><strong>—</strong><small>at -110 avg</small></div>
+        <div class="opportunity-chip" id="btStatPending"><span class="small-label">Pending</span><strong>—</strong><small>unresolved</small></div>
+      </div>
+      <!-- Tier breakdown -->
+      <div id="btTierBreakdown" style="margin-top:12px"></div>
+      <!-- Stat breakdown -->
+      <div id="btStatBreakdown" style="margin-top:8px"></div>
+    </div>
+
+    <!-- Log table -->
+    <div id="backtestLogWrap" style="padding:0 20px 16px">
+      <div id="backtestLog" style="margin-top:12px"></div>
+      <div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap">
+        <button class="secondary-btn" id="btRefreshBtn" style="font-size:12px;padding:6px 14px" type="button">↻ Refresh log</button>
+        <button class="secondary-btn" id="btClearBtn" style="font-size:12px;padding:6px 14px;color:var(--bad)" type="button">Clear all</button>
+      </div>
+    </div>
+  </div>
 </section>
+</section>
+
+<!-- ── Key Vault ─────────────────────────────────────────────────── -->
+<section class="dashboard-view gap-4" data-view="keyvault">
+  <section class="card glass rounded-[28px] border border-white/10 backdrop-blur-xl p-6" id="keyVaultPanel">
+    <div class="bet-finder-topbar market-topbar market-hero-head" style="margin-bottom:24px">
+      <div>
+        <p class="section-kicker">Key Vault</p>
+        <h2>Store and manage your API keys across all pages.</h2>
+        <p class="small-meta">Keys are saved locally in your browser. Choose which key is active — it will be used automatically by Market Scanner and Parlay Builder.</p>
+      </div>
+      <span class="small-badge" id="keyVaultStatus">Ready</span>
+    </div>
+
+    <!-- Add new key -->
+    <div class="card rounded-[28px] border border-white/10 p-5 mb-4" style="margin-bottom:16px">
+      <p class="section-kicker">Add a Key</p>
+      <div class="market-api-grid grid gap-3" style="grid-template-columns:1fr 1fr auto auto;align-items:flex-end">
+        <label class="field-inline">
+          <span class="small-label">Label (e.g. "Main key")</span>
+          <input class="market-api-input" id="kvLabelInput" placeholder="My Odds API Key" type="text"/>
+        </label>
+        <label class="field-inline">
+          <span class="small-label">API Key value</span>
+          <input class="market-api-input" id="kvKeyInput" placeholder="Paste key here" type="text"/>
+        </label>
+        <label class="field-inline">
+          <span class="small-label">Provider</span>
+          <select class="market-api-input" id="kvProviderSelect">
+            <option value="odds_api">The Odds API</option>
+          </select>
+        </label>
+        <button class="primary-btn" id="kvAddBtn" type="button">💾 Save Key</button>
+      </div>
+    </div>
+
+    <!-- Saved keys list -->
+    <div class="card rounded-[28px] border border-white/10 p-5">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+        <p class="section-kicker" style="margin:0">Saved Keys</p>
+        <span class="small-meta" id="kvActiveLabel">No active key selected</span>
+      </div>
+      <div id="kvKeyList">
+        <div class="bet-finder-state empty-state-panel compact" style="padding:32px 0">
+          <div class="empty-icon">🔑</div>
+          <strong>No keys saved yet.</strong>
+          <span>Add a key above to get started.</span>
+        </div>
+      </div>
+    </div>
+  </section>
+</section>
+
 </main>
 </div>
 <div aria-atomic="true" aria-live="polite" class="action-banner" id="actionBanner">
@@ -1051,6 +1281,104 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 <span class="action-banner-state" id="actionBannerState">Working</span>
 </div>
 </div>
+
+<!-- ══════════════════════════════════════════════════════════════
+     USER GUIDE MODAL
+     ══════════════════════════════════════════════════════════════ -->
+<div id="userGuideModal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.75);backdrop-filter:blur(6px);overflow-y:auto;padding:24px 16px">
+  <div style="max-width:780px;margin:0 auto;background:var(--card-bg,#0f1117);border:1px solid rgba(255,255,255,0.1);border-radius:24px;padding:32px;color:var(--text,#e8eaf0);font-family:inherit;position:relative">
+    <button id="closeUserGuideBtn" type="button" style="position:absolute;top:16px;right:16px;background:none;border:none;color:inherit;font-size:22px;cursor:pointer;opacity:0.5;line-height:1" title="Close">✕</button>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:28px">
+      <span style="font-size:32px">📖</span>
+      <div>
+        <p style="font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;opacity:.45;margin:0">NBA Props Tracker</p>
+        <h2 style="font-size:22px;font-weight:800;margin:2px 0 0">User Guide</h2>
+      </div>
+    </div>
+
+    <!-- SECTION: What each section does -->
+    <div class="ug-section">
+      <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">🗺️ Section Overview</h3>
+      <div style="display:grid;gap:10px">
+        <div class="ug-card"><span class="ug-icon">⌂</span><div><strong>Overview</strong> — Dashboard snapshot. Shows today's schedule, quick-access favorites, and recent tracker bets at a glance.</div></div>
+        <div class="ug-card"><span class="ug-icon">🗓️</span><div><strong>Today's Games</strong> — Full slate with team injury notes and game status. Use this to spot missing key players before analyzing props.</div></div>
+        <div class="ug-card"><span class="ug-icon">📊</span><div><strong>Player Analyzer</strong> — Deep-dive on one player prop. Pick a player, stat, and line to get hit rate, averages, trends, matchup data, and a confidence score.</div></div>
+        <div class="ug-card"><span class="ug-icon">🔍</span><div><strong>Bet Finder</strong> — Bulk analysis mode. Enter multiple props (or import from Odds API) and the scanner ranks them by EV, edge, and hit rate.</div></div>
+        <div class="ug-card"><span class="ug-icon">📡</span><div><strong>Live Tracker</strong> — Real-time monitoring for props you are tracking today. Add props here to watch their live stat as games progress.</div></div>
+        <div class="ug-card"><span class="ug-icon">🔗</span><div><strong>Parlay Builder</strong> — Provide Odds API keys and event IDs; the tool scrapes props, analyzes all of them, and builds the statistically strongest N-leg parlay.</div></div>
+        <div class="ug-card"><span class="ug-icon">📈</span><div><strong>Backtest Performance</strong> — Log your predictions <em>before</em> games, then resolve them after. Tracks win rate, ROI, and accuracy by confidence tier.</div></div>
+      </div>
+    </div>
+
+    <!-- SECTION: Key Metrics Explained -->
+    <div class="ug-section" style="margin-top:28px">
+      <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">🧮 Key Metrics Explained</h3>
+      <div style="display:grid;gap:8px">
+        <div class="ug-metric"><span class="ug-label">Hit Rate</span><span>% of last N games where the player went OVER the line. Above 60% is strong; above 70% is elite.</span></div>
+        <div class="ug-metric"><span class="ug-label">Average</span><span>Mean stat value across the sample window. Compare to the line — a big gap is your edge.</span></div>
+        <div class="ug-metric"><span class="ug-label">Edge</span><span>How far the average sits from the line, as a percentage. Higher edge = more statistical buffer.</span></div>
+        <div class="ug-metric"><span class="ug-label">EV (Expected Value)</span><span>Estimated profit per $100 based on hit rate × odds. Positive EV (green) = theoretically profitable long-term.</span></div>
+        <div class="ug-metric"><span class="ug-label">Confidence Score</span><span>0–100 composite score built from hit rate, sample size, H2H data, and minutes trend. 70+ = High, 50–69 = Medium, below 50 = Low.</span></div>
+        <div class="ug-metric"><span class="ug-label">Confidence Tier</span><span><strong style="color:#4ade80">High</strong> = strong lean, large sample. <strong style="color:#facc15">Medium</strong> = moderate lean. <strong style="color:#f87171">Low</strong> = small sample or mixed signals.</span></div>
+        <div class="ug-metric"><span class="ug-label">H2H Hit Rate</span><span>Hit rate in games specifically against today's opponent. Useful to confirm or override the overall trend.</span></div>
+        <div class="ug-metric"><span class="ug-label">vs. Position Delta</span><span>How much opponents at the same position allow compared to league average. Positive = the defense is weak at defending this stat.</span></div>
+        <div class="ug-metric"><span class="ug-label">Back-to-Back</span><span>Whether the player is playing on zero rest today. B2B typically reduces minutes and output — factor this in for OVER bets.</span></div>
+        <div class="ug-metric"><span class="ug-label">Minutes Trend</span><span>Whether the player's minutes are trending UP, DOWN, or FLAT over recent games. Rising minutes usually means rising prop output.</span></div>
+        <div class="ug-metric"><span class="ug-label">Impact Count</span><span>Number of key teammates missing (injured/out). Higher impact count = player may absorb extra usage and volume.</span></div>
+        <div class="ug-metric"><span class="ug-label">Odds API Credits</span><span>Each "Load Events" or "Import Props" call costs credits. Use <strong>Check Balance</strong> (free) to see remaining credits without spending any.</span></div>
+      </div>
+    </div>
+
+    <!-- SECTION: Step-by-step workflow -->
+    <div class="ug-section" style="margin-top:28px">
+      <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">🚀 Recommended Workflow</h3>
+      <ol style="margin:0;padding-left:20px;display:grid;gap:10px;font-size:13.5px;line-height:1.6">
+        <li><strong>Check Today's Games</strong> — Go to Today's Games to see the full slate. Note any injury news that could boost a player's usage or minutes.</li>
+        <li><strong>Enter your Odds API key</strong> — Go to Bet Finder → Odds API section. Paste your key, click <em>💾 Save Key</em> so it persists, then click <em>💳 Check Balance</em> to confirm your credits.</li>
+        <li><strong>Load Events &amp; Import Props</strong> — Click <em>Load Events</em>, pick a game from the dropdown, then click <em>Import Props &amp; Scan</em>. The scanner will rank all available props by EV and edge.</li>
+        <li><strong>Deep-dive with Player Analyzer</strong> — Click any player row in the scanner to open Player Analyzer. Review hit rate, average, H2H, matchup, and environment signals. Use Analyzer Filters to narrow by Home/Away, win/loss context, or opponent quality.</li>
+        <li><strong>Send results to other tools</strong> — Use the three action buttons at the top of the Analyzer results:
+          <ul style="margin-top:6px;padding-left:18px;display:grid;gap:4px">
+            <li><strong>Add to Slip</strong> — Adds the prop to your Prop Slip for a quick multi-pick summary.</li>
+            <li><strong>📡 Send to Tracker</strong> — Adds to Live Tracker so you can monitor the stat in real time during the game.</li>
+            <li><strong>📊 Send to Backtest</strong> — Pre-fills the Backtest log form so you can record this prediction before the game starts.</li>
+          </ul>
+        </li>
+        <li><strong>Log predictions in Backtest</strong> — Before games tip off, use Backtest Performance to log your picks. After the game, enter the actual stat value to resolve each prediction as a hit or miss.</li>
+        <li><strong>Review your performance</strong> — The Backtest dashboard shows overall win rate, ROI, and accuracy broken down by confidence tier. Use this to learn which tier and stat types you call best.</li>
+      </ol>
+    </div>
+
+    <!-- SECTION: Tips -->
+    <div class="ug-section" style="margin-top:28px">
+      <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">💡 Pro Tips</h3>
+      <ul style="margin:0;padding-left:20px;display:grid;gap:8px;font-size:13.5px;line-height:1.6">
+        <li>Always log predictions in Backtest <em>before</em> the game starts — resolving after the fact defeats the purpose of tracking your forecast accuracy.</li>
+        <li>A High confidence tier alone is not enough. Check H2H hit rate against today's opponent and confirm no back-to-back or key teammate is missing.</li>
+        <li>Use the "Last N" filter (5/10/15/20 games) in the Analyzer. A player with a 70% hit rate over 20 games but 90% in the last 5 is on a hot streak — lean on the recent form.</li>
+        <li>In Bet Finder, sort by EV first to find the most mispriced props. Sort by hit rate to find the most consistent ones. The best bets usually score well on both.</li>
+        <li>Use Parlay Builder only when you have 2–3 High-tier props already identified. The builder will round out the remaining legs with the best available stats.</li>
+        <li>Save your Odds API key once and it will be remembered between sessions. You won't need to re-enter it.</li>
+        <li>The <em>✕</em> button on Backtest logs removes just that one entry. The <em>Clear All</em> button wipes the entire log — use it carefully.</li>
+      </ul>
+    </div>
+
+    <div style="margin-top:32px;text-align:center">
+      <button id="closeUserGuideBtnBottom" type="button" style="background:var(--accent,#7c6ef5);color:#fff;border:none;border-radius:40px;padding:12px 40px;font-size:14px;font-weight:700;cursor:pointer;letter-spacing:.02em">Got it — close guide</button>
+    </div>
+  </div>
+</div>
+
+<style>
+.ug-section{}
+.ug-card{display:flex;align-items:flex-start;gap:12px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:12px 14px;font-size:13.5px;line-height:1.55}
+.ug-icon{font-size:20px;flex-shrink:0;margin-top:1px}
+.ug-metric{display:grid;grid-template-columns:160px 1fr;gap:10px;padding:8px 12px;background:rgba(255,255,255,0.03);border-radius:10px;font-size:13px;line-height:1.5;align-items:start}
+.ug-label{font-weight:700;opacity:.85;font-size:12px;padding-top:1px}
+@media(max-width:540px){.ug-metric{grid-template-columns:1fr;gap:2px}}
+</style>
+
 <script src="/static/app.js"></script>
+
 </body>
 </html>

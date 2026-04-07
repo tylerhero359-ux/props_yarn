@@ -6,8 +6,6 @@ import logging
 import math
 import os
 import queue
-import uuid
-import hashlib
 
 import re
 import datetime as dt
@@ -98,97 +96,6 @@ PERSISTENT_CACHE_MAX_PLAYER_INFO = max(100, int(os.getenv("NBA_PERSISTENT_CACHE_
 PERSISTENT_CACHE_MAX_NEXT_GAMES = max(30, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_NEXT_GAMES", "240")))
 PERSISTENT_CACHE_LOCK = Lock()
 
-PARLAY_JOB_LOCK = Lock()
-PARLAY_JOB_STORE: dict[str, dict[str, Any]] = {}
-PARLAY_JOB_MAX_AGE_SECONDS = max(300, int(os.getenv("PARLAY_JOB_MAX_AGE_SECONDS", "3600")))
-PARLAY_JOB_MAX_WORKERS = max(1, int(os.getenv("PARLAY_JOB_MAX_WORKERS", "2")))
-PARLAY_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=PARLAY_JOB_MAX_WORKERS, thread_name_prefix="parlay_job")
-
-PARLAY_RESULT_CACHE_TTL_SECONDS = max(300, int(os.getenv("PARLAY_RESULT_CACHE_TTL_SECONDS", "1800")))
-PARLAY_REQUEST_DEDUP_WINDOW_SECONDS = max(60, int(os.getenv("PARLAY_REQUEST_DEDUP_WINDOW_SECONDS", "900")))
-PARLAY_HOSTED_SAFE_MODE = bool(os.getenv("RENDER")) or os.getenv("PARLAY_HOSTED_SAFE_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
-PARLAY_HOSTED_PREWARM_PLAYER_CONTEXT = os.getenv("PARLAY_HOSTED_PREWARM_PLAYER_CONTEXT", "0" if PARLAY_HOSTED_SAFE_MODE else "1").strip().lower() in {"1", "true", "yes", "on"}
-PARLAY_HOSTED_PREFETCH_GAME_LOGS = os.getenv("PARLAY_HOSTED_PREFETCH_GAME_LOGS", "0" if PARLAY_HOSTED_SAFE_MODE else "1").strip().lower() in {"1", "true", "yes", "on"}
-PARLAY_MAX_UNIQUE_ANALYSES = max(12, int(os.getenv("PARLAY_MAX_UNIQUE_ANALYSES", "60" if PARLAY_HOSTED_SAFE_MODE else "120")))
-
-def _parlay_payload_fingerprint(payload: dict[str, Any]) -> str:
-    normalized = {
-        "api_keys_count": len([str(k).strip() for k in (payload.get("api_keys") or []) if str(k).strip()]),
-        "event_ids": sorted([str(e).strip() for e in (payload.get("event_ids") or []) if str(e).strip()]),
-        "legs": int(payload.get("legs") or 3),
-        "sport": str(payload.get("sport") or "basketball_nba"),
-        "regions": str(payload.get("regions") or "us"),
-        "odds_format": str(payload.get("odds_format") or "decimal"),
-        "last_n": int(payload.get("last_n") or 10),
-        "season": str(payload.get("season") or current_nba_season()),
-        "season_type": str(payload.get("season_type") or "Regular Season"),
-        "batch_size": max(1, int(payload.get("batch_size") or 3)),
-        "bookmaker": str(payload.get("bookmaker") or "draftkings").strip().lower(),
-    }
-    return hashlib.sha1(json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-
-def _find_existing_parlay_job_by_fingerprint(payload_fingerprint: str) -> dict[str, Any] | None:
-    now_ts = time.time()
-    with PARLAY_JOB_LOCK:
-        for job in PARLAY_JOB_STORE.values():
-            if job.get("payload_fingerprint") != payload_fingerprint:
-                continue
-            status = str(job.get("status") or "").lower()
-            updated_at = float(job.get("updated_at") or job.get("created_at") or now_ts)
-            if status in {"queued", "running"} and (now_ts - updated_at) <= PARLAY_REQUEST_DEDUP_WINDOW_SECONDS:
-                return copy.deepcopy(job)
-            if status == "completed" and (now_ts - updated_at) <= PARLAY_RESULT_CACHE_TTL_SECONDS:
-                return copy.deepcopy(job)
-    return None
-
-
-def _cleanup_parlay_jobs(now_ts: float | None = None) -> None:
-    now_ts = now_ts or time.time()
-    with PARLAY_JOB_LOCK:
-        stale_ids = [jid for jid, job in PARLAY_JOB_STORE.items() if (now_ts - float(job.get("updated_at") or job.get("created_at") or now_ts)) > PARLAY_JOB_MAX_AGE_SECONDS]
-        for jid in stale_ids:
-            PARLAY_JOB_STORE.pop(jid, None)
-
-def _get_parlay_job(job_id: str) -> dict[str, Any] | None:
-    with PARLAY_JOB_LOCK:
-        job = PARLAY_JOB_STORE.get(job_id)
-        return copy.deepcopy(job) if job else None
-
-def _set_parlay_job_fields(job_id: str, **fields: Any) -> None:
-    now_ts = time.time()
-    with PARLAY_JOB_LOCK:
-        job = PARLAY_JOB_STORE.get(job_id)
-        if not job:
-            return
-        job.update(fields)
-        job["updated_at"] = now_ts
-
-def _create_parlay_job(payload: dict[str, Any]) -> dict[str, Any]:
-    _cleanup_parlay_jobs()
-    payload_copy = copy.deepcopy(payload)
-    payload_fingerprint = _parlay_payload_fingerprint(payload_copy)
-    existing = _find_existing_parlay_job_by_fingerprint(payload_fingerprint)
-    if existing:
-        return existing
-    now_ts = time.time()
-    job_id = uuid.uuid4().hex
-    job = {
-        "job_id": job_id,
-        "status": "queued",
-        "progress": 0,
-        "stage": "Queued",
-        "message": "Queued for background processing.",
-        "created_at": now_ts,
-        "updated_at": now_ts,
-        "payload": payload_copy,
-        "payload_fingerprint": payload_fingerprint,
-        "result": None,
-        "error": None,
-    }
-    with PARLAY_JOB_LOCK:
-        PARLAY_JOB_STORE[job_id] = job
-    return copy.deepcopy(job)
-
 WARM_CACHE_START_LOCK = threading.Lock()
 WARM_CACHE_STARTED = False
 
@@ -232,6 +139,8 @@ def _trim_cache_dict(cache: dict[Any, dict[str, Any]], max_items: int) -> dict[A
 
 
 def save_persistent_caches() -> None:
+    """Write the persistent cache to disk synchronously. Prefer save_persistent_caches_async()
+    for call sites inside request handlers so the disk write never blocks a response."""
     if not PERSISTENT_CACHE_ENABLED:
         return
     try:
@@ -262,6 +171,51 @@ def save_persistent_caches() -> None:
             temp_path.replace(PERSISTENT_CACHE_PATH)
     except Exception as exc:
         LOGGER.warning("Persistent cache save failed: %s", exc)
+
+
+# Debounced background save: collapses rapid successive save requests into a
+# single disk write after PERSISTENT_CACHE_SAVE_DEBOUNCE_SECONDS of quiet time.
+# This prevents each roster/player-info fetch from blocking its caller with a
+# synchronous 300 KB JSON write.
+PERSISTENT_CACHE_SAVE_DEBOUNCE_SECONDS = float(
+    os.getenv("NBA_PERSISTENT_CACHE_SAVE_DEBOUNCE_SECONDS", "5")
+)
+_PERSISTENT_CACHE_SAVE_PENDING = threading.Event()
+_PERSISTENT_CACHE_SAVE_WORKER_STARTED = False
+_PERSISTENT_CACHE_SAVE_WORKER_LOCK = Lock()
+
+
+def _persistent_cache_save_worker() -> None:
+    """Background thread that flushes the persistent cache after a debounce window."""
+    while True:
+        _PERSISTENT_CACHE_SAVE_PENDING.wait()
+        _PERSISTENT_CACHE_SAVE_PENDING.clear()
+        time.sleep(PERSISTENT_CACHE_SAVE_DEBOUNCE_SECONDS)
+        # If another save was requested while we slept, keep draining.
+        if _PERSISTENT_CACHE_SAVE_PENDING.is_set():
+            continue
+        save_persistent_caches()
+
+
+def _ensure_persistent_cache_save_worker() -> None:
+    global _PERSISTENT_CACHE_SAVE_WORKER_STARTED
+    with _PERSISTENT_CACHE_SAVE_WORKER_LOCK:
+        if _PERSISTENT_CACHE_SAVE_WORKER_STARTED:
+            return
+        _PERSISTENT_CACHE_SAVE_WORKER_STARTED = True
+    threading.Thread(
+        target=_persistent_cache_save_worker,
+        name="persistent-cache-save",
+        daemon=True,
+    ).start()
+
+
+def save_persistent_caches_async() -> None:
+    """Schedule a debounced background save. Returns immediately; does not block."""
+    if not PERSISTENT_CACHE_ENABLED:
+        return
+    _ensure_persistent_cache_save_worker()
+    _PERSISTENT_CACHE_SAVE_PENDING.set()
 
 
 def _load_named_persistent_cache(entries: list[dict[str, Any]] | None, target: dict[Any, dict[str, Any]]) -> None:
@@ -385,6 +339,9 @@ STAT_MAP = {
     "PA": None,
     "RA": None,
 }
+VALIDATED_BOX_SCORE_COLUMNS = ("PTS", "REB", "AST", "FG3M", "STL", "BLK", "FGA", "FG3A", "FTA")
+GAME_LOG_CACHE_SCHEMA_VERSION = "validated_boxscore_v1"
+ANALYSIS_CACHE_SCHEMA_VERSION = "validated_analysis_v2"  # v2: last_n removed from cache key; filtered_pool stored alongside payload
 POSITION_LABELS = {
     "G": "Guards",
     "F": "Forwards",
@@ -1792,6 +1749,10 @@ def build_confidence_engine(
     opportunity: dict[str, Any] | None = None,
     team_context: dict[str, Any] | None = None,
     environment: dict[str, Any] | None = None,
+    stat: str | None = None,
+    player_position: str | None = None,
+    line: float | None = None,
+    average: float | None = None,
 ) -> dict[str, Any]:
     opportunity = opportunity or {}
     team_context = team_context or {}
@@ -1803,6 +1764,9 @@ def build_confidence_engine(
             "score": 0,
             "tone": "out",
             "summary": "Officially unavailable on the latest report.",
+            "tier": "Unavailable",
+            "components": {"availability": -100.0},
+            "tags": ["Unavailable"],
         }
 
     edge_value = float(edge or 0.0)
@@ -1810,113 +1774,159 @@ def build_confidence_engine(
     if side == "UNDER":
         matchup_value *= -1
 
-    score = 42.0
-    score += max(-16.0, min(18.0, ev * 105.0))
-    score += max(-14.0, min(16.0, edge_value * 1.0))
-    score += max(-10.0, min(13.0, (hit_rate - 50.0) * 0.44))
-    score += max(-5.0, min(6.0, (games_count - 5) * 0.65))
+    avg_value = float(average or 0.0)
+    line_value = float(line or 0.0)
+    raw_line_delta = round(avg_value - line_value, 2) if line is not None and average is not None else 0.0
+    line_delta = raw_line_delta if side == 'OVER' else -raw_line_delta
 
-    matchup_penalty_applied = False
-    matchup_bonus_applied = False
+    form_component = max(-12.0, min(16.0, (hit_rate - 50.0) * 0.46))
+    sample_component = max(-4.0, min(6.0, (games_count - 5) * 0.55))
+    ev_component = max(-14.0, min(16.0, ev * 100.0))
+    edge_component = max(-12.0, min(14.0, edge_value * 0.9))
+    line_value_component = max(-9.0, min(10.0, line_delta * 2.2))
+
+    matchup_component = 0.0
+    tags: list[str] = []
     if matchup_delta_pct is not None:
-        if matchup_value >= 0:
-            score += max(0.0, min(8.0, matchup_value * 0.28))
-            matchup_bonus_applied = matchup_value >= 5
-        else:
-            score -= max(0.0, min(24.0, abs(matchup_value) * 0.95))
-            matchup_penalty_applied = abs(matchup_value) >= 5
-            if abs(matchup_value) >= 12:
-                score = min(score, 72.0)
-            elif abs(matchup_value) >= 5:
-                score = min(score, 81.0)
+        matchup_component = max(-18.0, min(12.0, matchup_value * 0.52))
+        if matchup_value >= 10:
+            tags.append('Soft position matchup')
+        elif matchup_value >= 4:
+            tags.append('Opponent allows this stat')
+        elif matchup_value <= -10:
+            tags.append('Tough position matchup')
+        elif matchup_value <= -4:
+            tags.append('Opponent denies this stat')
+
+    injury_component = max(-2.0, min(12.0, float(team_context.get('net_adjustment') or team_context.get('injury_adjustment') or 0.0)))
+    if injury_component >= 5:
+        tags.append('Injury boost')
+    elif injury_component > 0:
+        tags.append('Usage bump')
 
     minutes_trend = str(opportunity.get("minutes_trend") or "steady")
     volume_trend = str(opportunity.get("volume_trend") or "steady")
-    if minutes_trend == "up":
-        score += 4.0
-    elif minutes_trend == "down":
-        score -= 5.0
+    minutes_component = 0.0
+    if minutes_trend == 'up':
+        minutes_component += 4.0
+        tags.append('Minutes rising')
+    elif minutes_trend == 'down':
+        minutes_component -= 5.0
+        tags.append('Minutes falling')
+    if volume_trend == 'up':
+        minutes_component += 3.5 if side == 'OVER' else -1.5
+        if 'Usage bump' not in tags:
+            tags.append('Volume up')
+    elif volume_trend == 'down':
+        minutes_component -= 3.5 if side == 'OVER' else 1.5
 
-    if volume_trend == "up":
-        score += 4.0 if side == "OVER" else -2.0
-    elif volume_trend == "down":
-        score -= 4.0 if side == "OVER" else 2.0
-
-    impact_count = int(team_context.get("impact_count") or 0)
-    if impact_count:
-        score += min(4.0, impact_count * 1.5) if side == "OVER" else max(-2.0, -impact_count * 0.8)
-
+    schedule_component = 0.0
     rest_days = environment.get("rest_days")
     if isinstance(rest_days, int):
         if rest_days >= 2:
-            score += 3.0
+            schedule_component += 2.5
+            tags.append('Extra rest')
         elif rest_days == 0:
-            score -= 4.0
-
+            schedule_component -= 4.0
+            tags.append('No rest edge')
     if environment.get("is_back_to_back"):
-        score -= 6.0
+        schedule_component -= 6.0
+        if 'Back-to-back' not in tags:
+            tags.append('Back-to-back')
     elif environment.get("schedule_density") == "light":
-        score += 2.0
+        schedule_component += 1.5
 
+    availability_component = 0.0
     if availability.get("is_risky"):
-        score -= 14.0
+        availability_component -= 12.0
+        tags.append('Player status risk')
 
+    score = 46.0
+    components = {
+        'form': round(form_component, 1),
+        'sample': round(sample_component, 1),
+        'ev': round(ev_component, 1),
+        'edge': round(edge_component, 1),
+        'line_value': round(line_value_component, 1),
+        'matchup': round(matchup_component, 1),
+        'injury_context': round(injury_component, 1),
+        'minutes_role': round(minutes_component, 1),
+        'schedule': round(schedule_component, 1),
+        'availability': round(availability_component, 1),
+    }
+    score += sum(components.values())
     score = int(max(0, min(99, round(score))))
 
-    if score >= 84:
-        grade = "A"
-        tone = "elite"
+    if score >= 85:
+        grade = 'A'
+        tone = 'elite'
+        tier = 'Elite'
     elif score >= 72:
-        grade = "B"
-        tone = "good"
+        grade = 'B'
+        tone = 'good'
+        tier = 'High'
     elif score >= 60:
-        grade = "C"
-        tone = "warm"
+        grade = 'C'
+        tone = 'warm'
+        tier = 'Medium'
     elif score >= 48:
-        grade = "D"
-        tone = "neutral"
+        grade = 'D'
+        tone = 'neutral'
+        tier = 'Low'
     else:
-        grade = "F"
-        tone = "bad"
+        grade = 'F'
+        tone = 'bad'
+        tier = 'Very low'
 
     summary_parts: list[str] = []
-    if edge_value >= 8:
-        summary_parts.append("strong edge")
-    elif edge_value >= 3:
-        summary_parts.append("modest edge")
-    else:
-        summary_parts.append("thin edge")
+    if injury_component >= 5:
+        summary_parts.append('injury-driven usage boost')
+    elif injury_component > 0:
+        summary_parts.append('mild lineup boost')
 
-    if ev >= 0.08:
-        summary_parts.append("healthy EV")
-    elif ev >= 0.02:
-        summary_parts.append("positive EV")
-    else:
-        summary_parts.append("limited EV")
+    if matchup_component >= 5:
+        summary_parts.append('favorable position environment')
+    elif matchup_component <= -5:
+        summary_parts.append('tough opponent environment')
 
-    if minutes_trend == "up" or volume_trend == "up":
-        summary_parts.append("role trending up")
-    elif minutes_trend == "down" or volume_trend == "down":
-        summary_parts.append("role cooling off")
+    if minutes_component >= 4:
+        summary_parts.append('role trending up')
+    elif minutes_component <= -4:
+        summary_parts.append('role cooling off')
 
-    if matchup_bonus_applied:
-        summary_parts.append("supportive matchup")
-    elif matchup_penalty_applied:
-        summary_parts.append("tough matchup penalty")
+    if line_value_component >= 4:
+        summary_parts.append('line sits below recent output')
+    elif line_value_component <= -4:
+        summary_parts.append('line looks inflated')
 
-    if environment.get("is_back_to_back"):
-        summary_parts.append("back-to-back spot")
-    elif isinstance(rest_days, int) and rest_days >= 2:
-        summary_parts.append("extra rest")
+    if availability.get('is_risky'):
+        summary_parts.append('watch final status')
+    elif schedule_component <= -5:
+        summary_parts.append('schedule drag applied')
 
-    if availability.get("is_risky"):
-        summary_parts.append("watch availability")
+    if not summary_parts:
+        if edge_value >= 4 or ev >= 0.05:
+            summary_parts.append('solid baseline edge')
+        else:
+            summary_parts.append('mixed signals')
+
+    unique_tags: list[str] = []
+    for tag in tags + list(team_context.get('impact_tags') or []):
+        if tag and tag not in unique_tags:
+            unique_tags.append(tag)
 
     return {
-        "grade": grade,
-        "score": score,
-        "tone": tone,
-        "summary": " • ".join(summary_parts).capitalize(),
+        'grade': grade,
+        'score': score,
+        'tone': tone,
+        'tier': tier,
+        'summary': ' • '.join(summary_parts).capitalize(),
+        'components': components,
+        'tags': unique_tags[:6],
+        'line_delta': round(line_delta, 2),
+        'raw_line_delta': round(raw_line_delta, 2),
+        'player_position': player_position or '',
+        'stat': stat or '',
     }
 
 def throttle_request() -> None:
@@ -1930,19 +1940,20 @@ def throttle_request() -> None:
 
 
 def compute_stat_value(row: dict[str, Any], stat: str) -> float:
+    normalized_row = sanitize_game_log_row(row)
     if stat == "PRA":
-        return float(row.get("PTS", 0)) + float(row.get("REB", 0)) + float(row.get("AST", 0))
+        return safe_stat_number(normalized_row, "PTS") + safe_stat_number(normalized_row, "REB") + safe_stat_number(normalized_row, "AST")
     if stat == "PR":
-        return float(row.get("PTS", 0)) + float(row.get("REB", 0))
+        return safe_stat_number(normalized_row, "PTS") + safe_stat_number(normalized_row, "REB")
     if stat == "PA":
-        return float(row.get("PTS", 0)) + float(row.get("AST", 0))
+        return safe_stat_number(normalized_row, "PTS") + safe_stat_number(normalized_row, "AST")
     if stat == "RA":
-        return float(row.get("REB", 0)) + float(row.get("AST", 0))
+        return safe_stat_number(normalized_row, "REB") + safe_stat_number(normalized_row, "AST")
 
     column = STAT_MAP.get(stat)
     if not column:
         raise ValueError(f"Unsupported stat: {stat}")
-    return float(row.get(column, 0))
+    return safe_stat_number(normalized_row, column)
 
 
 def parse_minutes_to_decimal(raw_minutes: Any) -> float:
@@ -1963,9 +1974,56 @@ def parse_minutes_to_decimal(raw_minutes: Any) -> float:
 
 def safe_stat_number(row: dict[str, Any], key: str) -> float:
     try:
-        return float(row.get(key, 0) or 0)
+        value = row.get(key, 0)
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return 0.0
+        number = float(value or 0)
+        if math.isnan(number) or math.isinf(number):
+            return 0.0
+        return number
     except Exception:
         return 0.0
+
+
+def sanitize_game_log_row(row: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(row)
+    for col in VALIDATED_BOX_SCORE_COLUMNS:
+        cleaned[col] = round(safe_stat_number(cleaned, col), 3)
+    cleaned["MIN"] = str(cleaned.get("MIN") or "").strip()
+    cleaned["GAME_DATE"] = str(cleaned.get("GAME_DATE") or "").strip()
+    cleaned["MATCHUP"] = str(cleaned.get("MATCHUP") or "").strip()
+    game_id = str(cleaned.get("Game_ID") or cleaned.get("GAME_ID") or "").strip()
+    if game_id:
+        cleaned["GAME_ID"] = game_id
+        cleaned["Game_ID"] = game_id
+    return cleaned
+
+
+def dedupe_game_log_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen_keys: set[tuple[Any, ...]] = set()
+    for raw_row in rows or []:
+        row = sanitize_game_log_row(raw_row)
+        row_key = str(row.get("GAME_ID") or row.get("Game_ID") or "").strip()
+        if row_key:
+            dedupe_key: tuple[Any, ...] = ("gid", row_key)
+        else:
+            dedupe_key = (
+                "fallback",
+                str(row.get("GAME_DATE") or ""),
+                str(row.get("MATCHUP") or ""),
+                str(row.get("WL") or ""),
+                row.get("MIN"),
+                *(row.get(col, 0.0) for col in VALIDATED_BOX_SCORE_COLUMNS),
+            )
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+        deduped.append(row)
+    deduped.sort(key=lambda item: parse_game_date_any(item.get("GAME_DATE")) or datetime.min, reverse=True)
+    return deduped
 
 
 def safe_int_score(*values: Any) -> int:
@@ -2316,6 +2374,9 @@ def apply_game_log_filters(
     max_fga: float | None = None,
     h2h_only: bool = False,
     opponent_abbreviation: str | None = None,
+    opponent_rank_min: int | None = None,
+    opponent_rank_max: int | None = None,
+    without_player_game_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     cache_key = _build_filtered_pool_cache_key(
         rows,
@@ -2329,6 +2390,9 @@ def apply_game_log_filters(
         max_fga=max_fga,
         h2h_only=h2h_only,
         opponent_abbreviation=opponent_abbreviation,
+        opponent_rank_min=opponent_rank_min,
+        opponent_rank_max=opponent_rank_max,
+        without_player_game_ids=tuple(sorted(without_player_game_ids or [])),
     )
     cached = FILTERED_POOL_CACHE.get(cache_key)
     now_ts = time.time()
@@ -2364,6 +2428,15 @@ def apply_game_log_filters(
         if h2h_only:
             if not opponent_abbreviation or opponent_abbreviation not in str(row.get('MATCHUP') or '').upper():
                 continue
+        rank_value = row.get('_opponent_rank')
+        if opponent_rank_min is not None and (not isinstance(rank_value, int) or rank_value < opponent_rank_min):
+            continue
+        if opponent_rank_max is not None and (not isinstance(rank_value, int) or rank_value > opponent_rank_max):
+            continue
+        if without_player_game_ids is not None:
+            game_id = str(row.get('GAME_ID') or row.get('Game_ID') or '').strip()
+            if not game_id or game_id in without_player_game_ids:
+                continue
         filtered.append(row)
     FILTERED_POOL_CACHE[cache_key] = {"timestamp": now_ts, "rows": [dict(row) for row in filtered]}
     return filtered
@@ -2380,6 +2453,9 @@ def build_filter_summary(
     min_fga: float | None = None,
     max_fga: float | None = None,
     h2h_only: bool = False,
+    opponent_rank_range: str | None = None,
+    without_player_name: str | None = None,
+    without_player_names: list[str] | None = None,
     debug: bool = False,
 ) -> dict[str, Any]:
     chips: list[str] = []
@@ -2414,11 +2490,147 @@ def build_filter_summary(
             chips.append(f'FGA ≤ {max_fga:g}')
     if h2h_only:
         chips.append('H2H only')
+    rank_min, rank_max, rank_label = normalize_opponent_rank_range(opponent_rank_range)
+    if rank_min is not None and rank_max is not None:
+        chips.append(f'Opp rank {rank_min}-{rank_max}')
+    teammate_names = [str(name).strip() for name in (without_player_names or []) if str(name).strip()]
+    teammate_name = str(without_player_name or '').strip()
+    if teammate_names:
+        chips.append(f"Without {', '.join(teammate_names)}")
+    elif teammate_name:
+        chips.append(f'Without {teammate_name}')
     return {
         'chips': chips,
         'label': ' • '.join(chips) if chips else 'All games',
         'has_filters': bool(chips),
     }
+
+
+TEAM_RECORDS_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+TEAM_RECORDS_CACHE_TTL_SECONDS = 6 * 60 * 60
+TEAMMATE_ABSENCE_CACHE: dict[tuple[int, str, str], dict[str, Any]] = {}
+TEAMMATE_ABSENCE_CACHE_TTL_SECONDS = 6 * 60 * 60
+
+
+def build_team_rank_map(season: str, season_type: str = 'Regular Season') -> dict[int, int]:
+    cache_key = (str(season), str(season_type))
+    cached = TEAM_RECORDS_CACHE.get(cache_key)
+    now_ts = time.time()
+    if cached and now_ts - float(cached.get('timestamp') or 0.0) < TEAM_RECORDS_CACHE_TTL_SECONDS:
+        return dict(cached.get('rank_map') or {})
+
+    rows: list[dict[str, Any]] = []
+    for team in TEAM_POOL:
+        team_id = int(team.get('id') or 0)
+        if not team_id:
+            continue
+        try:
+            logs = fetch_team_game_log(team_id=team_id, season=season, season_type=season_type)
+        except Exception:
+            continue
+        wins = 0
+        losses = 0
+        for row in logs:
+            wl = str(row.get('WL') or '').upper().strip()
+            if wl == 'W':
+                wins += 1
+            elif wl == 'L':
+                losses += 1
+        games = wins + losses
+        pct = (wins / games) if games else 0.0
+        rows.append({'team_id': team_id, 'wins': wins, 'losses': losses, 'win_pct': pct})
+
+    rows.sort(key=lambda item: (-float(item.get('win_pct') or 0.0), -int(item.get('wins') or 0), TEAM_LOOKUP.get(int(item.get('team_id') or 0), {}).get('full_name', '')))
+    rank_map = {int(item['team_id']): idx + 1 for idx, item in enumerate(rows)}
+    TEAM_RECORDS_CACHE[cache_key] = {'timestamp': now_ts, 'rank_map': rank_map}
+    return dict(rank_map)
+
+
+def teammate_absence_game_ids(player_id: int, season: str, season_type: str = 'Regular Season') -> set[str]:
+    cache_key = (int(player_id), str(season), str(season_type))
+    cached = TEAMMATE_ABSENCE_CACHE.get(cache_key)
+    now_ts = time.time()
+    if cached and now_ts - float(cached.get('timestamp') or 0.0) < TEAMMATE_ABSENCE_CACHE_TTL_SECONDS:
+        return set(cached.get('game_ids') or [])
+    try:
+        rows = fetch_player_game_log(player_id=player_id, season=season, season_type=season_type)
+    except Exception:
+        rows = []
+    game_ids = {str(row.get('GAME_ID') or row.get('Game_ID') or '').strip() for row in rows if str(row.get('GAME_ID') or row.get('Game_ID') or '').strip()}
+    TEAMMATE_ABSENCE_CACHE[cache_key] = {'timestamp': now_ts, 'game_ids': sorted(game_ids)}
+    return set(game_ids)
+
+
+
+
+def normalize_without_player_ids(raw_ids: Any) -> list[int]:
+    if raw_ids is None:
+        return []
+    values = raw_ids if isinstance(raw_ids, (list, tuple, set)) else [raw_ids]
+    cleaned: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        text = str(value or '').strip()
+        if not text:
+            continue
+        for chunk in text.split(','):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            try:
+                number = int(chunk)
+            except Exception:
+                continue
+            if number > 0 and number not in seen:
+                seen.add(number)
+                cleaned.append(number)
+    return cleaned
+
+
+def resolve_without_player_names(player_ids: list[int]) -> list[str]:
+    names: list[str] = []
+    for player_id in player_ids:
+        player = PLAYER_LOOKUP.get(int(player_id) or 0)
+        name = str((player or {}).get('full_name') or '').strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def build_without_player_union_game_ids(player_ids: list[int], season: str, season_type: str = 'Regular Season') -> set[str] | None:
+    normalized_ids = normalize_without_player_ids(player_ids)
+    if not normalized_ids:
+        return None
+    game_ids: set[str] = set()
+    for teammate_id in normalized_ids:
+        game_ids.update(teammate_absence_game_ids(int(teammate_id), season=season, season_type=season_type))
+    return game_ids
+
+def normalize_opponent_rank_range(opponent_rank_range: str | None) -> tuple[int | None, int | None, str]:
+    raw = str(opponent_rank_range or '').strip().lower()
+    if not raw or raw == 'all':
+        return None, None, 'all'
+    aliases = {
+        'top10': (1, 10, 'top10'),
+        'top_10': (1, 10, 'top10'),
+        'top5': (1, 5, 'top5'),
+        'top_5': (1, 5, 'top5'),
+        'mid10': (11, 20, 'mid10'),
+        'mid_10': (11, 20, 'mid10'),
+        'bottom10': (21, 30, 'bottom10'),
+        'bottom_10': (21, 30, 'bottom10'),
+        'bottom5': (26, 30, 'bottom5'),
+        'bottom_5': (26, 30, 'bottom5'),
+    }
+    if raw in aliases:
+        return aliases[raw]
+    match = re.match(r'^(\d{1,2})\s*[-:]\s*(\d{1,2})$', raw)
+    if match:
+        lo = max(1, min(30, int(match.group(1))))
+        hi = max(1, min(30, int(match.group(2))))
+        lo, hi = min(lo, hi), max(lo, hi)
+        return lo, hi, f'{lo}-{hi}'
+    return None, None, 'all'
 
 
 def build_opportunity_context(season_rows: list[dict[str, Any]], last_n: int) -> dict[str, Any]:
@@ -2493,11 +2705,65 @@ def build_opportunity_context(season_rows: list[dict[str, Any]], last_n: int) ->
     }
 
 
-def build_team_opportunity_context(team_name: str | None, player_name: str, stat: str) -> dict[str, Any]:
+def _normalize_position_group(position_text: str | None) -> str:
+    raw = str(position_text or '').upper().strip()
+    if not raw:
+        return ''
+    if 'G' in raw and 'F' not in raw and 'C' not in raw:
+        return 'G'
+    if 'C' in raw:
+        return 'C'
+    if 'F' in raw:
+        return 'F'
+    if 'G' in raw:
+        return 'G'
+    return raw[:1]
+
+
+def _injury_role_weight(target_position_group: str, injured_position_group: str, stat: str) -> float:
+    target = _normalize_position_group(target_position_group)
+    injured = _normalize_position_group(injured_position_group)
+    stat = str(stat or '').upper().strip()
+    if stat in {'AST', 'PA', 'RA'}:
+        if injured == 'G':
+            return 3.6 if target == 'G' else 1.1
+        if injured == 'F':
+            return 1.5 if target in {'G', 'F'} else 0.5
+        if injured == 'C':
+            return 0.9 if target in {'G', 'F'} else 0.4
+    if stat in {'REB'}:
+        if injured == 'C':
+            return 3.8 if target in {'C', 'F'} else 0.8
+        if injured == 'F':
+            return 2.2 if target in {'F', 'C'} else 0.7
+        if injured == 'G':
+            return 0.7
+    if stat in {'PTS', '3PM', 'PR', 'PRA', 'PA'}:
+        if injured == 'G':
+            return 3.2 if target == 'G' else 1.8
+        if injured == 'F':
+            return 2.6 if target in {'F', 'G'} else 0.9
+        if injured == 'C':
+            return 1.7 if target in {'C', 'F'} else 0.6
+    if stat in {'BLK'}:
+        return 2.8 if injured == 'C' and target in {'C', 'F'} else 0.8
+    if stat in {'STL'}:
+        return 1.9 if injured == 'G' and target == 'G' else 0.7
+    return 1.0
+
+
+def build_team_opportunity_context(
+    team_name: str | None,
+    player_name: str,
+    stat: str,
+    player_position: str | None = None,
+    team_id: int | None = None,
+    season: str | None = None,
+) -> dict[str, Any]:
     payload = fetch_latest_injury_report_payload()
     team_name = str(team_name or '').strip()
     report_label = str(payload.get('report_label') or '')
-    cache_key = (team_name, normalize_report_person_name(player_name), stat, report_label)
+    cache_key = (team_name, normalize_report_person_name(player_name), stat, str(player_position or ''), int(team_id or 0), str(season or ''), report_label)
     cached = TEAM_OPPORTUNITY_CACHE.get(cache_key)
     if cached:
         return copy.deepcopy(cached)
@@ -2509,6 +2775,13 @@ def build_team_opportunity_context(team_name: str | None, player_name: str, stat
         'listed_count': 0,
         'impact_count': 0,
         'players': [],
+        'injury_adjustment': 0.0,
+        'boost_score': 0,
+        'penalty_score': 0,
+        'net_adjustment': 0.0,
+        'impact_tags': [],
+        'impact_reasons': [],
+        'opportunity_label': 'Neutral injury environment',
     }
     if not payload.get('ok') or not team_name:
         TEAM_OPPORTUNITY_CACHE[cache_key] = copy.deepcopy(empty)
@@ -2518,6 +2791,17 @@ def build_team_opportunity_context(team_name: str | None, player_name: str, stat
     if not rows:
         TEAM_OPPORTUNITY_CACHE[cache_key] = copy.deepcopy(empty)
         return empty
+
+    roster_lookup: dict[str, str] = {}
+    if team_id and season:
+        try:
+            roster_rows = fetch_team_roster(team_id=int(team_id), season=str(season))
+            for roster_row in roster_rows:
+                roster_name = str(roster_row.get('PLAYER') or '').strip()
+                if roster_name:
+                    roster_lookup[normalize_report_person_name(roster_name)] = str(roster_row.get('POSITION') or '').strip()
+        except Exception:
+            roster_lookup = {}
 
     player_keys = build_player_name_variants(player_name) or set()
     filtered = [row for row in rows if row.get('player_key') not in player_keys]
@@ -2534,15 +2818,45 @@ def build_team_opportunity_context(team_name: str | None, player_name: str, stat
 
     out_count = sum(1 for row in impacted if str(row.get('status') or '') in UNAVAILABLE_STATUSES)
     risky_count = sum(1 for row in impacted if str(row.get('status') or '') in RISKY_STATUSES)
+    target_group = _normalize_position_group(player_position)
+    impact_tags: list[str] = []
+    impact_reasons: list[str] = []
+    boost_score = 0.0
+    penalty_score = 0.0
+
+    for row in impacted[:6]:
+        status = str(row.get('status') or '').strip()
+        injured_name = re.sub(r",(?!\s)", ", ", str(row.get('player_display') or '').strip())
+        injured_key = normalize_report_person_name(injured_name)
+        injured_pos = roster_lookup.get(injured_key, '')
+        injured_group = _normalize_position_group(injured_pos)
+        weight = _injury_role_weight(target_group, injured_group, stat)
+        if status in UNAVAILABLE_STATUSES:
+            adj = weight
+        else:
+            adj = weight * 0.45
+        if adj >= 2.8:
+            tag = 'Injury boost'
+        elif adj >= 1.4:
+            tag = 'Usage bump'
+        else:
+            tag = 'Thin rotation'
+        boost_score += adj
+        impact_tags.append(tag)
+        pos_label = injured_group or 'rotation'
+        impact_reasons.append(f"{injured_name} {status.lower()} ({pos_label}) can shift {get_stat_label_for_copy(stat).lower()} volume.")
+
+    boost_score = round(min(12.0, boost_score), 1)
+    net_adjustment = boost_score - penalty_score
 
     if stat in {'PTS', '3PM', 'PRA', 'PR', 'PA'}:
-        angle = 'That can open more shots and on-ball work for available teammates.'
+        angle = 'Same-team absences can open extra shots and usage for this prop.'
     elif stat in {'REB', 'RA'}:
-        angle = 'That can open more rebound chances or a bigger floor role.'
+        angle = 'Same-team absences can open rebound share and floor time.'
     elif stat in {'AST'}:
-        angle = 'That can open more playmaking and possession control.'
+        angle = 'Same-team absences can shift playmaking responsibility.'
     else:
-        angle = 'That can shift role and opportunity on this roster.'
+        angle = 'Same-team absences can change the player’s role and path to the line.'
 
     headline_parts = []
     if out_count:
@@ -2550,6 +2864,11 @@ def build_team_opportunity_context(team_name: str | None, player_name: str, stat
     if risky_count:
         headline_parts.append(f'{risky_count} questionable/doubtful')
     headline = ' • '.join(headline_parts)
+
+    unique_tags = []
+    for tag in impact_tags:
+        if tag not in unique_tags:
+            unique_tags.append(tag)
 
     result = {
         'headline': headline or 'Team absences flagged',
@@ -2564,6 +2883,13 @@ def build_team_opportunity_context(team_name: str | None, player_name: str, stat
             }
             for row in impacted[:4]
         ],
+        'injury_adjustment': net_adjustment,
+        'boost_score': round(boost_score, 1),
+        'penalty_score': round(penalty_score, 1),
+        'net_adjustment': round(net_adjustment, 1),
+        'impact_tags': unique_tags[:4],
+        'impact_reasons': impact_reasons[:4],
+        'opportunity_label': 'Positive injury environment' if net_adjustment >= 4 else ('Mild injury boost' if net_adjustment > 0 else 'Neutral injury environment'),
     }
     TEAM_OPPORTUNITY_CACHE[cache_key] = copy.deepcopy(result)
     return result
@@ -2721,18 +3047,14 @@ def _make_hashable(value: Any) -> Any:
 
 def _build_filtered_pool_cache_key(
     rows: list[dict[str, Any]],
-    *,
-    location: str,
-    result: str,
-    margin_min: float | None,
-    margin_max: float | None,
-    min_minutes: float | None,
-    max_minutes: float | None,
-    min_fga: float | None,
-    max_fga: float | None,
-    h2h_only: bool,
-    opponent_abbreviation: str | None,
+    **filters: Any,
 ) -> tuple[Any, ...]:
+    """Build a stable cache key for filtered pools.
+
+    This intentionally accepts arbitrary filter kwargs so future filter additions do
+    not break callers with unexpected-keyword errors. All filter values are
+    normalized and sorted by key name before being added to the cache key.
+    """
     row_signature = tuple(
         (
             str(row.get("Game_ID") or row.get("GAME_ID") or ""),
@@ -2745,19 +3067,18 @@ def _build_filtered_pool_cache_key(
         )
         for row in rows
     )
-    return (
-        row_signature,
-        str(location or "all").lower(),
-        str(result or "all").lower(),
-        margin_min,
-        margin_max,
-        min_minutes,
-        max_minutes,
-        min_fga,
-        max_fga,
-        bool(h2h_only),
-        str(opponent_abbreviation or "").upper().strip(),
+
+    normalized_filters = tuple(
+        (
+            str(key),
+            _make_hashable(
+                str(value).upper().strip() if key == "opponent_abbreviation" and value is not None else value
+            ),
+        )
+        for key, value in sorted(filters.items(), key=lambda item: str(item[0]))
     )
+
+    return (row_signature, normalized_filters)
 
 
 def build_stat_summary_block(rows: list[dict[str, Any]], stat: str, line: float) -> dict[str, Any]:
@@ -2777,12 +3098,48 @@ def build_stat_summary_block(rows: list[dict[str, Any]], stat: str, line: float)
         if game_entry["hit"]:
             hit_count += 1
 
+    avg = round(sum(values) / len(values), 2) if values else 0
+    hit_rate = round((hit_count / len(values)) * 100, 1) if values else 0
+
+    # Variance / distribution metrics
+    variance_metrics: dict[str, Any] = {}
+    if len(values) >= 3:
+        import statistics as _stats
+        std_dev = round(_stats.stdev(values), 2)
+        median = round(_stats.median(values), 2)
+        sorted_vals = sorted(values)
+        n = len(sorted_vals)
+        p25 = round(sorted_vals[max(0, int(n * 0.25))], 2)
+        p75 = round(sorted_vals[min(n - 1, int(n * 0.75))], 2)
+        # Consistency score: 0-100, higher = more consistent
+        # Based on coefficient of variation (lower CV = higher consistency)
+        cv = (std_dev / avg) if avg > 0 else 1.0
+        consistency_score = round(max(0, min(100, 100 - (cv * 80))), 1)
+        # Over-hit rate above median (games where player exceeded their own median)
+        above_median = sum(1 for v in values if v > median)
+        over_median_rate = round((above_median / len(values)) * 100, 1)
+        # Floor / ceiling
+        floor_val = round(sorted_vals[0], 2)
+        ceiling_val = round(sorted_vals[-1], 2)
+        variance_metrics = {
+            "std_dev": std_dev,
+            "median": median,
+            "p25": p25,
+            "p75": p75,
+            "consistency_score": consistency_score,
+            "over_median_rate": over_median_rate,
+            "floor": floor_val,
+            "ceiling": ceiling_val,
+            "cv": round(cv, 3),
+        }
+
     payload = {
         "games": games,
         "values": values,
         "hit_count": hit_count,
-        "average": round(sum(values) / len(values), 2) if values else 0,
-        "hit_rate": round((hit_count / len(values)) * 100, 1) if values else 0,
+        "average": avg,
+        "hit_rate": hit_rate,
+        "variance": variance_metrics,
     }
     STAT_SUMMARY_CACHE[cache_key] = {"timestamp": now_ts, "payload": copy.deepcopy(payload)}
     return payload
@@ -2939,20 +3296,23 @@ def _position_dash_cache_is_reliable_stale(cached: dict[str, Any] | None, cached
 
 @timed_call("fetch_player_game_log")
 def fetch_player_game_log(player_id: int, season: str, season_type: str) -> list[dict[str, Any]]:
-    cache_key = (player_id, season, season_type)
+    cache_key = (player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)
     cached = GAME_LOG_CACHE.get(cache_key)
     cached_ts = float((cached or {}).get("timestamp") or 0.0)
     now_ts = time.time()
 
     if cached and now_ts - cached_ts < CACHE_TTL_SECONDS:
-        return cached["rows"]
+        sanitized_cached_rows = dedupe_game_log_rows(cached["rows"])
+        if sanitized_cached_rows != cached.get("rows"):
+            GAME_LOG_CACHE[cache_key] = {"timestamp": cached_ts or time.time(), "rows": sanitized_cached_rows}
+        return sanitized_cached_rows
 
     has_reliable_stale = bool(cached and _game_log_cache_is_reliable_stale(cached, cached_ts))
 
     failure_meta = GAME_LOG_FAILURE_META.get(cache_key) or {}
     last_failure = float(failure_meta.get("last_failure") or 0.0)
     if has_reliable_stale and now_ts - last_failure < GAME_LOG_FAILURE_COOLDOWN_SECONDS:
-        return cached["rows"]
+        return dedupe_game_log_rows(cached["rows"])
 
     total_budget_seconds = (
         GAME_LOG_FETCH_BUDGET_WITH_RELIABLE_STALE_SECONDS
@@ -3007,7 +3367,7 @@ def fetch_player_game_log(player_id: int, season: str, season_type: str) -> list
     if df is None:
         GAME_LOG_FAILURE_META[cache_key] = {"last_failure": time.time()}
         if has_reliable_stale:
-            return cached["rows"]
+            return dedupe_game_log_rows(cached["rows"])
         detail_suffix = f" Details: {last_exc}" if last_exc else ""
         raise HTTPException(
             status_code=502,
@@ -3022,8 +3382,7 @@ def fetch_player_game_log(player_id: int, season: str, season_type: str) -> list
         raise HTTPException(status_code=404, detail="No game logs found for this player and season.")
 
     df["GAME_DATE"] = df["GAME_DATE"].astype(str)
-    rows = df.to_dict(orient="records")
-    rows.sort(key=lambda row: datetime.strptime(row["GAME_DATE"], "%b %d, %Y"), reverse=True)
+    rows = dedupe_game_log_rows(df.to_dict(orient="records"))
 
     GAME_LOG_FAILURE_META.pop(cache_key, None)
     GAME_LOG_CACHE[cache_key] = {"timestamp": time.time(), "rows": rows}
@@ -3031,7 +3390,7 @@ def fetch_player_game_log(player_id: int, season: str, season_type: str) -> list
 
 
 def fetch_recent_player_game_log(player_id: int, season: str, season_type: str, last_n: int) -> list[dict[str, Any]]:
-    cache_key = (player_id, season, season_type, int(last_n))
+    cache_key = (player_id, season, season_type, int(last_n), GAME_LOG_CACHE_SCHEMA_VERSION)
     cached = RECENT_GAME_LOG_CACHE.get(cache_key)
     now_ts = time.time()
 
@@ -3102,7 +3461,7 @@ def fetch_team_roster(team_id: int, season: str) -> list[dict[str, Any]]:
             payload = {"timestamp": time.time(), "rows": rows}
             ROSTER_CACHE[cache_key] = payload
             TEAM_ROSTER_FAILURE_META.pop(cache_key, None)
-            save_persistent_caches()
+            save_persistent_caches_async()
             return rows
         except HTTPException:
             raise
@@ -3159,7 +3518,7 @@ def fetch_common_player_info(player_id: int) -> dict[str, Any]:
             row = df.to_dict(orient="records")[0]
             PLAYER_INFO_CACHE[player_id] = {"timestamp": time.time(), "row": row}
             PLAYER_INFO_FAILURE_META.pop(player_id, None)
-            save_persistent_caches()
+            save_persistent_caches_async()
             return row
         except HTTPException:
             raise
@@ -3572,6 +3931,28 @@ def resolve_team_from_text(team_text: str | None) -> dict[str, Any] | None:
     return TEAM_ALIAS_LOOKUP.get(key)
 
 
+def resolve_opponent_team_from_matchup(matchup: str, player_team_id: int | None) -> dict[str, Any] | None:
+    """Parse a MATCHUP string (e.g. 'LAL vs. GSW' or 'LAL @ GSW') and return the
+    opponent team dict, excluding the player's own team identified by player_team_id."""
+    info = parse_matchup_descriptor(matchup)
+    team_abbr = info.get('team_abbreviation', '')
+    opp_abbr = info.get('opponent_abbreviation', '')
+
+    team_candidate = TEAM_ALIAS_LOOKUP.get(normalize_name(team_abbr)) if team_abbr else None
+    opp_candidate = TEAM_ALIAS_LOOKUP.get(normalize_name(opp_abbr)) if opp_abbr else None
+
+    # If we know the player's team, return whichever candidate is NOT their team
+    if player_team_id is not None:
+        if opp_candidate and int(opp_candidate.get('id') or 0) != player_team_id:
+            return opp_candidate
+        if team_candidate and int(team_candidate.get('id') or 0) != player_team_id:
+            return team_candidate
+        return opp_candidate  # fallback
+
+    # No team context — return the opponent abbreviation side
+    return opp_candidate or team_candidate
+
+
 def find_player_by_name(player_name: str, team_id: int | None = None) -> dict[str, Any] | None:
     needles = build_player_name_variants(player_name)
     if not needles:
@@ -3628,18 +4009,57 @@ def estimate_model_probabilities(
     opportunity: dict[str, Any] | None = None,
     team_context: dict[str, Any] | None = None,
     environment: dict[str, Any] | None = None,
+    variance: dict[str, Any] | None = None,
 ) -> tuple[float, float]:
     opportunity = opportunity or {}
     team_context = team_context or {}
     environment = environment or {}
+    variance = variance or {}
 
     base = hit_rate_pct / 100.0
     edge_term = 0.0
     scale = max(1.0, max(line, 1.0) * 0.18)
     edge_term += clamp((average - line) / scale, -0.18, 0.18)
+
+    # --- Variance-aware adjustment ---
+    # If we have distribution data, prefer median over mean for edge, and penalize high variance
+    variance_adjustment = 0.0
+    if variance:
+        std_dev = float(variance.get("std_dev") or 0.0)
+        median = float(variance.get("median") or average)
+        consistency_score = float(variance.get("consistency_score") or 50.0)
+        p25 = float(variance.get("p25") or 0.0)
+        p75 = float(variance.get("p75") or 0.0)
+
+        # Median-based edge: more robust than mean for skewed distributions
+        median_edge_term = clamp((median - line) / scale, -0.18, 0.18)
+        # Blend mean-edge and median-edge (median weighted higher for noisy stats)
+        noisy_stats = {"STL", "BLK", "3PM"}
+        median_weight = 0.65 if stat in noisy_stats else 0.45
+        edge_term = edge_term * (1 - median_weight) + median_edge_term * median_weight
+
+        # Consistency penalty: highly inconsistent players get shrinkage toward 0.5
+        consistency_factor = consistency_score / 100.0  # 0.0 - 1.0
+        variance_adjustment = clamp((consistency_factor - 0.5) * 0.10, -0.06, 0.06)
+
+        # Percentile-based confidence: if p25 > line → floor is above line (strong over signal)
+        if p25 > line:
+            variance_adjustment += 0.05
+        elif p75 < line:
+            variance_adjustment -= 0.05
+
+        # High std_dev relative to line → dampen edge (more uncertainty)
+        cv = float(variance.get("cv") or 0.0)
+        if cv > 0.5:
+            # Very volatile player — shrink edge contribution
+            edge_term *= max(0.4, 1.0 - (cv - 0.5))
+
     matchup_term = 0.0
     if matchup_delta_pct is not None:
-        matchup_term = clamp(matchup_delta_pct / 100.0 * 0.2, -0.12, 0.12)
+        # Reduce matchup weight for volatile/noisy stats
+        noisy_stats = {"STL", "BLK"}
+        matchup_weight = 0.08 if stat in noisy_stats else 0.2
+        matchup_term = clamp(matchup_delta_pct / 100.0 * matchup_weight, -0.12, 0.12)
 
     role_term = 0.0
     if opportunity.get('minutes_trend') == 'up':
@@ -3662,7 +4082,7 @@ def estimate_model_probabilities(
     elif isinstance(environment.get('rest_days'), int) and environment.get('rest_days') >= 2:
         environment_term += 0.02
 
-    model_over = clamp(base + edge_term + matchup_term + role_term + environment_term, 0.02, 0.98)
+    model_over = clamp(base + edge_term + matchup_term + role_term + environment_term + variance_adjustment, 0.02, 0.98)
     return round(model_over, 4), round(1 - model_over, 4)
 
 
@@ -3685,15 +4105,111 @@ def build_prop_analysis_payload(
     min_fga: float | None = None,
     max_fga: float | None = None,
     h2h_only: bool = False,
+    opponent_rank_range: str | None = None,
+    without_player_id: int | None = None,
+    without_player_name: str | None = None,
+    without_player_ids: list[int] | None = None,
+    without_player_names: list[str] | None = None,
     debug: bool = False,
     override_opponent_id: int | None = None,
 ) -> dict[str, Any]:
-    cache_key = (player_id, stat, float(line), int(last_n), season, season_type, team_id, player_position or '', location, result, margin_min, margin_max, min_minutes, max_minutes, min_fga, max_fga, h2h_only, override_opponent_id)
+    normalized_without_player_ids = normalize_without_player_ids(without_player_ids)
+    if not normalized_without_player_ids and without_player_id:
+        normalized_without_player_ids = [int(without_player_id)]
+    normalized_without_player_names = resolve_without_player_names(normalized_without_player_ids)
+    if not normalized_without_player_names and without_player_name:
+        fallback_name = str(without_player_name).strip()
+        if fallback_name:
+            normalized_without_player_names = [fallback_name]
+    # NOTE: last_n is intentionally excluded from the cache key.
+    # All window sizes (5 / 10 / 15) share the same filtered_pool cached here.
+    # last_n slicing happens after cache retrieval so they never diverge.
+    cache_key = (ANALYSIS_CACHE_SCHEMA_VERSION, player_id, stat, float(line), season, season_type, team_id, player_position or '', location, result, margin_min, margin_max, min_minutes, max_minutes, min_fga, max_fga, h2h_only, str(opponent_rank_range or ''), tuple(normalized_without_player_ids), tuple(normalized_without_player_names), override_opponent_id)
     cached = ANALYSIS_CACHE.get(cache_key)
     now_ts = time.time()
     analysis_cache_age = now_ts - float(cached.get('timestamp') or 0.0) if cached else None
     if cached and analysis_cache_age is not None and analysis_cache_age < ANALYSIS_CACHE_TTL_SECONDS:
         payload = copy.deepcopy(cached['payload'])
+        # Re-slice and recompute ALL last_n-dependent fields from the cached filtered_pool
+        cached_filtered_pool = cached.get('filtered_pool', [])
+        if cached_filtered_pool:
+            sliced_rows = cached_filtered_pool[:last_n]
+            sliced_stat_summary = build_stat_summary_block(sliced_rows, stat, line)
+            payload['games'] = list(reversed(sliced_stat_summary['games']))
+            payload['average'] = sliced_stat_summary['average']
+            payload['hit_count'] = sliced_stat_summary['hit_count']
+            payload['hit_rate'] = sliced_stat_summary['hit_rate']
+            payload['games_count'] = len(sliced_stat_summary['values'])
+            payload['last_n'] = last_n
+            payload['variance'] = sliced_stat_summary.get('variance') or {}
+            sliced_opportunity = build_opportunity_context(cached_filtered_pool, last_n)
+            payload['opportunity'] = sliced_opportunity
+            # --- Recompute model outputs that depend on last_n sample ---
+            _cached_vs_position = (payload.get('matchup') or {}).get('vs_position')
+            _cached_matchup_delta = (_cached_vs_position or {}).get('delta_pct') if isinstance(_cached_vs_position, dict) else None
+            _cached_team_context = payload.get('team_context') or {}
+            _cached_environment = payload.get('environment') or {}
+            _cached_availability = payload.get('availability') or {}
+            _cached_player = payload.get('player') or {}
+            _sliced_model_over, _sliced_model_under = estimate_model_probabilities(
+                hit_rate_pct=float(sliced_stat_summary['hit_rate']),
+                average=float(sliced_stat_summary['average']),
+                line=float(line),
+                matchup_delta_pct=float(_cached_matchup_delta) if _cached_matchup_delta is not None else None,
+                stat=str(stat),
+                opportunity=sliced_opportunity,
+                team_context=_cached_team_context,
+                environment=_cached_environment,
+                variance=sliced_stat_summary.get('variance') or {},
+            )
+            _sliced_recommended_side = 'OVER' if _sliced_model_over >= _sliced_model_under else 'UNDER'
+            _sliced_side_prob = _sliced_model_over if _sliced_recommended_side == 'OVER' else _sliced_model_under
+            _sliced_edge = round((_sliced_side_prob - 0.50) * 100, 1)
+            _sliced_ev = _sliced_side_prob - 0.50
+            _sliced_confidence = build_confidence_engine(
+                side=_sliced_recommended_side,
+                hit_rate=float(sliced_stat_summary['hit_rate']),
+                games_count=int(len(sliced_stat_summary['values'])),
+                edge=_sliced_edge,
+                ev=_sliced_ev,
+                matchup_delta_pct=float(_cached_matchup_delta) if _cached_matchup_delta is not None else None,
+                availability=_cached_availability,
+                opportunity=sliced_opportunity,
+                team_context=_cached_team_context,
+                environment=_cached_environment,
+                stat=str(stat),
+                player_position=str(_cached_player.get('position') or ''),
+                line=float(line),
+                average=float(sliced_stat_summary['average']),
+            )
+            payload['recommended_side'] = _sliced_recommended_side
+            payload['confidence'] = _sliced_confidence
+            # Recompute traffic light
+            _sliced_traffic_tone = 'yellow'
+            _sliced_traffic_label = 'Caution'
+            if _cached_availability.get('is_unavailable'):
+                _sliced_traffic_tone = 'red'
+                _sliced_traffic_label = 'Avoid'
+            elif _sliced_confidence['score'] >= 80:
+                _sliced_traffic_tone = 'green'
+                _sliced_traffic_label = f"Strong {_sliced_recommended_side}"
+            elif _sliced_confidence['score'] >= 68:
+                _sliced_traffic_tone = 'green'
+                _sliced_traffic_label = f"Lean {_sliced_recommended_side}"
+            elif _sliced_confidence['score'] <= 44:
+                _sliced_traffic_tone = 'red'
+                _sliced_traffic_label = 'Pass'
+            payload['traffic_light'] = {
+                'label': _sliced_traffic_label,
+                'tone': _sliced_traffic_tone,
+                'summary': _sliced_confidence.get('summary') or (payload.get('interpretation') or {}).get('market_takeaway') or '',
+            }
+            # Small sample warning
+            sliced_count = len(sliced_stat_summary['values'])
+            if sliced_count < 5:
+                payload['sample_warning'] = f"Only {sliced_count} games in filtered sample — treat recommendation with caution."
+            else:
+                payload.pop('sample_warning', None)
         freshness = {"analysis_cached_seconds_ago": round(analysis_cache_age, 2)}
         if HYBRID_ANALYZER_ENABLED:
             player_cache_rows, _ = get_player_game_log_hybrid(player_id=player_id, season=season, season_type=season_type)
@@ -3805,6 +4321,26 @@ def build_prop_analysis_payload(
         )
     else:
         enriched_rows = enrich_game_logs_light(season_rows)
+
+    opponent_rank_min, opponent_rank_max, normalized_opponent_rank_range = normalize_opponent_rank_range(opponent_rank_range)
+    if opponent_rank_min is not None or opponent_rank_max is not None:
+        team_rank_map = build_team_rank_map(season=season, season_type=season_type)
+        for row in enriched_rows:
+            matchup = str(row.get('MATCHUP') or '')
+            opp_team = resolve_opponent_team_from_matchup(matchup, resolved_team_id)
+            opp_team_id = int(opp_team['id']) if opp_team else None
+            row['_opponent_rank'] = team_rank_map.get(opp_team_id) if opp_team_id else None
+    else:
+        for row in enriched_rows:
+            row.setdefault('_opponent_rank', None)
+
+    without_player_game_ids = build_without_player_union_game_ids(normalized_without_player_ids, season=season, season_type=season_type)
+    if not normalized_without_player_names and without_player_name:
+        fallback_name = str(without_player_name).strip()
+        if fallback_name:
+            normalized_without_player_names = [fallback_name]
+    without_player_name = ', '.join(normalized_without_player_names)
+
     filtered_pool = apply_game_log_filters(
         enriched_rows,
         location=location,
@@ -3817,12 +4353,15 @@ def build_prop_analysis_payload(
         max_fga=max_fga,
         h2h_only=h2h_only,
         opponent_abbreviation=(next_game or {}).get('opponent_abbreviation'),
+        opponent_rank_min=opponent_rank_min,
+        opponent_rank_max=opponent_rank_max,
+        without_player_game_ids=without_player_game_ids,
     )
     rows = filtered_pool[:last_n]
 
     cache_status = {
         "analysis_cache": "miss",
-        "game_log_cache": "hit" if GAME_LOG_CACHE.get((player_id, season, season_type)) else "miss",
+        "game_log_cache": "hit" if GAME_LOG_CACHE.get((player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)) else "miss",
         "player_info_cache": "hit" if PLAYER_INFO_CACHE.get(player_id) else "miss",
         "next_game_cache": "hit" if TEAM_NEXT_GAME_CACHE.get((resolved_team_id, season, season_type)) else "miss",
         "position_matchup_cache": "unknown",
@@ -3842,6 +4381,9 @@ def build_prop_analysis_payload(
         max_fga=max_fga,
         h2h_only=h2h_only,
         opponent_abbreviation=(next_game or {}).get('opponent_abbreviation'),
+        opponent_rank_min=opponent_rank_min,
+        opponent_rank_max=opponent_rank_max,
+        without_player_game_ids=without_player_game_ids,
     )
     if FILTERED_POOL_CACHE.get(filtered_pool_cache_key):
         cache_status["filtered_pool_cache"] = "hit"
@@ -3901,7 +4443,7 @@ def build_prop_analysis_payload(
         return build_opportunity_context(analysis_source_rows, last_n)
 
     def _compute_team_context() -> dict[str, Any]:
-        return build_team_opportunity_context(team_name=team_name, player_name=player["full_name"], stat=stat)
+        return build_team_opportunity_context(team_name=team_name, player_name=player["full_name"], stat=stat, player_position=resolved_position, team_id=resolved_team_id, season=season)
 
     def _compute_environment() -> dict[str, Any]:
         return build_game_environment_context(analysis_source_rows, next_game, team_id=resolved_team_id, season=season, season_type=season_type)
@@ -3918,6 +4460,57 @@ def build_prop_analysis_payload(
         opportunity = _compute_opportunity()
         team_context = _compute_team_context()
         environment = _compute_environment()
+
+    matchup_delta_pct = (vs_position or {}).get('delta_pct') if isinstance(vs_position, dict) else None
+    variance_data = stat_summary.get("variance") or {}
+    model_over, model_under = estimate_model_probabilities(
+        hit_rate_pct=float(hit_rate),
+        average=float(average),
+        line=float(line),
+        matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
+        stat=str(stat),
+        opportunity=opportunity,
+        team_context=team_context,
+        environment=environment,
+        variance=variance_data,
+    )
+    recommended_side = 'OVER' if model_over >= model_under else 'UNDER'
+    # True edge: model probability minus fair implied probability (50% when no market odds)
+    # If market odds are available via vs_position or other context, use them; otherwise use 0.5 as fair line
+    side_model_prob = model_over if recommended_side == 'OVER' else model_under
+    fair_implied = 0.50  # default fair market (no-vig line assumed at 50%)
+    chosen_edge = round((side_model_prob - fair_implied) * 100, 1)  # expressed as percentage edge
+    chosen_ev = side_model_prob - fair_implied  # expected value vs fair line
+    confidence_engine = build_confidence_engine(
+        side=recommended_side,
+        hit_rate=float(hit_rate),
+        games_count=int(len(values)),
+        edge=chosen_edge,
+        ev=chosen_ev,
+        matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
+        availability=availability,
+        opportunity=opportunity,
+        team_context=team_context,
+        environment=environment,
+        stat=stat,
+        player_position=resolved_position,
+        line=line,
+        average=average,
+    )
+    traffic_tone = 'yellow'
+    traffic_label = 'Caution'
+    if availability.get('is_unavailable'):
+        traffic_tone = 'red'
+        traffic_label = 'Avoid'
+    elif confidence_engine['score'] >= 80:
+        traffic_tone = 'green'
+        traffic_label = f"Strong {recommended_side}"
+    elif confidence_engine['score'] >= 68:
+        traffic_tone = 'green'
+        traffic_label = f"Lean {recommended_side}"
+    elif confidence_engine['score'] <= 44:
+        traffic_tone = 'red'
+        traffic_label = 'Pass'
 
     interpretation = build_analyzer_interpretation(
         stat=stat,
@@ -3942,6 +4535,9 @@ def build_prop_analysis_payload(
         min_fga=min_fga,
         max_fga=max_fga,
         h2h_only=h2h_only,
+        opponent_rank_range=normalized_opponent_rank_range,
+        without_player_name=without_player_name,
+        without_player_names=normalized_without_player_names,
         debug=debug,
     )
 
@@ -3986,13 +4582,29 @@ def build_prop_analysis_payload(
         "opportunity": opportunity,
         "team_context": team_context,
         "environment": environment,
+        "confidence": confidence_engine,
+        "recommended_side": recommended_side,
+        "traffic_light": {
+            "label": traffic_label,
+            "tone": traffic_tone,
+            "summary": confidence_engine.get("summary") or interpretation.get("market_takeaway") or interpretation.get("summary"),
+        },
         "interpretation": interpretation,
         "active_filters": filter_summary,
+        "filter_options": {
+            "opponent_rank_range": normalized_opponent_rank_range,
+            "without_player_id": int(normalized_without_player_ids[0]) if normalized_without_player_ids else None,
+            "without_player_ids": normalized_without_player_ids,
+            "without_player_name": without_player_name,
+            "without_player_names": normalized_without_player_names,
+        },
         "filtered_pool_count": len(filtered_pool),
         "season_pool_count": len(season_rows),
+        "variance": variance_data,
+        "sample_warning": f"Only {len(values)} games in filtered sample — treat recommendation with caution." if len(values) < 5 else None,
     }
     freshness = {
-        "game_log_seconds_ago": round(time.time() - float((GAME_LOG_CACHE.get((player_id, season, season_type)) or {}).get("timestamp") or 0.0), 2) if GAME_LOG_CACHE.get((player_id, season, season_type)) else None,
+        "game_log_seconds_ago": round(time.time() - float((GAME_LOG_CACHE.get((player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)) or {}).get("timestamp") or 0.0), 2) if GAME_LOG_CACHE.get((player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)) else None,
         "player_info_seconds_ago": round(time.time() - float((PLAYER_INFO_CACHE.get(player_id) or {}).get("timestamp") or 0.0), 2) if PLAYER_INFO_CACHE.get(player_id) else None,
         "next_game_seconds_ago": round(time.time() - float((TEAM_NEXT_GAME_CACHE.get((resolved_team_id, season, season_type)) or {}).get("timestamp") or 0.0), 2) if TEAM_NEXT_GAME_CACHE.get((resolved_team_id, season, season_type)) else None,
         "game_log_source": game_log_meta.get("source") if 'game_log_meta' in locals() else None,
@@ -4004,7 +4616,7 @@ def build_prop_analysis_payload(
         "injury_report_seconds_ago": round(time.time() - float(INJURY_REPORT_CACHE.get("timestamp") or 0.0), 2) if INJURY_REPORT_CACHE.get("timestamp") else None,
     }
     payload["freshness"] = dict(freshness)
-    ANALYSIS_CACHE[cache_key] = {"timestamp": time.time(), "payload": copy.deepcopy(payload)}
+    ANALYSIS_CACHE[cache_key] = {"timestamp": time.time(), "payload": copy.deepcopy(payload), "filtered_pool": [dict(r) for r in filtered_pool]}
     if debug and DEBUG_METADATA_ENABLED:
         payload["debug"] = build_debug_metadata(cache_status=cache_status, freshness=freshness, timings_enabled=NBA_TIMING_ENABLED)
     return payload
@@ -4201,7 +4813,7 @@ def resolve_team_next_game(
     if scoreboard_next_game:
         TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": time.time(), "row": scoreboard_next_game}
         NEXT_GAME_FAILURE_META.pop(cache_key, None)
-        save_persistent_caches()
+        save_persistent_caches_async()
         return scoreboard_next_game
 
     next_game_row = fetch_next_game(primary_player_id, season, season_type)
@@ -4209,7 +4821,7 @@ def resolve_team_next_game(
     if next_game:
         TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": time.time(), "row": next_game}
         NEXT_GAME_FAILURE_META.pop(cache_key, None)
-        save_persistent_caches()
+        save_persistent_caches_async()
         return next_game
 
     NEXT_GAME_FAILURE_META[cache_key] = {"timestamp": time.time()}
@@ -4217,7 +4829,7 @@ def resolve_team_next_game(
         return cached.get("row")
 
     TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": time.time(), "row": None}
-    save_persistent_caches()
+    save_persistent_caches_async()
     return None
 
 
@@ -4226,7 +4838,11 @@ def resolve_team_next_game(
 @app.on_event("startup")
 def _startup_warm_cache() -> None:
     start_hybrid_refresh_workers()
-    warm_cache_on_startup()
+    # Run cache warming in a background thread so uvicorn can start serving
+    # immediately. This ensures Render's health check at /health passes right
+    # away instead of timing out while 30 roster fetches + injury PDF download
+    # block the startup event handler.
+    threading.Thread(target=warm_cache_on_startup, name="startup-warm-cache", daemon=True).start()
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def root() -> FileResponse:
@@ -4642,6 +5258,10 @@ def market_scan(
             opportunity=analysis.get("opportunity") or {},
             team_context=analysis.get("team_context") or {},
             environment=analysis.get("environment") or {},
+            stat=str(bulk_row["stat"]),
+            player_position=analysis.get("player", {}).get("position") or '',
+            line=float(bulk_row["line"]),
+            average=float(analysis["average"]),
         )
 
         display_side = best_side
@@ -4719,6 +5339,9 @@ def market_scan(
                 "confidence_score": confidence_engine["score"],
                 "confidence_summary": confidence_engine["summary"],
                 "confidence_tone": confidence_engine["tone"],
+                "confidence_tier": confidence_engine.get("tier"),
+                "confidence_tags": confidence_engine.get("tags") or [],
+                "confidence_components": confidence_engine.get("components") or {},
                 "playable": not availability.get("is_unavailable", False),
                 "user_read": analysis.get("interpretation", {}).get("market_takeaway") or confidence_engine["summary"],
             },
@@ -4814,7 +5437,8 @@ def odds_player_props_import(payload: dict[str, Any] = Body(...)) -> dict[str, A
     }
 
 
-def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[str, Any]:
+@app.post("/api/parlay-builder")
+def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """
     Scrape selected NBA events + all markets in batches using rotating API keys,
     analyze every prop via the existing bulk engine, rank by hit rate, and build
@@ -4832,14 +5456,6 @@ def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[s
       season_type   str         – "Regular Season"
       batch_size    int         – events per batch (default 3, keeps credit bursts small)
     """
-    def _emit_progress(progress: int, stage: str, message: str) -> None:
-        if progress_cb:
-            try:
-                progress_cb(progress, stage, message)
-            except Exception:
-                pass
-
-    _emit_progress(2, "validation", "Validating parlay request…")
     # ── Validate inputs ─────────────────────────────────────────────────
     raw_keys = payload.get("api_keys") or []
     if isinstance(raw_keys, str):
@@ -4879,12 +5495,10 @@ def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[s
         return key
 
     if requested_event_ids:
-        _emit_progress(8, "events", "Using selected events from the picker…")
         # User already selected specific events — build stub dicts directly
         # so we don't spend a credit on the events list
         events: list[dict[str, Any]] = [{"id": eid} for eid in requested_event_ids]
     else:
-        _emit_progress(8, "events", "Fetching today's events from The Odds API…")
         try:
             events_result = odds_api_fetch(
                 f"/sports/{sport}/events",
@@ -4897,7 +5511,6 @@ def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[s
         events = events_result["data"] or []
         quota_log.append({"call": "events_list", "quota": events_result["quota"]})
 
-    _emit_progress(12, "events", f"Resolved {len(events)} event(s) to scrape.")
     if not events:
         return {
             "legs": legs,
@@ -4915,11 +5528,9 @@ def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[s
     all_import_rows: list[dict[str, Any]] = []
     scrape_errors: list[dict[str, Any]] = []
 
-    total_events = max(1, len(events))
     for batch_start in range(0, len(events), batch_size):
         batch = events[batch_start: batch_start + batch_size]
-        for event_idx, event in enumerate(batch, start=batch_start + 1):
-            _emit_progress(min(42, 12 + int((event_idx / total_events) * 28)), "odds", f"Fetching odds for event {event_idx} of {total_events}…")
+        for event in batch:
             event_id = str(event.get("id") or "")
             if not event_id:
                 continue
@@ -4953,7 +5564,6 @@ def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[s
             except Exception as exc:
                 scrape_errors.append({"event_id": event_id, "reason": str(exc)})
 
-    _emit_progress(45, "odds", f"Fetched odds rows for {len(all_import_rows)} props.")
     if not all_import_rows:
         return {
             "legs": legs,
@@ -4967,42 +5577,45 @@ def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[s
             "message": "No props found across today's events. Check your API keys or try again later.",
         }
 
-    # ── Phase 3a: Optional player-context pre-warm ──────────────────────
-    _emit_progress(48, "prewarm", "Pre-warming player context…")
-    if PARLAY_HOSTED_PREWARM_PLAYER_CONTEXT:
-        try:
-            _bulk_dash = LeagueDashPlayerStats(
-                season=season,
-                season_type_all_star=season_type,
-                per_mode_detailed="PerGame",
-                timeout=15,
-            )
-            _bulk_df = _bulk_dash.get_data_frames()[0]
-            _bulk_rows = _bulk_df.to_dict(orient="records") if not _bulk_df.empty else []
-            _dash_lookup: dict[int, dict[str, Any]] = {
-                int(r.get("PLAYER_ID", 0)): r for r in _bulk_rows if r.get("PLAYER_ID")
-            }
-            now_ts_bulk = time.time()
-            for row in _bulk_rows:
-                pid = int(row.get("PLAYER_ID", 0))
-                if not pid:
-                    continue
-                if pid not in PLAYER_INFO_CACHE or (now_ts_bulk - float((PLAYER_INFO_CACHE.get(pid) or {}).get("timestamp", 0))) > PROFILE_TTL_SECONDS:
-                    team_id_val = row.get("TEAM_ID")
-                    PLAYER_INFO_CACHE[pid] = {
-                        "timestamp": now_ts_bulk,
-                        "row": {
-                            "TEAM_ID": team_id_val,
-                            "TEAM_ABBREVIATION": row.get("TEAM_ABBREVIATION", ""),
-                            "POSITION": row.get("PLAYER_POSITION", ""),
-                            "DISPLAY_FIRST_LAST": row.get("PLAYER_NAME", ""),
-                        }
+    # ── Phase 3a: Pre-warm game-log cache with one bulk LeagueDash call ────
+    # This single call fetches season stats for ALL players, warming the cache
+    # so individual fetch_player_game_log calls hit cache instead of NBA API.
+    try:
+        _bulk_dash = LeagueDashPlayerStats(
+            season=season,
+            season_type_all_star=season_type,
+            per_mode_detailed="PerGame",
+            timeout=15,
+        )
+        _bulk_df = _bulk_dash.get_data_frames()[0]
+        # Build a quick lookup so we can seed GAME_LOG_CACHE for each player
+        # (LeagueDash gives season averages, not per-game logs — we can't fully
+        # replace PlayerGameLog, but we CAN use it to pre-populate player info
+        # and skip fetch_common_player_info calls for every player.)
+        _bulk_rows = _bulk_df.to_dict(orient="records") if not _bulk_df.empty else []
+        _dash_lookup: dict[int, dict[str, Any]] = {
+            int(r.get("PLAYER_ID", 0)): r for r in _bulk_rows if r.get("PLAYER_ID")
+        }
+        # Seed PLAYER_INFO_CACHE for every player we're about to analyze
+        now_ts_bulk = time.time()
+        for row in _bulk_rows:
+            pid = int(row.get("PLAYER_ID", 0))
+            if not pid:
+                continue
+            if pid not in PLAYER_INFO_CACHE or (now_ts_bulk - float((PLAYER_INFO_CACHE.get(pid) or {}).get("timestamp", 0))) > PROFILE_TTL_SECONDS:
+                team_id_val = row.get("TEAM_ID")
+                PLAYER_INFO_CACHE[pid] = {
+                    "timestamp": now_ts_bulk,
+                    "row": {
+                        "TEAM_ID": team_id_val,
+                        "TEAM_ABBREVIATION": row.get("TEAM_ABBREVIATION", ""),
+                        "POSITION": row.get("PLAYER_POSITION", ""),
+                        "DISPLAY_FIRST_LAST": row.get("PLAYER_NAME", ""),
                     }
-            LOGGER.info("Parlay pre-warm: seeded PLAYER_INFO_CACHE for %d players from LeagueDash", len(_dash_lookup))
-        except Exception as _bulk_exc:
-            LOGGER.warning("Parlay pre-warm LeagueDash failed (non-fatal): %s", _bulk_exc)
-    else:
-        _emit_progress(48, "prewarm", "Hosted-safe mode: skipping heavy LeagueDash pre-warm.")
+                }
+        LOGGER.info("Parlay pre-warm: seeded PLAYER_INFO_CACHE for %d players from LeagueDash", len(_dash_lookup))
+    except Exception as _bulk_exc:
+        LOGGER.warning("Parlay pre-warm LeagueDash failed (non-fatal): %s", _bulk_exc)
 
     # ── Phase 3: Bulk-analyze all props in one shot (free, parallel) ──
     defaults = {"last_n": last_n, "season": season, "season_type": season_type}
@@ -5037,23 +5650,17 @@ def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[s
             seen_analysis_keys.add(ak)
             deduped_prepared.append((bulk_row, orig_row))
 
-    if len(deduped_prepared) > PARLAY_MAX_UNIQUE_ANALYSES:
-        LOGGER.info("Parlay hosted-safe cap: trimming unique analyses from %d to %d", len(deduped_prepared), PARLAY_MAX_UNIQUE_ANALYSES)
-        deduped_prepared = deduped_prepared[:PARLAY_MAX_UNIQUE_ANALYSES]
-
     # Pre-warm game log cache concurrently for all unique player IDs
     # This fires off all PlayerGameLog requests in parallel with a short timeout
     # so the sequential analysis loop below hits cache instead of blocking 1-by-1.
-    _emit_progress(58, "analysis", f"Preparing {len(deduped_prepared)} unique prop analyses…")
     unique_player_ids: set[int] = {int(br["player_id"]) for br, _ in deduped_prepared}
     already_cached_ids: set[int] = {
         pid for pid in unique_player_ids
-        if GAME_LOG_CACHE.get((pid, season, season_type)) and
-           (time.time() - float(GAME_LOG_CACHE[(pid, season, season_type)].get("timestamp", 0))) < CACHE_TTL_SECONDS
+        if GAME_LOG_CACHE.get((pid, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)) and
+           (time.time() - float(GAME_LOG_CACHE[(pid, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)].get("timestamp", 0))) < CACHE_TTL_SECONDS
     }
     ids_to_fetch = unique_player_ids - already_cached_ids
-    if ids_to_fetch and PARLAY_HOSTED_PREFETCH_GAME_LOGS:
-        _emit_progress(62, "analysis", f"Pre-fetching game logs for {len(ids_to_fetch)} players…")
+    if ids_to_fetch:
         LOGGER.info("Parlay pre-fetching game logs for %d uncached players", len(ids_to_fetch))
         def _prefetch_log(pid: int) -> None:
             try:
@@ -5064,10 +5671,7 @@ def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[s
         with ThreadPoolExecutor(max_workers=prewarm_workers) as _pre_ex:
             list(_pre_ex.map(_prefetch_log, ids_to_fetch))
         LOGGER.info("Parlay game-log pre-warm complete for %d players", len(ids_to_fetch))
-    elif ids_to_fetch:
-        _emit_progress(62, "analysis", f"Hosted-safe mode: skipping bulk game-log prefetch for {len(ids_to_fetch)} players.")
 
-    _emit_progress(70, "analysis", "Running prop analysis engine…")
     max_workers = min(BULK_ANALYSIS_MAX_WORKERS, max(1, len(deduped_prepared)))
 
     if max_workers <= 1:
@@ -5091,7 +5695,6 @@ def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[s
                     analysis_errors.append({"player_name": bulk_row["player_name"], "reason": str(exc)})
 
     # ── Phase 4: Score every prop by hit rate, pick best N legs ─────────
-    _emit_progress(88, "ranking", "Ranking props and building the final ticket…")
     scored: list[dict[str, Any]] = []
     for result, orig_row in analysis_rows:
         analysis = result.get("analysis") or {}
@@ -5120,10 +5723,30 @@ def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[s
         if odds < 1.40:
             continue
 
+        matchup = analysis.get("matchup") or {}
+        next_game_info = matchup.get("next_game") or {}
+        vs_position = matchup.get("vs_position") or {}
+        matchup_delta_pct = vs_position.get("delta_pct") if isinstance(vs_position, dict) else None
+        confidence_engine = build_confidence_engine(
+            side=side,
+            hit_rate=float(side_hit_rate),
+            games_count=int(analysis.get("games_count") or 0),
+            edge=round(abs(avg - line), 1),
+            ev=max(0.0, (side_hit_rate / 100.0) - decimal_implied_probability(odds)),
+            matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
+            availability=availability,
+            opportunity=analysis.get("opportunity") or {},
+            team_context=analysis.get("team_context") or {},
+            environment=analysis.get("environment") or {},
+            stat=stat,
+            player_position=(analysis.get("player") or {}).get("position") or '',
+            line=line,
+            average=avg,
+        )
+
         # Resolve team + opponent IDs from the analysis payload so the frontend
         # can auto-populate the analyzer without the user having to re-select manually.
         player_info    = analysis.get("player") or {}
-        next_game_info = (analysis.get("matchup") or {}).get("next_game") or {}
         resolved_team_id_scored    = player_info.get("team_id")
         resolved_opponent_team_id  = next_game_info.get("opponent_team_id")
         resolved_opponent_abbr     = str(next_game_info.get("opponent_abbreviation") or "").strip()
@@ -5152,6 +5775,12 @@ def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[s
             "availability": copy.deepcopy(availability),
             "matchup": copy.deepcopy(analysis.get("matchup") or {}),
             "environment": copy.deepcopy(analysis.get("environment") or {}),
+            "confidence": confidence_engine.get("grade"),
+            "confidence_score": confidence_engine.get("score"),
+            "confidence_tone": confidence_engine.get("tone"),
+            "confidence_tier": confidence_engine.get("tier"),
+            "confidence_summary": confidence_engine.get("summary"),
+            "confidence_tags": confidence_engine.get("tags") or [],
             "event_id": orig_row.get("event_id") or "",
             "game_label": orig_row.get("game_label") or "",
         })
@@ -5188,7 +5817,6 @@ def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[s
 
     all_errors = scrape_errors + analysis_errors
 
-    _emit_progress(100, "complete", "Parlay build complete.")
     return {
         "legs": legs,
         "parlay": parlay_legs,
@@ -5202,92 +5830,459 @@ def _compute_parlay_builder(payload: dict[str, Any], progress_cb=None) -> dict[s
     }
 
 
-@app.get("/api/parlay-builder/jobs/{job_id}")
-def get_parlay_builder_job(job_id: str) -> dict[str, Any]:
-    job = _get_parlay_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Parlay job not found or expired.")
-    result = job.get("result") or {}
+@app.get("/api/team-injuries")
+def get_team_injuries(team_name: str = Query(..., min_length=1)) -> dict[str, Any]:
+    """
+    Return injured/risky players for a team with their resolved NBA player IDs.
+    Used by the injury-aware parlay builder and Player Analyzer injury boost UI.
+    """
+    payload = fetch_latest_injury_report_payload()
+    rows = [row for row in (payload.get("rows") or []) if row.get("team_name") == team_name]
+
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        status = str(row.get("status") or "").strip()
+        if status not in UNAVAILABLE_STATUSES and status not in RISKY_STATUSES:
+            continue
+        raw_display = re.sub(r",(?!\s)", ", ", str(row.get("player_display") or "").strip())
+        # Convert "Last, First" → "First Last" for player lookup
+        parts = [p.strip() for p in raw_display.split(",")]
+        name_for_lookup = f"{parts[1]} {parts[0]}" if len(parts) == 2 else raw_display
+        player = find_player_by_name(name_for_lookup)
+        results.append({
+            "display_name": raw_display,
+            "lookup_name": name_for_lookup,
+            "player_id": int(player["id"]) if player else None,
+            "status": status,
+            "reason": str(row.get("reason") or "").strip(),
+            "is_unavailable": status in UNAVAILABLE_STATUSES,
+            "is_risky": status in RISKY_STATUSES,
+        })
+
+    results.sort(key=lambda p: (0 if p["is_unavailable"] else 1, p["display_name"]))
     return {
-        "job_id": job["job_id"],
-        "status": job.get("status") or "queued",
-        "progress": int(job.get("progress") or 0),
-        "stage": job.get("stage") or "Queued",
-        "message": job.get("message") or "",
-        "created_at": job.get("created_at"),
-        "updated_at": job.get("updated_at"),
-        "result_ready": (job.get("status") == "completed" and job.get("result") is not None),
-        "result_summary": {
-            "events_scraped": int(result.get("events_scraped") or 0),
-            "props_found": int(result.get("props_found") or 0),
-            "props_analyzed": int(result.get("props_analyzed") or 0),
-            "parlay_legs": len(result.get("parlay") or []),
-        } if job.get("status") == "completed" and result else None,
-        "error": job.get("error"),
+        "team_name": team_name,
+        "players": results,
+        "out_count": sum(1 for p in results if p["is_unavailable"]),
+        "risky_count": sum(1 for p in results if p["is_risky"]),
+        "report_label": payload.get("report_label", ""),
+        "ok": payload.get("ok", False),
     }
 
-@app.get("/api/parlay-builder/jobs/{job_id}/result")
-def get_parlay_builder_job_result(job_id: str) -> dict[str, Any]:
-    job = _get_parlay_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Parlay job not found or expired.")
-    status = str(job.get("status") or "").lower()
-    if status != "completed":
-        raise HTTPException(status_code=409, detail="Parlay job is not completed yet.")
-    result = job.get("result")
-    if result is None:
-        raise HTTPException(status_code=404, detail="Parlay job result is not available.")
-    return copy.deepcopy(result)
 
+@app.post("/api/parlay-builder-injury-aware")
+def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """
+    Injury-aware variant of the parlay builder.
+    Identical scraping pipeline as /api/parlay-builder, but after scoring each prop,
+    re-runs the analysis with the team's injured players as without_player_ids.
+    Adaptive: tries 1 injured player first (most impactful), checks games_count >= 5,
+    falls back to no filter if sample is too small.
+    """
+    raw_keys = payload.get("api_keys") or []
+    if isinstance(raw_keys, str):
+        raw_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+    api_keys: list[str] = [str(k).strip() for k in raw_keys if str(k).strip()]
+    if not api_keys:
+        raise HTTPException(status_code=400, detail="Provide at least one Odds API key in 'api_keys'.")
 
-def _parlay_job_runner(job_id: str) -> None:
-    job = _get_parlay_job(job_id)
-    if not job:
-        return
-    payload = copy.deepcopy(job.get("payload") or {})
-    _set_parlay_job_fields(job_id, status="running", progress=3, stage="Starting", message="Starting background parlay build…")
+    legs = int(payload.get("legs") or 3)
+    if legs < 2 or legs > 6:
+        raise HTTPException(status_code=400, detail="'legs' must be between 2 and 6.")
 
-    def _job_progress(progress: int, stage: str, message: str) -> None:
-        _set_parlay_job_fields(job_id, progress=max(0, min(100, int(progress))), stage=stage, message=message)
+    sport       = str(payload.get("sport") or "basketball_nba")
+    regions     = str(payload.get("regions") or "us")
+    odds_format = str(payload.get("odds_format") or "decimal")
+    last_n      = int(payload.get("last_n") or 10)
+    season      = str(payload.get("season") or current_nba_season())
+    season_type = str(payload.get("season_type") or "Regular Season")
+    batch_size  = max(1, int(payload.get("batch_size") or 3))
+    bookmaker   = str(payload.get("bookmaker") or "draftkings").strip().lower()
+    markets     = ",".join(ODDS_DEFAULT_MARKETS)
 
+    requested_event_ids: set[str] = set()
+    raw_event_ids = payload.get("event_ids") or []
+    if isinstance(raw_event_ids, list):
+        requested_event_ids = {str(e).strip() for e in raw_event_ids if str(e).strip()}
+
+    key_index = 0
+    quota_log: list[dict[str, Any]] = []
+
+    def next_key() -> str:
+        nonlocal key_index
+        key = api_keys[key_index % len(api_keys)]
+        key_index += 1
+        return key
+
+    if requested_event_ids:
+        events: list[dict[str, Any]] = [{"id": eid} for eid in requested_event_ids]
+    else:
+        try:
+            events_result = odds_api_fetch(f"/sports/{sport}/events", next_key(), {"dateFormat": "iso"})
+        except HTTPException as exc:
+            raise HTTPException(status_code=exc.status_code, detail=f"Failed to fetch events: {exc.detail}")
+        events = events_result["data"] or []
+        quota_log.append({"call": "events_list", "quota": events_result["quota"]})
+
+    if not events:
+        return {"legs": legs, "parlay": [], "parlay_odds": None, "all_props_scored": [],
+                "events_scraped": 0, "props_found": 0, "errors": [], "quota_log": quota_log,
+                "injury_summary": [], "message": "No events found for today."}
+
+    all_import_rows: list[dict[str, Any]] = []
+    scrape_errors: list[dict[str, Any]] = []
+
+    for batch_start in range(0, len(events), batch_size):
+        batch = events[batch_start: batch_start + batch_size]
+        for event in batch:
+            event_id = str(event.get("id") or "")
+            if not event_id:
+                continue
+            try:
+                result = odds_api_fetch(
+                    f"/sports/{sport}/events/{event_id}/odds", next_key(),
+                    {"regions": regions, "markets": markets, "oddsFormat": odds_format,
+                     "dateFormat": "iso", "bookmakers": bookmaker},
+                )
+                quota_log.append({"call": f"event_{event_id[:8]}", "quota": result["quota"]})
+                rows = build_odds_import_rows(result["data"] or {}, odds_format)
+                all_import_rows.extend(rows)
+            except HTTPException as exc:
+                scrape_errors.append({"event_id": event_id, "reason": exc.detail, "status_code": exc.status_code})
+                if exc.status_code in (402, 429):
+                    key_index += 1
+            except Exception as exc:
+                scrape_errors.append({"event_id": event_id, "reason": str(exc)})
+
+    if not all_import_rows:
+        return {"legs": legs, "parlay": [], "parlay_odds": None, "all_props_scored": [],
+                "events_scraped": len(events), "props_found": 0, "errors": scrape_errors,
+                "quota_log": quota_log, "injury_summary": [],
+                "message": "No props found across today's events. Check your API keys or try again later."}
+
+    # Pre-warm caches (same as regular parlay builder)
     try:
-        result = _compute_parlay_builder(payload, progress_cb=_job_progress)
-        _set_parlay_job_fields(job_id, status="completed", progress=100, stage="Complete", message="Parlay build complete.", result=result, error=None)
-    except HTTPException as exc:
-        _set_parlay_job_fields(job_id, status="failed", stage="Failed", message=str(exc.detail), error={"detail": exc.detail, "status_code": exc.status_code})
-    except Exception as exc:
-        LOGGER.exception("Parlay background job %s failed", job_id)
-        _set_parlay_job_fields(job_id, status="failed", stage="Failed", message=str(exc), error={"detail": str(exc), "status_code": 500})
+        _bulk_dash = LeagueDashPlayerStats(season=season, season_type_all_star=season_type,
+                                           per_mode_detailed="PerGame", timeout=15)
+        _bulk_df = _bulk_dash.get_data_frames()[0]
+        _bulk_rows = _bulk_df.to_dict(orient="records") if not _bulk_df.empty else []
+        now_ts_bulk = time.time()
+        for row in _bulk_rows:
+            pid = int(row.get("PLAYER_ID", 0))
+            if not pid:
+                continue
+            if pid not in PLAYER_INFO_CACHE or (now_ts_bulk - float((PLAYER_INFO_CACHE.get(pid) or {}).get("timestamp", 0))) > PROFILE_TTL_SECONDS:
+                PLAYER_INFO_CACHE[pid] = {
+                    "timestamp": now_ts_bulk,
+                    "row": {"TEAM_ID": row.get("TEAM_ID"), "TEAM_ABBREVIATION": row.get("TEAM_ABBREVIATION", ""),
+                            "POSITION": row.get("PLAYER_POSITION", ""), "DISPLAY_FIRST_LAST": row.get("PLAYER_NAME", "")},
+                }
+    except Exception as _e:
+        LOGGER.warning("Injury-aware parlay pre-warm failed (non-fatal): %s", _e)
 
+    # ── Pre-fetch injury report once ─────────────────────────────────────
+    try:
+        inj_report = fetch_latest_injury_report_payload()
+    except Exception:
+        inj_report = {"ok": False, "rows": []}
 
-@app.post("/api/parlay-builder/jobs")
-def create_parlay_builder_job(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    existing = _find_existing_parlay_job_by_fingerprint(_parlay_payload_fingerprint(copy.deepcopy(payload)))
-    if existing:
+    # Build per-team injured player IDs cache: team_name → list[int]
+    _team_injured_ids_cache: dict[str, list[int]] = {}
+
+    def get_injured_ids_for_team(team_name: str) -> list[int]:
+        if team_name in _team_injured_ids_cache:
+            return _team_injured_ids_cache[team_name]
+        # Normalize for fuzzy matching — injury report team names come from PDF parsing
+        # and may differ in casing/punctuation from NBA stats API team names.
+        norm_target = normalize_compact_text(team_name)
+        rows_inj = [r for r in (inj_report.get("rows") or [])
+                    if normalize_compact_text(str(r.get("team_name") or "")) == norm_target]
+        ids: list[int] = []
+        for row in rows_inj:
+            status = str(row.get("status") or "")
+            if status not in UNAVAILABLE_STATUSES and status not in RISKY_STATUSES:
+                continue
+            raw_disp = re.sub(r",(?!\s)", ", ", str(row.get("player_display") or "").strip())
+            parts = [p.strip() for p in raw_disp.split(",")]
+            name_lk = f"{parts[1]} {parts[0]}" if len(parts) == 2 else raw_disp
+            player = find_player_by_name(name_lk)
+            if player:
+                ids.append(int(player["id"]))
+        _team_injured_ids_cache[team_name] = ids
+        return ids
+
+    defaults = {"last_n": last_n, "season": season, "season_type": season_type}
+    local_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+    analysis_rows: list[dict[str, Any]] = []
+    analysis_errors: list[dict[str, Any]] = []
+
+    prepared: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for row in all_import_rows:
+        player_name = str(row.get("player_name") or "").strip()
+        player = find_player_by_name(player_name)
+        if not player:
+            analysis_errors.append({"player_name": player_name, "reason": "Player not found."})
+            continue
+        bulk_row = {"player_id": int(player["id"]), "player_name": player_name,
+                    "stat": row["stat"], "line": row["line"], "team_id": None, "player_position": None}
+        prepared.append((bulk_row, row))
+
+    seen_analysis_keys: set[tuple[Any, ...]] = set()
+    deduped_prepared: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for bulk_row, orig_row in prepared:
+        ak = (bulk_row["player_id"], bulk_row["stat"], float(bulk_row["line"]))
+        if ak not in seen_analysis_keys:
+            seen_analysis_keys.add(ak)
+            deduped_prepared.append((bulk_row, orig_row))
+
+    unique_player_ids: set[int] = {int(br["player_id"]) for br, _ in deduped_prepared}
+    already_cached_ids = {pid for pid in unique_player_ids
+                          if GAME_LOG_CACHE.get((pid, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)) and
+                          (time.time() - float(GAME_LOG_CACHE[(pid, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)].get("timestamp", 0))) < CACHE_TTL_SECONDS}
+    ids_to_fetch = unique_player_ids - already_cached_ids
+    if ids_to_fetch:
+        def _prefetch_log(pid: int) -> None:
+            try:
+                fetch_player_game_log(player_id=pid, season=season, season_type=season_type)
+            except Exception:
+                pass
+        prewarm_workers = min(BULK_ANALYSIS_MAX_WORKERS, len(ids_to_fetch), 8)
+        with ThreadPoolExecutor(max_workers=prewarm_workers) as _pre_ex:
+            list(_pre_ex.map(_prefetch_log, ids_to_fetch))
+
+    max_workers = min(BULK_ANALYSIS_MAX_WORKERS, max(1, len(deduped_prepared)))
+
+    if max_workers <= 1:
+        for idx, (bulk_row, orig_row) in enumerate(deduped_prepared, start=1):
+            try:
+                result = _build_bulk_prop_item(idx, bulk_row, defaults, local_cache)
+                analysis_rows.append((result, orig_row))
+            except Exception as exc:
+                analysis_errors.append({"player_name": bulk_row["player_name"], "reason": str(exc)})
+    else:
+        futures_list: list[tuple[int, dict[str, Any], dict[str, Any], Any]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for idx, (bulk_row, orig_row) in enumerate(deduped_prepared, start=1):
+                fut = executor.submit(_build_bulk_prop_item, idx, bulk_row, defaults, local_cache)
+                futures_list.append((idx, bulk_row, orig_row, fut))
+            for idx, bulk_row, orig_row, fut in futures_list:
+                try:
+                    result = fut.result()
+                    analysis_rows.append((result, orig_row))
+                except Exception as exc:
+                    analysis_errors.append({"player_name": bulk_row["player_name"], "reason": str(exc)})
+
+    # ── Injury-aware scoring ─────────────────────────────────────────────
+    def injury_aware_score(result: dict[str, Any], orig_row: dict[str, Any]) -> dict[str, Any] | None:
+        """Score a prop with injury-aware without_player boosting."""
+        analysis = result.get("analysis") or {}
+        hit_rate = float(analysis.get("hit_rate") or 0)
+        avg      = float(analysis.get("average") or 0)
+        line     = float(result.get("line") or orig_row.get("line") or 0)
+        stat     = str(result.get("stat") or orig_row.get("stat") or "")
+
+        availability = analysis.get("availability") or {}
+        if availability.get("is_unavailable"):
+            return None
+        if float(orig_row.get("over_odds") or 1.91) < 1.40 and float(orig_row.get("under_odds") or 1.91) < 1.40:
+            return None
+
+        player_info = analysis.get("player") or {}
+        player_id   = int(result.get("player_id") or 0)
+        # player dict carries team_id but often no team_name — resolve via TEAM_LOOKUP.
+        # Fall back to TEAM_ALIAS_LOOKUP using orig_row team abbreviation if still empty.
+        team_id_raw = player_info.get("team_id") or 0
+        team_name   = str(player_info.get("team_name") or "")
+        if not team_name and team_id_raw:
+            team_name = TEAM_LOOKUP.get(int(team_id_raw), {}).get("full_name", "")
+        if not team_name:
+            # Last resort: derive from orig_row game_label (e.g. "HOU @ GSW") via abbreviation
+            game_label = str(orig_row.get("game_label") or "")
+            home_abbr  = str(orig_row.get("home_team") or "")
+            away_abbr  = str(orig_row.get("away_team") or "")
+            player_nm  = str(result.get("player_name") or "").lower()
+            for abbr in [home_abbr, away_abbr]:
+                candidate = TEAM_ALIAS_LOOKUP.get(abbr.strip().lower(), {})
+                if candidate:
+                    team_name = candidate.get("full_name", "")
+                    break
+        LOGGER.debug(
+            "injury_aware_score team resolution: player=%s team_id=%s → team_name=%r",
+            result.get("player_name"), team_id_raw, team_name
+        )
+
+        # Try injury-aware re-analysis
+        injury_boost = False
+        injury_filter_player_ids: list[int] = []
+        injury_filter_player_names: list[str] = []
+        team_injury_player_names: list[str] = []
+        base_hit_rate = hit_rate
+        base_games_count = int(analysis.get("games_count") or 0)
+
+        if team_name and player_id:
+            inj_ids = get_injured_ids_for_team(team_name)
+            # Collect names for display
+            team_injury_player_names = resolve_without_player_names(inj_ids)
+            # Try 1 injured player first, then up to 2 if sample is still good
+            for max_filters in [1, 2]:
+                candidate_ids = inj_ids[:max_filters]
+                if not candidate_ids:
+                    break
+                try:
+                    boosted_analysis = build_prop_analysis_payload(
+                        player_id=player_id,
+                        stat=stat,
+                        line=line,
+                        last_n=last_n,
+                        season=season,
+                        season_type=season_type,
+                        without_player_ids=candidate_ids,
+                    )
+                    boosted_games = int(boosted_analysis.get("games_count") or 0)
+                    boosted_hr    = float(boosted_analysis.get("hit_rate") or 0)
+                    if boosted_games >= 5 and boosted_hr > hit_rate:
+                        hit_rate = boosted_hr
+                        avg      = float(boosted_analysis.get("average") or avg)
+                        injury_boost = True
+                        injury_filter_player_ids = candidate_ids
+                        injury_filter_player_names = resolve_without_player_names(candidate_ids)
+                        base_games_count = boosted_games
+                        break  # good result with this many filters
+                    elif boosted_games >= 5:
+                        # Sample is usable but no boost — still record filter used
+                        injury_filter_player_ids = candidate_ids
+                        injury_filter_player_names = resolve_without_player_names(candidate_ids)
+                        base_games_count = boosted_games
+                        break
+                except Exception:
+                    break
+
+        if hit_rate >= 50:
+            side = "OVER"
+            odds = float(orig_row.get("over_odds") or 1.91)
+            side_hit_rate = hit_rate
+        else:
+            side = "UNDER"
+            odds = float(orig_row.get("under_odds") or 1.91)
+            side_hit_rate = 100.0 - hit_rate
+
+        if odds < 1.40:
+            return None
+
+        matchup = analysis.get("matchup") or {}
+        next_game_info = matchup.get("next_game") or {}
+        vs_position = matchup.get("vs_position") or {}
+        matchup_delta_pct = vs_position.get("delta_pct") if isinstance(vs_position, dict) else None
+        confidence_engine = build_confidence_engine(
+            side=side, hit_rate=float(side_hit_rate), games_count=base_games_count,
+            edge=round(abs(avg - line), 1),
+            ev=max(0.0, (side_hit_rate / 100.0) - decimal_implied_probability(odds)),
+            matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
+            availability=availability, opportunity=analysis.get("opportunity") or {},
+            team_context=analysis.get("team_context") or {}, environment=analysis.get("environment") or {},
+            stat=stat, player_position=(analysis.get("player") or {}).get("position") or "",
+            line=line, average=avg,
+        )
+
+        resolved_team_id = player_info.get("team_id")
+        opponent_info    = next_game_info
+
         return {
-            "job_id": existing["job_id"],
-            "status": existing.get("status") or "queued",
-            "progress": int(existing.get("progress") or 0),
-            "stage": existing.get("stage") or "Queued",
-            "message": existing.get("message") or "Reusing existing parlay job.",
-            "reused": True,
+            "player_name": result.get("player_name") or "",
+            "player_id": player_id,
+            "team_id": resolved_team_id,
+            "team_name": team_name,
+            "team_abbreviation": player_info.get("team_abbreviation") or "",
+            "player_position": player_info.get("position") or "",
+            "player_jersey": player_info.get("jersey") or "",
+            "opponent_team_id": opponent_info.get("opponent_team_id"),
+            "opponent_abbreviation": str(opponent_info.get("opponent_abbreviation") or ""),
+            "stat": stat, "line": line, "side": side, "odds": odds,
+            "hit_rate": round(side_hit_rate, 1),
+            "base_hit_rate": round(base_hit_rate, 1),
+            "average": round(avg, 2),
+            "games_count": base_games_count,
+            "last_n": last_n,
+            "bookmaker": orig_row.get("bookmaker_title") or "N/A",
+            "market_key": orig_row.get("market_key") or "",
+            "availability_label": availability.get("label") or "Active",
+            "availability": copy.deepcopy(availability),
+            "matchup": copy.deepcopy(analysis.get("matchup") or {}),
+            "environment": copy.deepcopy(analysis.get("environment") or {}),
+            "confidence": confidence_engine.get("grade"),
+            "confidence_score": confidence_engine.get("score"),
+            "confidence_tone": confidence_engine.get("tone"),
+            "confidence_tier": confidence_engine.get("tier"),
+            "confidence_summary": confidence_engine.get("summary"),
+            "confidence_tags": confidence_engine.get("tags") or [],
+            "event_id": orig_row.get("event_id") or "",
+            "game_label": orig_row.get("game_label") or "",
+            # Injury-aware fields
+            "injury_boost": injury_boost,
+            "injury_filter_player_ids": injury_filter_player_ids,
+            "injury_filter_player_names": injury_filter_player_names,
+            "team_injury_player_names": team_injury_player_names,
         }
 
-    job = _create_parlay_job(payload)
-    PARLAY_JOB_EXECUTOR.submit(_parlay_job_runner, job["job_id"])
+    scored: list[dict[str, Any]] = []
+    for result, orig_row in analysis_rows:
+        item = injury_aware_score(result, orig_row)
+        if item:
+            scored.append(item)
+
+    scored.sort(key=lambda x: (x["hit_rate"], x["odds"]), reverse=True)
+
+    # Pick top N — one leg per player, one leg per game
+    parlay_legs: list[dict[str, Any]] = []
+    seen_player_ids: set[int] = set()
+    seen_event_ids: set[str] = set()
+    for prop in scored:
+        if len(parlay_legs) >= legs:
+            break
+        pid = prop.get("player_id")
+        eid = str(prop.get("event_id") or "")
+        if pid in seen_player_ids:
+            continue
+        if eid and eid in seen_event_ids:
+            continue
+        seen_player_ids.add(pid)
+        if eid:
+            seen_event_ids.add(eid)
+        parlay_legs.append(prop)
+
+    parlay_odds: float | None = None
+    if parlay_legs:
+        parlay_odds = 1.0
+        for leg in parlay_legs:
+            parlay_odds *= leg["odds"]
+        parlay_odds = round(parlay_odds, 2)
+
+    # Build injury summary for display
+    all_team_names: set[str] = {p.get("team_name", "") for p in scored if p.get("team_name")}
+    injury_summary: list[dict[str, Any]] = []
+    for tn in sorted(all_team_names):
+        inj_ids = get_injured_ids_for_team(tn)
+        if inj_ids:
+            injury_summary.append({
+                "team_name": tn,
+                "injured_player_names": resolve_without_player_names(inj_ids),
+                "count": len(inj_ids),
+            })
+
+    all_errors = scrape_errors + analysis_errors
     return {
-        "job_id": job["job_id"],
-        "status": "queued",
-        "progress": 0,
-        "stage": "Queued",
-        "message": "Queued for background processing.",
-        "reused": False,
+        "legs": legs,
+        "parlay": parlay_legs,
+        "parlay_odds": parlay_odds,
+        "all_props_scored": scored,
+        "events_scraped": len(events),
+        "props_found": len(all_import_rows),
+        "props_analyzed": len(scored),
+        "errors": all_errors,
+        "quota_log": quota_log,
+        "injury_summary": injury_summary,
     }
 
-
-@app.post("/api/parlay-builder")
-def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    return _compute_parlay_builder(payload)
 
 @app.get("/api/todays-games")
 @timed_call("todays_games_endpoint")
@@ -5588,6 +6583,10 @@ def player_prop(
     min_fga: float | None = Query(None, ge=0),
     max_fga: float | None = Query(None, ge=0),
     h2h_only: bool = Query(False),
+    opponent_rank_range: str | None = Query(None),
+    without_player_id: int | None = Query(None),
+    without_player_ids: list[int] | None = Query(None),
+    without_player_name: str | None = Query(None),
     override_opponent_id: int | None = Query(None),
 ) -> dict[str, Any]:
     selected_season = season or current_nba_season()
@@ -5610,19 +6609,17 @@ def player_prop(
         min_fga=min_fga,
         max_fga=max_fga,
         h2h_only=h2h_only,
+        opponent_rank_range=opponent_rank_range,
+        without_player_id=without_player_id,
+        without_player_ids=without_player_ids,
+        without_player_name=without_player_name,
         override_opponent_id=override_opponent_id,
     )
 
 BULK_ANALYSIS_ENABLED = os.getenv("NBA_BULK_ANALYSIS_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 BULK_ANALYSIS_MAX_WORKERS = max(1, int(os.getenv("NBA_BULK_ANALYSIS_MAX_WORKERS", "4")))
 BULK_ANALYSIS_MAX_ROWS = max(1, int(os.getenv("NBA_BULK_ANALYSIS_MAX_ROWS", "100")))
-
-WARM_CACHE_ON_STARTUP_ENABLED = os.getenv("NBA_WARM_CACHE_ON_STARTUP_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
-WARM_CACHE_STARTUP_MAX_WORKERS = max(1, int(os.getenv("NBA_WARM_CACHE_STARTUP_MAX_WORKERS", "4")))
-WARM_CACHE_PRELOAD_TODAYS_GAMES = os.getenv("NBA_WARM_CACHE_PRELOAD_TODAYS_GAMES", "1").strip().lower() not in {"0", "false", "no", "off"}
-WARM_CACHE_PRELOAD_INJURIES = os.getenv("NBA_WARM_CACHE_PRELOAD_INJURIES", "1").strip().lower() not in {"0", "false", "no", "off"}
-WARM_CACHE_PRELOAD_PLAYERS = os.getenv("NBA_WARM_CACHE_PRELOAD_PLAYERS", "1").strip().lower() not in {"0", "false", "no", "off"}
-WARM_CACHE_PRELOAD_TEAMS = os.getenv("NBA_WARM_CACHE_PRELOAD_TEAMS", "1").strip().lower() not in {"0", "false", "no", "off"}
+# WARM_CACHE_* vars declared at module top (lines 82-89); removed duplicate declarations here.
 
 
 def _build_bulk_prop_item(row_index: int, row: dict[str, Any], defaults: dict[str, Any], local_cache: dict[tuple[Any, ...], dict[str, Any]]) -> dict[str, Any]:
@@ -5823,3 +6820,197 @@ def debug_injury_report_raw() -> dict[str, Any]:
         "raw_text_preview": raw_text[:3000],
         "raw_text_lines": raw_text.splitlines()[:80],
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BACKTEST ENGINE
+# Logs predictions and actual results, computes ROI / hit-rate by bucket.
+# In-memory store (resets on restart). Frontend can persist via localStorage.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BACKTEST_LOCK = threading.Lock()
+_BACKTEST_LOG: list[dict[str, Any]] = []   # [{id, player, stat, line, side, confidence_score, confidence_tier, model_prob, result, hit, odds, ev, logged_at, resolved_at}]
+
+
+def _backtest_new_id() -> str:
+    import uuid
+    return str(uuid.uuid4())[:8]
+
+
+def _compute_backtest_stats(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate hit-rate, ROI, EV accuracy by confidence tier, stat, and odds band."""
+    resolved = [e for e in entries if e.get("result") in ("hit", "miss")]
+    total = len(resolved)
+    if total == 0:
+        return {"total": 0, "pending": len(entries) - total}
+
+    hits = sum(1 for e in resolved if e["result"] == "hit")
+    win_rate = round(hits / total * 100, 1)
+
+    # ROI: assumes -110 odds (decimal 1.909) unless odds supplied
+    roi_list = []
+    for e in resolved:
+        decimal_odds = float(e.get("odds") or 1.909)
+        if e["result"] == "hit":
+            roi_list.append(decimal_odds - 1)   # profit on 1 unit
+        else:
+            roi_list.append(-1.0)
+    roi = round(sum(roi_list) / total * 100, 2) if roi_list else 0.0
+
+    # By confidence tier
+    tier_stats: dict[str, dict] = {}
+    for e in resolved:
+        tier = str(e.get("confidence_tier") or "Unknown")
+        tier_stats.setdefault(tier, {"hits": 0, "total": 0})
+        tier_stats[tier]["total"] += 1
+        if e["result"] == "hit":
+            tier_stats[tier]["hits"] += 1
+    tier_summary = {
+        t: {
+            "win_rate": round(v["hits"] / v["total"] * 100, 1),
+            "total": v["total"],
+        }
+        for t, v in tier_stats.items()
+    }
+
+    # By stat type
+    stat_stats: dict[str, dict] = {}
+    for e in resolved:
+        s = str(e.get("stat") or "Unknown")
+        stat_stats.setdefault(s, {"hits": 0, "total": 0})
+        stat_stats[s]["total"] += 1
+        if e["result"] == "hit":
+            stat_stats[s]["hits"] += 1
+    stat_summary = {
+        s: {
+            "win_rate": round(v["hits"] / v["total"] * 100, 1),
+            "total": v["total"],
+        }
+        for s, v in stat_stats.items()
+    }
+
+    # By side
+    side_stats: dict[str, dict] = {}
+    for e in resolved:
+        sd = str(e.get("side") or "Unknown")
+        side_stats.setdefault(sd, {"hits": 0, "total": 0})
+        side_stats[sd]["total"] += 1
+        if e["result"] == "hit":
+            side_stats[sd]["hits"] += 1
+    side_summary = {
+        sd: {
+            "win_rate": round(v["hits"] / v["total"] * 100, 1),
+            "total": v["total"],
+        }
+        for sd, v in side_stats.items()
+    }
+
+    return {
+        "total": total,
+        "pending": len(entries) - total,
+        "hits": hits,
+        "misses": total - hits,
+        "win_rate": win_rate,
+        "roi_pct": roi,
+        "by_tier": tier_summary,
+        "by_stat": stat_summary,
+        "by_side": side_summary,
+    }
+
+
+@app.post("/api/backtest/log")
+def backtest_log_prediction(payload: dict = Body(...)) -> dict[str, Any]:
+    """
+    Log a prediction before a game.
+    Body: { player, stat, line, side, confidence_score, confidence_tier, model_prob, odds? }
+    """
+    entry = {
+        "id": _backtest_new_id(),
+        "player": str(payload.get("player") or ""),
+        "stat": str(payload.get("stat") or ""),
+        "line": float(payload.get("line") or 0),
+        "side": str(payload.get("side") or ""),
+        "confidence_score": int(payload.get("confidence_score") or 0),
+        "confidence_tier": str(payload.get("confidence_tier") or ""),
+        "model_prob": float(payload.get("model_prob") or 0.5),
+        "odds": payload.get("odds"),  # decimal odds, optional
+        "result": "pending",
+        "actual_value": None,
+        "logged_at": datetime.utcnow().isoformat() + "Z",
+        "resolved_at": None,
+    }
+    with _BACKTEST_LOCK:
+        _BACKTEST_LOG.append(entry)
+    return {"ok": True, "id": entry["id"], "entry": entry}
+
+
+@app.post("/api/backtest/resolve")
+def backtest_resolve_prediction(payload: dict = Body(...)) -> dict[str, Any]:
+    """
+    Mark a logged prediction as hit or miss.
+    Body: { id, actual_value }
+    """
+    pred_id = str(payload.get("id") or "")
+    actual_value = payload.get("actual_value")
+    if actual_value is None:
+        raise HTTPException(status_code=400, detail="actual_value is required")
+    actual_value = float(actual_value)
+
+    with _BACKTEST_LOCK:
+        for entry in _BACKTEST_LOG:
+            if entry["id"] == pred_id:
+                hit = (
+                    actual_value > entry["line"] if entry["side"] == "OVER"
+                    else actual_value < entry["line"]
+                )
+                entry["result"] = "hit" if hit else "miss"
+                entry["actual_value"] = actual_value
+                entry["resolved_at"] = datetime.utcnow().isoformat() + "Z"
+                return {"ok": True, "entry": entry}
+    raise HTTPException(status_code=404, detail=f"No prediction found with id={pred_id}")
+
+
+@app.get("/api/backtest/log")
+def backtest_get_log(limit: int = Query(200, ge=1, le=1000)) -> dict[str, Any]:
+    """Return the backtest log and aggregate stats."""
+    with _BACKTEST_LOCK:
+        entries = list(reversed(_BACKTEST_LOG))[:limit]
+        stats = _compute_backtest_stats(list(_BACKTEST_LOG))
+    return {"stats": stats, "entries": entries}
+
+
+@app.delete("/api/backtest/log/{entry_id}")
+def backtest_delete_entry(entry_id: str) -> dict[str, Any]:
+    """Delete a single backtest entry by ID."""
+    with _BACKTEST_LOCK:
+        before = len(_BACKTEST_LOG)
+        _BACKTEST_LOG[:] = [e for e in _BACKTEST_LOG if e["id"] != entry_id]
+        after = len(_BACKTEST_LOG)
+    if before == after:
+        raise HTTPException(status_code=404, detail=f"No entry found with id={entry_id}")
+    return {"ok": True, "deleted": entry_id}
+
+
+@app.delete("/api/backtest/log")
+def backtest_clear_log() -> dict[str, Any]:
+    """Clear all backtest entries."""
+    with _BACKTEST_LOCK:
+        count = len(_BACKTEST_LOG)
+        _BACKTEST_LOG.clear()
+    return {"ok": True, "cleared": count}
+
+
+@app.post("/api/odds/check-quota")
+def odds_check_quota(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Check remaining Odds API quota without loading events (uses a lightweight sports list call)."""
+    api_key = str(payload.get("api_key") or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Missing API key.")
+    # Hit the /sports endpoint — it's the cheapest call (costs 0 credits on free tier)
+    result = odds_api_fetch("/sports", api_key, {"all": "false"})
+    return {
+        "ok": True,
+        "quota": result["quota"],
+        "api_key_masked": mask_api_key_for_display(api_key),
+    }
+
