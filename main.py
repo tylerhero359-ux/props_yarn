@@ -46,6 +46,8 @@ from identity_utils import (
     normalize_report_person_name,
 )
 from injury_service import InjuryReportService
+from player_data_service import PlayerDataService
+from schedule_service import ScheduleDataService
 from runtime_utils import (
     build_timed_call,
     call_with_retries,
@@ -374,6 +376,63 @@ DEBUG_METADATA_ENABLED = os.getenv("NBA_DEBUG_METADATA_ENABLED", "0").strip() ==
 HYBRID_ANALYZER_ENABLED = os.getenv("NBA_HYBRID_ANALYZER_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 ANALYSIS_CACHE_TTL_SECONDS = min(ANALYSIS_CACHE_TTL_SECONDS, 300)
 HYBRID_ANALYSIS_MAX_STALE_SECONDS = max(ANALYSIS_CACHE_TTL_SECONDS, int(os.getenv("NBA_HYBRID_ANALYSIS_MAX_STALE_SECONDS", "1800")))
+
+
+def _build_analysis_cache_key(
+    *,
+    player_id: int,
+    stat: str,
+    line: float,
+    last_n: int,
+    season: str,
+    season_type: str,
+    team_id: int | None,
+    player_position: str | None,
+    location: str,
+    result: str,
+    margin_min: float | None,
+    margin_max: float | None,
+    min_minutes: float | None,
+    max_minutes: float | None,
+    min_fga: float | None,
+    max_fga: float | None,
+    h2h_only: bool,
+    opponent_rank_range: str | None,
+    without_player_ids: list[int],
+    without_player_name: str | None,
+    override_opponent_id: int | None,
+    debug: bool,
+) -> tuple[Any, ...]:
+    cached_injury_payload = INJURY_SERVICE.report_cache.get("payload") or {}
+    report_label = str(cached_injury_payload.get("report_label") or "")
+    report_url = str(cached_injury_payload.get("report_url") or "")
+    return (
+        ANALYSIS_CACHE_SCHEMA_VERSION,
+        int(player_id),
+        str(stat).upper().strip(),
+        float(line),
+        int(last_n),
+        str(season),
+        str(season_type),
+        int(team_id) if team_id not in (None, "") else None,
+        str(player_position or "").strip(),
+        str(location or "all").lower(),
+        str(result or "all").lower(),
+        float(margin_min) if margin_min not in (None, "") else None,
+        float(margin_max) if margin_max not in (None, "") else None,
+        float(min_minutes) if min_minutes not in (None, "") else None,
+        float(max_minutes) if max_minutes not in (None, "") else None,
+        float(min_fga) if min_fga not in (None, "") else None,
+        float(max_fga) if max_fga not in (None, "") else None,
+        bool(h2h_only),
+        str(opponent_rank_range or "").strip().lower(),
+        tuple(normalize_without_player_ids(without_player_ids)),
+        str(without_player_name or "").strip(),
+        int(override_opponent_id) if override_opponent_id not in (None, "") else None,
+        bool(debug),
+        report_label,
+        report_url,
+    )
 HYBRID_GAME_LOG_SOFT_TTL_SECONDS = max(300, int(os.getenv("NBA_HYBRID_GAME_LOG_SOFT_TTL_SECONDS", "3600")))
 HYBRID_GAME_LOG_MAX_STALE_SECONDS = max(HYBRID_GAME_LOG_SOFT_TTL_SECONDS, int(os.getenv("NBA_HYBRID_GAME_LOG_MAX_STALE_SECONDS", "43200")))
 HYBRID_PLAYER_INFO_SOFT_TTL_SECONDS = max(1800, int(os.getenv("NBA_HYBRID_PLAYER_INFO_SOFT_TTL_SECONDS", "21600")))
@@ -606,6 +665,7 @@ INJURY_SERVICE = InjuryReportService(
     team_pool=TEAM_POOL,
     http_get=nba_http_get,
     timed_call=timed_call,
+    team_alias_lookup=TEAM_ALIAS_LOOKUP,
     pdfplumber_module=pdfplumber,
     page_timeout=INJURY_REPORT_PAGE_TIMEOUT,
     pdf_timeout=INJURY_REPORT_PDF_TIMEOUT,
@@ -658,6 +718,11 @@ ODDS_DEFAULT_MARKETS = [
     "player_points_assists",
     "player_rebounds_assists",
 ]
+ODDS_GAME_CONTEXT_MARKETS = [
+    "spreads",
+    "totals",
+]
+ODDS_PARLAY_MARKETS = [*ODDS_DEFAULT_MARKETS, *ODDS_GAME_CONTEXT_MARKETS]
 ODDS_MARKET_TO_STAT = {
     "player_points": "PTS",
     "player_rebounds": "REB",
@@ -706,6 +771,16 @@ def safe_mean(values: list[float]) -> float | None:
     return sum(cleaned) / len(cleaned)
 
 
+def safe_float_or_none(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number) or math.isinf(number):
+        return None
+    return number
+
+
 def devig_two_way_market(over_odds: float | None, under_odds: float | None) -> dict[str, float] | None:
     if over_odds is None or under_odds is None:
         return None
@@ -723,6 +798,101 @@ def devig_two_way_market(over_odds: float | None, under_odds: float | None) -> d
         "under_fair_prob": under_raw / total,
         "hold": max(0.0, total - 1.0),
     }
+
+
+def build_event_market_context(event_payload: dict[str, Any]) -> dict[str, Any]:
+    home_team = str(event_payload.get("home_team") or "").strip()
+    away_team = str(event_payload.get("away_team") or "").strip()
+    home_spreads: list[float] = []
+    away_spreads: list[float] = []
+    totals: list[float] = []
+
+    for bookmaker in event_payload.get("bookmakers") or []:
+        for market in bookmaker.get("markets") or []:
+            market_key = str(market.get("key") or "").strip().lower()
+            outcomes = market.get("outcomes") or []
+            if market_key == "spreads":
+                home_spread = None
+                away_spread = None
+                for outcome in outcomes:
+                    point = safe_float_or_none(outcome.get("point"))
+                    if point is None:
+                        continue
+                    outcome_name = str(outcome.get("name") or "").strip()
+                    if outcome_name == home_team:
+                        home_spread = point
+                    elif outcome_name == away_team:
+                        away_spread = point
+                if home_spread is None and away_spread is not None:
+                    home_spread = -away_spread
+                if away_spread is None and home_spread is not None:
+                    away_spread = -home_spread
+                if home_spread is not None and away_spread is not None:
+                    home_spreads.append(home_spread)
+                    away_spreads.append(away_spread)
+            elif market_key == "totals":
+                market_total = next(
+                    (safe_float_or_none(outcome.get("point")) for outcome in outcomes if safe_float_or_none(outcome.get("point")) is not None),
+                    None,
+                )
+                if market_total is not None:
+                    totals.append(market_total)
+
+    home_spread_avg = safe_mean(home_spreads)
+    away_spread_avg = safe_mean(away_spreads)
+    game_total_avg = safe_mean(totals)
+
+    home_implied_total = None
+    away_implied_total = None
+    if game_total_avg is not None:
+        if home_spread_avg is not None:
+            home_implied_total = (game_total_avg / 2.0) - (home_spread_avg / 2.0)
+            away_implied_total = game_total_avg - home_implied_total
+        elif away_spread_avg is not None:
+            away_implied_total = (game_total_avg / 2.0) - (away_spread_avg / 2.0)
+            home_implied_total = game_total_avg - away_implied_total
+
+    return {
+        "market_game_total": round(float(game_total_avg), 1) if game_total_avg is not None else None,
+        "market_home_spread": round(float(home_spread_avg), 1) if home_spread_avg is not None else None,
+        "market_away_spread": round(float(away_spread_avg), 1) if away_spread_avg is not None else None,
+        "market_home_implied_total": round(float(home_implied_total), 1) if home_implied_total is not None else None,
+        "market_away_implied_total": round(float(away_implied_total), 1) if away_implied_total is not None else None,
+    }
+
+
+def _event_matches_teams(
+    event_payload: dict[str, Any],
+    *,
+    team_name: str = "",
+    opponent_name: str = "",
+    team_abbreviation: str = "",
+    opponent_abbreviation: str = "",
+) -> bool:
+    home_team = str(event_payload.get("home_team") or "").strip()
+    away_team = str(event_payload.get("away_team") or "").strip()
+    home_norm = normalize_name(home_team)
+    away_norm = normalize_name(away_team)
+    provided_names = {normalize_name(team_name), normalize_name(opponent_name)} - {""}
+    provided_abbrs = {normalize_name(team_abbreviation), normalize_name(opponent_abbreviation)} - {""}
+
+    home_aliases = {home_norm}
+    away_aliases = {away_norm}
+    home_resolved = resolve_team_from_text(home_team)
+    away_resolved = resolve_team_from_text(away_team)
+    if home_resolved:
+        home_aliases.add(normalize_name(home_resolved.get("abbreviation") or ""))
+        home_aliases.add(normalize_name(home_resolved.get("full_name") or ""))
+    if away_resolved:
+        away_aliases.add(normalize_name(away_resolved.get("abbreviation") or ""))
+        away_aliases.add(normalize_name(away_resolved.get("full_name") or ""))
+
+    event_aliases = home_aliases | away_aliases
+    if provided_names and not provided_names.issubset(event_aliases):
+        return False
+    if provided_abbrs and not provided_abbrs.issubset(event_aliases):
+        return False
+    return bool(provided_names or provided_abbrs)
 
 
 def approximate_odds_api_region_equivalent(bookmakers: list[str]) -> int:
@@ -744,6 +914,596 @@ def build_odds_api_cost_hint(markets: str, bookmakers: list[str]) -> dict[str, A
 def report_name_variants(name: str) -> set[str]:
     """Backward-compatible alias for player name variant generation."""
     return build_player_name_variants(name)
+
+
+def compute_recent_hit_streak(hit_flags: list[bool]) -> int:
+    streak = 0
+    for hit in hit_flags:
+        if hit:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def decimal_implied_probability(odds: float | None) -> float | None:
+    if odds in (None, 0):
+        return None
+    try:
+        odds_value = float(odds)
+    except (TypeError, ValueError):
+        return None
+    if odds_value <= 1:
+        return None
+    return 1 / odds_value
+
+
+def resolve_team_from_text(team_text: str | None) -> dict[str, Any] | None:
+    if not team_text:
+        return None
+    return TEAM_ALIAS_LOOKUP.get(normalize_name(team_text))
+
+
+def resolve_opponent_team_from_matchup(matchup: str, player_team_id: int | None) -> dict[str, Any] | None:
+    info = parse_matchup_descriptor(matchup)
+    team_abbr = info.get("team_abbreviation", "")
+    opp_abbr = info.get("opponent_abbreviation", "")
+    team_candidate = TEAM_ALIAS_LOOKUP.get(normalize_name(team_abbr)) if team_abbr else None
+    opp_candidate = TEAM_ALIAS_LOOKUP.get(normalize_name(opp_abbr)) if opp_abbr else None
+    if player_team_id is not None:
+        if opp_candidate and int(opp_candidate.get("id") or 0) != player_team_id:
+            return opp_candidate
+        if team_candidate and int(team_candidate.get("id") or 0) != player_team_id:
+            return team_candidate
+    return opp_candidate or team_candidate
+
+
+def find_player_by_name(player_name: str, team_id: int | None = None) -> dict[str, Any] | None:
+    roster_ids: set[int] | None = None
+    if team_id is not None:
+        try:
+            roster = fetch_team_roster(team_id=team_id, season=current_nba_season())
+            roster_ids = {int(row.get("PLAYER_ID")) for row in roster if row.get("PLAYER_ID") not in (None, "")}
+        except HTTPException:
+            roster_ids = None
+    return PLAYER_SEARCH_INDEX.find_player(player_name, roster_ids=roster_ids)
+
+
+def clamp(value: float, min_value: float, max_value: float) -> float:
+    return max(min_value, min(max_value, value))
+
+
+def estimate_model_probabilities(
+    hit_rate_pct: float,
+    average: float,
+    line: float,
+    matchup_delta_pct: float | None = None,
+    *,
+    stat: str | None = None,
+    opportunity: dict[str, Any] | None = None,
+    team_context: dict[str, Any] | None = None,
+    environment: dict[str, Any] | None = None,
+    variance: dict[str, Any] | None = None,
+) -> tuple[float, float]:
+    opportunity = opportunity or {}
+    team_context = team_context or {}
+    environment = environment or {}
+    variance = variance or {}
+
+    base = hit_rate_pct / 100.0
+    edge_term = 0.0
+    scale = max(1.0, max(line, 1.0) * 0.18)
+    edge_term += clamp((average - line) / scale, -0.18, 0.18)
+
+    variance_adjustment = 0.0
+    if variance:
+        median = float(variance.get("median") or average)
+        consistency_score = float(variance.get("consistency_score") or 50.0)
+        p25 = float(variance.get("p25") or 0.0)
+        p75 = float(variance.get("p75") or 0.0)
+        median_edge_term = clamp((median - line) / scale, -0.18, 0.18)
+        noisy_stats = {"STL", "BLK", "3PM"}
+        median_weight = 0.65 if stat in noisy_stats else 0.45
+        edge_term = edge_term * (1 - median_weight) + median_edge_term * median_weight
+        consistency_factor = consistency_score / 100.0
+        variance_adjustment = clamp((consistency_factor - 0.5) * 0.10, -0.06, 0.06)
+        if p25 > line:
+            variance_adjustment += 0.05
+        elif p75 < line:
+            variance_adjustment -= 0.05
+        cv = float(variance.get("cv") or 0.0)
+        if cv > 0.5:
+            edge_term *= max(0.4, 1.0 - (cv - 0.5))
+
+    matchup_term = 0.0
+    if matchup_delta_pct is not None:
+        noisy_stats = {"STL", "BLK"}
+        matchup_weight = 0.08 if stat in noisy_stats else 0.2
+        matchup_term = clamp(matchup_delta_pct / 100.0 * matchup_weight, -0.12, 0.12)
+
+    role_term = 0.0
+    if opportunity.get("minutes_trend") == "up":
+        role_term += 0.03
+    elif opportunity.get("minutes_trend") == "down":
+        role_term -= 0.04
+
+    scoring_stats = {"PTS", "3PM", "PRA", "PR", "PA"}
+    if opportunity.get("volume_trend") == "up":
+        role_term += 0.04 if stat in scoring_stats else 0.02
+    elif opportunity.get("volume_trend") == "down":
+        role_term -= 0.04 if stat in scoring_stats else 0.02
+
+    if int(team_context.get("impact_count") or 0) > 0:
+        role_term += min(0.03, int(team_context.get("impact_count") or 0) * 0.01)
+
+    environment_term = 0.0
+    if environment.get("is_back_to_back"):
+        environment_term -= 0.03
+    elif isinstance(environment.get("rest_days"), int) and environment.get("rest_days") >= 2:
+        environment_term += 0.02
+    market_signal = derive_market_environment_signal(stat, environment)
+    environment_term += float(market_signal.get("over_adjustment") or 0.0)
+
+    model_over = clamp(base + edge_term + matchup_term + role_term + environment_term + variance_adjustment, 0.02, 0.98)
+    return round(model_over, 4), round(1 - model_over, 4)
+
+
+def fetch_position_dash(season: str, season_type: str, position_code: str, opponent_team_id: int = 0) -> list[dict[str, Any]]:
+    normalized_position = str(position_code or "").upper().strip()
+    normalized_season = str(season or "").strip()
+    normalized_season_type = str(season_type or "Regular Season").strip()
+    cache_key = (normalized_season, normalized_season_type, normalized_position, int(opponent_team_id or 0))
+    cached = POSITION_DASH_CACHE.get(cache_key)
+    now_ts = time.time()
+    if cached and now_ts - float(cached.get("timestamp") or 0.0) < POSITION_TTL_SECONDS:
+        return [dict(row) for row in (cached.get("rows") or [])]
+
+    if not normalized_position:
+        return []
+
+    try:
+        throttle_request()
+        response = call_nba_with_retries(
+            lambda: LeagueDashPlayerStats(
+                season=normalized_season,
+                season_type_all_star=normalized_season_type,
+                per_mode_detailed="PerGame",
+                measure_type_detailed_defense="Base",
+                player_position_abbreviation_nullable=normalized_position,
+                opponent_team_id=int(opponent_team_id or 0),
+                timeout=15,
+            ),
+            label="position dash request",
+            attempts=2,
+            base_delay=0.6,
+        )
+        df = response.get_data_frames()[0]
+        rows = df.to_dict(orient="records") if not df.empty else []
+    except Exception:
+        rows = []
+
+    POSITION_DASH_CACHE[cache_key] = {"timestamp": now_ts, "rows": [dict(row) for row in rows]}
+    return [dict(row) for row in rows]
+
+
+def summarize_position_environment(rows: list[dict[str, Any]], stat: str) -> dict[str, Any] | None:
+    if not rows:
+        return None
+    total_gp = 0.0
+    total_weighted_value = 0.0
+    players_count = 0
+    for row in rows:
+        gp = float(row.get("GP") or 0)
+        if gp <= 0:
+            continue
+        per_game_value = compute_stat_value(row, stat)
+        players_count += 1
+        total_gp += gp
+        total_weighted_value += per_game_value * gp
+    if total_gp <= 0:
+        return None
+    return {
+        "players_count": players_count,
+        "sample_gp": round(total_gp, 1),
+        # LeagueDashPlayerStats returns per-game player rows, so we need a
+        # GP-weighted average instead of dividing those per-game values by GP again.
+        "per_player_game": round(total_weighted_value / total_gp, 2),
+        "total_value": round(total_weighted_value, 1),
+    }
+
+
+def build_position_matchup(
+    opponent_team_id: int,
+    position_code: str,
+    stat: str,
+    season: str,
+    season_type: str,
+) -> dict[str, Any] | None:
+    normalized_position = str(position_code or "").upper().strip()
+    normalized_stat = str(stat or "").upper().strip()
+    normalized_season = str(season or "").strip()
+    normalized_season_type = str(season_type or "Regular Season").strip()
+    cache_key = (int(opponent_team_id or 0), normalized_position, normalized_stat, normalized_season, normalized_season_type)
+    cached = POSITION_MATCHUP_CACHE.get(cache_key)
+    now_ts = time.time()
+    if cached and now_ts - float(cached.get("timestamp") or 0.0) < POSITION_TTL_SECONDS:
+        payload = cached.get("payload")
+        return dict(payload) if isinstance(payload, dict) else None
+
+    if int(opponent_team_id or 0) <= 0 or not normalized_position or normalized_stat not in STAT_MAP:
+        return None
+
+    league_rows = fetch_position_dash(normalized_season, normalized_season_type, normalized_position, opponent_team_id=0)
+    opponent_rows = fetch_position_dash(normalized_season, normalized_season_type, normalized_position, opponent_team_id=int(opponent_team_id))
+    league_summary = summarize_position_environment(league_rows, normalized_stat)
+    opponent_summary = summarize_position_environment(opponent_rows, normalized_stat)
+    if not league_summary or not opponent_summary:
+        POSITION_MATCHUP_CACHE[cache_key] = {"timestamp": now_ts, "payload": None}
+        return None
+
+    league_average = float(league_summary.get("per_player_game") or 0.0)
+    opponent_value = float(opponent_summary.get("per_player_game") or 0.0)
+    if league_average <= 0:
+        POSITION_MATCHUP_CACHE[cache_key] = {"timestamp": now_ts, "payload": None}
+        return None
+
+    delta_pct = round(((opponent_value - league_average) / league_average) * 100.0, 1)
+    if delta_pct >= 8:
+        lean = "Soft position matchup"
+        lean_tone = "good"
+    elif delta_pct >= 3:
+        lean = "Favorable matchup"
+        lean_tone = "good"
+    elif delta_pct <= -8:
+        lean = "Tough position matchup"
+        lean_tone = "bad"
+    elif delta_pct <= -3:
+        lean = "Below-average matchup"
+        lean_tone = "bad"
+    else:
+        lean = "Neutral"
+        lean_tone = "neutral"
+
+    payload = {
+        "opponent_team_id": int(opponent_team_id),
+        "position_code": normalized_position,
+        "position_label": POSITION_LABELS.get(normalized_position, normalized_position),
+        "stat": normalized_stat,
+        "opponent_value": round(opponent_value, 2),
+        "league_average": round(league_average, 2),
+        "delta_pct": delta_pct,
+        "sample_gp": round(float(opponent_summary.get("sample_gp") or 0.0), 1),
+        "players_count": int(opponent_summary.get("players_count") or 0),
+        "lean": lean,
+        "lean_tone": lean_tone,
+    }
+    POSITION_MATCHUP_CACHE[cache_key] = {"timestamp": now_ts, "payload": dict(payload)}
+    return dict(payload)
+
+
+@timed_call("build_prop_analysis_payload")
+def build_prop_analysis_payload(
+    player_id: int,
+    stat: str,
+    line: float,
+    last_n: int,
+    season: str,
+    season_type: str,
+    team_id: int | None = None,
+    player_position: str | None = None,
+    location: str = "all",
+    result: str = "all",
+    margin_min: float | None = None,
+    margin_max: float | None = None,
+    min_minutes: float | None = None,
+    max_minutes: float | None = None,
+    min_fga: float | None = None,
+    max_fga: float | None = None,
+    h2h_only: bool = False,
+    opponent_rank_range: str | None = None,
+    without_player_id: int | None = None,
+    without_player_name: str | None = None,
+    without_player_ids: list[int] | None = None,
+    without_player_names: list[str] | None = None,
+    debug: bool = False,
+    override_opponent_id: int | None = None,
+) -> dict[str, Any]:
+    player = PLAYER_LOOKUP.get(int(player_id))
+    if not player:
+        raise HTTPException(status_code=404, detail="Player not found.")
+
+    normalized_without_player_ids = normalize_without_player_ids(without_player_ids)
+    if not normalized_without_player_ids and without_player_id:
+        normalized_without_player_ids = [int(without_player_id)]
+    normalized_without_player_names = resolve_without_player_names(normalized_without_player_ids)
+    if not normalized_without_player_names and without_player_name:
+        fallback_name = str(without_player_name).strip()
+        if fallback_name:
+            normalized_without_player_names = [fallback_name]
+
+    analysis_cache_key = _build_analysis_cache_key(
+        player_id=player_id,
+        stat=stat,
+        line=line,
+        last_n=last_n,
+        season=season,
+        season_type=season_type,
+        team_id=team_id,
+        player_position=player_position,
+        location=location,
+        result=result,
+        margin_min=margin_min,
+        margin_max=margin_max,
+        min_minutes=min_minutes,
+        max_minutes=max_minutes,
+        min_fga=min_fga,
+        max_fga=max_fga,
+        h2h_only=h2h_only,
+        opponent_rank_range=opponent_rank_range,
+        without_player_ids=normalized_without_player_ids,
+        without_player_name=without_player_name,
+        override_opponent_id=override_opponent_id,
+        debug=debug,
+    )
+    now_ts = time.time()
+    cached_analysis = ANALYSIS_CACHE.get(analysis_cache_key)
+    if cached_analysis and now_ts - float(cached_analysis.get("timestamp") or 0.0) < ANALYSIS_CACHE_TTL_SECONDS:
+        cached_payload = copy.deepcopy(cached_analysis.get("payload") or {})
+        if debug and DEBUG_METADATA_ENABLED:
+            cached_payload.setdefault("debug", {})
+            cached_payload["debug"]["cache_status"] = {
+                **dict((cached_payload.get("debug") or {}).get("cache_status") or {}),
+                "analysis_cache": "hit",
+            }
+        return cached_payload
+
+    season_rows, game_log_meta = get_player_game_log_hybrid(player_id=player_id, season=season, season_type=season_type) if HYBRID_ANALYZER_ENABLED else (fetch_player_game_log(player_id=player_id, season=season, season_type=season_type), {"source": "live", "seconds_ago": None, "refresh_queued": False})
+
+    profile_row = None
+    player_info_meta = {"source": "unused", "seconds_ago": None, "refresh_queued": False}
+    resolved_team_id = team_id
+    resolved_position = player_position
+
+    if resolved_team_id is None or not resolved_position:
+        if HYBRID_ANALYZER_ENABLED:
+            profile_row, player_info_meta = get_player_info_hybrid(player_id)
+        else:
+            try:
+                profile_row = fetch_common_player_info(player_id)
+            except HTTPException:
+                profile_row = None
+        if profile_row:
+            if resolved_team_id is None:
+                raw_team_id = profile_row.get("TEAM_ID")
+                resolved_team_id = int(raw_team_id) if raw_team_id not in (None, "") else None
+            if not resolved_position:
+                resolved_position = str(profile_row.get("POSITION", "")).strip()
+
+    position_code, position_label = resolve_primary_position(resolved_position)
+
+    next_game_meta = {"source": "live", "seconds_ago": None, "refresh_queued": False}
+    if override_opponent_id and override_opponent_id != 0:
+        override_opp = TEAM_LOOKUP.get(int(override_opponent_id))
+        if override_opp:
+            player_team = TEAM_LOOKUP.get(resolved_team_id, {}) if resolved_team_id else {}
+            override_abbr = str(override_opp.get("abbreviation") or "").strip()
+            next_game = {
+                "game_date": "",
+                "game_time": "",
+                "is_home": None,
+                "matchup_label": f"vs {override_abbr}",
+                "opponent_team_id": int(override_opponent_id),
+                "opponent_name": str(override_opp.get("full_name") or "").strip(),
+                "opponent_abbreviation": override_abbr,
+                "player_team_abbreviation": str(player_team.get("abbreviation") or "").strip(),
+                "is_override": True,
+            }
+        else:
+            next_game, next_game_meta = get_team_next_game_hybrid(team_id=resolved_team_id, primary_player_id=player_id, season=season, season_type=season_type)
+    else:
+        next_game, next_game_meta = get_team_next_game_hybrid(team_id=resolved_team_id, primary_player_id=player_id, season=season, season_type=season_type)
+
+    needs_margin_context = margin_min is not None or margin_max is not None
+    enriched_rows = enrich_game_logs_with_context(season_rows, resolved_team_id, season, season_type, player_id) if needs_margin_context else enrich_game_logs_light(season_rows)
+
+    opponent_rank_min, opponent_rank_max, normalized_opponent_rank_range = normalize_opponent_rank_range(opponent_rank_range)
+    if opponent_rank_min is not None or opponent_rank_max is not None:
+        team_rank_map = build_team_rank_map(season=season, season_type=season_type)
+        for row in enriched_rows:
+            opp_team = resolve_opponent_team_from_matchup(str(row.get("MATCHUP") or ""), resolved_team_id)
+            opp_team_id = int(opp_team["id"]) if opp_team else None
+            row["_opponent_rank"] = team_rank_map.get(opp_team_id) if opp_team_id else None
+    else:
+        for row in enriched_rows:
+            row.setdefault("_opponent_rank", None)
+
+    without_player_game_ids = build_without_player_union_game_ids(normalized_without_player_ids, season=season, season_type=season_type)
+    without_player_name = ", ".join(normalized_without_player_names)
+
+    filtered_pool = apply_game_log_filters(
+        enriched_rows,
+        location=location,
+        result=result,
+        margin_min=margin_min,
+        margin_max=margin_max,
+        min_minutes=min_minutes,
+        max_minutes=max_minutes,
+        min_fga=min_fga,
+        max_fga=max_fga,
+        h2h_only=h2h_only,
+        opponent_abbreviation=(next_game or {}).get("opponent_abbreviation"),
+        opponent_rank_min=opponent_rank_min,
+        opponent_rank_max=opponent_rank_max,
+        without_player_game_ids=without_player_game_ids,
+    )
+    rows = filtered_pool[:last_n]
+    stat_summary = build_stat_summary_block(rows, stat, line)
+    games = stat_summary["games"]
+    values = stat_summary["values"]
+    hit_count = stat_summary["hit_count"]
+    average = stat_summary["average"]
+    hit_rate = stat_summary["hit_rate"]
+    variance_data = stat_summary.get("variance") or {}
+
+    team_name = TEAM_LOOKUP.get(resolved_team_id, {}).get("full_name") if resolved_team_id else None
+    availability = build_availability_payload(player_name=player["full_name"], team_name=team_name)
+    vs_position = build_position_matchup(opponent_team_id=int((next_game or {}).get("opponent_team_id") or 0), position_code=position_code or "", stat=stat, season=season, season_type=season_type) if next_game and position_code else None
+    h2h_payload = build_h2h_payload_from_rows(filtered_pool or enriched_rows, next_game, stat, line)
+    analysis_source_rows = filtered_pool or enriched_rows or season_rows
+    opportunity = build_opportunity_context(analysis_source_rows, last_n)
+    team_context = build_team_opportunity_context(team_name=team_name, player_name=player["full_name"], stat=stat, player_position=resolved_position, team_id=resolved_team_id, season=season)
+    environment = build_game_environment_context(analysis_source_rows, next_game, team_id=resolved_team_id, season=season, season_type=season_type)
+    matchup_delta_pct = (vs_position or {}).get("delta_pct") if isinstance(vs_position, dict) else None
+    model_over, model_under = estimate_model_probabilities(
+        hit_rate_pct=float(hit_rate),
+        average=float(average),
+        line=float(line),
+        matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
+        stat=str(stat),
+        opportunity=opportunity,
+        team_context=team_context,
+        environment=environment,
+        variance=variance_data,
+    )
+    recommended_side = "OVER" if model_over >= model_under else "UNDER"
+    side_model_prob = model_over if recommended_side == "OVER" else model_under
+    chosen_edge = round((side_model_prob - 0.50) * 100, 1)
+    chosen_ev = side_model_prob - 0.50
+    confidence_engine = build_confidence_engine(
+        side=recommended_side,
+        hit_rate=float(hit_rate),
+        games_count=int(len(values)),
+        edge=chosen_edge,
+        ev=chosen_ev,
+        matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
+        availability=availability,
+        opportunity=opportunity,
+        team_context=team_context,
+        environment=environment,
+        stat=stat,
+        player_position=resolved_position,
+        line=line,
+        average=average,
+    )
+
+    traffic_tone = "yellow"
+    traffic_label = "Caution"
+    if availability.get("is_unavailable"):
+        traffic_tone = "red"
+        traffic_label = "Avoid"
+    elif confidence_engine["score"] >= 80:
+        traffic_tone = "green"
+        traffic_label = f"Strong {recommended_side}"
+    elif confidence_engine["score"] >= 68:
+        traffic_tone = "green"
+        traffic_label = f"Lean {recommended_side}"
+    elif confidence_engine["score"] <= 44:
+        traffic_tone = "red"
+        traffic_label = "Pass"
+
+    interpretation = build_analyzer_interpretation(
+        stat=stat,
+        line=line,
+        hit_rate=hit_rate,
+        average=average,
+        availability=availability,
+        matchup={"next_game": next_game, "vs_position": vs_position},
+        opportunity=opportunity,
+        team_context=team_context,
+        h2h=h2h_payload,
+        environment=environment,
+    )
+
+    filter_summary = build_filter_summary(
+        location=location,
+        result=result,
+        margin_min=margin_min,
+        margin_max=margin_max,
+        min_minutes=min_minutes,
+        max_minutes=max_minutes,
+        min_fga=min_fga,
+        max_fga=max_fga,
+        h2h_only=h2h_only,
+        opponent_rank_range=normalized_opponent_rank_range,
+        without_player_name=without_player_name,
+        without_player_names=normalized_without_player_names,
+        debug=debug,
+    )
+
+    payload = {
+        "player": {
+            "id": player["id"],
+            "full_name": player["full_name"],
+            "is_active": player.get("is_active", False),
+            "team_id": resolved_team_id,
+            "team_name": team_name or "",
+            "position": resolved_position or "",
+            "position_group": position_code or "",
+            "position_group_label": position_label or "",
+        },
+        "season": season,
+        "season_type": season_type,
+        "stat": stat,
+        "line": line,
+        "last_n": last_n,
+        "average": average,
+        "hit_count": hit_count,
+        "games_count": len(values),
+        "hit_rate": hit_rate,
+        "games": list(reversed(games)),
+        "availability": availability,
+        "matchup": {"next_game": next_game, "vs_position": vs_position},
+        "h2h": h2h_payload,
+        "opportunity": opportunity,
+        "team_context": team_context,
+        "environment": environment,
+        "confidence": confidence_engine,
+        "recommended_side": recommended_side,
+        "traffic_light": {
+            "label": traffic_label,
+            "tone": traffic_tone,
+            "summary": confidence_engine.get("summary") or interpretation.get("market_takeaway") or interpretation.get("summary"),
+        },
+        "interpretation": interpretation,
+        "active_filters": filter_summary,
+        "filter_options": {
+            "opponent_rank_range": normalized_opponent_rank_range,
+            "without_player_id": int(normalized_without_player_ids[0]) if normalized_without_player_ids else None,
+            "without_player_ids": normalized_without_player_ids,
+            "without_player_name": without_player_name,
+            "without_player_names": normalized_without_player_names,
+        },
+        "filtered_pool_count": len(filtered_pool),
+        "season_pool_count": len(season_rows),
+        "variance": variance_data,
+        "sample_warning": f"Only {len(values)} games in filtered sample â€” treat recommendation with caution." if len(values) < 5 else None,
+    }
+    freshness = {
+        "game_log_seconds_ago": round(time.time() - float((GAME_LOG_CACHE.get((player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)) or {}).get("timestamp") or 0.0), 2) if GAME_LOG_CACHE.get((player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)) else None,
+        "player_info_seconds_ago": round(time.time() - float((PLAYER_INFO_CACHE.get(player_id) or {}).get("timestamp") or 0.0), 2) if PLAYER_INFO_CACHE.get(player_id) else None,
+        "next_game_seconds_ago": round(time.time() - float((TEAM_NEXT_GAME_CACHE.get((resolved_team_id, season, season_type)) or {}).get("timestamp") or 0.0), 2) if TEAM_NEXT_GAME_CACHE.get((resolved_team_id, season, season_type)) else None,
+        "game_log_source": game_log_meta.get("source"),
+        "game_log_refresh_queued": game_log_meta.get("refresh_queued"),
+        "player_info_source": player_info_meta.get("source"),
+        "player_info_refresh_queued": player_info_meta.get("refresh_queued"),
+        "next_game_source": next_game_meta.get("source"),
+        "next_game_refresh_queued": next_game_meta.get("refresh_queued"),
+        "injury_report_seconds_ago": INJURY_SERVICE.report_cache_age_seconds(),
+    }
+    payload["freshness"] = dict(freshness)
+    if debug and DEBUG_METADATA_ENABLED:
+        payload["debug"] = build_debug_metadata(
+            cache_status={
+                "analysis_cache": "miss",
+                "game_log_cache": "hit" if GAME_LOG_CACHE.get((player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)) else "miss",
+                "player_info_cache": "hit" if PLAYER_INFO_CACHE.get(player_id) else "miss",
+                "next_game_cache": "hit" if TEAM_NEXT_GAME_CACHE.get((resolved_team_id, season, season_type)) else "miss",
+            },
+            freshness=freshness,
+            timings_enabled=NBA_TIMING_ENABLED,
+        )
+    ANALYSIS_CACHE[analysis_cache_key] = {"timestamp": now_ts, "payload": copy.deepcopy(payload)}
+    return payload
 
 
 def parse_injury_report_timestamp(url: str) -> datetime:
@@ -802,8 +1562,8 @@ def build_availability_payload(player_name: str, team_name: str | None = None) -
     return INJURY_SERVICE.build_availability_payload(player_name, team_name=team_name)
 
 
-def build_team_availability_summary(team_name: str | None, report_payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    return INJURY_SERVICE.build_team_availability_summary(team_name, report_payload=report_payload)
+def build_team_availability_summary(team_name: str | None, report_payload: dict[str, Any] | None = None, game_date: str | None = None) -> dict[str, Any]:
+    return INJURY_SERVICE.build_team_availability_summary(team_name, report_payload=report_payload, game_date=game_date)
 
 def build_confidence_engine(
     *,
@@ -909,6 +1669,20 @@ def build_confidence_engine(
         availability_component -= 12.0
         tags.append('Player status risk')
 
+    market_signal = derive_market_environment_signal(stat, environment)
+    market_component = max(
+        -8.0,
+        min(8.0, float(market_signal.get("over_adjustment") or 0.0) * 100.0 * (1 if side == "OVER" else -1) * 0.75),
+    )
+    if market_component >= 2:
+        for tag in market_signal.get("support_tags") or []:
+            if tag not in tags:
+                tags.append(tag)
+    elif market_component <= -2:
+        for tag in market_signal.get("caution_tags") or []:
+            if tag not in tags:
+                tags.append(tag)
+
     score = 46.0
     components = {
         'form': round(form_component, 1),
@@ -920,6 +1694,7 @@ def build_confidence_engine(
         'injury_context': round(injury_component, 1),
         'minutes_role': round(minutes_component, 1),
         'schedule': round(schedule_component, 1),
+        'market_environment': round(market_component, 1),
         'availability': round(availability_component, 1),
     }
     score += sum(components.values())
@@ -971,6 +1746,8 @@ def build_confidence_engine(
         summary_parts.append('watch final status')
     elif schedule_component <= -5:
         summary_parts.append('schedule drag applied')
+    elif abs(market_component) >= 4 and market_signal.get("summary"):
+        summary_parts.append(f"market context: {market_signal.get('summary')}")
 
     if not summary_parts:
         if edge_value >= 4 or ev >= 0.05:
@@ -996,6 +1773,84 @@ def build_confidence_engine(
         'player_position': player_position or '',
         'stat': stat or '',
     }
+
+
+def _confidence_band_from_score(score: int) -> tuple[str, str, str]:
+    if score >= 85:
+        return 'A', 'elite', 'Elite'
+    if score >= 72:
+        return 'B', 'good', 'High'
+    if score >= 60:
+        return 'C', 'warm', 'Medium'
+    if score >= 48:
+        return 'D', 'neutral', 'Low'
+    return 'F', 'bad', 'Very low'
+
+
+def apply_market_confidence_adjustment(
+    confidence_engine: dict[str, Any],
+    *,
+    side: str,
+    over_probability: float | None,
+    under_probability: float | None,
+    odds: float | None,
+) -> dict[str, Any]:
+    adjusted = copy.deepcopy(confidence_engine)
+    try:
+        over_prob = float(over_probability) if over_probability is not None else None
+        under_prob = float(under_probability) if under_probability is not None else None
+    except (TypeError, ValueError):
+        over_prob = None
+        under_prob = None
+
+    adjusted["market_side"] = None
+    adjusted["market_disagrees"] = False
+    adjusted["market_penalty"] = 0
+    adjusted["market_support_pct"] = None
+    adjusted["ranking_score"] = int(adjusted.get("score") or 0)
+
+    if over_prob is None or under_prob is None:
+        return adjusted
+
+    market_side = "OVER" if over_prob >= under_prob else "UNDER"
+    chosen_prob = over_prob if side == "OVER" else under_prob
+    opposite_prob = under_prob if side == "OVER" else over_prob
+    disagreement = market_side != side
+    penalty = 0.0
+    odds_value = float(odds or 0.0)
+
+    if disagreement:
+        probability_gap = max(0.0, opposite_prob - chosen_prob) * 100.0
+        penalty = max(6.0, probability_gap * 1.6)
+        if odds_value >= 2.0:
+            penalty += 6.0
+        elif odds_value >= 1.9:
+            penalty += 3.0
+
+    adjusted_score = int(max(0, min(99, round(float(adjusted.get("score") or 0) - penalty))))
+    grade, tone, tier = _confidence_band_from_score(adjusted_score)
+    adjusted["score"] = adjusted_score
+    adjusted["grade"] = grade
+    adjusted["tone"] = tone
+    adjusted["tier"] = tier
+    adjusted["market_side"] = market_side
+    adjusted["market_disagrees"] = disagreement
+    adjusted["market_penalty"] = round(penalty, 1)
+    adjusted["market_support_pct"] = round(chosen_prob * 100.0, 1)
+    adjusted["ranking_score"] = adjusted_score
+
+    tags = list(adjusted.get("tags") or [])
+    if disagreement and "Market disagreement" not in tags:
+        tags.append("Market disagreement")
+    elif not disagreement and "Market aligned" not in tags:
+        tags.append("Market aligned")
+    adjusted["tags"] = tags[:6]
+
+    summary = str(adjusted.get("summary") or "").strip()
+    if disagreement:
+        note = f"market leans {market_side.lower()}"
+        adjusted["summary"] = f"{summary} • {note}".strip(" •")
+    return adjusted
 
 def throttle_request() -> None:
     global LAST_REQUEST_TIME
@@ -1258,6 +2113,160 @@ def enrich_environment_with_team_context(environment: dict[str, Any], team_conte
             payload["spread_bucket"] = "close"
             payload["spread_label"] = f"Close spread setup • est. {projected_spread:+.1f}"
     return payload
+
+def derive_market_environment_signal(stat: str | None, environment: dict[str, Any] | None = None) -> dict[str, Any]:
+    env = environment or {}
+    normalized_stat = str(stat or "").upper().strip()
+    scoring_stats = {"PTS", "3PM", "PRA", "PR", "PA"}
+    playmaking_stats = {"AST", "PA", "PRA"}
+    rebound_stats = {"REB", "RA", "PR", "PRA"}
+
+    over_adjustment = 0.0
+    support_tags: list[str] = []
+    caution_tags: list[str] = []
+    summary_bits: list[str] = []
+
+    team_total = safe_float_or_none(env.get("market_team_total"))
+    game_total = safe_float_or_none(env.get("market_game_total"))
+    spread = safe_float_or_none(env.get("market_spread"))
+
+    if team_total is not None:
+        if team_total >= 118:
+            support_tags.append("Strong team total")
+            summary_bits.append(f"team total {team_total:.1f}")
+        elif team_total <= 108:
+            caution_tags.append("Low team total")
+            summary_bits.append(f"team total {team_total:.1f}")
+
+        if normalized_stat in scoring_stats:
+            over_adjustment += clamp((team_total - 112.0) * 0.006, -0.04, 0.04)
+        elif normalized_stat in playmaking_stats:
+            over_adjustment += clamp((team_total - 112.0) * 0.0045, -0.03, 0.03)
+        elif normalized_stat in rebound_stats:
+            over_adjustment += clamp((team_total - 112.0) * 0.002, -0.015, 0.015)
+
+    if game_total is not None:
+        if game_total >= 232:
+            support_tags.append("High game total")
+            summary_bits.append(f"game total {game_total:.1f}")
+        elif game_total <= 220:
+            caution_tags.append("Low game total")
+            summary_bits.append(f"game total {game_total:.1f}")
+
+        if normalized_stat in scoring_stats:
+            over_adjustment += clamp((game_total - 226.0) * 0.003, -0.025, 0.025)
+        elif normalized_stat in playmaking_stats:
+            over_adjustment += clamp((game_total - 226.0) * 0.0025, -0.02, 0.02)
+        elif normalized_stat in rebound_stats:
+            over_adjustment += clamp((game_total - 226.0) * 0.0015, -0.015, 0.015)
+
+    if spread is not None:
+        abs_spread = abs(spread)
+        if abs_spread <= 3.5:
+            support_tags.append("Tight spread")
+            summary_bits.append(f"close spread {spread:+.1f}")
+        elif abs_spread >= 10:
+            caution_tags.append("Blowout risk")
+            summary_bits.append(f"spread {spread:+.1f}")
+
+        if abs_spread <= 3.5 and normalized_stat in scoring_stats.union(playmaking_stats):
+            over_adjustment += 0.01
+        elif abs_spread >= 10 and normalized_stat in scoring_stats.union(playmaking_stats):
+            over_adjustment -= 0.02
+        elif abs_spread >= 10 and normalized_stat in rebound_stats:
+            over_adjustment -= 0.01
+
+    return {
+        "over_adjustment": round(clamp(over_adjustment, -0.08, 0.08), 4),
+        "support_tags": support_tags,
+        "caution_tags": caution_tags,
+        "summary": " • ".join(summary_bits),
+    }
+
+
+def enrich_environment_with_market_context(
+    environment: dict[str, Any] | None,
+    event_row: dict[str, Any] | None,
+    *,
+    player_team_name: str = "",
+    player_team_abbreviation: str = "",
+) -> dict[str, Any]:
+    payload = copy.deepcopy(environment or {})
+    row = event_row or {}
+    home_team_text = str(row.get("home_team") or "").strip()
+    away_team_text = str(row.get("away_team") or "").strip()
+    team_text = player_team_name or player_team_abbreviation
+
+    player_team = resolve_team_from_text(team_text)
+    home_team = resolve_team_from_text(home_team_text)
+    away_team = resolve_team_from_text(away_team_text)
+
+    player_side = None
+    if player_team and home_team and int(player_team.get("id") or 0) == int(home_team.get("id") or 0):
+        player_side = "home"
+    elif player_team and away_team and int(player_team.get("id") or 0) == int(away_team.get("id") or 0):
+        player_side = "away"
+    elif team_text and normalize_name(team_text) == normalize_name(home_team_text):
+        player_side = "home"
+    elif team_text and normalize_name(team_text) == normalize_name(away_team_text):
+        player_side = "away"
+
+    game_total = safe_float_or_none(row.get("market_game_total"))
+    home_spread = safe_float_or_none(row.get("market_home_spread"))
+    away_spread = safe_float_or_none(row.get("market_away_spread"))
+    home_total = safe_float_or_none(row.get("market_home_implied_total"))
+    away_total = safe_float_or_none(row.get("market_away_implied_total"))
+
+    team_total = None
+    opponent_total = None
+    team_spread = None
+    if player_side == "home":
+        team_total = home_total
+        opponent_total = away_total
+        team_spread = home_spread
+    elif player_side == "away":
+        team_total = away_total
+        opponent_total = home_total
+        team_spread = away_spread
+
+    if game_total is not None:
+        payload["market_game_total"] = round(game_total, 1)
+    if team_total is not None:
+        payload["market_team_total"] = round(team_total, 1)
+    if opponent_total is not None:
+        payload["market_opponent_total"] = round(opponent_total, 1)
+    if team_spread is not None:
+        team_spread = round(team_spread, 1)
+        payload["market_spread"] = team_spread
+        payload["projected_spread"] = team_spread
+        if abs(team_spread) >= 10:
+            payload["spread_bucket"] = "blowout"
+            payload["spread_label"] = f"Market blowout risk • {team_spread:+.1f}"
+        elif abs(team_spread) <= 3.5:
+            payload["spread_bucket"] = "close"
+            payload["spread_label"] = f"Market close spread • {team_spread:+.1f}"
+        elif team_spread < 0:
+            payload["spread_bucket"] = "favorite"
+            payload["spread_label"] = f"Market favorite • {team_spread:+.1f}"
+        else:
+            payload["spread_bucket"] = "underdog"
+            payload["spread_label"] = f"Market underdog • {team_spread:+.1f}"
+
+    market_bits: list[str] = []
+    if team_total is not None:
+        market_bits.append(f"team total {team_total:.1f}")
+    if game_total is not None:
+        market_bits.append(f"game total {game_total:.1f}")
+    if team_spread is not None:
+        market_bits.append(f"spread {team_spread:+.1f}")
+    if market_bits:
+        market_summary = "Market context: " + " • ".join(market_bits) + "."
+        payload["market_summary"] = market_summary
+        existing_summary = str(payload.get("summary") or "").strip()
+        payload["summary"] = f"{existing_summary} {market_summary}".strip() if existing_summary else market_summary
+    payload["market_context"] = derive_market_environment_signal(None, payload)
+    return payload
+
 
 def build_game_environment_context(season_rows: list[dict[str, Any]], next_game: dict[str, Any] | None, team_id: int | None = None, season: str = "", season_type: str = "") -> dict[str, Any]:
     last_game_dt = parse_game_date_any(season_rows[0].get("GAME_DATE")) if season_rows else None
@@ -1578,6 +2587,8 @@ TEAM_RECORDS_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 TEAM_RECORDS_CACHE_TTL_SECONDS = 6 * 60 * 60
 TEAMMATE_ABSENCE_CACHE: dict[tuple[int, str, str], dict[str, Any]] = {}
 TEAMMATE_ABSENCE_CACHE_TTL_SECONDS = 6 * 60 * 60
+TEAMMATE_IMPACT_CACHE: dict[tuple[int, str, str], dict[str, Any]] = {}
+TEAMMATE_IMPACT_CACHE_TTL_SECONDS = 6 * 60 * 60
 
 
 def build_team_rank_map(season: str, season_type: str = 'Regular Season') -> dict[int, int]:
@@ -1627,6 +2638,47 @@ def teammate_absence_game_ids(player_id: int, season: str, season_type: str = 'R
     game_ids = {str(row.get('GAME_ID') or row.get('Game_ID') or '').strip() for row in rows if str(row.get('GAME_ID') or row.get('Game_ID') or '').strip()}
     TEAMMATE_ABSENCE_CACHE[cache_key] = {'timestamp': now_ts, 'game_ids': sorted(game_ids)}
     return set(game_ids)
+
+
+def teammate_impact_score(player_id: int, season: str, season_type: str = 'Regular Season') -> float:
+    cache_key = (int(player_id), str(season), str(season_type))
+    cached = TEAMMATE_IMPACT_CACHE.get(cache_key)
+    now_ts = time.time()
+    if cached and now_ts - float(cached.get('timestamp') or 0.0) < TEAMMATE_IMPACT_CACHE_TTL_SECONDS:
+        return float(cached.get('score') or 0.0)
+
+    score = 0.0
+    try:
+        rows = fetch_recent_player_game_log(player_id=player_id, season=season, season_type=season_type, last_n=10)
+    except Exception:
+        rows = []
+
+    if rows:
+        minutes_vals = [float(row.get('MIN') or row.get('_minutes') or 0.0) for row in rows]
+        pts_vals = [float(row.get('PTS') or 0.0) for row in rows]
+        ast_vals = [float(row.get('AST') or 0.0) for row in rows]
+        reb_vals = [float(row.get('REB') or 0.0) for row in rows]
+        fga_vals = [float(row.get('FGA') or row.get('_fga') or 0.0) for row in rows]
+        avg_min = safe_mean(minutes_vals) or 0.0
+        avg_pts = safe_mean(pts_vals) or 0.0
+        avg_ast = safe_mean(ast_vals) or 0.0
+        avg_reb = safe_mean(reb_vals) or 0.0
+        avg_fga = safe_mean(fga_vals) or 0.0
+        score = (
+            avg_min * 0.55
+            + avg_pts * 1.0
+            + avg_ast * 1.7
+            + avg_reb * 0.45
+            + avg_fga * 0.8
+        )
+
+    if score <= 0.0:
+        player = PLAYER_LOOKUP.get(int(player_id) or 0) or {}
+        fallback_name = str(player.get('full_name') or '')
+        score = max(1.0, float(len(fallback_name.split()) or 1))
+
+    TEAMMATE_IMPACT_CACHE[cache_key] = {'timestamp': now_ts, 'score': score}
+    return float(score)
 
 
 
@@ -2288,6 +3340,53 @@ def odds_api_fetch(endpoint: str, api_key: str, params: dict[str, Any] | None = 
     }
 
 
+def _fetch_event_odds_payload(
+    *,
+    event_id: str,
+    api_key: str,
+    sport: str,
+    regions: str,
+    markets: str,
+    odds_format: str,
+    requested_bookmakers: list[str],
+) -> dict[str, Any]:
+    try:
+        result = odds_api_fetch(
+            f"/sports/{sport}/events/{event_id}/odds",
+            api_key,
+            {
+                "regions": regions,
+                "markets": markets,
+                "oddsFormat": odds_format,
+                "dateFormat": "iso",
+                "bookmakers": ",".join(requested_bookmakers),
+            },
+        )
+        return {
+            "event_id": event_id,
+            "rows": build_odds_import_rows(result["data"] or {}, odds_format),
+            "quota": result["quota"],
+            "error": None,
+            "status_code": None,
+        }
+    except HTTPException as exc:
+        return {
+            "event_id": event_id,
+            "rows": [],
+            "quota": None,
+            "error": exc.detail,
+            "status_code": exc.status_code,
+        }
+    except Exception as exc:
+        return {
+            "event_id": event_id,
+            "rows": [],
+            "quota": None,
+            "error": str(exc),
+            "status_code": None,
+        }
+
+
 def build_odds_import_rows(event_payload: dict[str, Any], odds_format: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     pair_map: dict[tuple[str, str, str, str], dict[str, Any]] = {}
@@ -2296,6 +3395,7 @@ def build_odds_import_rows(event_payload: dict[str, Any], odds_format: str) -> l
     home_team = str(event_payload.get("home_team") or "")
     away_team = str(event_payload.get("away_team") or "")
     game_label = f"{away_team} @ {home_team}" if home_team or away_team else ""
+    market_context = build_event_market_context(event_payload)
 
     for bookmaker in event_payload.get("bookmakers") or []:
         bookmaker_title = str(bookmaker.get("title") or bookmaker.get("key") or "Book")
@@ -2328,6 +3428,8 @@ def build_odds_import_rows(event_payload: dict[str, Any], odds_format: str) -> l
                     "market_last_update": market_updated,
                     "event_id": event_id,
                     "game_label": game_label,
+                    "home_team": home_team,
+                    "away_team": away_team,
                 })
                 bucket[f"{side}_odds"] = decimal_odds
                 if market_updated and not bucket.get("market_last_update"):
@@ -2377,6 +3479,8 @@ def build_odds_import_rows(event_payload: dict[str, Any], odds_format: str) -> l
             "market_last_update": representative["market_last_update"],
             "event_id": representative.get("event_id", ""),
             "game_label": representative.get("game_label", ""),
+            "home_team": representative.get("home_team", ""),
+            "away_team": representative.get("away_team", ""),
             "same_book_pair": True,
             "over_raw_prob": round(float(representative["over_raw_prob"]), 6),
             "under_raw_prob": round(float(representative["under_raw_prob"]), 6),
@@ -2393,6 +3497,7 @@ def build_odds_import_rows(event_payload: dict[str, Any], odds_format: str) -> l
             "consensus_hold_percent": round(float(consensus_hold or representative["hold"]) * 100.0, 3),
             "market_implied_line": round(market_implied_line, 1),
             "market_implied_source": f"consensus_{books_count}_book" if books_count > 1 else "single_book",
+            **market_context,
             "csv_row": f"{representative['player_name']},{representative['stat']},{round(float(representative['line']),1)},{float(representative['over_odds'])},{float(representative['under_odds'])}",
         })
     rows.sort(key=lambda item: (item["player_name"].lower(), item["stat"], item["line"]))
@@ -2407,111 +3512,11 @@ def _position_dash_cache_is_reliable_stale(cached: dict[str, Any] | None, cached
 
 @timed_call("fetch_player_game_log")
 def fetch_player_game_log(player_id: int, season: str, season_type: str) -> list[dict[str, Any]]:
-    cache_key = (player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)
-    cached = GAME_LOG_CACHE.get(cache_key)
-    cached_ts = float((cached or {}).get("timestamp") or 0.0)
-    now_ts = time.time()
-
-    if cached and now_ts - cached_ts < CACHE_TTL_SECONDS:
-        sanitized_cached_rows = dedupe_game_log_rows(cached["rows"])
-        if sanitized_cached_rows != cached.get("rows"):
-            GAME_LOG_CACHE[cache_key] = {"timestamp": cached_ts or time.time(), "rows": sanitized_cached_rows}
-        return sanitized_cached_rows
-
-    has_reliable_stale = bool(cached and _game_log_cache_is_reliable_stale(cached, cached_ts))
-
-    failure_meta = GAME_LOG_FAILURE_META.get(cache_key) or {}
-    last_failure = float(failure_meta.get("last_failure") or 0.0)
-    if has_reliable_stale and now_ts - last_failure < GAME_LOG_FAILURE_COOLDOWN_SECONDS:
-        return dedupe_game_log_rows(cached["rows"])
-
-    total_budget_seconds = (
-        GAME_LOG_FETCH_BUDGET_WITH_RELIABLE_STALE_SECONDS
-        if has_reliable_stale
-        else GAME_LOG_FETCH_BUDGET_NO_RELIABLE_STALE_SECONDS
-    )
-    max_attempts = (
-        GAME_LOG_FETCH_ATTEMPTS_WITH_RELIABLE_STALE
-        if has_reliable_stale
-        else GAME_LOG_FETCH_ATTEMPTS_NO_RELIABLE_STALE
-    )
-
-    started_at = time.monotonic()
-    last_exc: Exception | None = None
-    df = None
-
-    for attempt in range(max_attempts):
-        elapsed = time.monotonic() - started_at
-        remaining_budget = total_budget_seconds - elapsed
-        if remaining_budget <= 0:
-            break
-
-        timeout_seconds = max(
-            GAME_LOG_FETCH_TIMEOUT_FLOOR_SECONDS,
-            min(GAME_LOG_FETCH_TIMEOUT_CAP_SECONDS, int(remaining_budget)),
-        )
-
-        throttle_request()
-        try:
-            response = PlayerGameLog(
-                player_id=player_id,
-                season=season,
-                season_type_all_star=season_type,
-                timeout=timeout_seconds,
-            )
-            df = response.get_data_frames()[0]
-            break
-        except Exception as exc:
-            last_exc = exc
-            if not is_transient_nba_error(exc):
-                break
-
-            elapsed = time.monotonic() - started_at
-            remaining_budget = total_budget_seconds - elapsed
-            if attempt >= max_attempts - 1 or remaining_budget <= 0:
-                break
-
-            sleep_for = min(NBA_BACKOFF_FACTOR * (2 ** attempt), max(0.0, remaining_budget))
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-
-    if df is None:
-        GAME_LOG_FAILURE_META[cache_key] = {"last_failure": time.time()}
-        if has_reliable_stale:
-            return dedupe_game_log_rows(cached["rows"])
-        detail_suffix = f" Details: {last_exc}" if last_exc else ""
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "NBA data request failed. This can happen when NBA stats throttles or times out."
-                f" Total live fetch budget: {int(total_budget_seconds)}s."
-                f"{detail_suffix}"
-            ),
-        ) from last_exc
-
-    if df.empty:
-        raise HTTPException(status_code=404, detail="No game logs found for this player and season.")
-
-    df["GAME_DATE"] = df["GAME_DATE"].astype(str)
-    rows = dedupe_game_log_rows(df.to_dict(orient="records"))
-
-    GAME_LOG_FAILURE_META.pop(cache_key, None)
-    GAME_LOG_CACHE[cache_key] = {"timestamp": time.time(), "rows": rows}
-    return rows
+    return PLAYER_DATA_SERVICE.fetch_player_game_log(player_id, season, season_type)
 
 
 def fetch_recent_player_game_log(player_id: int, season: str, season_type: str, last_n: int) -> list[dict[str, Any]]:
-    cache_key = (player_id, season, season_type, int(last_n), GAME_LOG_CACHE_SCHEMA_VERSION)
-    cached = RECENT_GAME_LOG_CACHE.get(cache_key)
-    now_ts = time.time()
-
-    if cached and now_ts - cached["timestamp"] < CACHE_TTL_SECONDS:
-        return cached["rows"]
-
-    full_rows = fetch_player_game_log(player_id=player_id, season=season, season_type=season_type)
-    recent_rows = full_rows[:last_n]
-    RECENT_GAME_LOG_CACHE[cache_key] = {"timestamp": time.time(), "rows": recent_rows}
-    return recent_rows
+    return PLAYER_DATA_SERVICE.fetch_recent_player_game_log(player_id, season, season_type, last_n)
 
 
 def _team_roster_cache_is_reliable_stale(cached: dict[str, Any] | None, cache_timestamp: float | None = None) -> bool:
@@ -2524,1391 +3529,137 @@ def _team_roster_cache_is_reliable_stale(cached: dict[str, Any] | None, cache_ti
 
 
 def fetch_team_roster(team_id: int, season: str) -> list[dict[str, Any]]:
-    cache_key = (team_id, season)
-    cached = ROSTER_CACHE.get(cache_key)
-    now_ts = time.time()
-    cached_ts = float((cached or {}).get("timestamp") or 0.0)
-
-    if cached and now_ts - cached_ts < TEAM_ROSTER_CACHE_TTL_SECONDS:
-        return cached["rows"]
-
-    reliable_stale_exists = _team_roster_cache_is_reliable_stale(cached, cached_ts)
-    failure_meta = TEAM_ROSTER_FAILURE_META.get(cache_key) or {}
-    last_failure_ts = float(failure_meta.get("timestamp") or 0.0)
-
-    if reliable_stale_exists and last_failure_ts and (now_ts - last_failure_ts) < TEAM_ROSTER_FAILURE_COOLDOWN_SECONDS:
-        return cached["rows"]
-
-    budget_seconds = TEAM_ROSTER_FETCH_BUDGET_WITH_RELIABLE_STALE_SECONDS if reliable_stale_exists else TEAM_ROSTER_FETCH_BUDGET_NO_RELIABLE_STALE_SECONDS
-    attempts = TEAM_ROSTER_FETCH_ATTEMPTS_WITH_RELIABLE_STALE if reliable_stale_exists else TEAM_ROSTER_FETCH_ATTEMPTS_NO_RELIABLE_STALE
-    started_at = time.monotonic()
-    last_exc: Exception | None = None
-
-    for _attempt_idx in range(max(1, attempts)):
-        elapsed = time.monotonic() - started_at
-        remaining = budget_seconds - elapsed
-        if remaining <= 0:
-            break
-        timeout_seconds = max(TEAM_ROSTER_FETCH_TIMEOUT_FLOOR_SECONDS, min(TEAM_ROSTER_FETCH_TIMEOUT_CAP_SECONDS, int(math.ceil(remaining))))
-        try:
-            response = call_nba_with_retries(
-                lambda timeout_seconds=timeout_seconds: CommonTeamRoster(team_id=team_id, season=season, timeout=timeout_seconds),
-                label="team roster request",
-                attempts=1,
-                base_delay=TEAM_ROSTER_RETRY_BASE_DELAY,
-            )
-            df = response.get_data_frames()[0]
-            if df.empty:
-                raise HTTPException(status_code=404, detail="No roster found for this team and season.")
-
-            rows = df.to_dict(orient="records")
-
-            def jersey_sort_key(row: dict[str, Any]) -> tuple[int, str]:
-                raw_num = str(row.get("NUM", "")).strip()
-                jersey_num = int(raw_num) if raw_num.isdigit() else 999
-                return jersey_num, str(row.get("PLAYER", "")).lower()
-
-            rows.sort(key=jersey_sort_key)
-            payload = {"timestamp": time.time(), "rows": rows}
-            ROSTER_CACHE[cache_key] = payload
-            TEAM_ROSTER_FAILURE_META.pop(cache_key, None)
-            save_persistent_caches()
-            return rows
-        except HTTPException:
-            raise
-        except Exception as exc:
-            last_exc = exc
-            TEAM_ROSTER_FAILURE_META[cache_key] = {"timestamp": time.time()}
-
-    if cached and cached.get("rows"):
-        return cached["rows"]
-
-    detail = "Team roster request failed. This can happen when NBA stats throttles or times out."
-    if last_exc is not None:
-        detail = f"{detail} Details: {last_exc}"
-    raise HTTPException(status_code=502, detail=detail)
+    return PLAYER_DATA_SERVICE.fetch_team_roster(team_id, season)
 
 
 @timed_call("fetch_common_player_info")
 def fetch_common_player_info(player_id: int) -> dict[str, Any]:
-    cached = PLAYER_INFO_CACHE.get(player_id)
-    now_ts = time.time()
-    cached_ts = float((cached or {}).get("timestamp") or 0.0)
-
-    if cached and now_ts - cached_ts < PROFILE_TTL_SECONDS:
-        return cached["row"]
-
-    reliable_stale_exists = _player_info_cache_is_reliable_stale(cached, cached_ts)
-    failure_meta = PLAYER_INFO_FAILURE_META.get(player_id) or {}
-    last_failure_ts = float(failure_meta.get("timestamp") or 0.0)
-
-    if reliable_stale_exists and last_failure_ts and (now_ts - last_failure_ts) < PLAYER_INFO_FAILURE_COOLDOWN_SECONDS:
-        return cached["row"]
-
-    budget_seconds = PLAYER_INFO_FETCH_BUDGET_WITH_RELIABLE_STALE_SECONDS if reliable_stale_exists else PLAYER_INFO_FETCH_BUDGET_NO_RELIABLE_STALE_SECONDS
-    attempts = PLAYER_INFO_FETCH_ATTEMPTS_WITH_RELIABLE_STALE if reliable_stale_exists else PLAYER_INFO_FETCH_ATTEMPTS_NO_RELIABLE_STALE
-    started_at = time.monotonic()
-    last_exc: Exception | None = None
-
-    for attempt_idx in range(max(1, attempts)):
-        elapsed = time.monotonic() - started_at
-        remaining = budget_seconds - elapsed
-        if remaining <= 0:
-            break
-        timeout_seconds = max(PLAYER_INFO_FETCH_TIMEOUT_FLOOR_SECONDS, min(PLAYER_INFO_FETCH_TIMEOUT_CAP_SECONDS, int(math.ceil(remaining))))
-        try:
-            response = call_nba_with_retries(
-                lambda timeout_seconds=timeout_seconds: CommonPlayerInfo(player_id=player_id, timeout=timeout_seconds),
-                label="player info request",
-                attempts=1,
-                base_delay=PLAYER_INFO_RETRY_BASE_DELAY,
-            )
-            df = response.get_data_frames()[0]
-            if df.empty:
-                raise HTTPException(status_code=404, detail="Player info not found.")
-            row = df.to_dict(orient="records")[0]
-            PLAYER_INFO_CACHE[player_id] = {"timestamp": time.time(), "row": row}
-            PLAYER_INFO_FAILURE_META.pop(player_id, None)
-            save_persistent_caches()
-            return row
-        except HTTPException:
-            raise
-        except Exception as exc:
-            last_exc = exc
-            PLAYER_INFO_FAILURE_META[player_id] = {"timestamp": time.time()}
-            if reliable_stale_exists:
-                return cached["row"]
-            if attempt_idx < max(1, attempts) - 1:
-                time.sleep(min(PLAYER_INFO_RETRY_BASE_DELAY * (attempt_idx + 1), max(0.0, max(remaining - 1, 0.0))))
-
-    if reliable_stale_exists and cached and cached.get("row"):
-        return cached["row"]
-    if cached and cached.get("row") and _player_info_cache_is_reliable_stale(cached, cached_ts):
-        return cached["row"]
-    raise HTTPException(
-        status_code=502,
-        detail=(
-            "Player info request failed. This can happen when NBA stats throttles or times out. "
-            f"Details: {last_exc}"
-        ),
-    ) from last_exc
+    return PLAYER_DATA_SERVICE.fetch_common_player_info(player_id)
 
 
 def fetch_next_game(player_id: int, season: str, season_type: str) -> dict[str, Any] | None:
-    cache_key = (player_id, season, season_type)
-    cached = NEXT_GAME_CACHE.get(cache_key)
-    now_ts = time.time()
-    cached_ts = float((cached or {}).get("timestamp") or 0.0)
+    return PLAYER_DATA_SERVICE.fetch_next_game(player_id, season, season_type)
 
-    if cached and now_ts - cached_ts < NEXT_GAME_TTL_SECONDS:
-        return cached.get("row")
 
-    reliable_stale_exists = _next_game_cache_is_reliable_stale(cached, cached_ts)
-    failure_meta = NEXT_GAME_FAILURE_META.get(cache_key) or {}
-    last_failure_ts = float(failure_meta.get("timestamp") or 0.0)
-    if reliable_stale_exists and last_failure_ts and (now_ts - last_failure_ts) < NEXT_GAME_FAILURE_COOLDOWN_SECONDS:
-        return cached.get("row")
 
-    budget_seconds = NEXT_GAME_FETCH_BUDGET_WITH_RELIABLE_STALE_SECONDS if reliable_stale_exists else NEXT_GAME_FETCH_BUDGET_NO_RELIABLE_STALE_SECONDS
-    attempts = NEXT_GAME_FETCH_ATTEMPTS_WITH_RELIABLE_STALE if reliable_stale_exists else NEXT_GAME_FETCH_ATTEMPTS_NO_RELIABLE_STALE
-    started_at = time.monotonic()
-    last_exc: Exception | None = None
+PLAYER_DATA_SERVICE = PlayerDataService(
+    game_log_cache_schema_version=GAME_LOG_CACHE_SCHEMA_VERSION,
+    cache_ttl_seconds=CACHE_TTL_SECONDS,
+    profile_ttl_seconds=PROFILE_TTL_SECONDS,
+    team_roster_cache_ttl_seconds=TEAM_ROSTER_CACHE_TTL_SECONDS,
+    game_log_cache=GAME_LOG_CACHE,
+    recent_game_log_cache=RECENT_GAME_LOG_CACHE,
+    game_log_failure_meta=GAME_LOG_FAILURE_META,
+    roster_cache=ROSTER_CACHE,
+    team_roster_failure_meta=TEAM_ROSTER_FAILURE_META,
+    player_info_cache=PLAYER_INFO_CACHE,
+    player_info_failure_meta=PLAYER_INFO_FAILURE_META,
+    next_game_cache=NEXT_GAME_CACHE,
+    next_game_failure_meta=NEXT_GAME_FAILURE_META,
+    player_game_log_cls=PlayerGameLog,
+    common_team_roster_cls=CommonTeamRoster,
+    common_player_info_cls=CommonPlayerInfo,
+    player_next_n_games_cls=PlayerNextNGames,
+    dedupe_game_log_rows=dedupe_game_log_rows,
+    throttle_request=throttle_request,
+    call_nba_with_retries=call_nba_with_retries,
+    save_persistent_caches=save_persistent_caches,
+    is_transient_nba_error=is_transient_nba_error,
+    game_log_cache_is_reliable_stale=_game_log_cache_is_reliable_stale,
+    player_info_cache_is_reliable_stale=_player_info_cache_is_reliable_stale,
+    next_game_cache_is_reliable_stale=_next_game_cache_is_reliable_stale,
+    team_roster_cache_is_reliable_stale=_team_roster_cache_is_reliable_stale,
+    game_log_failure_cooldown_seconds=GAME_LOG_FAILURE_COOLDOWN_SECONDS,
+    game_log_fetch_budget_with_reliable_stale_seconds=GAME_LOG_FETCH_BUDGET_WITH_RELIABLE_STALE_SECONDS,
+    game_log_fetch_budget_no_reliable_stale_seconds=GAME_LOG_FETCH_BUDGET_NO_RELIABLE_STALE_SECONDS,
+    game_log_fetch_attempts_with_reliable_stale=GAME_LOG_FETCH_ATTEMPTS_WITH_RELIABLE_STALE,
+    game_log_fetch_attempts_no_reliable_stale=GAME_LOG_FETCH_ATTEMPTS_NO_RELIABLE_STALE,
+    game_log_fetch_timeout_cap_seconds=GAME_LOG_FETCH_TIMEOUT_CAP_SECONDS,
+    game_log_fetch_timeout_floor_seconds=GAME_LOG_FETCH_TIMEOUT_FLOOR_SECONDS,
+    nba_backoff_factor=NBA_BACKOFF_FACTOR,
+    team_roster_failure_cooldown_seconds=TEAM_ROSTER_FAILURE_COOLDOWN_SECONDS,
+    team_roster_fetch_budget_with_reliable_stale_seconds=TEAM_ROSTER_FETCH_BUDGET_WITH_RELIABLE_STALE_SECONDS,
+    team_roster_fetch_budget_no_reliable_stale_seconds=TEAM_ROSTER_FETCH_BUDGET_NO_RELIABLE_STALE_SECONDS,
+    team_roster_fetch_attempts_with_reliable_stale=TEAM_ROSTER_FETCH_ATTEMPTS_WITH_RELIABLE_STALE,
+    team_roster_fetch_attempts_no_reliable_stale=TEAM_ROSTER_FETCH_ATTEMPTS_NO_RELIABLE_STALE,
+    team_roster_fetch_timeout_cap_seconds=TEAM_ROSTER_FETCH_TIMEOUT_CAP_SECONDS,
+    team_roster_fetch_timeout_floor_seconds=TEAM_ROSTER_FETCH_TIMEOUT_FLOOR_SECONDS,
+    team_roster_retry_base_delay=TEAM_ROSTER_RETRY_BASE_DELAY,
+    player_info_failure_cooldown_seconds=PLAYER_INFO_FAILURE_COOLDOWN_SECONDS,
+    player_info_fetch_budget_with_reliable_stale_seconds=PLAYER_INFO_FETCH_BUDGET_WITH_RELIABLE_STALE_SECONDS,
+    player_info_fetch_budget_no_reliable_stale_seconds=PLAYER_INFO_FETCH_BUDGET_NO_RELIABLE_STALE_SECONDS,
+    player_info_fetch_attempts_with_reliable_stale=PLAYER_INFO_FETCH_ATTEMPTS_WITH_RELIABLE_STALE,
+    player_info_fetch_attempts_no_reliable_stale=PLAYER_INFO_FETCH_ATTEMPTS_NO_RELIABLE_STALE,
+    player_info_fetch_timeout_cap_seconds=PLAYER_INFO_FETCH_TIMEOUT_CAP_SECONDS,
+    player_info_fetch_timeout_floor_seconds=PLAYER_INFO_FETCH_TIMEOUT_FLOOR_SECONDS,
+    player_info_retry_base_delay=PLAYER_INFO_RETRY_BASE_DELAY,
+    next_game_ttl_seconds=NEXT_GAME_TTL_SECONDS,
+    next_game_failure_cooldown_seconds=NEXT_GAME_FAILURE_COOLDOWN_SECONDS,
+    next_game_fetch_budget_with_reliable_stale_seconds=NEXT_GAME_FETCH_BUDGET_WITH_RELIABLE_STALE_SECONDS,
+    next_game_fetch_budget_no_reliable_stale_seconds=NEXT_GAME_FETCH_BUDGET_NO_RELIABLE_STALE_SECONDS,
+    next_game_fetch_attempts_with_reliable_stale=NEXT_GAME_FETCH_ATTEMPTS_WITH_RELIABLE_STALE,
+    next_game_fetch_attempts_no_reliable_stale=NEXT_GAME_FETCH_ATTEMPTS_NO_RELIABLE_STALE,
+    next_game_fetch_timeout_cap_seconds=NEXT_GAME_FETCH_TIMEOUT_CAP_SECONDS,
+    next_game_fetch_timeout_floor_seconds=NEXT_GAME_FETCH_TIMEOUT_FLOOR_SECONDS,
+    next_game_retry_base_delay=NEXT_GAME_RETRY_BASE_DELAY,
+    http_exception_cls=HTTPException,
+)
 
-    for attempt_idx in range(max(1, attempts)):
-        elapsed = time.monotonic() - started_at
-        remaining = budget_seconds - elapsed
-        if remaining <= 0:
-            break
-        timeout_seconds = max(NEXT_GAME_FETCH_TIMEOUT_FLOOR_SECONDS, min(NEXT_GAME_FETCH_TIMEOUT_CAP_SECONDS, int(math.ceil(remaining))))
-        try:
-            response = call_nba_with_retries(
-                lambda timeout_seconds=timeout_seconds: PlayerNextNGames(
-                    player_id=player_id,
-                    number_of_games=1,
-                    season_all=season,
-                    season_type_all_star=season_type,
-                    timeout=timeout_seconds,
-                ),
-                label="next game request",
-                attempts=1,
-                base_delay=NEXT_GAME_RETRY_BASE_DELAY,
-            )
-            df = response.get_data_frames()[0]
-            row = None if df.empty else df.to_dict(orient="records")[0]
-            NEXT_GAME_CACHE[cache_key] = {"timestamp": time.time(), "row": row}
-            NEXT_GAME_FAILURE_META.pop(cache_key, None)
-            return row
-        except Exception as exc:
-            last_exc = exc
-            NEXT_GAME_FAILURE_META[cache_key] = {"timestamp": time.time()}
-            if reliable_stale_exists:
-                return cached.get("row")
-            if attempt_idx < max(1, attempts) - 1:
-                time.sleep(min(NEXT_GAME_RETRY_BASE_DELAY * (attempt_idx + 1), max(0.0, max(remaining - 1, 0.0))))
 
-    if cached:
-        return cached.get("row")
-    return None
+SCHEDULE_SERVICE = ScheduleDataService(
+    team_lookup=TEAM_LOOKUP,
+    scoreboard_cache=SCOREBOARD_CACHE,
+    next_game_cache=TEAM_NEXT_GAME_CACHE,
+    next_game_failure_meta=NEXT_GAME_FAILURE_META,
+    scoreboard_v2_cls=ScoreboardV2,
+    call_with_retries=call_nba_with_retries,
+    fetch_next_game=fetch_next_game,
+    save_persistent_caches=save_persistent_caches,
+    safe_int_score=safe_int_score,
+    current_nba_game_date=current_nba_game_date,
+    timed_call=timed_call,
+    next_game_ttl_seconds=NEXT_GAME_TTL_SECONDS,
+    next_game_failure_cooldown_seconds=NEXT_GAME_FAILURE_COOLDOWN_SECONDS,
+    scoreboard_cache_ttl_seconds=SCOREBOARD_CACHE_TTL_SECONDS,
+    scoreboard_max_stale_seconds=SCOREBOARD_MAX_STALE_SECONDS,
+    scoreboard_failure_cooldown_seconds=SCOREBOARD_FAILURE_COOLDOWN_SECONDS,
+    scoreboard_fetch_budget_with_reliable_stale_seconds=SCOREBOARD_FETCH_BUDGET_WITH_RELIABLE_STALE_SECONDS,
+    scoreboard_fetch_budget_no_reliable_stale_seconds=SCOREBOARD_FETCH_BUDGET_NO_RELIABLE_STALE_SECONDS,
+    scoreboard_fetch_attempts_with_reliable_stale=SCOREBOARD_FETCH_ATTEMPTS_WITH_RELIABLE_STALE,
+    scoreboard_fetch_attempts_no_reliable_stale=SCOREBOARD_FETCH_ATTEMPTS_NO_RELIABLE_STALE,
+    scoreboard_fetch_timeout_cap_seconds=SCOREBOARD_FETCH_TIMEOUT_CAP_SECONDS,
+    scoreboard_fetch_timeout_floor_seconds=SCOREBOARD_FETCH_TIMEOUT_FLOOR_SECONDS,
+    scoreboard_retry_base_delay=SCOREBOARD_RETRY_BASE_DELAY,
+    next_game_cache_is_reliable_stale=_next_game_cache_is_reliable_stale,
+)
 
 
 def _scoreboard_cache_is_reliable_stale(game_date: str, cached: dict[str, Any] | None, cached_ts: float) -> bool:
-    if not cached:
-        return False
-    rows = cached.get("rows") or []
-    if not rows:
-        return False
-    age_seconds = time.time() - float(cached_ts or 0.0)
-    if age_seconds > SCOREBOARD_MAX_STALE_SECONDS:
-        return False
-    current_date = current_nba_game_date()
-    return str(game_date or "").strip() == str(current_date or "").strip()
+    return SCHEDULE_SERVICE._scoreboard_cache_is_reliable_stale(game_date, cached, cached_ts)
 
 
 def _get_scoreboard_failure_meta(game_date: str) -> dict[str, Any]:
-    return SCOREBOARD_CACHE.setdefault(f"__failure__::{game_date}", {})
+    return SCHEDULE_SERVICE._get_scoreboard_failure_meta(game_date)
 
 
 def fetch_scoreboard_games(game_date: str) -> list[dict[str, Any]]:
-    game_date = str(game_date or "").strip()
-    cached = SCOREBOARD_CACHE.get(game_date)
-    now_ts = time.time()
-
-    if cached and now_ts - float(cached.get("timestamp") or 0.0) < SCOREBOARD_CACHE_TTL_SECONDS:
-        return cached.get("rows") or []
-
-    cached_ts = float(cached.get("timestamp") or 0.0) if cached else 0.0
-    reliable_stale_exists = _scoreboard_cache_is_reliable_stale(game_date, cached, cached_ts)
-    failure_meta = _get_scoreboard_failure_meta(game_date)
-    last_failure_ts = float(failure_meta.get("timestamp") or 0.0)
-
-    if reliable_stale_exists and last_failure_ts and (now_ts - last_failure_ts) < SCOREBOARD_FAILURE_COOLDOWN_SECONDS:
-        return cached.get("rows") or []
-
-    total_budget = (
-        SCOREBOARD_FETCH_BUDGET_WITH_RELIABLE_STALE_SECONDS
-        if reliable_stale_exists
-        else SCOREBOARD_FETCH_BUDGET_NO_RELIABLE_STALE_SECONDS
-    )
-    max_attempts = (
-        SCOREBOARD_FETCH_ATTEMPTS_WITH_RELIABLE_STALE
-        if reliable_stale_exists
-        else SCOREBOARD_FETCH_ATTEMPTS_NO_RELIABLE_STALE
-    )
-
-    start_ts = time.monotonic()
-    attempts_made = 0
-    last_exc: Exception | None = None
-
-    while attempts_made < max_attempts:
-        elapsed = time.monotonic() - start_ts
-        remaining_budget = total_budget - elapsed
-        if remaining_budget <= 0:
-            break
-
-        timeout_seconds = max(
-            SCOREBOARD_FETCH_TIMEOUT_FLOOR_SECONDS,
-            min(SCOREBOARD_FETCH_TIMEOUT_CAP_SECONDS, int(remaining_budget)),
-        )
-
-        try:
-            response = call_nba_with_retries(
-                lambda timeout_seconds=timeout_seconds: ScoreboardV2(
-                    game_date=game_date,
-                    day_offset=0,
-                    league_id="00",
-                    timeout=timeout_seconds,
-                ),
-                label="scoreboard request",
-                attempts=1,
-                base_delay=SCOREBOARD_RETRY_BASE_DELAY,
-            )
-            header_df = response.game_header.get_data_frame()
-            try:
-                line_score_df = response.line_score.get_data_frame()
-            except Exception:
-                line_score_df = None
-
-            rows = header_df.to_dict(orient="records") if not header_df.empty else []
-            if not rows:
-                SCOREBOARD_CACHE[game_date] = {"timestamp": time.time(), "rows": []}
-                SCOREBOARD_CACHE.pop(f"__failure__::{game_date}", None)
-                return []
-
-            line_score_lookup: dict[tuple[str, int], dict[str, Any]] = {}
-            if line_score_df is not None and not line_score_df.empty:
-                for score_row in line_score_df.to_dict(orient="records"):
-                    row_game_id = str(score_row.get("GAME_ID") or "").strip()
-                    team_id = int(score_row.get("TEAM_ID") or 0)
-                    if row_game_id and team_id:
-                        line_score_lookup[(row_game_id, team_id)] = score_row
-
-            enriched_rows: list[dict[str, Any]] = []
-            for row in rows:
-                row_game_id = str(row.get("GAME_ID") or "").strip()
-                home_team_id = int(row.get("HOME_TEAM_ID") or 0)
-                away_team_id = int(row.get("VISITOR_TEAM_ID") or 0)
-                home_score_row = line_score_lookup.get((row_game_id, home_team_id), {})
-                away_score_row = line_score_lookup.get((row_game_id, away_team_id), {})
-
-                enriched_row = dict(row)
-                enriched_row["PTS_HOME"] = safe_int_score(home_score_row.get("PTS"), row.get("PTS_HOME"), 0)
-                enriched_row["PTS_AWAY"] = safe_int_score(away_score_row.get("PTS"), row.get("PTS_AWAY"), 0)
-                enriched_rows.append(enriched_row)
-
-            SCOREBOARD_CACHE[game_date] = {"timestamp": time.time(), "rows": enriched_rows}
-            SCOREBOARD_CACHE.pop(f"__failure__::{game_date}", None)
-            return enriched_rows
-        except Exception as exc:
-            attempts_made += 1
-            last_exc = exc
-            if reliable_stale_exists:
-                SCOREBOARD_CACHE[f"__failure__::{game_date}"] = {"timestamp": time.time(), "error": str(exc)}
-                return cached.get("rows") or []
-            if attempts_made >= max_attempts:
-                break
-
-    if reliable_stale_exists:
-        SCOREBOARD_CACHE[f"__failure__::{game_date}"] = {"timestamp": time.time(), "error": str(last_exc) if last_exc else "timeout"}
-        return cached.get("rows") or []
-
-    if cached:
-        # For non-current dates, any existing cache is better than failing hard.
-        SCOREBOARD_CACHE[f"__failure__::{game_date}"] = {"timestamp": time.time(), "error": str(last_exc) if last_exc else "timeout"}
-        return cached.get("rows") or []
-
-    return []
+    return SCHEDULE_SERVICE.fetch_scoreboard_games(game_date)
 
 
-def build_scoreboard_next_game_payload(
-    game_row: dict[str, Any],
-    player_team_id: int | None,
-) -> dict[str, Any] | None:
-    if not player_team_id:
-        return None
-
-    home_team_id = int(game_row.get("HOME_TEAM_ID") or 0)
-    visitor_team_id = int(game_row.get("VISITOR_TEAM_ID") or 0)
-
-    if player_team_id == home_team_id:
-        is_home = True
-        opponent_team_id = visitor_team_id
-        opponent = TEAM_LOOKUP.get(visitor_team_id, {})
-        player_team = TEAM_LOOKUP.get(home_team_id, {})
-        opponent_abbreviation = str(opponent.get("abbreviation") or "").strip()
-        matchup_label = f"vs {opponent_abbreviation}" if opponent_abbreviation else "vs Opponent"
-    elif player_team_id == visitor_team_id:
-        is_home = False
-        opponent_team_id = home_team_id
-        opponent = TEAM_LOOKUP.get(home_team_id, {})
-        player_team = TEAM_LOOKUP.get(visitor_team_id, {})
-        opponent_abbreviation = str(opponent.get("abbreviation") or "").strip()
-        matchup_label = f"@ {opponent_abbreviation}" if opponent_abbreviation else "@ Opponent"
-    else:
-        return None
-
-    game_date = str(game_row.get("GAME_DATE_EST") or "").strip()
-
-    return {
-        "game_date": game_date,
-        "game_time": "",
-        "is_home": is_home,
-        "matchup_label": matchup_label,
-        "opponent_team_id": opponent_team_id,
-        "opponent_name": str(opponent.get("full_name") or "").strip(),
-        "opponent_abbreviation": opponent_abbreviation,
-        "player_team_abbreviation": str(player_team.get("abbreviation") or "").strip(),
-    }
+def build_scoreboard_next_game_payload(game_row: dict[str, Any], player_team_id: int | None) -> dict[str, Any] | None:
+    return SCHEDULE_SERVICE.build_scoreboard_next_game_payload(game_row, player_team_id)
 
 
 def find_team_next_game_via_scoreboard(team_id: int | None, lookahead_days: int = 10) -> dict[str, Any] | None:
-    if not team_id:
-        return None
+    return SCHEDULE_SERVICE.find_team_next_game_via_scoreboard(team_id, lookahead_days=lookahead_days)
 
-    start_date = datetime.now(ZoneInfo("America/New_York")).date()
-    for offset in range(lookahead_days + 1):
-        game_date = (start_date + timedelta(days=offset)).strftime("%Y-%m-%d")
-        rows = fetch_scoreboard_games(game_date)
-        for row in rows:
-            payload = build_scoreboard_next_game_payload(row, team_id)
-            if payload:
-                return payload
 
-    return None
+def build_next_game_payload(next_game_row: dict[str, Any] | None, player_team_id: int | None) -> dict[str, Any] | None:
+    return SCHEDULE_SERVICE.build_next_game_payload(next_game_row, player_team_id)
 
 
-def fetch_position_dash(
-    season: str,
-    season_type: str,
-    position_code: str,
-    opponent_team_id: int = 0,
-) -> list[dict[str, Any]]:
-    cache_key = (season, season_type, position_code, opponent_team_id)
-    cached = POSITION_DASH_CACHE.get(cache_key)
-    now_ts = time.time()
-    cached_ts = float((cached or {}).get("timestamp") or 0.0)
-
-    if cached and now_ts - cached_ts < POSITION_TTL_SECONDS:
-        return cached["rows"]
-
-    reliable_stale_exists = _position_dash_cache_is_reliable_stale(cached, cached_ts)
-
-    failure_meta = POSITION_DASH_FAILURE_META.get(cache_key) or {}
-    last_failure_ts = float(failure_meta.get("timestamp") or 0.0)
-    if reliable_stale_exists and last_failure_ts and (now_ts - last_failure_ts) < POSITION_DASH_FAILURE_COOLDOWN_SECONDS:
-        return cached.get("rows") or []
-
-    total_budget = (
-        POSITION_DASH_FETCH_BUDGET_WITH_RELIABLE_STALE_SECONDS
-        if reliable_stale_exists
-        else POSITION_DASH_FETCH_BUDGET_NO_RELIABLE_STALE_SECONDS
-    )
-    attempts = (
-        POSITION_DASH_FETCH_ATTEMPTS_WITH_RELIABLE_STALE
-        if reliable_stale_exists
-        else POSITION_DASH_FETCH_ATTEMPTS_NO_RELIABLE_STALE
-    )
-
-    start_monotonic = time.monotonic()
-
-    for attempt in range(attempts):
-        elapsed = time.monotonic() - start_monotonic
-        remaining = total_budget - elapsed
-        if remaining <= 0:
-            break
-
-        per_attempt_timeout = max(
-            POSITION_DASH_FETCH_TIMEOUT_FLOOR_SECONDS,
-            min(POSITION_DASH_FETCH_TIMEOUT_CAP_SECONDS, int(math.ceil(remaining))),
-        )
-
-        try:
-            response = call_nba_with_retries(
-                lambda: LeagueDashPlayerStats(
-                    season=season,
-                    season_type_all_star=season_type,
-                    per_mode_detailed="Totals",
-                    player_position_abbreviation_nullable=position_code,
-                    opponent_team_id=opponent_team_id,
-                    timeout=per_attempt_timeout,
-                ),
-                label="position dashboard request",
-                attempts=1,
-            )
-            df = response.get_data_frames()[0]
-            rows = df.to_dict(orient="records") if not df.empty else []
-            POSITION_DASH_CACHE[cache_key] = {"timestamp": time.time(), "rows": rows}
-            POSITION_DASH_FAILURE_META.pop(cache_key, None)
-            return rows
-        except Exception as exc:
-            POSITION_DASH_FAILURE_META[cache_key] = {"timestamp": time.time()}
-
-            remaining_after = total_budget - (time.monotonic() - start_monotonic)
-            if reliable_stale_exists:
-                return cached.get("rows") or []
-
-            if attempt >= attempts - 1 or remaining_after <= 0 or not is_transient_nba_error(exc):
-                break
-
-            time.sleep(min(0.6 * (2 ** attempt), max(0.0, remaining_after)))
-
-    if reliable_stale_exists and cached:
-        return cached.get("rows") or []
-
-    if cached:
-        return cached.get("rows") or []
-
-    return []
-
-
-def summarize_position_environment(rows: list[dict[str, Any]], stat: str) -> dict[str, Any] | None:
-    if not rows:
-        return None
-
-    cache_key = (str(stat), id(rows), str(len(rows)))
-    cached = POSITION_SUMMARY_CACHE.get(cache_key)
-    now_ts = time.time()
-
-    if cached and now_ts - float(cached.get("timestamp") or 0.0) < POSITION_TTL_SECONDS:
-        summary = cached.get("summary")
-        return dict(summary) if isinstance(summary, dict) else None
-
-    total_gp = 0.0
-    total_value = 0.0
-    players_count = 0
-
-    for row in rows:
-        gp = float(row.get("GP") or 0)
-        if gp <= 0:
-            continue
-        players_count += 1
-        total_gp += gp
-        total_value += compute_stat_value(row, stat)
-
-    if total_gp <= 0:
-        POSITION_SUMMARY_CACHE[cache_key] = {"timestamp": now_ts, "summary": None}
-        return None
-
-    summary = {
-        "players_count": players_count,
-        "sample_gp": round(total_gp, 1),
-        "per_player_game": round(total_value / total_gp, 2),
-        "total_value": round(total_value, 1),
-    }
-    POSITION_SUMMARY_CACHE[cache_key] = {"timestamp": now_ts, "summary": dict(summary)}
-    return summary
-
-
-
-def clamp(value: float, min_value: float, max_value: float) -> float:
-    return max(min_value, min(max_value, value))
-
-
-def decimal_implied_probability(odds: float | None) -> float | None:
-    if odds in (None, 0):
-        return None
-    try:
-        odds_value = float(odds)
-    except (TypeError, ValueError):
-        return None
-    if odds_value <= 1:
-        return None
-    return 1 / odds_value
-
-
-def resolve_team_from_text(team_text: str | None) -> dict[str, Any] | None:
-    if not team_text:
-        return None
-    key = normalize_name(team_text)
-    return TEAM_ALIAS_LOOKUP.get(key)
-
-
-def resolve_opponent_team_from_matchup(matchup: str, player_team_id: int | None) -> dict[str, Any] | None:
-    """Parse a MATCHUP string (e.g. 'LAL vs. GSW' or 'LAL @ GSW') and return the
-    opponent team dict, excluding the player's own team identified by player_team_id."""
-    info = parse_matchup_descriptor(matchup)
-    team_abbr = info.get('team_abbreviation', '')
-    opp_abbr = info.get('opponent_abbreviation', '')
-
-    team_candidate = TEAM_ALIAS_LOOKUP.get(normalize_name(team_abbr)) if team_abbr else None
-    opp_candidate = TEAM_ALIAS_LOOKUP.get(normalize_name(opp_abbr)) if opp_abbr else None
-
-    # If we know the player's team, return whichever candidate is NOT their team
-    if player_team_id is not None:
-        if opp_candidate and int(opp_candidate.get('id') or 0) != player_team_id:
-            return opp_candidate
-        if team_candidate and int(team_candidate.get('id') or 0) != player_team_id:
-            return team_candidate
-        return opp_candidate  # fallback
-
-    # No team context — return the opponent abbreviation side
-    return opp_candidate or team_candidate
-
-
-def find_player_by_name(player_name: str, team_id: int | None = None) -> dict[str, Any] | None:
-    roster_ids: set[int] | None = None
-    if team_id is not None:
-        try:
-            roster = fetch_team_roster(team_id=team_id, season=current_nba_season())
-            roster_ids = {int(row.get("PLAYER_ID")) for row in roster if row.get("PLAYER_ID") not in (None, "")}
-        except HTTPException:
-            roster_ids = None
-
-    return PLAYER_SEARCH_INDEX.find_player(player_name, roster_ids=roster_ids)
-
-
-def estimate_model_probabilities(
-    hit_rate_pct: float,
-    average: float,
-    line: float,
-    matchup_delta_pct: float | None = None,
-    *,
-    stat: str | None = None,
-    opportunity: dict[str, Any] | None = None,
-    team_context: dict[str, Any] | None = None,
-    environment: dict[str, Any] | None = None,
-    variance: dict[str, Any] | None = None,
-) -> tuple[float, float]:
-    opportunity = opportunity or {}
-    team_context = team_context or {}
-    environment = environment or {}
-    variance = variance or {}
-
-    base = hit_rate_pct / 100.0
-    edge_term = 0.0
-    scale = max(1.0, max(line, 1.0) * 0.18)
-    edge_term += clamp((average - line) / scale, -0.18, 0.18)
-
-    # --- Variance-aware adjustment ---
-    # If we have distribution data, prefer median over mean for edge, and penalize high variance
-    variance_adjustment = 0.0
-    if variance:
-        std_dev = float(variance.get("std_dev") or 0.0)
-        median = float(variance.get("median") or average)
-        consistency_score = float(variance.get("consistency_score") or 50.0)
-        p25 = float(variance.get("p25") or 0.0)
-        p75 = float(variance.get("p75") or 0.0)
-
-        # Median-based edge: more robust than mean for skewed distributions
-        median_edge_term = clamp((median - line) / scale, -0.18, 0.18)
-        # Blend mean-edge and median-edge (median weighted higher for noisy stats)
-        noisy_stats = {"STL", "BLK", "3PM"}
-        median_weight = 0.65 if stat in noisy_stats else 0.45
-        edge_term = edge_term * (1 - median_weight) + median_edge_term * median_weight
-
-        # Consistency penalty: highly inconsistent players get shrinkage toward 0.5
-        consistency_factor = consistency_score / 100.0  # 0.0 - 1.0
-        variance_adjustment = clamp((consistency_factor - 0.5) * 0.10, -0.06, 0.06)
-
-        # Percentile-based confidence: if p25 > line → floor is above line (strong over signal)
-        if p25 > line:
-            variance_adjustment += 0.05
-        elif p75 < line:
-            variance_adjustment -= 0.05
-
-        # High std_dev relative to line → dampen edge (more uncertainty)
-        cv = float(variance.get("cv") or 0.0)
-        if cv > 0.5:
-            # Very volatile player — shrink edge contribution
-            edge_term *= max(0.4, 1.0 - (cv - 0.5))
-
-    matchup_term = 0.0
-    if matchup_delta_pct is not None:
-        # Reduce matchup weight for volatile/noisy stats
-        noisy_stats = {"STL", "BLK"}
-        matchup_weight = 0.08 if stat in noisy_stats else 0.2
-        matchup_term = clamp(matchup_delta_pct / 100.0 * matchup_weight, -0.12, 0.12)
-
-    role_term = 0.0
-    if opportunity.get('minutes_trend') == 'up':
-        role_term += 0.03
-    elif opportunity.get('minutes_trend') == 'down':
-        role_term -= 0.04
-
-    scoring_stats = {'PTS', '3PM', 'PRA', 'PR', 'PA'}
-    if opportunity.get('volume_trend') == 'up':
-        role_term += 0.04 if stat in scoring_stats else 0.02
-    elif opportunity.get('volume_trend') == 'down':
-        role_term -= 0.04 if stat in scoring_stats else 0.02
-
-    if int(team_context.get('impact_count') or 0) > 0:
-        role_term += min(0.03, int(team_context.get('impact_count') or 0) * 0.01)
-
-    environment_term = 0.0
-    if environment.get('is_back_to_back'):
-        environment_term -= 0.03
-    elif isinstance(environment.get('rest_days'), int) and environment.get('rest_days') >= 2:
-        environment_term += 0.02
-
-    model_over = clamp(base + edge_term + matchup_term + role_term + environment_term + variance_adjustment, 0.02, 0.98)
-    return round(model_over, 4), round(1 - model_over, 4)
-
-
-@timed_call("build_prop_analysis_payload")
-def build_prop_analysis_payload(
-    player_id: int,
-    stat: str,
-    line: float,
-    last_n: int,
-    season: str,
-    season_type: str,
-    team_id: int | None = None,
-    player_position: str | None = None,
-    location: str = 'all',
-    result: str = 'all',
-    margin_min: float | None = None,
-    margin_max: float | None = None,
-    min_minutes: float | None = None,
-    max_minutes: float | None = None,
-    min_fga: float | None = None,
-    max_fga: float | None = None,
-    h2h_only: bool = False,
-    opponent_rank_range: str | None = None,
-    without_player_id: int | None = None,
-    without_player_name: str | None = None,
-    without_player_ids: list[int] | None = None,
-    without_player_names: list[str] | None = None,
-    debug: bool = False,
-    override_opponent_id: int | None = None,
-) -> dict[str, Any]:
-    normalized_without_player_ids = normalize_without_player_ids(without_player_ids)
-    if not normalized_without_player_ids and without_player_id:
-        normalized_without_player_ids = [int(without_player_id)]
-    normalized_without_player_names = resolve_without_player_names(normalized_without_player_ids)
-    if not normalized_without_player_names and without_player_name:
-        fallback_name = str(without_player_name).strip()
-        if fallback_name:
-            normalized_without_player_names = [fallback_name]
-    # NOTE: last_n is intentionally excluded from the cache key.
-    # All window sizes (5 / 10 / 15) share the same filtered_pool cached here.
-    # last_n slicing happens after cache retrieval so they never diverge.
-    cache_key = (ANALYSIS_CACHE_SCHEMA_VERSION, player_id, stat, float(line), season, season_type, team_id, player_position or '', location, result, margin_min, margin_max, min_minutes, max_minutes, min_fga, max_fga, h2h_only, str(opponent_rank_range or ''), tuple(normalized_without_player_ids), tuple(normalized_without_player_names), override_opponent_id)
-    cached = ANALYSIS_CACHE.get(cache_key)
-    now_ts = time.time()
-    analysis_cache_age = now_ts - float(cached.get('timestamp') or 0.0) if cached else None
-    if cached and analysis_cache_age is not None and analysis_cache_age < ANALYSIS_CACHE_TTL_SECONDS:
-        payload = copy.deepcopy(cached['payload'])
-        # Re-slice and recompute ALL last_n-dependent fields from the cached filtered_pool
-        cached_filtered_pool = cached.get('filtered_pool', [])
-        if cached_filtered_pool:
-            sliced_rows = cached_filtered_pool[:last_n]
-            sliced_stat_summary = build_stat_summary_block(sliced_rows, stat, line)
-            payload['games'] = list(reversed(sliced_stat_summary['games']))
-            payload['average'] = sliced_stat_summary['average']
-            payload['hit_count'] = sliced_stat_summary['hit_count']
-            payload['hit_rate'] = sliced_stat_summary['hit_rate']
-            payload['games_count'] = len(sliced_stat_summary['values'])
-            payload['last_n'] = last_n
-            payload['variance'] = sliced_stat_summary.get('variance') or {}
-            sliced_opportunity = build_opportunity_context(cached_filtered_pool, last_n)
-            payload['opportunity'] = sliced_opportunity
-            # --- Recompute model outputs that depend on last_n sample ---
-            _cached_vs_position = (payload.get('matchup') or {}).get('vs_position')
-            _cached_matchup_delta = (_cached_vs_position or {}).get('delta_pct') if isinstance(_cached_vs_position, dict) else None
-            _cached_team_context = payload.get('team_context') or {}
-            _cached_environment = payload.get('environment') or {}
-            _cached_availability = payload.get('availability') or {}
-            _cached_player = payload.get('player') or {}
-            _sliced_model_over, _sliced_model_under = estimate_model_probabilities(
-                hit_rate_pct=float(sliced_stat_summary['hit_rate']),
-                average=float(sliced_stat_summary['average']),
-                line=float(line),
-                matchup_delta_pct=float(_cached_matchup_delta) if _cached_matchup_delta is not None else None,
-                stat=str(stat),
-                opportunity=sliced_opportunity,
-                team_context=_cached_team_context,
-                environment=_cached_environment,
-                variance=sliced_stat_summary.get('variance') or {},
-            )
-            _sliced_recommended_side = 'OVER' if _sliced_model_over >= _sliced_model_under else 'UNDER'
-            _sliced_side_prob = _sliced_model_over if _sliced_recommended_side == 'OVER' else _sliced_model_under
-            _sliced_edge = round((_sliced_side_prob - 0.50) * 100, 1)
-            _sliced_ev = _sliced_side_prob - 0.50
-            _sliced_confidence = build_confidence_engine(
-                side=_sliced_recommended_side,
-                hit_rate=float(sliced_stat_summary['hit_rate']),
-                games_count=int(len(sliced_stat_summary['values'])),
-                edge=_sliced_edge,
-                ev=_sliced_ev,
-                matchup_delta_pct=float(_cached_matchup_delta) if _cached_matchup_delta is not None else None,
-                availability=_cached_availability,
-                opportunity=sliced_opportunity,
-                team_context=_cached_team_context,
-                environment=_cached_environment,
-                stat=str(stat),
-                player_position=str(_cached_player.get('position') or ''),
-                line=float(line),
-                average=float(sliced_stat_summary['average']),
-            )
-            payload['recommended_side'] = _sliced_recommended_side
-            payload['confidence'] = _sliced_confidence
-            # Recompute traffic light
-            _sliced_traffic_tone = 'yellow'
-            _sliced_traffic_label = 'Caution'
-            if _cached_availability.get('is_unavailable'):
-                _sliced_traffic_tone = 'red'
-                _sliced_traffic_label = 'Avoid'
-            elif _sliced_confidence['score'] >= 80:
-                _sliced_traffic_tone = 'green'
-                _sliced_traffic_label = f"Strong {_sliced_recommended_side}"
-            elif _sliced_confidence['score'] >= 68:
-                _sliced_traffic_tone = 'green'
-                _sliced_traffic_label = f"Lean {_sliced_recommended_side}"
-            elif _sliced_confidence['score'] <= 44:
-                _sliced_traffic_tone = 'red'
-                _sliced_traffic_label = 'Pass'
-            payload['traffic_light'] = {
-                'label': _sliced_traffic_label,
-                'tone': _sliced_traffic_tone,
-                'summary': _sliced_confidence.get('summary') or (payload.get('interpretation') or {}).get('market_takeaway') or '',
-            }
-            # Small sample warning
-            sliced_count = len(sliced_stat_summary['values'])
-            if sliced_count < 5:
-                payload['sample_warning'] = f"Only {sliced_count} games in filtered sample — treat recommendation with caution."
-            else:
-                payload.pop('sample_warning', None)
-        freshness = {"analysis_cached_seconds_ago": round(analysis_cache_age, 2)}
-        if HYBRID_ANALYZER_ENABLED:
-            player_cache_rows, _ = get_player_game_log_hybrid(player_id=player_id, season=season, season_type=season_type)
-            cached_player = payload.get("player") or {}
-            cached_team_name = cached_player.get("team_name") or TEAM_LOOKUP.get(int(cached_player.get("team_id") or 0), {}).get("full_name")
-            payload, freshness_overlay = overlay_sensitive_analysis_sections(
-                payload=payload,
-                player_name=str(cached_player.get("full_name") or player.get("full_name") if 'player' in locals() else ""),
-                team_name=str(cached_team_name or "") or None,
-                analysis_source_rows=player_cache_rows,
-                resolved_team_id=int(cached_player.get("team_id") or 0) or None,
-                player_id=player_id,
-                season=season,
-                season_type=season_type,
-                stat=stat,
-                line=line,
-            )
-            freshness.update(freshness_overlay)
-            if analysis_cache_age >= ANALYSIS_CACHE_TTL_SECONDS * 0.5:
-                enqueue_hybrid_refresh("game_log", (player_id, season, season_type))
-                if payload.get("player", {}).get("team_id"):
-                    enqueue_hybrid_refresh("team_next_game", (int(payload["player"]["team_id"]), player_id, season, season_type))
-        if debug and DEBUG_METADATA_ENABLED:
-            payload["debug"] = build_debug_metadata(
-                cache_status={"analysis_cache": "hit"},
-                freshness=freshness,
-                timings_enabled=NBA_TIMING_ENABLED,
-            )
-        return payload
-
-    player = PLAYER_LOOKUP.get(int(player_id))
-    if not player:
-        raise HTTPException(status_code=404, detail="Player not found.")
-
-    season_rows, game_log_meta = get_player_game_log_hybrid(player_id=player_id, season=season, season_type=season_type) if HYBRID_ANALYZER_ENABLED else (fetch_player_game_log(player_id=player_id, season=season, season_type=season_type), {"source": "live", "seconds_ago": None, "refresh_queued": False})
-
-    profile_row = None
-    player_info_meta = {"source": "unused", "seconds_ago": None, "refresh_queued": False}
-    resolved_team_id = team_id
-    resolved_position = player_position
-
-    if resolved_team_id is None or not resolved_position:
-        if HYBRID_ANALYZER_ENABLED:
-            profile_row, player_info_meta = get_player_info_hybrid(player_id)
-        else:
-            try:
-                profile_row = fetch_common_player_info(player_id)
-            except HTTPException:
-                profile_row = None
-        if profile_row:
-            if resolved_team_id is None:
-                raw_team_id = profile_row.get("TEAM_ID")
-                resolved_team_id = int(raw_team_id) if raw_team_id not in (None, "") else None
-            if not resolved_position:
-                resolved_position = str(profile_row.get("POSITION", "")).strip()
-
-    position_code, position_label = resolve_primary_position(resolved_position)
-
-    # If caller supplied an override opponent, build a synthetic next_game
-    if override_opponent_id and override_opponent_id != 0:
-        override_opp = TEAM_LOOKUP.get(int(override_opponent_id))
-        if override_opp:
-            player_team = TEAM_LOOKUP.get(resolved_team_id, {}) if resolved_team_id else {}
-            override_abbr = str(override_opp.get("abbreviation") or "").strip()
-            next_game = {
-                "game_date": "",
-                "game_time": "",
-                "is_home": None,
-                "matchup_label": f"vs {override_abbr}",
-                "opponent_team_id": int(override_opponent_id),
-                "opponent_name": str(override_opp.get("full_name") or "").strip(),
-                "opponent_abbreviation": override_abbr,
-                "player_team_abbreviation": str(player_team.get("abbreviation") or "").strip(),
-                "is_override": True,
-            }
-        else:
-            next_game, next_game_meta = get_team_next_game_hybrid(
-                team_id=resolved_team_id,
-                primary_player_id=player_id,
-                season=season,
-                season_type=season_type,
-            ) if HYBRID_ANALYZER_ENABLED else (resolve_team_next_game(
-                team_id=resolved_team_id,
-                primary_player_id=player_id,
-                season=season,
-                season_type=season_type,
-            ), {"source": "live", "seconds_ago": None, "refresh_queued": False})
-    else:
-        next_game, next_game_meta = get_team_next_game_hybrid(
-            team_id=resolved_team_id,
-            primary_player_id=player_id,
-            season=season,
-            season_type=season_type,
-        ) if HYBRID_ANALYZER_ENABLED else (resolve_team_next_game(
-            team_id=resolved_team_id,
-            primary_player_id=player_id,
-            season=season,
-            season_type=season_type,
-        ), {"source": "live", "seconds_ago": None, "refresh_queued": False})
-
-    needs_margin_context = margin_min is not None or margin_max is not None
-    if needs_margin_context:
-        enriched_rows = enrich_game_logs_with_context(
-            season_rows,
-            resolved_team_id,
-            season,
-            season_type,
-            player_id,
-        )
-    else:
-        enriched_rows = enrich_game_logs_light(season_rows)
-
-    opponent_rank_min, opponent_rank_max, normalized_opponent_rank_range = normalize_opponent_rank_range(opponent_rank_range)
-    if opponent_rank_min is not None or opponent_rank_max is not None:
-        team_rank_map = build_team_rank_map(season=season, season_type=season_type)
-        for row in enriched_rows:
-            matchup = str(row.get('MATCHUP') or '')
-            opp_team = resolve_opponent_team_from_matchup(matchup, resolved_team_id)
-            opp_team_id = int(opp_team['id']) if opp_team else None
-            row['_opponent_rank'] = team_rank_map.get(opp_team_id) if opp_team_id else None
-    else:
-        for row in enriched_rows:
-            row.setdefault('_opponent_rank', None)
-
-    without_player_game_ids = build_without_player_union_game_ids(normalized_without_player_ids, season=season, season_type=season_type)
-    if not normalized_without_player_names and without_player_name:
-        fallback_name = str(without_player_name).strip()
-        if fallback_name:
-            normalized_without_player_names = [fallback_name]
-    without_player_name = ', '.join(normalized_without_player_names)
-
-    filtered_pool = apply_game_log_filters(
-        enriched_rows,
-        location=location,
-        result=result,
-        margin_min=margin_min,
-        margin_max=margin_max,
-        min_minutes=min_minutes,
-        max_minutes=max_minutes,
-        min_fga=min_fga,
-        max_fga=max_fga,
-        h2h_only=h2h_only,
-        opponent_abbreviation=(next_game or {}).get('opponent_abbreviation'),
-        opponent_rank_min=opponent_rank_min,
-        opponent_rank_max=opponent_rank_max,
-        without_player_game_ids=without_player_game_ids,
-    )
-    rows = filtered_pool[:last_n]
-
-    cache_status = {
-        "analysis_cache": "miss",
-        "game_log_cache": "hit" if GAME_LOG_CACHE.get((player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)) else "miss",
-        "player_info_cache": "hit" if PLAYER_INFO_CACHE.get(player_id) else "miss",
-        "next_game_cache": "hit" if TEAM_NEXT_GAME_CACHE.get((resolved_team_id, season, season_type)) else "miss",
-        "position_matchup_cache": "unknown",
-        "filtered_pool_cache": "unknown",
-        "stat_summary_cache": "unknown",
-    }
-
-    filtered_pool_cache_key = _build_filtered_pool_cache_key(
-        enriched_rows,
-        location=location,
-        result=result,
-        margin_min=margin_min,
-        margin_max=margin_max,
-        min_minutes=min_minutes,
-        max_minutes=max_minutes,
-        min_fga=min_fga,
-        max_fga=max_fga,
-        h2h_only=h2h_only,
-        opponent_abbreviation=(next_game or {}).get('opponent_abbreviation'),
-        opponent_rank_min=opponent_rank_min,
-        opponent_rank_max=opponent_rank_max,
-        without_player_game_ids=without_player_game_ids,
-    )
-    if FILTERED_POOL_CACHE.get(filtered_pool_cache_key):
-        cache_status["filtered_pool_cache"] = "hit"
-    else:
-        cache_status["filtered_pool_cache"] = "miss"
-
-    stat_summary_cache_key = (tuple(str(row.get("Game_ID") or row.get("GAME_ID") or row.get("GAME_DATE") or "") for row in rows), str(stat), float(line))
-    cache_status["stat_summary_cache"] = "hit" if STAT_SUMMARY_CACHE.get(stat_summary_cache_key) else "miss"
-    stat_summary = build_stat_summary_block(rows, stat, line)
-    games = stat_summary["games"]
-    values = stat_summary["values"]
-    hit_count = stat_summary["hit_count"]
-    average = stat_summary["average"]
-    hit_rate = stat_summary["hit_rate"]
-
-    team_name = TEAM_LOOKUP.get(resolved_team_id, {}).get("full_name") if resolved_team_id else None
-
-    position_cache_key = None
-    if next_game and position_code:
-        position_cache_key = (int(next_game["opponent_team_id"]), str(position_code), str(stat), str(season), str(season_type))
-        cache_status["position_matchup_cache"] = "hit" if POSITION_MATCHUP_CACHE.get(position_cache_key) else "miss"
-
-    def _compute_availability() -> dict[str, Any]:
-        return build_availability_payload(player_name=player["full_name"], team_name=team_name)
-
-    def _compute_vs_position() -> dict[str, Any] | None:
-        if not next_game or not position_code:
-            return None
-        return build_position_matchup(
-            opponent_team_id=next_game["opponent_team_id"],
-            position_code=position_code,
-            stat=stat,
-            season=season,
-            season_type=season_type,
-        )
-
-    availability = None
-    vs_position = None
-    # Always run both computations in parallel when parallel mode is on —
-    # previously gated on position_cache_key being truthy, which silently
-    # skipped vs_position whenever position_code was not yet resolved.
-    if ANALYSIS_PARALLEL_ENABLED:
-        with ThreadPoolExecutor(max_workers=min(ANALYSIS_PARALLEL_MAX_WORKERS, 2)) as executor:
-            future_availability = executor.submit(_compute_availability)
-            future_vs_position = executor.submit(_compute_vs_position)
-            availability = future_availability.result()
-            vs_position = future_vs_position.result()
-    else:
-        availability = _compute_availability()
-        vs_position = _compute_vs_position()
-
-    h2h_payload = build_h2h_payload_from_rows(filtered_pool or enriched_rows, next_game, stat, line)
-
-    analysis_source_rows = filtered_pool or enriched_rows or season_rows
-
-    def _compute_opportunity() -> dict[str, Any]:
-        return build_opportunity_context(analysis_source_rows, last_n)
-
-    def _compute_team_context() -> dict[str, Any]:
-        return build_team_opportunity_context(team_name=team_name, player_name=player["full_name"], stat=stat, player_position=resolved_position, team_id=resolved_team_id, season=season)
-
-    def _compute_environment() -> dict[str, Any]:
-        return build_game_environment_context(analysis_source_rows, next_game, team_id=resolved_team_id, season=season, season_type=season_type)
-
-    if ANALYSIS_PARALLEL_ENABLED:
-        with ThreadPoolExecutor(max_workers=min(ANALYSIS_PARALLEL_MAX_WORKERS, 3)) as executor:
-            future_opportunity = executor.submit(_compute_opportunity)
-            future_team_context = executor.submit(_compute_team_context)
-            future_environment = executor.submit(_compute_environment)
-            opportunity = future_opportunity.result()
-            team_context = future_team_context.result()
-            environment = future_environment.result()
-    else:
-        opportunity = _compute_opportunity()
-        team_context = _compute_team_context()
-        environment = _compute_environment()
-
-    matchup_delta_pct = (vs_position or {}).get('delta_pct') if isinstance(vs_position, dict) else None
-    variance_data = stat_summary.get("variance") or {}
-    model_over, model_under = estimate_model_probabilities(
-        hit_rate_pct=float(hit_rate),
-        average=float(average),
-        line=float(line),
-        matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
-        stat=str(stat),
-        opportunity=opportunity,
-        team_context=team_context,
-        environment=environment,
-        variance=variance_data,
-    )
-    recommended_side = 'OVER' if model_over >= model_under else 'UNDER'
-    # True edge: model probability minus fair implied probability (50% when no market odds)
-    # If market odds are available via vs_position or other context, use them; otherwise use 0.5 as fair line
-    side_model_prob = model_over if recommended_side == 'OVER' else model_under
-    fair_implied = 0.50  # default fair market (no-vig line assumed at 50%)
-    chosen_edge = round((side_model_prob - fair_implied) * 100, 1)  # expressed as percentage edge
-    chosen_ev = side_model_prob - fair_implied  # expected value vs fair line
-    confidence_engine = build_confidence_engine(
-        side=recommended_side,
-        hit_rate=float(hit_rate),
-        games_count=int(len(values)),
-        edge=chosen_edge,
-        ev=chosen_ev,
-        matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
-        availability=availability,
-        opportunity=opportunity,
-        team_context=team_context,
-        environment=environment,
-        stat=stat,
-        player_position=resolved_position,
-        line=line,
-        average=average,
-    )
-    traffic_tone = 'yellow'
-    traffic_label = 'Caution'
-    if availability.get('is_unavailable'):
-        traffic_tone = 'red'
-        traffic_label = 'Avoid'
-    elif confidence_engine['score'] >= 80:
-        traffic_tone = 'green'
-        traffic_label = f"Strong {recommended_side}"
-    elif confidence_engine['score'] >= 68:
-        traffic_tone = 'green'
-        traffic_label = f"Lean {recommended_side}"
-    elif confidence_engine['score'] <= 44:
-        traffic_tone = 'red'
-        traffic_label = 'Pass'
-
-    interpretation = build_analyzer_interpretation(
-        stat=stat,
-        line=line,
-        hit_rate=hit_rate,
-        average=average,
-        availability=availability,
-        matchup={"next_game": next_game, "vs_position": vs_position},
-        opportunity=opportunity,
-        team_context=team_context,
-        h2h=h2h_payload,
-        environment=environment,
-    )
-
-    filter_summary = build_filter_summary(
-        location=location,
-        result=result,
-        margin_min=margin_min,
-        margin_max=margin_max,
-        min_minutes=min_minutes,
-        max_minutes=max_minutes,
-        min_fga=min_fga,
-        max_fga=max_fga,
-        h2h_only=h2h_only,
-        opponent_rank_range=normalized_opponent_rank_range,
-        without_player_name=without_player_name,
-        without_player_names=normalized_without_player_names,
-        debug=debug,
-    )
-
-    if not rows:
-        interpretation = {
-            'headline': 'No filtered sample',
-            'tone': 'warning',
-            'summary': 'The current filters removed every game from the sample. Relax the split to rebuild the trend view.',
-            'bullets': [
-                f"Active filters: {filter_summary['label']}",
-                f"Season pool: {len(season_rows)} games",
-            ],
-            'market_takeaway': 'No lean until the filter sample is rebuilt.',
-        }
-
-    payload = {
-        "player": {
-            "id": player["id"],
-            "full_name": player["full_name"],
-            "is_active": player.get("is_active", False),
-            "team_id": resolved_team_id,
-            "position": resolved_position or "",
-            "position_group": position_code or "",
-            "position_group_label": position_label or "",
-        },
-        "season": season,
-        "season_type": season_type,
-        "stat": stat,
-        "line": line,
-        "last_n": last_n,
-        "average": average,
-        "hit_count": hit_count,
-        "games_count": len(values),
-        "hit_rate": hit_rate,
-        "games": list(reversed(games)),
-        "availability": availability,
-        "matchup": {
-            "next_game": next_game,
-            "vs_position": vs_position,
-        },
-        "h2h": h2h_payload,
-        "opportunity": opportunity,
-        "team_context": team_context,
-        "environment": environment,
-        "confidence": confidence_engine,
-        "recommended_side": recommended_side,
-        "traffic_light": {
-            "label": traffic_label,
-            "tone": traffic_tone,
-            "summary": confidence_engine.get("summary") or interpretation.get("market_takeaway") or interpretation.get("summary"),
-        },
-        "interpretation": interpretation,
-        "active_filters": filter_summary,
-        "filter_options": {
-            "opponent_rank_range": normalized_opponent_rank_range,
-            "without_player_id": int(normalized_without_player_ids[0]) if normalized_without_player_ids else None,
-            "without_player_ids": normalized_without_player_ids,
-            "without_player_name": without_player_name,
-            "without_player_names": normalized_without_player_names,
-        },
-        "filtered_pool_count": len(filtered_pool),
-        "season_pool_count": len(season_rows),
-        "variance": variance_data,
-        "sample_warning": f"Only {len(values)} games in filtered sample — treat recommendation with caution." if len(values) < 5 else None,
-    }
-    freshness = {
-        "game_log_seconds_ago": round(time.time() - float((GAME_LOG_CACHE.get((player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)) or {}).get("timestamp") or 0.0), 2) if GAME_LOG_CACHE.get((player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)) else None,
-        "player_info_seconds_ago": round(time.time() - float((PLAYER_INFO_CACHE.get(player_id) or {}).get("timestamp") or 0.0), 2) if PLAYER_INFO_CACHE.get(player_id) else None,
-        "next_game_seconds_ago": round(time.time() - float((TEAM_NEXT_GAME_CACHE.get((resolved_team_id, season, season_type)) or {}).get("timestamp") or 0.0), 2) if TEAM_NEXT_GAME_CACHE.get((resolved_team_id, season, season_type)) else None,
-        "game_log_source": game_log_meta.get("source") if 'game_log_meta' in locals() else None,
-        "game_log_refresh_queued": game_log_meta.get("refresh_queued") if 'game_log_meta' in locals() else False,
-        "player_info_source": player_info_meta.get("source") if 'player_info_meta' in locals() else None,
-        "player_info_refresh_queued": player_info_meta.get("refresh_queued") if 'player_info_meta' in locals() else False,
-        "next_game_source": next_game_meta.get("source") if 'next_game_meta' in locals() else None,
-        "next_game_refresh_queued": next_game_meta.get("refresh_queued") if 'next_game_meta' in locals() else False,
-        "injury_report_seconds_ago": INJURY_SERVICE.report_cache_age_seconds(),
-    }
-    payload["freshness"] = dict(freshness)
-    ANALYSIS_CACHE[cache_key] = {"timestamp": time.time(), "payload": copy.deepcopy(payload), "filtered_pool": [dict(r) for r in filtered_pool]}
-    if debug and DEBUG_METADATA_ENABLED:
-        payload["debug"] = build_debug_metadata(cache_status=cache_status, freshness=freshness, timings_enabled=NBA_TIMING_ENABLED)
-    return payload
-
-
-def compute_recent_hit_streak(hit_flags: list[bool]) -> int:
-    streak = 0
-    for hit in hit_flags:
-        if hit:
-            streak += 1
-        else:
-            break
-    return streak
-
-@timed_call("build_position_matchup")
-def build_position_matchup(
-    opponent_team_id: int,
-    position_code: str,
-    stat: str,
-    season: str,
-    season_type: str,
-) -> dict[str, Any] | None:
-    cache_key = (int(opponent_team_id), str(position_code), str(stat), str(season), str(season_type))
-    cached = POSITION_MATCHUP_CACHE.get(cache_key)
-    now_ts = time.time()
-
-    if cached and now_ts - float(cached.get("timestamp") or 0.0) < POSITION_TTL_SECONDS:
-        payload = cached.get("payload")
-        return dict(payload) if isinstance(payload, dict) else None
-
-    opponent_rows = fetch_position_dash(
-        season=season,
-        season_type=season_type,
-        position_code=position_code,
-        opponent_team_id=opponent_team_id,
-    )
-    league_rows = fetch_position_dash(
-        season=season,
-        season_type=season_type,
-        position_code=position_code,
-        opponent_team_id=0,
-    )
-
-    opponent_summary = summarize_position_environment(opponent_rows, stat)
-    league_summary = summarize_position_environment(league_rows, stat)
-    if not opponent_summary or not league_summary:
-        POSITION_MATCHUP_CACHE[cache_key] = {"timestamp": now_ts, "payload": None}
-        return None
-
-    opponent_value = opponent_summary["per_player_game"]
-    league_average = league_summary["per_player_game"]
-    delta = round(opponent_value - league_average, 2)
-    delta_pct = round((delta / league_average) * 100, 1) if league_average else 0.0
-
-    # Build defense rank by querying each NBA team individually.
-    # league_rows (opponent_team_id=0) returns season totals without per-opponent
-    # breakdown, so OPP_TEAM_ID is absent. We use cached per-team queries instead,
-    # falling back gracefully if they are unavailable to avoid extra API calls.
-    defense_rank = None
-    rank_label = None
-    team_summaries: list[dict[str, Any]] = []
-
-    for team in TEAM_POOL:
-        tid = int(team.get("id") or 0)
-        if not tid:
-            continue
-        per_team_cache_key = (season, season_type, position_code, tid)
-        per_team_cached = POSITION_DASH_CACHE.get(per_team_cache_key)
-        if not per_team_cached or not per_team_cached.get("rows"):
-            # Only use already-cached per-team data to avoid 30 extra API calls.
-            # The opponent team itself will always be cached from the query above.
-            if tid != int(opponent_team_id):
-                continue
-            per_team_rows = opponent_rows
-        else:
-            per_team_rows = per_team_cached["rows"]
-        summary = summarize_position_environment(per_team_rows, stat)
-        if not summary:
-            continue
-        team_summaries.append({
-            "team_id": tid,
-            "per_player_game": summary["per_player_game"],
-        })
-
-    if team_summaries:
-        ranked = sorted(team_summaries, key=lambda item: float(item.get("per_player_game") or 0.0), reverse=True)
-        for index, item in enumerate(ranked, start=1):
-            if int(item.get("team_id") or 0) == int(opponent_team_id):
-                defense_rank = index
-                break
-        if defense_rank:
-            rank_label = f"#{defense_rank} vs {POSITION_LABELS.get(position_code, position_code)}"
-
-    if delta_pct >= 12:
-        lean = "Very favorable"
-        lean_tone = "good"
-    elif delta_pct >= 5:
-        lean = "Favorable"
-        lean_tone = "good"
-    elif delta_pct <= -12:
-        lean = "Very tough"
-        lean_tone = "bad"
-    elif delta_pct <= -5:
-        lean = "Tough"
-        lean_tone = "bad"
-    else:
-        lean = "Neutral"
-        lean_tone = "neutral"
-
-    payload = {
-        "position_code": position_code,
-        "position_label": POSITION_LABELS.get(position_code, position_code),
-        "stat": stat,
-        "opponent_value": opponent_value,
-        "league_average": league_average,
-        "delta": delta,
-        "delta_pct": delta_pct,
-        "lean": lean,
-        "lean_tone": lean_tone,
-        "sample_gp": opponent_summary["sample_gp"],
-        "players_count": opponent_summary["players_count"],
-        "def_rank": defense_rank,
-        "rank_label": rank_label,
-        "team_count": len(team_summaries),
-    }
-    POSITION_MATCHUP_CACHE[cache_key] = {"timestamp": now_ts, "payload": dict(payload)}
-    return payload
-
-
-def build_next_game_payload(
-    next_game_row: dict[str, Any] | None,
-    player_team_id: int | None,
-) -> dict[str, Any] | None:
-    if not next_game_row or not player_team_id:
-        return None
-
-    home_team_id = int(next_game_row.get("HOME_TEAM_ID") or 0)
-    visitor_team_id = int(next_game_row.get("VISITOR_TEAM_ID") or 0)
-
-    if player_team_id == home_team_id:
-        is_home = True
-        opponent_team_id = visitor_team_id
-        opponent_name = next_game_row.get("VISITOR_TEAM_NAME")
-        opponent_abbreviation = next_game_row.get("VISITOR_TEAM_ABBREVIATION")
-        player_team_abbreviation = next_game_row.get("HOME_TEAM_ABBREVIATION")
-        matchup_label = f"vs {opponent_abbreviation}"
-    elif player_team_id == visitor_team_id:
-        is_home = False
-        opponent_team_id = home_team_id
-        opponent_name = next_game_row.get("HOME_TEAM_NAME")
-        opponent_abbreviation = next_game_row.get("HOME_TEAM_ABBREVIATION")
-        player_team_abbreviation = next_game_row.get("VISITOR_TEAM_ABBREVIATION")
-        matchup_label = f"@ {opponent_abbreviation}"
-    else:
-        return None
-
-    return {
-        "game_date": str(next_game_row.get("GAME_DATE", "")).strip(),
-        "game_time": str(next_game_row.get("GAME_TIME", "")).strip(),
-        "is_home": is_home,
-        "matchup_label": matchup_label,
-        "opponent_team_id": opponent_team_id,
-        "opponent_name": str(opponent_name or "").strip(),
-        "opponent_abbreviation": str(opponent_abbreviation or "").strip(),
-        "player_team_abbreviation": str(player_team_abbreviation or "").strip(),
-    }
-
-
-@timed_call("resolve_team_next_game")
-def resolve_team_next_game(
-    team_id: int | None,
-    primary_player_id: int,
-    season: str,
-    season_type: str,
-) -> dict[str, Any] | None:
-    if not team_id:
-        return None
-
-    cache_key = (team_id, season, season_type)
-    cached = TEAM_NEXT_GAME_CACHE.get(cache_key)
-    now_ts = time.time()
-    cached_ts = float((cached or {}).get("timestamp") or 0.0)
-
-    if cached and now_ts - cached_ts < NEXT_GAME_TTL_SECONDS:
-        return cached["row"]
-
-    reliable_stale_exists = _next_game_cache_is_reliable_stale(cached, cached_ts)
-    failure_meta = NEXT_GAME_FAILURE_META.get(cache_key) or {}
-    last_failure_ts = float(failure_meta.get("timestamp") or 0.0)
-    if reliable_stale_exists and last_failure_ts and (now_ts - last_failure_ts) < NEXT_GAME_FAILURE_COOLDOWN_SECONDS:
-        return cached.get("row")
-
-    scoreboard_next_game = find_team_next_game_via_scoreboard(team_id=team_id, lookahead_days=10)
-    if scoreboard_next_game:
-        TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": time.time(), "row": scoreboard_next_game}
-        NEXT_GAME_FAILURE_META.pop(cache_key, None)
-        save_persistent_caches()
-        return scoreboard_next_game
-
-    next_game_row = fetch_next_game(primary_player_id, season, season_type)
-    next_game = build_next_game_payload(next_game_row, team_id)
-    if next_game:
-        TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": time.time(), "row": next_game}
-        NEXT_GAME_FAILURE_META.pop(cache_key, None)
-        save_persistent_caches()
-        return next_game
-
-    NEXT_GAME_FAILURE_META[cache_key] = {"timestamp": time.time()}
-    if reliable_stale_exists and cached:
-        return cached.get("row")
-
-    TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": time.time(), "row": None}
-    save_persistent_caches()
-    return None
-
+def resolve_team_next_game(team_id: int | None, primary_player_id: int, season: str, season_type: str) -> dict[str, Any] | None:
+    return SCHEDULE_SERVICE.resolve_team_next_game(team_id, primary_player_id, season, season_type)
 
 
 
@@ -4365,9 +4116,13 @@ def market_scan(
                 "id": analysis["player"]["id"],
                 "full_name": analysis["player"]["full_name"],
                 "team_id": resolved_team_id,
+                "team_name": (resolved_team or {}).get("full_name") or analysis["player"].get("team_name") or team_text,
+                "team_abbreviation": resolved_team_abbreviation,
                 "team": resolved_team_abbreviation,
+                "opponent_name": next_game.get("opponent_name") or (opponent.get("full_name") if opponent else opponent_text),
                 "opponent": resolved_opponent_abbreviation,
                 "position": analysis["player"].get("position") or "",
+                "jersey": analysis["player"].get("jersey") or "",
             },
             "market": {
                 "stat": str(bulk_row["stat"]),
@@ -4569,7 +4324,7 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     season_type  = str(payload.get("season_type") or "Regular Season")
     batch_size   = max(1, int(payload.get("batch_size") or 3))
     requested_bookmakers = parse_requested_bookmakers(payload.get("bookmakers") or payload.get("bookmaker") or ODDS_DEFAULT_BOOKMAKERS)
-    markets      = ",".join(ODDS_DEFAULT_MARKETS)
+    markets      = ",".join(ODDS_PARLAY_MARKETS)
 
     # event_ids — if provided, skip fetching the events list entirely (saves 1 credit)
     requested_event_ids: set[str] = set()
@@ -4625,38 +4380,67 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
     for batch_start in range(0, len(events), batch_size):
         batch = events[batch_start: batch_start + batch_size]
-        for event in batch:
-            event_id = str(event.get("id") or "")
-            if not event_id:
-                continue
-            try:
-                result = odds_api_fetch(
-                    f"/sports/{sport}/events/{event_id}/odds",
-                    next_key(),
-                    {
-                        "regions": regions,
-                        "markets": markets,
-                        "oddsFormat": odds_format,
-                        "dateFormat": "iso",
-                        "bookmakers": ",".join(requested_bookmakers),
-                    },
+        batch_jobs = [
+            {
+                "event_id": str(event.get("id") or ""),
+                "api_key": next_key(),
+                "home_team": event.get("home_team"),
+                "away_team": event.get("away_team"),
+            }
+            for event in batch
+            if str(event.get("id") or "")
+        ]
+        if not batch_jobs:
+            continue
+        batch_workers = min(len(batch_jobs), max(1, len(api_keys)), batch_size, 6)
+        if batch_workers <= 1:
+            batch_results = [
+                (
+                    job,
+                    _fetch_event_odds_payload(
+                        event_id=job["event_id"],
+                        api_key=job["api_key"],
+                        sport=sport,
+                        regions=regions,
+                        markets=markets,
+                        odds_format=odds_format,
+                        requested_bookmakers=requested_bookmakers,
+                    ),
                 )
-                quota_log.append({"call": f"event_{event_id[:8]}", "quota": result["quota"]})
-                rows = build_odds_import_rows(result["data"] or {}, odds_format)
-                all_import_rows.extend(rows)
-            except HTTPException as exc:
+                for job in batch_jobs
+            ]
+        else:
+            with ThreadPoolExecutor(max_workers=batch_workers) as executor:
+                futures = [
+                    (
+                        job,
+                        executor.submit(
+                            _fetch_event_odds_payload,
+                            event_id=job["event_id"],
+                            api_key=job["api_key"],
+                            sport=sport,
+                            regions=regions,
+                            markets=markets,
+                            odds_format=odds_format,
+                            requested_bookmakers=requested_bookmakers,
+                        ),
+                    )
+                    for job in batch_jobs
+                ]
+                batch_results = [(job, future.result()) for job, future in futures]
+        for job, result in batch_results:
+            event_id = str(result.get("event_id") or job["event_id"] or "")
+            if result.get("error"):
                 scrape_errors.append({
                     "event_id": event_id,
-                    "home_team": event.get("home_team"),
-                    "away_team": event.get("away_team"),
-                    "reason": exc.detail,
-                    "status_code": exc.status_code,
+                    "home_team": job.get("home_team"),
+                    "away_team": job.get("away_team"),
+                    "reason": result.get("error"),
+                    "status_code": result.get("status_code"),
                 })
-                # 402 / 429 → key is exhausted; advance to next key
-                if exc.status_code in (402, 429):
-                    key_index += 1
-            except Exception as exc:
-                scrape_errors.append({"event_id": event_id, "reason": str(exc)})
+                continue
+            quota_log.append({"call": f"event_{event_id[:8]}", "quota": result.get("quota")})
+            all_import_rows.extend(result.get("rows") or [])
 
     if not all_import_rows:
         return {
@@ -4823,13 +4607,27 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         next_game_info = matchup.get("next_game") or {}
         vs_position = matchup.get("vs_position") or {}
         matchup_delta_pct = vs_position.get("delta_pct") if isinstance(vs_position, dict) else None
-        fair_prob = orig_row.get("consensus_over_fair_prob") if side == "OVER" else orig_row.get("consensus_under_fair_prob")
-        if fair_prob is None:
-            fair_prob = orig_row.get("over_fair_prob") if side == "OVER" else orig_row.get("under_fair_prob")
+        fair_over_prob = orig_row.get("consensus_over_fair_prob")
+        fair_under_prob = orig_row.get("consensus_under_fair_prob")
+        if fair_over_prob is None:
+            fair_over_prob = orig_row.get("over_fair_prob")
+        if fair_under_prob is None:
+            fair_under_prob = orig_row.get("under_fair_prob")
+        if fair_over_prob is None:
+            fair_over_prob = decimal_implied_probability(orig_row.get("over_odds"))
+        if fair_under_prob is None:
+            fair_under_prob = decimal_implied_probability(orig_row.get("under_odds"))
+        fair_prob = fair_over_prob if side == "OVER" else fair_under_prob
         try:
             fair_prob = float(fair_prob) if fair_prob is not None else decimal_implied_probability(odds)
         except (TypeError, ValueError):
             fair_prob = decimal_implied_probability(odds)
+        enriched_environment = enrich_environment_with_market_context(
+            analysis.get("environment") or {},
+            orig_row,
+            player_team_name=(analysis.get("player") or {}).get("team_name") or "",
+            player_team_abbreviation=(analysis.get("player") or {}).get("team_abbreviation") or "",
+        )
         confidence_engine = build_confidence_engine(
             side=side,
             hit_rate=float(side_hit_rate),
@@ -4840,11 +4638,18 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             availability=availability,
             opportunity=analysis.get("opportunity") or {},
             team_context=analysis.get("team_context") or {},
-            environment=analysis.get("environment") or {},
+            environment=enriched_environment,
             stat=stat,
             player_position=(analysis.get("player") or {}).get("position") or '',
             line=line,
             average=avg,
+        )
+        confidence_engine = apply_market_confidence_adjustment(
+            confidence_engine,
+            side=side,
+            over_probability=fair_over_prob,
+            under_probability=fair_under_prob,
+            odds=odds,
         )
 
         # Resolve team + opponent IDs from the analysis payload so the frontend
@@ -4853,6 +4658,16 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         resolved_team_id_scored    = player_info.get("team_id")
         resolved_opponent_team_id  = next_game_info.get("opponent_team_id")
         resolved_opponent_abbr     = str(next_game_info.get("opponent_abbreviation") or "").strip()
+        if not resolved_opponent_team_id:
+            home_candidate = resolve_team_from_text(str(orig_row.get("home_team") or ""))
+            away_candidate = resolve_team_from_text(str(orig_row.get("away_team") or ""))
+            player_team_id_int = int(resolved_team_id_scored or 0)
+            for candidate in [away_candidate, home_candidate]:
+                if candidate and int(candidate.get("id") or 0) != player_team_id_int:
+                    resolved_opponent_team_id = int(candidate.get("id") or 0)
+                    if not resolved_opponent_abbr:
+                        resolved_opponent_abbr = str(candidate.get("abbreviation") or "").strip()
+                    break
 
         scored.append({
             "player_name": result.get("player_name") or "",
@@ -4877,15 +4692,21 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             "availability_label": availability.get("label") or "Active",
             "availability": copy.deepcopy(availability),
             "matchup": copy.deepcopy(analysis.get("matchup") or {}),
-            "environment": copy.deepcopy(analysis.get("environment") or {}),
+            "environment": copy.deepcopy(enriched_environment),
             "confidence": confidence_engine.get("grade"),
             "confidence_score": confidence_engine.get("score"),
             "confidence_tone": confidence_engine.get("tone"),
             "confidence_tier": confidence_engine.get("tier"),
             "confidence_summary": confidence_engine.get("summary"),
             "confidence_tags": confidence_engine.get("tags") or [],
+            "market_side": confidence_engine.get("market_side"),
+            "market_disagrees": confidence_engine.get("market_disagrees"),
+            "market_penalty": confidence_engine.get("market_penalty"),
+            "ranking_score": confidence_engine.get("ranking_score"),
             "event_id": orig_row.get("event_id") or "",
             "game_label": orig_row.get("game_label") or "",
+            "home_team": orig_row.get("home_team") or "",
+            "away_team": orig_row.get("away_team") or "",
             "books_count": orig_row.get("books_count") or 1,
             "hold_percent": orig_row.get("hold_percent"),
             "fair_probability": round(fair_prob * 100.0, 1) if fair_prob is not None else None,
@@ -4895,8 +4716,9 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             "best_under_bookmaker": orig_row.get("best_under_bookmaker"),
         })
 
-    # Sort descending by hit rate (primary), then odds (prefer value)
-    scored.sort(key=lambda x: (x["hit_rate"], x["odds"]), reverse=True)
+    # Sort by market-adjusted confidence first so sides fighting the market
+    # do not float to the top on raw hit rate alone.
+    scored.sort(key=lambda x: (x.get("ranking_score", x["confidence_score"]), x["hit_rate"], x["odds"]), reverse=True)
 
     # Pick top N — enforce one leg per player AND one leg per game (no SGP)
     parlay_legs: list[dict[str, Any]] = []
@@ -5010,7 +4832,7 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
     season_type = str(payload.get("season_type") or "Regular Season")
     batch_size  = max(1, int(payload.get("batch_size") or 3))
     requested_bookmakers = parse_requested_bookmakers(payload.get("bookmakers") or payload.get("bookmaker") or ODDS_DEFAULT_BOOKMAKERS)
-    markets     = ",".join(ODDS_DEFAULT_MARKETS)
+    markets     = ",".join(ODDS_PARLAY_MARKETS)
 
     requested_event_ids: set[str] = set()
     raw_event_ids = payload.get("event_ids") or []
@@ -5047,25 +4869,53 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
 
     for batch_start in range(0, len(events), batch_size):
         batch = events[batch_start: batch_start + batch_size]
-        for event in batch:
-            event_id = str(event.get("id") or "")
-            if not event_id:
-                continue
-            try:
-                result = odds_api_fetch(
-                    f"/sports/{sport}/events/{event_id}/odds", next_key(),
-                    {"regions": regions, "markets": markets, "oddsFormat": odds_format,
-                     "dateFormat": "iso", "bookmakers": ",".join(requested_bookmakers)},
+        batch_jobs = [
+            {
+                "event_id": str(event.get("id") or ""),
+                "api_key": next_key(),
+            }
+            for event in batch
+            if str(event.get("id") or "")
+        ]
+        if not batch_jobs:
+            continue
+        batch_workers = min(len(batch_jobs), max(1, len(api_keys)), batch_size, 6)
+        if batch_workers <= 1:
+            batch_results = [
+                _fetch_event_odds_payload(
+                    event_id=job["event_id"],
+                    api_key=job["api_key"],
+                    sport=sport,
+                    regions=regions,
+                    markets=markets,
+                    odds_format=odds_format,
+                    requested_bookmakers=requested_bookmakers,
                 )
-                quota_log.append({"call": f"event_{event_id[:8]}", "quota": result["quota"]})
-                rows = build_odds_import_rows(result["data"] or {}, odds_format)
-                all_import_rows.extend(rows)
-            except HTTPException as exc:
-                scrape_errors.append({"event_id": event_id, "reason": exc.detail, "status_code": exc.status_code})
-                if exc.status_code in (402, 429):
-                    key_index += 1
-            except Exception as exc:
-                scrape_errors.append({"event_id": event_id, "reason": str(exc)})
+                for job in batch_jobs
+            ]
+        else:
+            with ThreadPoolExecutor(max_workers=batch_workers) as executor:
+                futures = [
+                    executor.submit(
+                        _fetch_event_odds_payload,
+                        event_id=job["event_id"],
+                        api_key=job["api_key"],
+                        sport=sport,
+                        regions=regions,
+                        markets=markets,
+                        odds_format=odds_format,
+                        requested_bookmakers=requested_bookmakers,
+                    )
+                    for job in batch_jobs
+                ]
+                batch_results = [future.result() for future in futures]
+        for result in batch_results:
+            event_id = str(result.get("event_id") or "")
+            if result.get("error"):
+                scrape_errors.append({"event_id": event_id, "reason": result.get("error"), "status_code": result.get("status_code")})
+                continue
+            quota_log.append({"call": f"event_{event_id[:8]}", "quota": result.get("quota")})
+            all_import_rows.extend(result.get("rows") or [])
 
     if not all_import_rows:
         return {"legs": legs, "parlay": [], "parlay_odds": None, "all_props_scored": [],
@@ -5100,17 +4950,38 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
     except Exception:
         inj_report = {"ok": False, "rows": []}
 
+    player_lookup_cache: dict[tuple[str, int | None], dict[str, Any] | None] = {}
+    without_player_names_cache: dict[tuple[int, ...], list[str]] = {}
+    boosted_analysis_cache: dict[tuple[int, str, float, int, str, str, tuple[int, ...]], dict[str, Any] | None] = {}
+    teammate_impact_cache: dict[int, float] = {}
+
+    def cached_find_player_by_name(player_name: str, team_id: int | None = None) -> dict[str, Any] | None:
+        cache_key = (str(player_name or "").strip().lower(), team_id)
+        if cache_key not in player_lookup_cache:
+            player_lookup_cache[cache_key] = find_player_by_name(player_name, team_id=team_id)
+        return player_lookup_cache[cache_key]
+
+    def cached_without_player_names(player_ids: list[int]) -> list[str]:
+        cache_key = tuple(normalize_without_player_ids(player_ids))
+        if cache_key not in without_player_names_cache:
+            without_player_names_cache[cache_key] = resolve_without_player_names(list(cache_key))
+        return list(without_player_names_cache[cache_key])
+
+    def cached_teammate_impact(player_id: int) -> float:
+        normalized_player_id = int(player_id or 0)
+        if normalized_player_id <= 0:
+            return 0.0
+        if normalized_player_id not in teammate_impact_cache:
+            teammate_impact_cache[normalized_player_id] = teammate_impact_score(normalized_player_id, season=season, season_type=season_type)
+        return float(teammate_impact_cache[normalized_player_id])
+
     # Build per-team injured player IDs cache: team_name → list[int]
     _team_injured_ids_cache: dict[str, list[int]] = {}
 
     def get_injured_ids_for_team(team_name: str) -> list[int]:
         if team_name in _team_injured_ids_cache:
             return _team_injured_ids_cache[team_name]
-        # Normalize for fuzzy matching — injury report team names come from PDF parsing
-        # and may differ in casing/punctuation from NBA stats API team names.
-        norm_target = normalize_compact_text(team_name)
-        rows_inj = [r for r in (inj_report.get("rows") or [])
-                    if normalize_compact_text(str(r.get("team_name") or "")) == norm_target]
+        rows_inj = INJURY_SERVICE.get_team_rows(inj_report, team_name)
         ids: list[int] = []
         for row in rows_inj:
             status = str(row.get("status") or "")
@@ -5119,9 +4990,10 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
             raw_disp = re.sub(r",(?!\s)", ", ", str(row.get("player_display") or "").strip())
             parts = [p.strip() for p in raw_disp.split(",")]
             name_lk = f"{parts[1]} {parts[0]}" if len(parts) == 2 else raw_disp
-            player = find_player_by_name(name_lk)
+            player = cached_find_player_by_name(name_lk)
             if player:
                 ids.append(int(player["id"]))
+        ids.sort(key=lambda teammate_id: (-cached_teammate_impact(teammate_id), teammate_id))
         _team_injured_ids_cache[team_name] = ids
         return ids
 
@@ -5133,7 +5005,7 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
     prepared: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for row in all_import_rows:
         player_name = str(row.get("player_name") or "").strip()
-        player = find_player_by_name(player_name)
+        player = cached_find_player_by_name(player_name)
         if not player:
             analysis_errors.append({"player_name": player_name, "reason": "Player not found."})
             continue
@@ -5209,17 +5081,31 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
         team_name   = str(player_info.get("team_name") or "")
         if not team_name and team_id_raw:
             team_name = TEAM_LOOKUP.get(int(team_id_raw), {}).get("full_name", "")
+        next_game_info = (analysis.get("matchup") or {}).get("next_game") or {}
+        player_team_abbr = str(next_game_info.get("player_team_abbreviation") or "").strip()
+        opponent_abbr = str(next_game_info.get("opponent_abbreviation") or "").strip()
+        if not team_name and player_team_abbr:
+            candidate_team = TEAM_ALIAS_LOOKUP.get(normalize_name(player_team_abbr))
+            if candidate_team:
+                team_name = str(candidate_team.get("full_name") or "")
         if not team_name:
-            # Last resort: derive from orig_row game_label (e.g. "HOU @ GSW") via abbreviation
-            game_label = str(orig_row.get("game_label") or "")
-            home_abbr  = str(orig_row.get("home_team") or "")
-            away_abbr  = str(orig_row.get("away_team") or "")
-            player_nm  = str(result.get("player_name") or "").lower()
-            for abbr in [home_abbr, away_abbr]:
-                candidate = TEAM_ALIAS_LOOKUP.get(abbr.strip().lower(), {})
-                if candidate:
-                    team_name = candidate.get("full_name", "")
+            # Last resort: only trust the side that matches the player's next-game team abbreviation.
+            home_team_text = str(orig_row.get("home_team") or "").strip()
+            away_team_text = str(orig_row.get("away_team") or "").strip()
+            for team_text in [away_team_text, home_team_text]:
+                candidate = resolve_team_from_text(team_text)
+                if not candidate:
+                    continue
+                candidate_abbr = str(candidate.get("abbreviation") or "").strip().upper()
+                if player_team_abbr and candidate_abbr == player_team_abbr.upper():
+                    team_name = str(candidate.get("full_name") or "")
                     break
+            if not team_name and team_id_raw:
+                for team_text in [away_team_text, home_team_text]:
+                    candidate = resolve_team_from_text(team_text)
+                    if candidate and int(candidate.get("id") or 0) == int(team_id_raw):
+                        team_name = str(candidate.get("full_name") or "")
+                        break
         LOGGER.debug(
             "injury_aware_score team resolution: player=%s team_id=%s → team_name=%r",
             result.get("player_name"), team_id_raw, team_name
@@ -5236,40 +5122,46 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
         if team_name and player_id:
             inj_ids = get_injured_ids_for_team(team_name)
             # Collect names for display
-            team_injury_player_names = resolve_without_player_names(inj_ids)
-            # Try 1 injured player first, then up to 2 if sample is still good
-            for max_filters in [1, 2]:
+            team_injury_player_names = cached_without_player_names(inj_ids)
+            best_usable_combo: tuple[list[int], float, float, int] | None = None
+            # Try top 1, top 2, then top 3 impacted absences.
+            for max_filters in [1, 2, 3]:
                 candidate_ids = inj_ids[:max_filters]
                 if not candidate_ids:
                     break
                 try:
-                    boosted_analysis = build_prop_analysis_payload(
-                        player_id=player_id,
-                        stat=stat,
-                        line=line,
-                        last_n=last_n,
-                        season=season,
-                        season_type=season_type,
-                        without_player_ids=candidate_ids,
-                    )
+                    boost_cache_key = (player_id, stat, float(line), int(last_n), str(season), str(season_type), tuple(candidate_ids))
+                    if boost_cache_key not in boosted_analysis_cache:
+                        boosted_analysis_cache[boost_cache_key] = build_prop_analysis_payload(
+                            player_id=player_id,
+                            stat=stat,
+                            line=line,
+                            last_n=last_n,
+                            season=season,
+                            season_type=season_type,
+                            without_player_ids=candidate_ids,
+                        )
+                    boosted_analysis = boosted_analysis_cache[boost_cache_key]
+                    if not boosted_analysis:
+                        break
                     boosted_games = int(boosted_analysis.get("games_count") or 0)
                     boosted_hr    = float(boosted_analysis.get("hit_rate") or 0)
-                    if boosted_games >= 5 and boosted_hr > hit_rate:
-                        hit_rate = boosted_hr
-                        avg      = float(boosted_analysis.get("average") or avg)
-                        injury_boost = True
-                        injury_filter_player_ids = candidate_ids
-                        injury_filter_player_names = resolve_without_player_names(candidate_ids)
-                        base_games_count = boosted_games
-                        break  # good result with this many filters
-                    elif boosted_games >= 5:
-                        # Sample is usable but no boost — still record filter used
-                        injury_filter_player_ids = candidate_ids
-                        injury_filter_player_names = resolve_without_player_names(candidate_ids)
-                        base_games_count = boosted_games
-                        break
+                    if boosted_games >= 5:
+                        boosted_avg = float(boosted_analysis.get("average") or avg)
+                        if best_usable_combo is None or boosted_hr > best_usable_combo[1] or (
+                            boosted_hr == best_usable_combo[1] and boosted_games > best_usable_combo[3]
+                        ):
+                            best_usable_combo = (list(candidate_ids), boosted_hr, boosted_avg, boosted_games)
                 except Exception:
                     break
+            if best_usable_combo is not None:
+                injury_filter_player_ids = list(best_usable_combo[0])
+                injury_filter_player_names = cached_without_player_names(injury_filter_player_ids)
+                base_games_count = int(best_usable_combo[3])
+                if float(best_usable_combo[1]) > hit_rate:
+                    hit_rate = float(best_usable_combo[1])
+                    avg = float(best_usable_combo[2])
+                    injury_boost = True
 
         if hit_rate >= 50:
             side = "OVER"
@@ -5287,26 +5179,57 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
         next_game_info = matchup.get("next_game") or {}
         vs_position = matchup.get("vs_position") or {}
         matchup_delta_pct = vs_position.get("delta_pct") if isinstance(vs_position, dict) else None
-        fair_prob = orig_row.get("consensus_over_fair_prob") if side == "OVER" else orig_row.get("consensus_under_fair_prob")
-        if fair_prob is None:
-            fair_prob = orig_row.get("over_fair_prob") if side == "OVER" else orig_row.get("under_fair_prob")
+        fair_over_prob = orig_row.get("consensus_over_fair_prob")
+        fair_under_prob = orig_row.get("consensus_under_fair_prob")
+        if fair_over_prob is None:
+            fair_over_prob = orig_row.get("over_fair_prob")
+        if fair_under_prob is None:
+            fair_under_prob = orig_row.get("under_fair_prob")
+        if fair_over_prob is None:
+            fair_over_prob = decimal_implied_probability(orig_row.get("over_odds"))
+        if fair_under_prob is None:
+            fair_under_prob = decimal_implied_probability(orig_row.get("under_odds"))
+        fair_prob = fair_over_prob if side == "OVER" else fair_under_prob
         try:
             fair_prob = float(fair_prob) if fair_prob is not None else decimal_implied_probability(odds)
         except (TypeError, ValueError):
             fair_prob = decimal_implied_probability(odds)
+        enriched_environment = enrich_environment_with_market_context(
+            analysis.get("environment") or {},
+            orig_row,
+            player_team_name=team_name,
+            player_team_abbreviation=player_info.get("team_abbreviation") or "",
+        )
         confidence_engine = build_confidence_engine(
             side=side, hit_rate=float(side_hit_rate), games_count=base_games_count,
             edge=round((side_hit_rate / 100.0 - fair_prob) * 100.0, 1) if fair_prob is not None else round(abs(avg - line), 1),
             ev=max(0.0, (side_hit_rate / 100.0) - fair_prob) if fair_prob is not None else max(0.0, (side_hit_rate / 100.0) - decimal_implied_probability(odds)),
             matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
             availability=availability, opportunity=analysis.get("opportunity") or {},
-            team_context=analysis.get("team_context") or {}, environment=analysis.get("environment") or {},
+            team_context=analysis.get("team_context") or {}, environment=enriched_environment,
             stat=stat, player_position=(analysis.get("player") or {}).get("position") or "",
             line=line, average=avg,
         )
+        confidence_engine = apply_market_confidence_adjustment(
+            confidence_engine,
+            side=side,
+            over_probability=fair_over_prob,
+            under_probability=fair_under_prob,
+            odds=odds,
+        )
 
         resolved_team_id = player_info.get("team_id")
-        opponent_info    = next_game_info
+        opponent_info    = copy.deepcopy(next_game_info)
+        if not opponent_info.get("opponent_team_id"):
+            home_candidate = resolve_team_from_text(str(orig_row.get("home_team") or ""))
+            away_candidate = resolve_team_from_text(str(orig_row.get("away_team") or ""))
+            player_team_id_int = int(resolved_team_id or 0)
+            for candidate in [away_candidate, home_candidate]:
+                if candidate and int(candidate.get("id") or 0) != player_team_id_int:
+                    opponent_info["opponent_team_id"] = int(candidate.get("id") or 0)
+                    opponent_info["opponent_abbreviation"] = str(candidate.get("abbreviation") or "").strip()
+                    opponent_info["opponent_name"] = str(candidate.get("full_name") or "").strip()
+                    break
 
         return {
             "player_name": result.get("player_name") or "",
@@ -5329,15 +5252,21 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
             "availability_label": availability.get("label") or "Active",
             "availability": copy.deepcopy(availability),
             "matchup": copy.deepcopy(analysis.get("matchup") or {}),
-            "environment": copy.deepcopy(analysis.get("environment") or {}),
+            "environment": copy.deepcopy(enriched_environment),
             "confidence": confidence_engine.get("grade"),
             "confidence_score": confidence_engine.get("score"),
             "confidence_tone": confidence_engine.get("tone"),
             "confidence_tier": confidence_engine.get("tier"),
             "confidence_summary": confidence_engine.get("summary"),
             "confidence_tags": confidence_engine.get("tags") or [],
+            "market_side": confidence_engine.get("market_side"),
+            "market_disagrees": confidence_engine.get("market_disagrees"),
+            "market_penalty": confidence_engine.get("market_penalty"),
+            "ranking_score": confidence_engine.get("ranking_score"),
             "event_id": orig_row.get("event_id") or "",
             "game_label": orig_row.get("game_label") or "",
+            "home_team": orig_row.get("home_team") or "",
+            "away_team": orig_row.get("away_team") or "",
             # Injury-aware fields
             "injury_boost": injury_boost,
             "injury_filter_player_ids": injury_filter_player_ids,
@@ -5358,7 +5287,7 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
         if item:
             scored.append(item)
 
-    scored.sort(key=lambda x: (x["hit_rate"], x["odds"]), reverse=True)
+    scored.sort(key=lambda x: (x.get("ranking_score", x["confidence_score"]), x["hit_rate"], x["odds"]), reverse=True)
 
     # Pick top N — one leg per player, one leg per game
     parlay_legs: list[dict[str, Any]] = []
@@ -5393,7 +5322,7 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
         if inj_ids:
             injury_summary.append({
                 "team_name": tn,
-                "injured_player_names": resolve_without_player_names(inj_ids),
+                "injured_player_names": cached_without_player_names(inj_ids),
                 "count": len(inj_ids),
             })
 
@@ -5434,6 +5363,21 @@ def todays_games(game_date: str | None = None) -> dict[str, Any]:
                 break
 
     report_payload = fetch_latest_injury_report_payload()
+    injury_rows_by_team: dict[str, list[dict[str, Any]]] = {}
+    if report_payload.get("ok"):
+        involved_teams = {
+            str(team.get("full_name") or "").strip()
+            for row in rows
+            for team in (
+                TEAM_LOOKUP.get(int(row.get("HOME_TEAM_ID") or 0), {}),
+                TEAM_LOOKUP.get(int(row.get("VISITOR_TEAM_ID") or 0), {}),
+            )
+            if str(team.get("full_name") or "").strip()
+        }
+        injury_rows_by_team = {
+            team_name: INJURY_SERVICE.get_team_rows(report_payload, team_name, game_date=resolved_date)
+            for team_name in involved_teams
+        }
     games: list[dict[str, Any]] = []
 
     for row in rows:
@@ -5444,27 +5388,24 @@ def todays_games(game_date: str | None = None) -> dict[str, Any]:
         game_status = str(row.get("GAME_STATUS_TEXT") or "").strip()
         home_score = safe_int_score(row.get("PTS_HOME"), 0)
         away_score = safe_int_score(row.get("PTS_AWAY"), 0)
-        home_summary = build_team_availability_summary(str(home_team.get("full_name") or ""), report_payload)
-        away_summary = build_team_availability_summary(str(away_team.get("full_name") or ""), report_payload)
+        home_summary = build_team_availability_summary(str(home_team.get("full_name") or ""), report_payload, game_date=resolved_date)
+        away_summary = build_team_availability_summary(str(away_team.get("full_name") or ""), report_payload, game_date=resolved_date)
 
         def _inj_players(team_full_name: str) -> list[dict[str, Any]]:
             seen_keys: set[str] = set()
             result: list[dict[str, Any]] = []
             team_full_name_norm = team_full_name.strip()
-            for ir in (report_payload.get("rows") or []):
+            for ir in injury_rows_by_team.get(team_full_name_norm, []):
                 status = str(ir.get("status") or "").strip()
                 if status not in UNAVAILABLE_STATUSES and status not in RISKY_STATUSES:
-                    continue
-                # Use exact team name match (same as build_team_availability_summary)
-                # to prevent players bleeding across teams when PDF parsing misassigns rows.
-                ir_team = str(ir.get("team_name") or "").strip()
-                if ir_team != team_full_name_norm:
                     continue
                 pk = str(ir.get("player_key") or "")
                 if pk in seen_keys:
                     continue
                 seen_keys.add(pk)
                 raw_display = str(ir.get("player_display") or "").strip()
+                if "@" in raw_display:
+                    continue
                 # Normalise display: PDF text-extract gives "Last,First" (no space).
                 # Insert space after comma if missing so the UI shows "Last, First".
                 display = re.sub(r",(?!\s)", ", ", raw_display)
@@ -6147,5 +6088,77 @@ def odds_check_quota(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     return {
         "ok": True,
         "quota": result["quota"],
+        "api_key_masked": mask_api_key_for_display(api_key),
+    }
+
+
+@app.post("/api/odds/game-context")
+def odds_game_context(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    api_key = str(payload.get("api_key") or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Provide an Odds API key.")
+
+    sport = str(payload.get("sport") or "basketball_nba").strip()
+    regions = str(payload.get("regions") or "us").strip()
+    odds_format = str(payload.get("odds_format") or "decimal").strip()
+    requested_bookmakers = parse_requested_bookmakers(payload.get("bookmakers") or payload.get("bookmaker") or ODDS_DEFAULT_BOOKMAKERS)
+    team_name = str(payload.get("team_name") or "").strip()
+    opponent_name = str(payload.get("opponent_name") or "").strip()
+    team_abbreviation = str(payload.get("team_abbreviation") or "").strip()
+    opponent_abbreviation = str(payload.get("opponent_abbreviation") or "").strip()
+
+    events_result = odds_api_fetch(f"/sports/{sport}/events", api_key, {"dateFormat": "iso"})
+    events = events_result.get("data") or []
+    matched_event = next(
+        (
+            event for event in events
+            if _event_matches_teams(
+                event,
+                team_name=team_name,
+                opponent_name=opponent_name,
+                team_abbreviation=team_abbreviation,
+                opponent_abbreviation=opponent_abbreviation,
+            )
+        ),
+        None,
+    )
+    if not matched_event:
+        return {"ok": False, "context": {}, "environment": {}, "quota": events_result.get("quota"), "message": "No matching odds event found."}
+
+    event_id = str(matched_event.get("id") or "").strip()
+    if not event_id:
+        return {"ok": False, "context": {}, "environment": {}, "quota": events_result.get("quota"), "message": "Matched odds event is missing an id."}
+
+    odds_result = odds_api_fetch(
+        f"/sports/{sport}/events/{event_id}/odds",
+        api_key,
+        {
+            "regions": regions,
+            "markets": ",".join(ODDS_GAME_CONTEXT_MARKETS),
+            "oddsFormat": odds_format,
+            "dateFormat": "iso",
+            "bookmakers": ",".join(requested_bookmakers),
+        },
+    )
+    odds_event = odds_result.get("data") or {}
+    event_context = build_event_market_context(odds_event)
+    environment = enrich_environment_with_market_context(
+        {},
+        {
+            "home_team": odds_event.get("home_team") or matched_event.get("home_team") or "",
+            "away_team": odds_event.get("away_team") or matched_event.get("away_team") or "",
+            **event_context,
+        },
+        player_team_name=team_name,
+        player_team_abbreviation=team_abbreviation,
+    )
+    return {
+        "ok": True,
+        "event_id": event_id,
+        "home_team": odds_event.get("home_team") or matched_event.get("home_team") or "",
+        "away_team": odds_event.get("away_team") or matched_event.get("away_team") or "",
+        "context": event_context,
+        "environment": environment,
+        "quota": odds_result.get("quota") or events_result.get("quota"),
         "api_key_masked": mask_api_key_for_display(api_key),
     }

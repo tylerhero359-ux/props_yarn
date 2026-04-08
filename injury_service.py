@@ -19,6 +19,7 @@ class InjuryReportService:
     team_pool: list[dict[str, Any]]
     http_get: Callable[..., Any]
     timed_call: Callable[[str], Callable]
+    team_alias_lookup: dict[str, dict[str, Any]] = field(default_factory=dict)
     pdfplumber_module: Any | None = None
     page_url: str = "https://official.nba.com/nba-injury-report-2025-26-season/"
     report_ttl_seconds: int = 600
@@ -55,12 +56,77 @@ class InjuryReportService:
 
     def __post_init__(self) -> None:
         self.status_pattern = "|".join(re.escape(status) for status in sorted(self.report_statuses, key=len, reverse=True))
+        self.compact_team_lookup: dict[str, str] = {}
+        for team in self.team_pool:
+            full_name = str(team.get("full_name") or "")
+            compact_full_name = normalize_compact_text(full_name)
+            if compact_full_name:
+                self.compact_team_lookup[compact_full_name] = full_name
+            abbreviation = str(team.get("abbreviation") or "").strip()
+            nickname = str(team.get("nickname") or "").strip()
+            city = str(team.get("city") or "").strip()
+            if abbreviation and nickname:
+                compact_abbr_nickname = normalize_compact_text(f"{abbreviation} {nickname}")
+                if compact_abbr_nickname:
+                    self.compact_team_lookup[compact_abbr_nickname] = full_name
+            if city and nickname:
+                city_initials = "".join(part[:1] for part in city.split() if part)
+                compact_city_initials = normalize_compact_text(f"{city_initials} {nickname}")
+                if compact_city_initials:
+                    self.compact_team_lookup[compact_city_initials] = full_name
+        for alias, team in self.team_alias_lookup.items():
+            compact_alias = normalize_compact_text(alias)
+            full_name = str(team.get("full_name") or "")
+            if compact_alias and full_name:
+                self.compact_team_lookup[compact_alias] = full_name
+
+    def _strip_matchup_prefix(self, text_line: str) -> str:
+        cleaned = " ".join(str(text_line or "").split())
+        patterns = (
+            r"^[A-Z]{2,4}\s*@\s*[A-Z]{2,4}\s+",
+            r"^[A-Z]{2,4}@[A-Z]{2,4}\s+",
+        )
+        for pattern in patterns:
+            updated = re.sub(pattern, "", cleaned)
+            if updated != cleaned:
+                cleaned = updated.strip()
+        return cleaned
+
+    def _extract_team_remainder(self, text_line: str, compact_team: str) -> str:
+        compact_seen = ""
+        for idx, char in enumerate(text_line):
+            if char.isspace():
+                continue
+            compact_seen += char
+            if compact_seen.lower() == compact_team.lower():
+                return text_line[idx + 1 :].strip()
+            if not compact_team.lower().startswith(compact_seen.lower()):
+                break
+        return text_line.strip()
+
+    def _format_player_display(self, player_display: str) -> str:
+        cleaned = re.sub(r",(?!\s)", ", ", str(player_display or "").strip())
+        cleaned = re.sub(r"(?<=[a-z])(?=(?:Jr\.|Sr\.|II|III|IV|V)\b)", " ", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned)
+        return cleaned.strip()
+
+    def _is_plausible_player_display(self, player_display: str) -> bool:
+        candidate = str(player_display or "").strip()
+        if not candidate or "@" in candidate:
+            return False
+
+        compact_candidate = normalize_compact_text(candidate)
+        if not compact_candidate:
+            return False
+
+        for team in self.team_pool:
+            compact_team = normalize_compact_text(str(team.get("full_name") or ""))
+            if compact_team and compact_team in compact_candidate:
+                return False
+        return True
 
     def _team_name_by_compact_text(self, compact_text: str) -> str | None:
-        for team in self.team_pool:
-            if normalize_compact_text(str(team.get("full_name") or "")) == compact_text:
-                return str(team.get("full_name") or "")
-        return None
+        return self.compact_team_lookup.get(compact_text)
 
     def parse_report_timestamp(self, url: str) -> datetime:
         match = re.search(r"Injury-Report_(\d{4}-\d{2}-\d{2})_(\d{2})_(\d{2})(AM|PM)\.pdf", url)
@@ -83,34 +149,45 @@ class InjuryReportService:
         return local_dt.strftime("%b %d, %Y %I:%M %p ET")
 
     def extract_team_prefix(self, text_line: str) -> tuple[str | None, str]:
-        compact_line = normalize_compact_text(text_line)
+        cleaned_line = self._strip_matchup_prefix(text_line)
+        compact_line = normalize_compact_text(cleaned_line)
         for team in sorted(self.team_pool, key=lambda item: len(item["full_name"]), reverse=True):
             team_name = str(team.get("full_name") or "")
             compact_team = normalize_compact_text(team_name)
             if compact_team and compact_line.startswith(compact_team):
-                remainder = text_line[len(team_name):].strip()
+                if cleaned_line.startswith(team_name):
+                    remainder = cleaned_line[len(team_name):].strip()
+                else:
+                    remainder = self._extract_team_remainder(cleaned_line, compact_team)
                 return team_name, remainder
-        return None, text_line.strip()
+        return None, cleaned_line.strip()
 
     def parse_report_rows(self, report_text: str) -> dict[str, Any]:
         rows: list[dict[str, Any]] = []
         pending_teams: list[str] = []
         current_team: str | None = None
 
-        for raw_line in report_text.splitlines():
-            line = " ".join(str(raw_line or "").split())
-            if not line:
+        lines = [" ".join(line.split()) for line in report_text.splitlines() if str(line or "").strip()]
+
+        for line in lines:
+            lower_line = line.lower()
+            if (
+                "nba injury report" in lower_line
+                or lower_line.startswith("game date game time matchup team player current status")
+                or lower_line.startswith("game date")
+                or lower_line.startswith("matchup team player")
+            ):
                 continue
 
-            team_name, remainder = self.extract_team_prefix(line)
-            if team_name:
-                current_team = team_name
+            team_hit, remainder = self.extract_team_prefix(line)
+            if team_hit:
+                current_team = team_hit
             else:
                 remainder = line
 
-            pending_match = re.search(r"pending\s+report", remainder, flags=re.IGNORECASE)
-            if team_name and pending_match:
-                pending_teams.append(team_name)
+            if re.search(r"\b(pending report|not\s*yet\s*submitted)\b", remainder, flags=re.IGNORECASE):
+                if current_team and current_team not in pending_teams:
+                    pending_teams.append(current_team)
                 continue
 
             row_match = re.match(
@@ -121,20 +198,25 @@ class InjuryReportService:
             if not row_match or not current_team:
                 continue
 
-            player_display = re.sub(r",(?!\s)", ", ", row_match.group("player").strip())
+            player_display = self._format_player_display(row_match.group("player").strip())
+            if not self._is_plausible_player_display(player_display):
+                continue
+
             status = row_match.group("status").strip()
-            canonical_status = next((s for s in self.report_statuses if s.lower() == status.lower()), status)
+            canonical_status = next((candidate for candidate in self.report_statuses if candidate.lower() == status.lower()), status)
+            reason = (row_match.group("reason") or "").strip()
+
             rows.append(
                 {
                     "team_name": current_team,
                     "player_display": player_display,
                     "player_key": normalize_report_person_name(player_display),
                     "status": canonical_status,
-                    "reason": (row_match.group("reason") or "").strip(),
+                    "reason": reason,
                 }
             )
 
-        return {"rows": rows, "pending_teams": list(dict.fromkeys(pending_teams))}
+        return {"rows": rows, "pending_teams": pending_teams}
 
     def extract_report_rows_from_table(self, pdf_bytes: bytes) -> list[dict[str, Any]] | None:
         if self.pdfplumber_module is None:
@@ -191,8 +273,8 @@ class InjuryReportService:
                                     continue
                                 status_cell = found
 
-                            player_display = re.sub(r",(?!\s)", ", ", player_cell.strip())
-                            if not player_display or not last_team_name:
+                            player_display = self._format_player_display(player_cell.strip())
+                            if not last_team_name or not self._is_plausible_player_display(player_display):
                                 continue
 
                             rows.append(
@@ -205,6 +287,122 @@ class InjuryReportService:
                                 }
                             )
             return rows if rows else None
+        except Exception:
+            return None
+
+    def extract_report_rows_from_layout(self, pdf_bytes: bytes) -> dict[str, Any] | None:
+        if self.pdfplumber_module is None:
+            return None
+
+        def group_lines(words: list[dict[str, Any]], tolerance: float = 4.0) -> list[list[dict[str, Any]]]:
+            lines: list[list[dict[str, Any]]] = []
+            current: list[dict[str, Any]] = []
+            current_top: float | None = None
+            for word in sorted(words, key=lambda item: (float(item.get("top") or 0.0), float(item.get("x0") or 0.0))):
+                top = float(word.get("top") or 0.0)
+                if current_top is None or abs(top - current_top) <= tolerance:
+                    current.append(word)
+                    if current_top is None:
+                        current_top = top
+                else:
+                    lines.append(current)
+                    current = [word]
+                    current_top = top
+            if current:
+                lines.append(current)
+            return lines
+
+        def join_words(items: list[dict[str, Any]]) -> str:
+            return " ".join(str(item.get("text") or "").strip() for item in sorted(items, key=lambda item: float(item.get("x0") or 0.0)) if str(item.get("text") or "").strip()).strip()
+
+        rows: list[dict[str, Any]] = []
+        pending_teams: list[str] = []
+        pending_entries: list[dict[str, Any]] = []
+        current_team: str | None = None
+        last_row: dict[str, Any] | None = None
+        current_game_date: str | None = None
+        current_matchup: str | None = None
+
+        try:
+            with self.pdfplumber_module.open(BytesIO(pdf_bytes)) as pdf:  # type: ignore[arg-type]
+                for page in pdf.pages:
+                    words = page.extract_words(use_text_flow=False, keep_blank_chars=False) or []
+                    for line in group_lines(words):
+                        team_words = [word for word in line if 250 <= float(word.get("x0") or 0.0) < 410]
+                        player_words = [word for word in line if 410 <= float(word.get("x0") or 0.0) < 580]
+                        status_words = [word for word in line if 580 <= float(word.get("x0") or 0.0) < 660]
+                        reason_words = [word for word in line if float(word.get("x0") or 0.0) >= 660]
+                        lead_words = [word for word in line if float(word.get("x0") or 0.0) < 250]
+
+                        lead_text = join_words(lead_words)
+                        team_text = join_words(team_words)
+                        player_text = join_words(player_words)
+                        status_text = join_words(status_words)
+                        reason_text = join_words(reason_words)
+                        full_line = " ".join(part for part in (lead_text, team_text, player_text, status_text, reason_text) if part).strip()
+                        lower_line = full_line.lower()
+
+                        if (
+                            not full_line
+                            or lower_line.startswith("injury report:")
+                            or lower_line.startswith("page ")
+                            or lower_line == "page"
+                            or "game date game time matchup team player name current status reason" in lower_line
+                        ):
+                            continue
+
+                        date_match = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", full_line)
+                        if date_match:
+                            try:
+                                current_game_date = datetime.strptime(date_match.group(1), "%m/%d/%Y").strftime("%Y-%m-%d")
+                            except Exception:
+                                current_game_date = date_match.group(1)
+
+                        matchup_match = re.search(r"\b([A-Z]{2,4}@[A-Z]{2,4})\b", full_line)
+                        if matchup_match:
+                            current_matchup = matchup_match.group(1)
+
+                        team_name = self._team_name_by_compact_text(normalize_compact_text(team_text)) if team_text else None
+                        if team_name:
+                            current_team = team_name
+
+                        pending_text = " ".join(part for part in (player_text, status_text, reason_text) if part).strip()
+                        if re.search(r"\bnot\s*yet\s*submitted\b", pending_text, flags=re.IGNORECASE):
+                            if current_team and current_team not in pending_teams:
+                                pending_teams.append(current_team)
+                            if current_team:
+                                pending_entries.append(
+                                    {
+                                        "team_name": current_team,
+                                        "game_date": current_game_date or "",
+                                        "matchup": current_matchup or "",
+                                    }
+                                )
+                            last_row = None
+                            continue
+
+                        status_value = next((status for status in self.report_statuses if status.lower() == status_text.lower()), "")
+                        if player_text and status_value and current_team:
+                            player_display = self._format_player_display(player_text)
+                            if self._is_plausible_player_display(player_display):
+                                row = {
+                                    "team_name": current_team,
+                                    "game_date": current_game_date or "",
+                                    "matchup": current_matchup or "",
+                                    "player_display": player_display,
+                                    "player_key": normalize_report_person_name(player_display),
+                                    "status": status_value,
+                                    "reason": reason_text.strip(),
+                                }
+                                rows.append(row)
+                                last_row = row
+                                continue
+
+                        if reason_text and last_row is not None and not player_text and not status_text:
+                            previous_reason = str(last_row.get("reason") or "").strip()
+                            last_row["reason"] = f"{previous_reason} {reason_text.strip()}".strip()
+
+            return {"rows": rows, "pending_teams": pending_teams, "pending_entries": pending_entries} if rows or pending_teams else None
         except Exception:
             return None
 
@@ -242,8 +440,28 @@ class InjuryReportService:
         return unique
 
     def choose_best_report_parse(self, pdf_bytes: bytes) -> dict[str, Any]:
+        layout_parsed = self.extract_report_rows_from_layout(pdf_bytes)
+        if layout_parsed:
+            return {
+                "rows": layout_parsed.get("rows") or [],
+                "pending_teams": layout_parsed.get("pending_teams") or [],
+                "pending_entries": layout_parsed.get("pending_entries") or [],
+                "raw_text": "",
+                "method": "layout",
+            }
+
         candidates = self.extract_report_text_candidates(pdf_bytes)
-        best_payload: dict[str, Any] = {"rows": [], "pending_teams": [], "raw_text": "", "method": "none"}
+        best_payload: dict[str, Any] = {"rows": [], "pending_teams": [], "pending_entries": [], "raw_text": "", "method": "none"}
+
+        table_rows = self.extract_report_rows_from_table(pdf_bytes)
+        if table_rows:
+            best_payload = {
+                "rows": table_rows,
+                "pending_teams": [],
+                "pending_entries": [],
+                "raw_text": "",
+                "method": "table",
+            }
 
         for candidate in candidates:
             parsed = self.parse_report_rows(candidate["text"])
@@ -251,6 +469,7 @@ class InjuryReportService:
                 best_payload = {
                     "rows": parsed.get("rows") or [],
                     "pending_teams": parsed.get("pending_teams") or [],
+                    "pending_entries": parsed.get("pending_entries") or [],
                     "raw_text": candidate["text"],
                     "method": candidate["method"],
                 }
@@ -261,6 +480,7 @@ class InjuryReportService:
             best_payload = {
                 "rows": parsed.get("rows") or [],
                 "pending_teams": parsed.get("pending_teams") or [],
+                "pending_entries": parsed.get("pending_entries") or [],
                 "raw_text": fallback["text"],
                 "method": fallback["method"],
             }
@@ -308,6 +528,7 @@ class InjuryReportService:
             "report_label": self.format_report_timestamp(latest_dt),
             "rows": parsed_choice.get("rows") or [],
             "pending_teams": parsed_choice.get("pending_teams") or [],
+            "pending_entries": parsed_choice.get("pending_entries") or [],
             "raw_text": parsed_choice.get("raw_text") or "",
             "parse_method": parsed_choice.get("method") or "unknown",
             "error": None,
@@ -473,6 +694,51 @@ class InjuryReportService:
             age_seconds = max(0.0, time.time() - float(cache_timestamp))
 
         return age_seconds is not None and age_seconds <= self.max_stale_seconds
+
+    def _ensure_payload_indexes(self, payload: dict[str, Any]) -> dict[str, Any]:
+        cached = payload.get("_injury_indexes")
+        if isinstance(cached, dict):
+            return cached
+
+        rows = payload.get("rows") or []
+        rows_by_team_date: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        rows_by_team: dict[str, list[dict[str, Any]]] = {}
+        pending_by_date: dict[str, set[str]] = {}
+
+        for row in rows:
+            team_name = str(row.get("team_name") or "").strip()
+            if not team_name:
+                continue
+            game_date = str(row.get("game_date") or "").strip()
+            rows_by_team.setdefault(team_name, []).append(row)
+            rows_by_team_date.setdefault((team_name, game_date), []).append(row)
+
+        for entry in (payload.get("pending_entries") or []):
+            team_name = str(entry.get("team_name") or "").strip()
+            game_date = str(entry.get("game_date") or "").strip()
+            if team_name:
+                pending_by_date.setdefault(game_date, set()).add(team_name)
+
+        indexes = {
+            "rows_by_team_date": rows_by_team_date,
+            "rows_by_team": rows_by_team,
+            "pending_by_date": pending_by_date,
+        }
+        payload["_injury_indexes"] = indexes
+        return indexes
+
+    def get_team_rows(self, payload: dict[str, Any], team_name: str, game_date: str | None = None) -> list[dict[str, Any]]:
+        indexes = self._ensure_payload_indexes(payload)
+        normalized_team_name = str(team_name or "").strip()
+        if game_date is None:
+            return list(indexes["rows_by_team"].get(normalized_team_name, []))
+        return list(indexes["rows_by_team_date"].get((normalized_team_name, str(game_date or "").strip()), []))
+
+    def get_pending_teams(self, payload: dict[str, Any], game_date: str | None = None) -> set[str]:
+        indexes = self._ensure_payload_indexes(payload)
+        if game_date is None:
+            return set(payload.get("pending_teams") or [])
+        return set(indexes["pending_by_date"].get(str(game_date or "").strip(), set()))
 
     def _build_error_payload(self, exc: Exception) -> dict[str, Any]:
         return {
@@ -662,7 +928,7 @@ class InjuryReportService:
         self.availability_cache[cache_key] = dict(result)
         return result
 
-    def build_team_availability_summary(self, team_name: str | None, report_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def build_team_availability_summary(self, team_name: str | None, report_payload: dict[str, Any] | None = None, game_date: str | None = None) -> dict[str, Any]:
         team_name = str(team_name or "").strip()
         payload = report_payload or self.fetch_latest_report_payload()
         if not payload.get("ok"):
@@ -677,7 +943,7 @@ class InjuryReportService:
                 "players": [],
             }
 
-        pending_teams = set(payload.get("pending_teams") or [])
+        pending_teams = self.get_pending_teams(payload, game_date=game_date)
         if team_name and team_name in pending_teams:
             return {
                 "team_name": team_name,
@@ -690,7 +956,7 @@ class InjuryReportService:
                 "players": [],
             }
 
-        rows = [row for row in (payload.get("rows") or []) if row.get("team_name") == team_name]
+        rows = self.get_team_rows(payload, team_name, game_date=game_date)
         out_count = sum(1 for row in rows if str(row.get("status") or "") in self.unavailable_statuses)
         questionable_count = sum(1 for row in rows if str(row.get("status") or "") in self.risky_statuses)
         probable_count = sum(1 for row in rows if str(row.get("status") or "") in self.good_statuses)
