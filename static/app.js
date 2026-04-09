@@ -188,6 +188,10 @@ const KEY_VAULT_MIN_USABLE_CREDITS = 1;
 const KEY_VAULT_BALANCE_STALE_MS = 5 * 60 * 1000;
 let cachedEligibleVaultKeys = [];
 let cachedEligibleVaultKeysAt = 0;
+let oddsKeyVaultState = [];
+let oddsKeyVaultActiveId = '';
+let keyVaultBootstrapPromise = null;
+let keyVaultSyncPromise = Promise.resolve();
 
 const VIEW_META = {
   overview: {
@@ -233,16 +237,85 @@ const VIEW_META = {
 };
 
 function loadOddsKeyVault(provider = 'odds_api') {
+  const vault = Array.isArray(oddsKeyVaultState) ? oddsKeyVaultState : [];
+  return provider ? vault.filter(entry => entry?.provider === provider) : vault.slice();
+}
+
+function readLegacyOddsKeyVault() {
   try {
     const raw = JSON.parse(localStorage.getItem(KEY_VAULT_STORAGE) || '[]');
-    return Array.isArray(raw) ? raw.filter(entry => !provider || entry?.provider === provider) : [];
+    return Array.isArray(raw) ? raw : [];
   } catch {
     return [];
   }
 }
 
-function saveOddsKeyVault(vault) {
-  localStorage.setItem(KEY_VAULT_STORAGE, JSON.stringify(Array.isArray(vault) ? vault : []));
+function readLegacyOddsKeyVaultActiveId() {
+  try {
+    return localStorage.getItem(KEY_VAULT_ACTIVE_STORAGE) || '';
+  } catch {
+    return '';
+  }
+}
+
+async function ensureOddsKeyVaultLoaded(force = false) {
+  if (!force && keyVaultBootstrapPromise) {
+    return keyVaultBootstrapPromise;
+  }
+  keyVaultBootstrapPromise = fetch('/api/key-vault')
+    .then(async function (response) {
+      if (!response.ok) {
+        throw new Error('Failed to load Key Vault.');
+      }
+      const data = await response.json();
+      oddsKeyVaultState = Array.isArray(data.entries) ? data.entries : [];
+      oddsKeyVaultActiveId = String(data.active_id || '');
+      if (!oddsKeyVaultState.length) {
+        const legacyVault = readLegacyOddsKeyVault();
+        if (legacyVault.length) {
+          oddsKeyVaultState = legacyVault.slice();
+          oddsKeyVaultActiveId = readLegacyOddsKeyVaultActiveId();
+          await saveOddsKeyVault(oddsKeyVaultState, { activeId: oddsKeyVaultActiveId });
+        }
+      }
+      return oddsKeyVaultState;
+    })
+    .catch(function (error) {
+      console.error('Key Vault load failed:', error);
+      oddsKeyVaultState = [];
+      oddsKeyVaultActiveId = '';
+      throw error;
+    });
+  return keyVaultBootstrapPromise;
+}
+
+function saveOddsKeyVault(vault, { activeId = oddsKeyVaultActiveId } = {}) {
+  oddsKeyVaultState = Array.isArray(vault) ? vault.slice() : [];
+  oddsKeyVaultActiveId = String(activeId || '');
+  keyVaultSyncPromise = keyVaultSyncPromise
+    .catch(function () { })
+    .then(async function () {
+      const response = await fetch('/api/key-vault', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          entries: oddsKeyVaultState,
+          active_id: oddsKeyVaultActiveId,
+        }),
+      });
+      if (!response.ok) {
+        let detail = 'Failed to save Key Vault.';
+        try {
+          const data = await response.json();
+          detail = data.detail || detail;
+        } catch (e) { }
+        throw new Error(detail);
+      }
+    })
+    .catch(function (error) {
+      console.error('Key Vault save failed:', error);
+    });
+  return keyVaultSyncPromise;
 }
 
 function updateOddsKeyVaultEntry(entryId, patch) {
@@ -255,11 +328,9 @@ function updateOddsKeyVaultEntry(entryId, patch) {
 
 function deleteOddsKeyVaultEntry(entryId) {
   const vault = loadOddsKeyVault(null).filter(entry => entry.id !== entryId);
-  saveOddsKeyVault(vault);
+  const nextActiveId = oddsKeyVaultActiveId === entryId ? '' : oddsKeyVaultActiveId;
+  return saveOddsKeyVault(vault, { activeId: nextActiveId });
   invalidateEligibleVaultKeyCache();
-  if (localStorage.getItem(KEY_VAULT_ACTIVE_STORAGE) === entryId) {
-    localStorage.setItem(KEY_VAULT_ACTIVE_STORAGE, '');
-  }
 }
 
 function maskVaultKey(key) {
@@ -304,6 +375,7 @@ function primeEligibleVaultKeyCache(entries) {
 }
 
 async function refreshOddsVaultEntryCredits(entry, { force = false, onLowCredits } = {}) {
+  await ensureOddsKeyVaultLoaded();
   if (!entry?.key) return null;
   const checkedAt = entry.last_checked_at ? Date.parse(entry.last_checked_at) : 0;
   const hasFreshBalance = Number.isFinite(Number(entry.remaining)) && checkedAt && ((Date.now() - checkedAt) < KEY_VAULT_BALANCE_STALE_MS);
@@ -361,6 +433,7 @@ async function pickRandomVaultKeyForFeature({
   sourceLabel = 'this feature',
   enforceMinimum = true,
 } = {}) {
+  await ensureOddsKeyVaultLoaded();
   const cachedPool = shuffleArray(getCachedEligibleVaultKeys({ provider, requiredCredits }));
   if (cachedPool.length) {
     const winner = cachedPool[0];
@@ -409,6 +482,7 @@ async function getRotatingVaultKeysForFeature({
   requiredCredits = 1,
   sourceLabel = 'this feature',
 } = {}) {
+  await ensureOddsKeyVaultLoaded();
   const cachedPool = getCachedEligibleVaultKeys({ provider, requiredCredits });
   if (cachedPool.length >= minimumKeys) {
     const eligible = shuffleArray(cachedPool).slice(0, Math.max(minimumKeys, cachedPool.length));
@@ -7896,13 +7970,14 @@ function passesAdvancedMarketFilters(item) {
     return loadOddsKeyVault(null);
   }
   function saveVault(vault) {
-    saveOddsKeyVault(vault);
+    return saveOddsKeyVault(vault, { activeId: oddsKeyVaultActiveId });
   }
   function getActiveId() {
-    return localStorage.getItem(KEY_VAULT_ACTIVE_STORAGE) || '';
+    return oddsKeyVaultActiveId || '';
   }
   function setActiveId(id) {
-    localStorage.setItem(KEY_VAULT_ACTIVE_STORAGE, id);
+    oddsKeyVaultActiveId = String(id || '');
+    return saveOddsKeyVault(loadVault(), { activeId: oddsKeyVaultActiveId });
   }
   function maskKey(key) {
     if (!key || key.length < 8) return '••••••••';
@@ -8014,9 +8089,9 @@ function passesAdvancedMarketFilters(item) {
 
     // Bind buttons
     kvKeyList.querySelectorAll('.kv-delete-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
+      btn.addEventListener('click', async () => {
         if (!confirm('Remove this key from the vault?')) return;
-        deleteOddsKeyVaultEntry(btn.dataset.id);
+        await deleteOddsKeyVaultEntry(btn.dataset.id);
         renderVault();
       });
     });
@@ -8051,7 +8126,8 @@ function passesAdvancedMarketFilters(item) {
   }
 
   // ── Add key ───────────────────────────────────────────────────────────
-  kvAddBtn?.addEventListener('click', () => {
+  kvAddBtn?.addEventListener('click', async () => {
+    await ensureOddsKeyVaultLoaded().catch(function () { });
     const rawKeys = (kvKeyInput?.value || '').trim();
     const provider = kvProviderSelect?.value || 'odds_api';
 
@@ -8098,11 +8174,11 @@ function passesAdvancedMarketFilters(item) {
     }
 
     invalidateEligibleVaultKeyCache();
-    saveVault(vault);
+    await saveVault(vault);
 
     // Auto-activate if first key
     if (vault.length === addedEntries.length) {
-      setActiveId(addedEntries[0].id);
+      await setActiveId(addedEntries[0].id);
       syncActiveKeyToPages(addedEntries[0].key);
     }
 
@@ -8114,6 +8190,7 @@ function passesAdvancedMarketFilters(item) {
   });
 
   kvRefreshAllBtn?.addEventListener('click', async () => {
+    await ensureOddsKeyVaultLoaded().catch(function () { });
     const oddsVault = loadVault().filter(entry => entry.provider === 'odds_api');
     if (!oddsVault.length) {
       setKvStatus('Add Odds API keys first.', 'bad');
@@ -8141,9 +8218,16 @@ function passesAdvancedMarketFilters(item) {
   });
 
   // ── Init: render vault and sync active key on load ────────────────────
-  renderVault();
-  const vault = loadVault();
-  const activeId = getActiveId();
-  const activeEntry = vault.find(k => k.id === activeId);
-  if (activeEntry) syncActiveKeyToPages(activeEntry.key);
+  (async function bootstrapVaultUi() {
+    try {
+      await ensureOddsKeyVaultLoaded();
+    } catch (error) {
+      setKvStatus('Could not load Key Vault.', 'bad');
+    }
+    renderVault();
+    const vault = loadVault();
+    const activeId = getActiveId();
+    const activeEntry = vault.find(k => k.id === activeId);
+    if (activeEntry) syncActiveKeyToPages(activeEntry.key);
+  })();
 })();

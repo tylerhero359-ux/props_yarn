@@ -91,6 +91,7 @@ WARM_CACHE_TEAM_ROSTERS_MAX_WORKERS = max(1, int(os.getenv("NBA_WARM_CACHE_TEAM_
 PERSISTENT_CACHE_DIR = BASE_DIR / ".runtime_cache"
 PERSISTENT_CACHE_PATH = PERSISTENT_CACHE_DIR / "persistent_cache.json"
 BACKTEST_PERSIST_PATH = PERSISTENT_CACHE_DIR / "backtest_log.json"
+KEY_VAULT_PERSIST_PATH = PERSISTENT_CACHE_DIR / "key_vault.json"
 PERSISTENT_CACHE_ENABLED = os.getenv("NBA_PERSISTENT_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 PERSISTENT_CACHE_MAX_ROSTERS = max(30, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_ROSTERS", "120")))
 PERSISTENT_CACHE_MAX_PLAYER_INFO = max(100, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_PLAYER_INFO", "600")))
@@ -3761,6 +3762,7 @@ def resolve_team_next_game(team_id: int | None, primary_player_id: int, season: 
 
 @app.on_event("startup")
 def _startup_warm_cache() -> None:
+    _load_key_vault_state()
     start_hybrid_refresh_workers()
     warm_cache_on_startup()
 
@@ -5972,6 +5974,45 @@ def debug_injury_report_raw() -> dict[str, Any]:
 
 _BACKTEST_LOCK = threading.Lock()
 _BACKTEST_LOG: list[dict[str, Any]] = []   # [{id, player, stat, line, side, confidence_score, confidence_tier, model_prob, result, hit, odds, ev, logged_at, resolved_at}]
+_KEY_VAULT_LOCK = threading.Lock()
+_KEY_VAULT_STATE: dict[str, Any] = {"entries": [], "active_id": ""}
+
+
+def _save_key_vault_state() -> None:
+    if not PERSISTENT_CACHE_ENABLED:
+        return
+    try:
+        PERSISTENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with _KEY_VAULT_LOCK:
+            payload = {
+                "version": 1,
+                "saved_at": time.time(),
+                "entries": list(_KEY_VAULT_STATE.get("entries") or []),
+                "active_id": str(_KEY_VAULT_STATE.get("active_id") or ""),
+            }
+        temp_path = KEY_VAULT_PERSIST_PATH.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temp_path.replace(KEY_VAULT_PERSIST_PATH)
+    except Exception as exc:
+        LOGGER.warning("Key vault save failed: %s", exc)
+
+
+def _load_key_vault_state() -> None:
+    if not PERSISTENT_CACHE_ENABLED or not KEY_VAULT_PERSIST_PATH.exists():
+        return
+    try:
+        payload = json.loads(KEY_VAULT_PERSIST_PATH.read_text(encoding="utf-8"))
+        entries = payload.get("entries") or []
+        active_id = str(payload.get("active_id") or "")
+        if not isinstance(entries, list):
+            return
+        sanitized = [entry for entry in entries if isinstance(entry, dict)]
+        with _KEY_VAULT_LOCK:
+            _KEY_VAULT_STATE["entries"] = sanitized
+            _KEY_VAULT_STATE["active_id"] = active_id
+        LOGGER.info("Loaded %s key vault entrie(s) from persistent storage", len(sanitized))
+    except Exception as exc:
+        LOGGER.warning("Key vault load failed: %s", exc)
 
 
 def _backtest_new_id() -> str:
@@ -6155,6 +6196,29 @@ def odds_check_quota(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         "quota": result["quota"],
         "api_key_masked": mask_api_key_for_display(api_key),
     }
+
+
+@app.get("/api/key-vault")
+def key_vault_get() -> dict[str, Any]:
+    with _KEY_VAULT_LOCK:
+        return {
+            "entries": list(_KEY_VAULT_STATE.get("entries") or []),
+            "active_id": str(_KEY_VAULT_STATE.get("active_id") or ""),
+        }
+
+
+@app.put("/api/key-vault")
+def key_vault_put(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    entries = payload.get("entries") or []
+    active_id = str(payload.get("active_id") or "")
+    if not isinstance(entries, list):
+        raise HTTPException(status_code=400, detail="entries must be a list")
+    sanitized = [entry for entry in entries if isinstance(entry, dict)]
+    with _KEY_VAULT_LOCK:
+        _KEY_VAULT_STATE["entries"] = sanitized
+        _KEY_VAULT_STATE["active_id"] = active_id
+    _save_key_vault_state()
+    return {"ok": True, "count": len(sanitized), "active_id": active_id}
 
 
 @app.post("/api/odds/game-context")
