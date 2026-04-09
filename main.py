@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import math
 import os
@@ -89,6 +90,7 @@ WARM_CACHE_TEAM_ROSTERS_MAX_WORKERS = max(1, int(os.getenv("NBA_WARM_CACHE_TEAM_
 
 PERSISTENT_CACHE_DIR = BASE_DIR / ".runtime_cache"
 PERSISTENT_CACHE_PATH = PERSISTENT_CACHE_DIR / "persistent_cache.json"
+BACKTEST_PERSIST_PATH = PERSISTENT_CACHE_DIR / "backtest_log.json"
 PERSISTENT_CACHE_ENABLED = os.getenv("NBA_PERSISTENT_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 PERSISTENT_CACHE_MAX_ROSTERS = max(30, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_ROSTERS", "120")))
 PERSISTENT_CACHE_MAX_PLAYER_INFO = max(100, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_PLAYER_INFO", "600")))
@@ -1723,9 +1725,9 @@ def build_confidence_engine(
 
     summary_parts: list[str] = []
     if injury_component >= 5:
-        summary_parts.append('injury-driven usage boost')
+        summary_parts.append('strong lineup-context support')
     elif injury_component > 0:
-        summary_parts.append('mild lineup boost')
+        summary_parts.append('mild lineup-context support')
 
     if matchup_component >= 5:
         summary_parts.append('favorable position environment')
@@ -1851,6 +1853,100 @@ def apply_market_confidence_adjustment(
         note = f"market leans {market_side.lower()}"
         adjusted["summary"] = f"{summary} • {note}".strip(" •")
     return adjusted
+
+def _build_parlay_reason_fragments(prop: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    try:
+        hit_rate = float(prop.get("hit_rate") or 0.0)
+    except (TypeError, ValueError):
+        hit_rate = 0.0
+    try:
+        games_count = int(prop.get("games_count") or 0)
+    except (TypeError, ValueError):
+        games_count = 0
+    try:
+        average = float(prop.get("average") or 0.0)
+    except (TypeError, ValueError):
+        average = 0.0
+    try:
+        line = float(prop.get("line") or 0.0)
+    except (TypeError, ValueError):
+        line = 0.0
+
+    side = str(prop.get("side") or "").upper()
+    market_side = str(prop.get("market_side") or "").upper()
+    confidence_tier = str(prop.get("confidence_tier") or "")
+    ranking_score = prop.get("ranking_score")
+    injury_boost = bool(prop.get("injury_boost"))
+    injury_names = prop.get("injury_filter_player_names") or prop.get("team_injury_player_names") or []
+    matchup = prop.get("matchup") or {}
+    matchup_lean = str(((matchup.get("vs_position") or {}).get("lean")) or "").strip()
+
+    if confidence_tier:
+        reasons.append(f"{confidence_tier} confidence profile")
+    elif ranking_score is not None:
+        reasons.append(f"rank score {ranking_score}")
+
+    if hit_rate >= 1 and games_count > 0:
+        reasons.append(f"{round(hit_rate, 1)}% hit rate over {games_count} games")
+
+    cushion = (average - line) if side == "OVER" else (line - average)
+    if cushion >= 0.75:
+        reasons.append(f"{round(cushion, 1)} of cushion versus the line")
+
+    if market_side:
+        if market_side == side:
+            reasons.append(f"market leans {market_side.lower()} too")
+        else:
+            reasons.append(f"picked despite market leaning {market_side.lower()}")
+
+    if injury_boost and injury_names:
+        reasons.append(f"lineup context improved with {', '.join(str(name) for name in injury_names[:2])} out")
+    elif injury_names:
+        reasons.append("same-team absences were considered")
+
+    lean_lower = matchup_lean.lower()
+    if lean_lower in {"good matchup", "favorable", "very favorable"}:
+        reasons.append("matchup context is favorable")
+    elif lean_lower in {"tough", "very tough", "bad matchup"}:
+        reasons.append("matchup context is tougher than average")
+
+    return reasons[:4]
+
+
+def annotate_parlay_selection(scored: list[dict[str, Any]], legs: int) -> list[dict[str, Any]]:
+    parlay_legs: list[dict[str, Any]] = []
+    seen_player_ids: set[int] = set()
+    seen_event_ids: set[str] = set()
+
+    for idx, prop in enumerate(scored, start=1):
+        pid = prop.get("player_id")
+        eid = str(prop.get("event_id") or "")
+        prop["board_rank"] = idx
+        prop["selection_reason_parts"] = _build_parlay_reason_fragments(prop)
+        prop["selection_reason"] = ""
+        prop["selection_status"] = "not_selected"
+
+        if len(parlay_legs) >= legs:
+            prop["selection_reason"] = f"Ranked below the final cutoff for this {legs}-leg ticket."
+            continue
+        if pid in seen_player_ids:
+            prop["selection_reason"] = "Skipped because a higher-ranked prop from the same player was already selected."
+            continue
+        if eid and eid in seen_event_ids:
+            prop["selection_reason"] = "Skipped because the ticket avoids same-game parlays."
+            continue
+
+        seen_player_ids.add(pid)
+        if eid:
+            seen_event_ids.add(eid)
+        prop["selection_status"] = "selected"
+        why = prop.get("selection_reason_parts") or []
+        prop["selection_reason"] = "Selected for " + "; ".join(why[:3]) + "." if why else "Selected as one of the strongest board fits."
+        parlay_legs.append(prop)
+
+    return parlay_legs
+
 
 def throttle_request() -> None:
     global LAST_REQUEST_TIME
@@ -2901,7 +2997,7 @@ def build_team_opportunity_context(
         'net_adjustment': 0.0,
         'impact_tags': [],
         'impact_reasons': [],
-        'opportunity_label': 'Neutral injury environment',
+        'opportunity_label': 'Neutral lineup context',
     }
     if not payload.get('ok') or not team_name:
         TEAM_OPPORTUNITY_CACHE[cache_key] = copy.deepcopy(empty)
@@ -2956,25 +3052,25 @@ def build_team_opportunity_context(
         else:
             adj = weight * 0.45
         if adj >= 2.8:
-            tag = 'Injury boost'
+            tag = 'Lineup shift'
         elif adj >= 1.4:
-            tag = 'Usage bump'
+            tag = 'Role change'
         else:
-            tag = 'Thin rotation'
+            tag = 'Rotation change'
         boost_score += adj
         impact_tags.append(tag)
         pos_label = injured_group or 'rotation'
-        impact_reasons.append(f"{injured_name} {status.lower()} ({pos_label}) can shift {get_stat_label_for_copy(stat).lower()} volume.")
+        impact_reasons.append(f"{injured_name} {status.lower()} ({pos_label}) changes the lineup context for this {get_stat_label_for_copy(stat).lower()} prop.")
 
     boost_score = round(min(12.0, boost_score), 1)
     net_adjustment = boost_score - penalty_score
 
     if stat in {'PTS', '3PM', 'PRA', 'PR', 'PA'}:
-        angle = 'Same-team absences can open extra shots and usage for this prop.'
+        angle = 'Same-team absences can materially change the scoring and usage environment for this prop.'
     elif stat in {'REB', 'RA'}:
-        angle = 'Same-team absences can open rebound share and floor time.'
+        angle = 'Same-team absences can change rebound share, role, and floor time.'
     elif stat in {'AST'}:
-        angle = 'Same-team absences can shift playmaking responsibility.'
+        angle = 'Same-team absences can shift playmaking responsibility and assist paths.'
     else:
         angle = 'Same-team absences can change the player’s role and path to the line.'
 
@@ -3009,7 +3105,7 @@ def build_team_opportunity_context(
         'net_adjustment': round(net_adjustment, 1),
         'impact_tags': unique_tags[:4],
         'impact_reasons': impact_reasons[:4],
-        'opportunity_label': 'Positive injury environment' if net_adjustment >= 4 else ('Mild injury boost' if net_adjustment > 0 else 'Neutral injury environment'),
+        'opportunity_label': 'Strong lineup context' if net_adjustment >= 4 else ('Mild lineup context' if net_adjustment > 0 else 'Neutral lineup context'),
     }
     TEAM_OPPORTUNITY_CACHE[cache_key] = copy.deepcopy(result)
     return result
@@ -3092,7 +3188,7 @@ def build_analyzer_interpretation(
     if lean.lower() != 'neutral':
         bullets.append(f"Matchup read: {lean} versus the next opponent.")
     if team_context.get('impact_count'):
-        bullets.append(f"Team context: {team_context.get('headline')}. {team_context.get('summary')}")
+        bullets.append(f"Lineup context: {team_context.get('headline')}. {team_context.get('summary')}")
     if environment.get('headline'):
         env_summary = environment.get('summary') or ''
         bullets.append(f"Schedule spot: {environment.get('headline')}. {env_summary}")
@@ -4720,24 +4816,8 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     # do not float to the top on raw hit rate alone.
     scored.sort(key=lambda x: (x.get("ranking_score", x["confidence_score"]), x["hit_rate"], x["odds"]), reverse=True)
 
-    # Pick top N — enforce one leg per player AND one leg per game (no SGP)
-    parlay_legs: list[dict[str, Any]] = []
-    seen_player_ids: set[int] = set()
-    seen_event_ids: set[str] = set()
-    for prop in scored:
-        if len(parlay_legs) >= legs:
-            break
-        pid = prop.get("player_id")
-        eid = str(prop.get("event_id") or "")
-        if pid in seen_player_ids:
-            continue
-        # Block same-game parlay: if this event already has a leg, skip
-        if eid and eid in seen_event_ids:
-            continue
-        seen_player_ids.add(pid)
-        if eid:
-            seen_event_ids.add(eid)
-        parlay_legs.append(prop)
+    # Pick top N and annotate why each row was selected or skipped.
+    parlay_legs = annotate_parlay_selection(scored, legs)
 
     # Calculate combined parlay odds (decimal product)
     parlay_odds: float | None = None
@@ -4768,7 +4848,7 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 def get_team_injuries(team_name: str = Query(..., min_length=1)) -> dict[str, Any]:
     """
     Return injured/risky players for a team with their resolved NBA player IDs.
-    Used by the injury-aware parlay builder and Player Analyzer injury boost UI.
+    Used by the injury-aware parlay builder and Player Analyzer lineup-context UI.
     """
     payload = fetch_latest_injury_report_payload()
     rows = [row for row in (payload.get("rows") or []) if row.get("team_name") == team_name]
@@ -5289,23 +5369,8 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
 
     scored.sort(key=lambda x: (x.get("ranking_score", x["confidence_score"]), x["hit_rate"], x["odds"]), reverse=True)
 
-    # Pick top N — one leg per player, one leg per game
-    parlay_legs: list[dict[str, Any]] = []
-    seen_player_ids: set[int] = set()
-    seen_event_ids: set[str] = set()
-    for prop in scored:
-        if len(parlay_legs) >= legs:
-            break
-        pid = prop.get("player_id")
-        eid = str(prop.get("event_id") or "")
-        if pid in seen_player_ids:
-            continue
-        if eid and eid in seen_event_ids:
-            continue
-        seen_player_ids.add(pid)
-        if eid:
-            seen_event_ids.add(eid)
-        parlay_legs.append(prop)
+    # Pick top N and annotate why each row was selected or skipped.
+    parlay_legs = annotate_parlay_selection(scored, legs)
 
     parlay_odds: float | None = None
     if parlay_legs:

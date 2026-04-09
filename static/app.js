@@ -51,6 +51,7 @@ const marketMeta = document.getElementById('marketMeta');
 const marketSortSelect = document.getElementById('marketSortSelect');
 const marketFilterChips = document.getElementById('marketFilterChips');
 const marketExpertFilterChips = document.getElementById('marketExpertFilterChips');
+const marketInspectTray = document.getElementById('marketInspectTray');
 const oddsApiKeyInput = document.getElementById('oddsApiKeyInput');
 const oddsSportSelect = document.getElementById('oddsSportSelect');
 const oddsRegionsInput = document.getElementById('oddsRegionsInput');
@@ -115,6 +116,10 @@ const FALLBACK_HEADSHOT = encodeURIComponent(`
   </svg>
 `);
 
+if (marketInspectTray && marketInspectTray.parentElement !== document.body) {
+  document.body.appendChild(marketInspectTray);
+}
+
 const TEAM_COLORS = {
   ATL: { accent: '#e03a3e', accent2: '#fdb927', rgb: '224, 58, 62' },
   BOS: { accent: '#007a33', accent2: '#ba9653', rgb: '0, 122, 51' },
@@ -167,6 +172,8 @@ let currentMarketSortDirection = localStorage.getItem('nba-props-market-sort-dir
 let currentMarketFilter = localStorage.getItem('nba-props-market-filter') || 'all';
 let currentExpertFilters = loadStoredExpertFilters();
 const currentExpertSettings = { min_minutes: 22, min_fga: 10, min_h2h_games: 2, min_h2h_hit_rate: 60 };
+let currentMarketInspectKey = '';
+let currentMarketInspectKeys = [];
 
 // ── Market advanced filters (bookmaker + odds range) ──────────────────
 let currentMarketBookFilter = '';
@@ -176,6 +183,11 @@ let currentMarketMaxOdds = null;
 // ── Key Vault ─────────────────────────────────────────────────────────
 const KEY_VAULT_STORAGE = 'nba-props-key-vault';
 const KEY_VAULT_ACTIVE_STORAGE = 'nba-props-key-vault-active';
+const KEY_VAULT_MIN_ROTATING_KEYS = 5;
+const KEY_VAULT_MIN_USABLE_CREDITS = 1;
+const KEY_VAULT_BALANCE_STALE_MS = 5 * 60 * 1000;
+let cachedEligibleVaultKeys = [];
+let cachedEligibleVaultKeysAt = 0;
 
 const VIEW_META = {
   overview: {
@@ -219,6 +231,220 @@ const VIEW_META = {
     subtitle: 'Store, activate, and check credits for your API keys — used automatically across all pages.'
   }
 };
+
+function loadOddsKeyVault(provider = 'odds_api') {
+  try {
+    const raw = JSON.parse(localStorage.getItem(KEY_VAULT_STORAGE) || '[]');
+    return Array.isArray(raw) ? raw.filter(entry => !provider || entry?.provider === provider) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveOddsKeyVault(vault) {
+  localStorage.setItem(KEY_VAULT_STORAGE, JSON.stringify(Array.isArray(vault) ? vault : []));
+}
+
+function updateOddsKeyVaultEntry(entryId, patch) {
+  const vault = loadOddsKeyVault(null);
+  const next = vault.map(entry => entry.id === entryId ? { ...entry, ...patch } : entry);
+  saveOddsKeyVault(next);
+  invalidateEligibleVaultKeyCache();
+  return next.find(entry => entry.id === entryId) || null;
+}
+
+function deleteOddsKeyVaultEntry(entryId) {
+  const vault = loadOddsKeyVault(null).filter(entry => entry.id !== entryId);
+  saveOddsKeyVault(vault);
+  invalidateEligibleVaultKeyCache();
+  if (localStorage.getItem(KEY_VAULT_ACTIVE_STORAGE) === entryId) {
+    localStorage.setItem(KEY_VAULT_ACTIVE_STORAGE, '');
+  }
+}
+
+function maskVaultKey(key) {
+  const raw = String(key || '');
+  if (raw.length < 8) return '••••••••';
+  return raw.slice(0, 4) + '••••••••' + raw.slice(-4);
+}
+
+function shuffleArray(items) {
+  const copy = Array.isArray(items) ? items.slice() : [];
+  for (let i = copy.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
+}
+
+function hasFreshVaultBalance(entry) {
+  const checkedAt = entry?.last_checked_at ? Date.parse(entry.last_checked_at) : 0;
+  return Number.isFinite(Number(entry?.remaining)) && checkedAt && ((Date.now() - checkedAt) < KEY_VAULT_BALANCE_STALE_MS);
+}
+
+function invalidateEligibleVaultKeyCache() {
+  cachedEligibleVaultKeys = [];
+  cachedEligibleVaultKeysAt = 0;
+}
+
+function getCachedEligibleVaultKeys({ provider = 'odds_api', requiredCredits = 1 } = {}) {
+  if (!cachedEligibleVaultKeys.length || !cachedEligibleVaultKeysAt) return [];
+  if ((Date.now() - cachedEligibleVaultKeysAt) >= KEY_VAULT_BALANCE_STALE_MS) return [];
+  return cachedEligibleVaultKeys.filter(entry =>
+    (!provider || entry?.provider === provider) &&
+    hasFreshVaultBalance(entry) &&
+    Number(entry?.remaining) >= requiredCredits &&
+    Number(entry?.remaining) >= KEY_VAULT_MIN_USABLE_CREDITS
+  );
+}
+
+function primeEligibleVaultKeyCache(entries) {
+  cachedEligibleVaultKeys = Array.isArray(entries) ? entries.slice() : [];
+  cachedEligibleVaultKeysAt = cachedEligibleVaultKeys.length ? Date.now() : 0;
+}
+
+async function refreshOddsVaultEntryCredits(entry, { force = false, onLowCredits } = {}) {
+  if (!entry?.key) return null;
+  const checkedAt = entry.last_checked_at ? Date.parse(entry.last_checked_at) : 0;
+  const hasFreshBalance = Number.isFinite(Number(entry.remaining)) && checkedAt && ((Date.now() - checkedAt) < KEY_VAULT_BALANCE_STALE_MS);
+  if (!force && hasFreshBalance) return entry;
+
+  const response = await fetch('/api/odds/check-quota', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ api_key: entry.key })
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.detail || 'Failed to check quota.');
+
+  const next = updateOddsKeyVaultEntry(entry.id, {
+    remaining: data.quota?.remaining ?? null,
+    used: data.quota?.used ?? null,
+    last_cost: data.quota?.last ?? null,
+    last_checked_at: new Date().toISOString(),
+    api_key_masked: data.api_key_masked || maskVaultKey(entry.key),
+  });
+
+  if (Number(next?.remaining) < KEY_VAULT_MIN_USABLE_CREDITS && typeof onLowCredits === 'function') {
+    await onLowCredits(next);
+  }
+  return next;
+}
+
+async function promptDeleteLowCreditVaultKey(entry, sourceLabel = 'this feature') {
+  if (!entry?.id) return;
+  const remaining = Number(entry.remaining);
+  const prettyRemaining = Number.isFinite(remaining) ? remaining : 0;
+  const shouldDelete = confirm(`"${entry.label}" only has ${prettyRemaining} remaining credit${prettyRemaining === 1 ? '' : 's'} and is not usable for ${sourceLabel}.\n\nDo you want to delete it from the Key Vault?`);
+  if (shouldDelete) {
+    deleteOddsKeyVaultEntry(entry.id);
+    showAppToast(`Removed low-credit key: ${entry.label}`, 'warning');
+  } else {
+    invalidateEligibleVaultKeyCache();
+  }
+}
+
+function syncVaultKeyIntoOddsInputs(key) {
+  const raw = String(key || '').trim();
+  if (!raw) return;
+  if (oddsApiKeyInput) {
+    oddsApiKeyInput.value = raw;
+  }
+  if (typeof setOddsApiKeyMeta === 'function') {
+    setOddsApiKeyMeta(raw);
+  }
+}
+
+async function pickRandomVaultKeyForFeature({
+  provider = 'odds_api',
+  requiredCredits = 1,
+  sourceLabel = 'this feature',
+  enforceMinimum = true,
+} = {}) {
+  const cachedPool = shuffleArray(getCachedEligibleVaultKeys({ provider, requiredCredits }));
+  if (cachedPool.length) {
+    const winner = cachedPool[0];
+    if (winner?.key) syncVaultKeyIntoOddsInputs(winner.key);
+    return winner;
+  }
+
+  const vault = loadOddsKeyVault(provider);
+  if (enforceMinimum && vault.length < KEY_VAULT_MIN_ROTATING_KEYS) {
+    throw new Error(`Add at least ${KEY_VAULT_MIN_ROTATING_KEYS} Odds API keys to Key Vault before using ${sourceLabel}.`);
+  }
+  if (!vault.length) {
+    throw new Error('No Odds API keys saved in Key Vault.');
+  }
+
+  const shuffled = shuffleArray(vault);
+  const eligible = [];
+  for (const candidate of shuffled) {
+    let refreshed = candidate;
+    try {
+      refreshed = await refreshOddsVaultEntryCredits(candidate, {
+        force: false,
+        onLowCredits: async (lowEntry) => promptDeleteLowCreditVaultKey(lowEntry, sourceLabel),
+      });
+    } catch (error) {
+      console.warn('Key credit check failed for', candidate.label, error);
+      continue;
+    }
+    const remaining = Number(refreshed?.remaining);
+    if (Number.isFinite(remaining) && remaining >= requiredCredits && remaining >= KEY_VAULT_MIN_USABLE_CREDITS) {
+      eligible.push(refreshed);
+    }
+  }
+  if (eligible.length) {
+    primeEligibleVaultKeyCache(eligible);
+    const winner = shuffleArray(eligible)[0];
+    if (winner?.key) syncVaultKeyIntoOddsInputs(winner.key);
+    return winner;
+  }
+  throw new Error(`No usable Odds API key found in Key Vault for ${sourceLabel}.`);
+}
+
+async function getRotatingVaultKeysForFeature({
+  provider = 'odds_api',
+  minimumKeys = KEY_VAULT_MIN_ROTATING_KEYS,
+  requiredCredits = 1,
+  sourceLabel = 'this feature',
+} = {}) {
+  const cachedPool = getCachedEligibleVaultKeys({ provider, requiredCredits });
+  if (cachedPool.length >= minimumKeys) {
+    const eligible = shuffleArray(cachedPool).slice(0, Math.max(minimumKeys, cachedPool.length));
+    const first = eligible[0];
+    if (first?.key) syncVaultKeyIntoOddsInputs(first.key);
+    return eligible;
+  }
+
+  const vault = loadOddsKeyVault(provider);
+  if (vault.length < minimumKeys) {
+    throw new Error(`Add at least ${minimumKeys} Odds API keys to Key Vault before using ${sourceLabel}.`);
+  }
+  const shuffled = shuffleArray(vault);
+  const eligible = [];
+  for (const candidate of shuffled) {
+    try {
+      const refreshed = await refreshOddsVaultEntryCredits(candidate, {
+        force: false,
+        onLowCredits: async (lowEntry) => promptDeleteLowCreditVaultKey(lowEntry, sourceLabel),
+      });
+      const remaining = Number(refreshed?.remaining);
+      if (Number.isFinite(remaining) && remaining >= requiredCredits && remaining >= KEY_VAULT_MIN_USABLE_CREDITS) {
+        eligible.push(refreshed);
+      }
+    } catch (error) {
+      console.warn('Key credit check failed for', candidate.label, error);
+    }
+  }
+  if (eligible.length < minimumKeys) {
+    throw new Error(`Only ${eligible.length} usable Odds API key${eligible.length === 1 ? '' : 's'} found. ${sourceLabel} requires at least ${minimumKeys}.`);
+  }
+  primeEligibleVaultKeyCache(eligible);
+  const first = eligible[0];
+  if (first?.key) syncVaultKeyIntoOddsInputs(first.key);
+  return eligible;
+}
 
 // ── Global app toast ─────────────────────────────────────────────────
 function showAppToast(msg, type = 'default') {
@@ -2018,7 +2244,6 @@ function setOddsApiKeyMeta(apiKey) {
 
 function getOddsApiSettings() {
   const settings = {
-    api_key: oddsApiKeyInput?.value?.trim() || '',
     sport: oddsSportSelect?.value || 'basketball_nba',
     regions: oddsRegionsInput?.value?.trim() || 'us',
     odds_format: oddsFormatSelect?.value || 'decimal',
@@ -2061,7 +2286,16 @@ function mergeMarketEnvironmentIntoItem(item, marketContextResult) {
 
 async function fetchAnalyzerGameContext(source) {
   const settings = getOddsApiSettings();
-  if (!settings.api_key) return null;
+  let keyEntry = null;
+  try {
+    keyEntry = await pickRandomVaultKeyForFeature({
+      requiredCredits: 1,
+      sourceLabel: 'Player Analyzer market context',
+    });
+  } catch (error) {
+    console.warn(error.message || error);
+    return null;
+  }
   const requestData = getGameContextRequestData(source);
   if (!requestData) return null;
 
@@ -2069,7 +2303,7 @@ async function fetchAnalyzerGameContext(source) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      api_key: settings.api_key,
+      api_key: keyEntry.key,
       sport: settings.sport || 'basketball_nba',
       regions: settings.regions || 'us',
       odds_format: settings.odds_format || 'decimal',
@@ -2083,30 +2317,27 @@ async function fetchAnalyzerGameContext(source) {
 
 function persistOddsApiSettings() {
   const settings = getOddsApiSettings();
-  if (settings.api_key) localStorage.setItem(ODDS_API_KEY_STORAGE, settings.api_key);
   localStorage.setItem(ODDS_API_SETTINGS_STORAGE, JSON.stringify({
     sport: settings.sport,
     regions: settings.regions,
     odds_format: settings.odds_format,
     markets: settings.markets,
   }));
-  setOddsApiKeyMeta(settings.api_key);
+  setOddsApiKeyMeta('Key Vault rotation');
 }
 
 function loadStoredOddsApiSettings() {
-  const storedKey = localStorage.getItem(ODDS_API_KEY_STORAGE) || '';
   let storedSettings = {};
   try {
     storedSettings = JSON.parse(localStorage.getItem(ODDS_API_SETTINGS_STORAGE) || '{}');
   } catch {
     storedSettings = {};
   }
-  if (oddsApiKeyInput) oddsApiKeyInput.value = storedKey;
   if (oddsSportSelect && storedSettings.sport) oddsSportSelect.value = storedSettings.sport;
   if (oddsRegionsInput && storedSettings.regions) oddsRegionsInput.value = storedSettings.regions;
   if (oddsFormatSelect && storedSettings.odds_format) oddsFormatSelect.value = storedSettings.odds_format;
   if (oddsMarketsInput && storedSettings.markets) oddsMarketsInput.value = storedSettings.markets;
-  setOddsApiKeyMeta(storedKey);
+  setOddsApiKeyMeta('Key Vault rotation');
 }
 
 function renderOddsEvents(events) {
@@ -2124,8 +2355,14 @@ function renderOddsEvents(events) {
 
 async function loadOddsEvents() {
   const settings = getOddsApiSettings();
-  if (!settings.api_key) {
-    alert('Please enter an Odds API key first.');
+  let keyEntry = null;
+  try {
+    keyEntry = await pickRandomVaultKeyForFeature({
+      requiredCredits: 1,
+      sourceLabel: 'Odds event loading',
+    });
+  } catch (error) {
+    alert(error.message || 'No usable Odds API key found in Key Vault.');
     return;
   }
   persistOddsApiSettings();
@@ -2136,13 +2373,13 @@ async function loadOddsEvents() {
     const response = await fetch('/api/odds/events', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ api_key: settings.api_key, sport: settings.sport })
+      body: JSON.stringify({ api_key: keyEntry.key, sport: settings.sport })
     });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.detail || payload.error || 'Failed to load events.');
     renderOddsEvents(payload.events || []);
     setOddsQuotaMeta(payload.quota);
-    setOddsApiKeyMeta(payload.api_key_used || settings.api_key);
+    setOddsApiKeyMeta(payload.api_key_used || keyEntry.key);
     setOddsApiStatus(`Loaded ${(payload.events || []).length} event(s)`, 'good');
   } catch (error) {
     console.error(error);
@@ -2160,8 +2397,14 @@ function buildImportedRowsText(importRows) {
 async function importOddsPropsAndScan() {
   const settings = getOddsApiSettings();
   const eventId = oddsEventSelect?.value || '';
-  if (!settings.api_key) {
-    alert('Please enter an Odds API key first.');
+  let keyEntry = null;
+  try {
+    keyEntry = await pickRandomVaultKeyForFeature({
+      requiredCredits: 1,
+      sourceLabel: 'Odds props import',
+    });
+  } catch (error) {
+    alert(error.message || 'No usable Odds API key found in Key Vault.');
     return;
   }
   if (!eventId) {
@@ -2176,7 +2419,7 @@ async function importOddsPropsAndScan() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        api_key: settings.api_key,
+        api_key: keyEntry.key,
         sport: settings.sport,
         event_id: eventId,
         regions: settings.regions,
@@ -2187,7 +2430,7 @@ async function importOddsPropsAndScan() {
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.detail || payload.error || 'Failed to import player props.');
     setOddsQuotaMeta(payload.quota);
-    setOddsApiKeyMeta(payload.api_key_used || settings.api_key);
+    setOddsApiKeyMeta(payload.api_key_used || keyEntry.key);
     const csvRows = Array.isArray(payload.csv_rows) ? payload.csv_rows : [];
     if (!csvRows.length) {
       setOddsApiStatus('No props found', 'bad');
@@ -2337,8 +2580,6 @@ async function focusMarketPlayerEnhanced(item) {
 
 async function enrichMarketResultsWithGameContext(payload) {
   if (!payload?.results?.length) return false;
-  const settings = getOddsApiSettings();
-  if (!settings.api_key) return false;
 
   let changed = false;
   const targets = payload.results.slice(0, 24);
@@ -2352,6 +2593,158 @@ async function enrichMarketResultsWithGameContext(payload) {
     changed = true;
   }));
   return changed;
+}
+
+function getMarketItemKey(item) {
+  if (!item) return '';
+  const playerId = item?.player?.id ?? item?.player_id ?? '';
+  const stat = item?.market?.stat ?? item?.stat ?? '';
+  const line = item?.market?.line ?? item?.line ?? '';
+  const side = item?.best_bet?.display_side ?? item?.best_bet?.side ?? item?.side ?? '';
+  return [playerId, stat, line, side].join('|');
+}
+
+function getMarketInspectDetails(item) {
+  const analysis = item?.analysis || {};
+  const matchup = analysis.matchup || item?.matchup || {};
+  const environment = analysis.environment || item?.environment || {};
+  const availability = item?.availability || analysis?.availability || { status: 'Unknown', tone: 'neutral', reason: 'No report found', note: '' };
+  const bestBet = item?.best_bet || {};
+  const teamContext = analysis.team_context || item?.team_context || {};
+  const expertAngles = getMarketExpertAngles(item).slice(0, 4);
+  const marketSide = String(bestBet.display_side || bestBet.side || 'Lean').toUpperCase();
+  const marketSupport = bestBet.model_probability !== undefined && bestBet.implied_probability !== undefined
+    ? `${bestBet.model_probability}% model vs ${bestBet.implied_probability}% implied`
+    : 'Model and market percentages unavailable';
+  const lineupNames = (teamContext.players || []).map(p => `${formatPlayerName(p.name)} (${p.status})`).slice(0, 4);
+  return {
+    title: `${item?.player?.full_name || 'Unknown player'} • ${item?.market?.stat || 'Prop'} ${item?.market?.line ?? ''}`,
+    subtitle: `${item?.player?.team || ''} vs ${item?.player?.opponent || ''}`.trim(),
+    side: marketSide,
+    summary: bestBet.user_read || bestBet.confidence_summary || 'Confidence summary unavailable.',
+    availability,
+    matchupLean: matchup?.vs_position?.lean || 'No matchup lean',
+    matchupDetail: matchup?.next_game?.matchup_label || 'No next opponent',
+    marketSupport,
+    teamTotal: Number.isFinite(Number(environment.market_team_total)) ? Number(environment.market_team_total).toFixed(1) : '—',
+    spread: Number.isFinite(Number(environment.market_spread)) ? `${Number(environment.market_spread) > 0 ? '+' : ''}${Number(environment.market_spread).toFixed(1)}` : '—',
+    gameTotal: Number.isFinite(Number(environment.market_game_total)) ? Number(environment.market_game_total).toFixed(1) : '—',
+    expertAngles,
+    lineupHeadline: teamContext.headline || 'Lineup context unavailable',
+    lineupSummary: teamContext.summary || 'No same-team absences flagged in the current context.',
+    lineupNames
+  };
+}
+
+function closeMarketInspectTrayItem(key) {
+  if (!key) return;
+  currentMarketInspectKeys = currentMarketInspectKeys.filter(entry => entry !== key);
+  if (currentMarketInspectKey === key) {
+    currentMarketInspectKey = currentMarketInspectKeys[0] || '';
+  }
+  renderMarketInspectTray();
+}
+
+function openMarketInspectTrayItem(item) {
+  if (!item) return;
+  const key = getMarketItemKey(item);
+  if (!key) return;
+  currentMarketInspectKey = key;
+  currentMarketInspectKeys = [key, ...currentMarketInspectKeys.filter(entry => entry !== key)].slice(0, 4);
+  renderMarketInspectTray();
+}
+
+function renderMarketInspectTray() {
+  if (!marketInspectTray) return;
+  const source = currentMarketResultsPayload?.results || [];
+  const items = currentMarketInspectKeys
+    .map(key => source.find(entry => getMarketItemKey(entry) === key))
+    .filter(Boolean);
+  if (!items.length) {
+    marketInspectTray.classList.add('hidden');
+    marketInspectTray.innerHTML = '';
+    return;
+  }
+  marketInspectTray.classList.remove('hidden');
+  marketInspectTray.innerHTML = items.map(item => {
+    const details = getMarketInspectDetails(item);
+    const key = getMarketItemKey(item);
+    const sideLower = String(details.side).toLowerCase();
+    return `
+      <aside class="market-inspect-chat-card" data-inspect-key="${escapeHtml(key)}">
+        <div class="market-inspect-chat-head">
+          <div>
+            <span class="section-kicker">Scanner Inspect</span>
+            <h3>${escapeHtml(details.title)}</h3>
+            <p>${escapeHtml(details.subtitle)}</p>
+          </div>
+          <div class="market-inspect-chat-actions">
+            <span class="finder-badge ${sideLower.includes('under') ? 'bad' : 'good'}">${escapeHtml(details.side)}</span>
+            <button class="secondary-btn market-chat-open-btn" type="button" data-inspect-key="${escapeHtml(key)}">Open in Analyzer</button>
+            <button class="ghost-btn market-chat-close-btn" type="button" data-inspect-key="${escapeHtml(key)}" aria-label="Close inspect panel">Close</button>
+          </div>
+        </div>
+        <div class="market-inspect-chat-body">
+          <div class="market-inspect-block">
+            <span class="small-label">Confidence read</span>
+            <strong>${escapeHtml(details.summary)}</strong>
+            <small>${escapeHtml(details.marketSupport)}</small>
+          </div>
+          <div class="market-inspect-block">
+            <span class="small-label">Availability</span>
+            <strong>${escapeHtml(details.availability.status || 'Unknown')}</strong>
+            <small>${escapeHtml(details.availability.reason || details.availability.note || 'No official note')}</small>
+          </div>
+          <div class="market-inspect-block">
+            <span class="small-label">Matchup</span>
+            <strong>${escapeHtml(details.matchupLean)}</strong>
+            <small>${escapeHtml(details.matchupDetail)}</small>
+          </div>
+          <div class="market-inspect-block">
+            <span class="small-label">Market context</span>
+            <strong>TT ${escapeHtml(details.teamTotal)} • Spr ${escapeHtml(details.spread)} • GT ${escapeHtml(details.gameTotal)}</strong>
+            <small>Spread and totals loaded into scanner context</small>
+          </div>
+          <div class="market-inspect-lineup">
+            <span class="small-label">Lineup context</span>
+            <div class="market-inspect-lineup-card">
+              <strong>${escapeHtml(details.lineupHeadline)}</strong>
+              <small>${escapeHtml(details.lineupSummary)}</small>
+              ${details.lineupNames.length ? `<p>${escapeHtml(details.lineupNames.join(' • '))}</p>` : ''}
+            </div>
+          </div>
+          <div class="market-slip-angle-row">
+            ${details.expertAngles.length ? details.expertAngles.map(angle => `<span class="market-angle-badge ${angle.tone ? `tone-${angle.tone}` : ''} ${angle.kind ? `kind-${angle.kind}` : ''}">${escapeHtml(angle.label)}</span>`).join('') : '<span class="market-angle-empty">No expert angle</span>'}
+          </div>
+        </div>
+      </aside>
+    `;
+  }).join('');
+
+  marketInspectTray.querySelectorAll('.market-chat-close-btn').forEach(btn => {
+    btn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      closeMarketInspectTrayItem(btn.dataset.inspectKey);
+    });
+  });
+
+  marketInspectTray.querySelectorAll('.market-chat-open-btn').forEach(btn => {
+    btn.addEventListener('click', async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const item = source.find(entry => getMarketItemKey(entry) === btn.dataset.inspectKey);
+      if (!item) return;
+      try {
+        setStatus('Loading market pick');
+        await focusMarketPlayerEnhanced(item);
+        setStatus('Ready');
+      } catch (error) {
+        console.error(error);
+        setStatus('Error');
+      }
+    });
+  });
 }
 
 function renderMarketResults(payload) {
@@ -2373,6 +2766,13 @@ function renderMarketResults(payload) {
   renderMarketExpertFilterChips();
   marketMeta.textContent = `${results.length} props scanned • ${getMarketSortLabel(sortKey)} • ${getMarketFilterLabel(filterKey)} • ${getExpertFilterSummary()}`;
 
+  const resultKeySet = new Set(results.map(getMarketItemKey));
+  currentMarketInspectKeys = currentMarketInspectKeys.filter(key => resultKeySet.has(key));
+  if (currentMarketInspectKey && !resultKeySet.has(currentMarketInspectKey)) {
+    currentMarketInspectKey = currentMarketInspectKeys[0] || '';
+  }
+  renderMarketInspectTray();
+
   const featured = results.slice(0, 6);
   marketResults.className = 'market-results-shell';
   marketResults.innerHTML = `
@@ -2393,8 +2793,10 @@ function renderMarketResults(payload) {
     const expertAngles = getMarketExpertAngles(item).slice(0, 3);
     const side = (item.best_bet.display_side || item.best_bet.side || 'Lean').toUpperCase();
     const sideClass = side.toLowerCase().includes('under') ? 'under' : 'over';
+    const itemKey = getMarketItemKey(item);
+    const isInspected = currentMarketInspectKeys.includes(itemKey);
     return `
-          <article class="market-slip-card" data-index="${index}">
+          <article class="market-slip-card ${isInspected ? 'is-inspected' : ''}" data-index="${index}" data-item-key="${escapeHtml(itemKey)}">
             <div class="market-slip-head">
               <div class="market-slip-player">
                 <img src="${getPlayerImage(item.player.id)}" alt="${escapeHtml(item.player.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
@@ -2440,9 +2842,14 @@ function renderMarketResults(payload) {
               <div class="market-slip-angle-row">
                 ${expertAngles.length ? expertAngles.map(angle => `<span class="market-angle-badge ${angle.tone ? `tone-${angle.tone}` : ''} ${angle.kind ? `kind-${angle.kind}` : ''}">${escapeHtml(angle.label)}</span>`).join('') : '<span class="market-angle-empty">No expert angle</span>'}
               </div>
-              <div class="market-matchup-cell">
-                <strong>${escapeHtml(matchupLean)}</strong>
-                <small>${escapeHtml(matchupDetail)}</small>
+              <div class="market-slip-action-row">
+                <div class="market-matchup-cell">
+                  <strong>${escapeHtml(matchupLean)}</strong>
+                  <small>${escapeHtml(matchupDetail)}</small>
+                </div>
+                <div class="market-slip-quick-actions">
+                  <button class="secondary-btn market-inline-btn" type="button" data-action="inspect" data-index="${index}">${isInspected ? 'Opened' : 'Inspect'}</button>
+                </div>
               </div>
             </div>
           </article>
@@ -2466,6 +2873,7 @@ function renderMarketResults(payload) {
             <th>Expert angles</th>
             <th>Matchup</th>
             <th>🏥 Team injuries</th>
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -2477,7 +2885,7 @@ function renderMarketResults(payload) {
     const matchupDetail = matchupData?.next_game?.matchup_label || 'No next opponent';
     const expertAngles = getMarketExpertAngles(item);
     return `
-              <tr class="market-row" data-index="${index}">
+              <tr class="market-row" data-index="${index}" data-item-key="${escapeHtml(getMarketItemKey(item))}">
                 <td>
                   <div class="market-player-cell">
                     <img src="${getPlayerImage(item.player.id)}" alt="${escapeHtml(item.player.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
@@ -2513,6 +2921,11 @@ function renderMarketResults(payload) {
                   </div>
                 </td>
                 <td><div class="parlay-inj-cell" id="market-inj-${index}"><span style="opacity:0.3">—</span></div></td>
+                <td>
+                  <div class="market-row-actions">
+                    <button class="secondary-btn market-inline-btn" type="button" data-action="inspect" data-index="${index}">Inspect</button>
+                  </div>
+                </td>
               </tr>
             `;
   }).join('')}
@@ -2540,6 +2953,19 @@ function renderMarketResults(payload) {
         cell.innerHTML = html || '<span style="opacity:0.35">Clean</span>';
       })
       .catch(() => {});
+  });
+
+  marketResults.querySelectorAll('.market-inline-btn').forEach(btn => {
+    btn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const item = results[Number(btn.dataset.index)];
+      if (!item) return;
+      if (btn.dataset.action === 'inspect') {
+        openMarketInspectTrayItem(item);
+      }
+      renderMarketResults(currentMarketResultsPayload || payload);
+    });
   });
 
   marketResults.querySelectorAll('.market-row, .market-slip-card').forEach(row => {
@@ -2812,22 +3238,18 @@ marketScanBtn.addEventListener('click', runMarketScan);
 oddsLoadEventsBtn?.addEventListener('click', loadOddsEvents);
 oddsImportScanBtn?.addEventListener('click', importOddsPropsAndScan);
 
-// Save Key button — persist key + settings, show confirmation
-oddsSaveKeyBtn?.addEventListener('click', () => {
-  const settings = getOddsApiSettings();
-  if (!settings.api_key) { alert('Please enter an Odds API key first.'); return; }
-  persistOddsApiSettings();
-  setOddsApiKeyMeta(settings.api_key);
-  const orig = oddsSaveKeyBtn.textContent;
-  oddsSaveKeyBtn.textContent = '✓ Key Saved!';
-  oddsSaveKeyBtn.disabled = true;
-  setTimeout(() => { oddsSaveKeyBtn.textContent = orig; oddsSaveKeyBtn.disabled = false; }, 2000);
-});
-
 // Check Balance button — hits /api/odds/check-quota (costs 0 credits)
 oddsCheckBalBtn?.addEventListener('click', async () => {
-  const settings = getOddsApiSettings();
-  if (!settings.api_key) { alert('Please enter an Odds API key first.'); return; }
+  let keyEntry = null;
+  try {
+    keyEntry = await pickRandomVaultKeyForFeature({
+      requiredCredits: 0,
+      sourceLabel: 'balance check',
+    });
+  } catch (error) {
+    alert(error.message || 'No usable Odds API key found in Key Vault.');
+    return;
+  }
   const orig = oddsCheckBalBtn.textContent;
   oddsCheckBalBtn.textContent = 'Checking…';
   oddsCheckBalBtn.disabled = true;
@@ -2835,12 +3257,12 @@ oddsCheckBalBtn?.addEventListener('click', async () => {
     const r = await fetch('/api/odds/check-quota', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ api_key: settings.api_key })
+      body: JSON.stringify({ api_key: keyEntry.key })
     });
     const data = await r.json();
     if (!r.ok) throw new Error(data.detail || 'Failed');
     setOddsQuotaMeta(data.quota);
-    setOddsApiKeyMeta(settings.api_key);
+    setOddsApiKeyMeta(data.api_key_masked || keyEntry.key);
     setOddsApiStatus('Balance checked', 'good');
   } catch (err) {
     alert('Could not check balance: ' + err.message);
@@ -2850,7 +3272,7 @@ oddsCheckBalBtn?.addEventListener('click', async () => {
     oddsCheckBalBtn.disabled = false;
   }
 });
-[oddsApiKeyInput, oddsSportSelect, oddsRegionsInput, oddsFormatSelect, oddsMarketsInput].forEach(el => {
+[oddsSportSelect, oddsRegionsInput, oddsFormatSelect, oddsMarketsInput].forEach(el => {
   el?.addEventListener('change', persistOddsApiSettings);
   el?.addEventListener('input', persistOddsApiSettings);
 });
@@ -2997,6 +3419,7 @@ const simpleViewBtnEl = document.getElementById('simpleViewBtn');
 const advancedViewBtnEl = document.getElementById('advancedViewBtn');
 const stickyPlayerNameEl = document.getElementById('stickyPlayerName');
 const stickyPropLabelEl = document.getElementById('stickyPropLabel');
+const stickySignalLabelEl = document.getElementById('stickySignalLabel');
 const favoritePlayerBtnEl = document.getElementById('favoritePlayerBtn');
 const savePropBtnEl = document.getElementById('savePropBtn');
 const chartModeBarsBtnEl = document.getElementById('chartModeBarsBtn');
@@ -3033,9 +3456,46 @@ function saveFavoritesUpgrade(items) {
   localStorage.setItem(FAVORITES_KEY, JSON.stringify(items.slice(0, 12)));
 }
 
+function getAnalyzerHeroState() {
+  if (!selectedPlayer) return null;
+  const payload = lastPayload && String(lastPayload?.player?.id || '') === String(selectedPlayer?.id || '') ? lastPayload : null;
+  const contextData = getSelectedPlayerContextData();
+  const environment = payload?.environment || contextData.environment || {};
+  const matchup = payload?.matchup || contextData.matchup || {};
+  const teamContext = payload?.team_context || {};
+  const recommendation = payload?.traffic_light || {};
+  const confidence = payload?.confidence || {};
+  const chosenSide = String(payload?.recommended_side || '').toUpperCase();
+  const nextGame = matchup?.next_game || {};
+  const teamTotal = Number.isFinite(Number(environment.market_team_total)) ? Number(environment.market_team_total).toFixed(1) : '';
+  const spread = Number.isFinite(Number(environment.market_spread))
+    ? `${Number(environment.market_spread) > 0 ? '+' : ''}${Number(environment.market_spread).toFixed(1)}`
+    : '';
+  const lineupCount = Number(teamContext.impact_count || 0);
+  const signalText = payload
+    ? `${recommendation.label || chosenSide || 'Lean'}${confidence.grade ? ` • ${confidence.grade} ${confidence.score || ''}` : ''}${nextGame.matchup_label ? ` • ${nextGame.matchup_label}` : ''}`
+    : 'Awaiting analysis';
+  const chips = payload ? [
+    chosenSide ? `${chosenSide} lean` : '',
+    confidence.grade ? `${confidence.grade} ${confidence.score || ''}` : '',
+    nextGame.matchup_label ? `Next ${nextGame.matchup_label}` : '',
+    teamTotal ? `TT ${teamTotal}` : '',
+    spread ? `Spr ${spread}` : '',
+    lineupCount ? `${lineupCount} lineup flag${lineupCount === 1 ? '' : 's'}` : ''
+  ].filter(Boolean) : [];
+  return {
+    payload,
+    signalText,
+    chips,
+    summary: payload?.interpretation?.summary || payload?.confidence?.summary || '',
+    availability: contextData.availability || selectedPlayer.availability || null,
+  };
+}
+
 function updateStickyAnalyzerSummary() {
   if (stickyPlayerNameEl) stickyPlayerNameEl.textContent = selectedPlayer?.full_name || 'No player selected';
   if (stickyPropLabelEl) stickyPropLabelEl.textContent = `${selectedStat} ${lineInput?.value || '—'}`;
+  if (stickySignalLabelEl) stickySignalLabelEl.textContent = getAnalyzerHeroState()?.signalText || 'Awaiting analysis';
   if (favoritePlayerBtnEl) {
     const favorites = loadFavoritesUpgrade();
     const isFavorite = !!selectedPlayer && favorites.some(item => item.type === 'player' && item.key === String(selectedPlayer.id));
@@ -3205,10 +3665,10 @@ function renderOverviewBestBets() {
 
   const strongest = results.slice(0, 5);
   const caution = results.filter(item => ['yellow', 'red'].includes(item.best_bet.traffic_light?.tone || '') || item.analysis?.availability?.is_risky || item.availability?.is_risky || (item.analysis?.matchup?.vs_position?.lean_tone === 'bad')).slice(0, 3);
-  const boosts = results.filter(item => Number(item.analysis?.team_context?.impact_count || item.team_context?.impact_count || 0) > 0 || /boost|expanded|thin|rise/i.test(String(item.analysis?.team_context?.headline || item.team_context?.headline || ''))).slice(0, 3);
+  const boosts = results.filter(item => Number(item.analysis?.team_context?.impact_count || item.team_context?.impact_count || 0) > 0 || /context|expanded|thin|rise/i.test(String(item.analysis?.team_context?.headline || item.team_context?.headline || ''))).slice(0, 3);
   renderBoard(overviewBestBets, strongest, '⭐', 'No best bets saved yet.', 'Run Market Scanner to pin the strongest current board edges here.');
   renderBoard(overviewCautionBoardEl, caution, '⚠️', 'No caution spots yet.', 'Risky plays will appear here after a board scan.');
-  renderBoard(overviewBoostBoardEl, boosts, '📈', 'No injury boosts yet.', 'Plays with teammate-absence boosts will appear here.');
+  renderBoard(overviewBoostBoardEl, boosts, '📈', 'No lineup-context edges yet.', 'Plays with strong teammate-absence context will appear here.');
 }
 
 // buildTodayGameCard defined above (with injury panel)
@@ -3339,8 +3799,8 @@ function renderInterpretationPanels(payload) {
         <div class="opportunity-focus-grid">${focusMetrics.length ? focusMetrics.map(metric => `<div class="focus-metric"><span>${escapeHtml(metric.label)}</span><strong>${escapeHtml(String(metric.value))}</strong><small>${escapeHtml(metric.note || '')}</small></div>`).join('') : '<div class="focus-metric"><span>Stat</span><strong>—</strong><small>Analyze a prop first</small></div>'}</div>
       </div>
       <div class="opportunity-summary-wrap refined-opportunity-wrap">
-        <div class="insight-summary neutral compact-summary"><span class="insight-summary-label">Opportunity read</span><p class="opportunity-summary">${escapeHtml(opportunity.summary || 'Opportunity trends will appear after analysis.')}</p></div>
-        <div class="team-context-box ${teamContext.impact_count ? 'warning' : 'neutral'}"><strong>${escapeHtml(teamContext.headline || 'Team context')}</strong><p>${escapeHtml(teamContext.impact_summary || teamContext.summary || 'No team-availability context yet.')}</p>${listedPlayers.length ? `<small>${escapeHtml(listedPlayers.join(' • '))}</small>` : '<small>No major same-team absences flagged on the latest report.</small>'}</div>
+        <div class="insight-summary neutral compact-summary"><span class="insight-summary-label">Model read</span><p class="opportunity-summary">${escapeHtml(opportunity.summary || 'Opportunity trends will appear after analysis.')}</p></div>
+        <div class="team-context-box ${teamContext.impact_count ? 'warning' : 'neutral'}"><strong>${escapeHtml(teamContext.headline || 'Lineup context')}</strong><p>${escapeHtml(teamContext.impact_summary || teamContext.summary || 'No team-availability context yet.')}</p>${listedPlayers.length ? `<small>${escapeHtml(listedPlayers.join(' • '))}</small>` : '<small>No major same-team absences flagged on the latest report.</small>'}</div>
       </div>`;
   }
   if (environmentBody) {
@@ -3371,7 +3831,7 @@ function renderInterpretationPanels(payload) {
       : 'â€”';
     const opponentTotalValue = Number.isFinite(Number(environment.market_opponent_total)) ? Number(environment.market_opponent_total).toFixed(1) : 'â€”';
     const hasMarketContext = Number.isFinite(Number(environment.market_team_total)) || Number.isFinite(Number(environment.market_game_total)) || Number.isFinite(Number(environment.market_spread));
-    const marketSummary = environment.market_summary || 'Market context unavailable for this matchup. Save an Odds API key, then run Analyze Prop again.';
+    const marketSummary = environment.market_summary || 'Market context unavailable for this matchup. Add usable Odds API keys to Key Vault, then run Analyze Prop again.';
     marketBody.className = 'environment-body';
     marketBody.innerHTML = `
       <div class="environment-chip-grid">
@@ -3380,7 +3840,7 @@ function renderInterpretationPanels(payload) {
         <div class="environment-chip"><span class="small-label">Game total</span><strong>${escapeHtml(gameTotalValue)}</strong><small>${escapeHtml(environment.market_game_total ? 'Full-game betting total' : 'No game total found')}</small></div>
         <div class="environment-chip"><span class="small-label">Opponent total</span><strong>${escapeHtml(opponentTotalValue)}</strong><small>${escapeHtml(environment.market_opponent_total ? 'Opponent implied points' : 'No opponent total found')}</small></div>
       </div>
-      <div class="insight-summary ${hasMarketContext ? 'good' : 'neutral'} compact-summary"><span class="insight-summary-label">Market read</span><strong>${escapeHtml(hasMarketContext ? 'Betting market context loaded' : 'Market context unavailable')}</strong><p class="opportunity-summary">${escapeHtml(marketSummary)}</p></div>`;
+      <div class="insight-summary ${hasMarketContext ? 'good' : 'neutral'} compact-summary"><span class="insight-summary-label">Market read</span><strong>${escapeHtml(hasMarketContext ? 'Betting market context loaded' : 'Market context unavailable')}</strong><p class="opportunity-summary">${escapeHtml(marketSummary)}</p><small>${escapeHtml(hasMarketContext ? 'Market context is supportive information, not an automatic over or under trigger.' : 'Add usable Odds API keys to Key Vault and re-run analysis to add market context.')}</small></div>`;
   }
 
   // ── Variance / distribution panel ────────────────────────────────────
@@ -3895,6 +4355,13 @@ function renderSelectedPlayer() {
   const availabilityHtml = availabilitySource
     ? `<div class="selected-player-meta-row">${renderAvailabilityBadge(availabilitySource)}<small>${escapeHtml(availabilitySource.reason || availabilitySource.note || '')}</small></div>`
     : '';
+  const heroState = getAnalyzerHeroState();
+  const heroChipsHtml = heroState?.chips?.length
+    ? `<div class="selected-player-signal-row">${heroState.chips.map(chip => `<span class="selected-player-signal-chip">${escapeHtml(chip)}</span>`).join('')}</div>`
+    : '';
+  const heroSummaryHtml = heroState?.summary
+    ? `<div class="selected-player-summary">${escapeHtml(heroState.summary)}</div>`
+    : '<div class="selected-player-summary muted">Analyze the selected prop to surface the strongest signals here.</div>';
 
   selectedPlayerBadge.className = 'selected-player';
   selectedPlayerBadge.innerHTML = `
@@ -3904,6 +4371,8 @@ function renderSelectedPlayer() {
       <strong>${escapeHtml(selectedPlayer.full_name)}</strong>
       <small>${escapeHtml(subLine || (selectedPlayer.is_active ? 'Active player' : 'Player'))}</small>
       ${availabilityHtml}
+      ${heroChipsHtml}
+      ${heroSummaryHtml}
     </div>
   `;
   renderSelectedPlayerContext();
@@ -3960,8 +4429,8 @@ function clearAnalysisForNewSelection() {
       </div>
       <div class="opportunity-focus-card neutral"><span class="insight-summary-label">Prop focus</span><strong>Prop-specific context will appear here after analysis.</strong></div>
       <div class="opportunity-summary-wrap refined-opportunity-wrap">
-        <div class="insight-summary neutral compact-summary"><span class="insight-summary-label">Opportunity read</span><p class="opportunity-summary">Analyze a player prop to load minutes, attempts, and team context.</p></div>
-        <div class="team-context-box neutral"><strong>Team context</strong><p>No team-availability context yet.</p><small>Latest same-team absences will appear here after analysis.</small></div>
+        <div class="insight-summary neutral compact-summary"><span class="insight-summary-label">Model read</span><p class="opportunity-summary">Analyze a player prop to load minutes, attempts, and team context.</p></div>
+        <div class="team-context-box neutral"><strong>Lineup context</strong><p>No team-availability context yet.</p><small>Latest same-team absences will appear here after analysis.</small></div>
       </div>
     `;
   }
@@ -5057,7 +5526,6 @@ function buildSparklineSvg(values, line, width, height) {
    PARLAY BUILDER
 ═══════════════════════════════════════════════════════════════════════ */
 (function initParlayBuilder() {
-  const PARLAY_KEYS_STORAGE = 'nba-props-parlay-keys';
   const PARLAY_SETTINGS_STORAGE = 'nba-props-parlay-settings';
 
   // ── DOM refs ──────────────────────────────────────────────────────────
@@ -5121,8 +5589,6 @@ function buildSparklineSvg(values, line, width, height) {
 
   // ── Persist / restore ─────────────────────────────────────────────────
   try {
-    const k = localStorage.getItem(PARLAY_KEYS_STORAGE);
-    if (k && parlayApiKeys) parlayApiKeys.value = k;
     const s = JSON.parse(localStorage.getItem(PARLAY_SETTINGS_STORAGE) || '{}');
     if (s.sport && parlaySportSelect) parlaySportSelect.value = s.sport;
     if (s.odds_format && parlayOddsFormatSel) parlayOddsFormatSel.value = s.odds_format;
@@ -5133,7 +5599,6 @@ function buildSparklineSvg(values, line, width, height) {
 
   function saveSettings() {
     try {
-      localStorage.setItem(PARLAY_KEYS_STORAGE, (parlayApiKeys.value || '').trim());
       localStorage.setItem(PARLAY_SETTINGS_STORAGE, JSON.stringify({
         sport: parlaySportSelect.value, odds_format: parlayOddsFormatSel.value,
         legs: parseInt(parlayLegsSelect.value), last_n: parseInt(parlayLastNSelect.value),
@@ -5278,6 +5743,10 @@ function buildSparklineSvg(values, line, width, height) {
       const fp = Math.min(100, leg.hit_rate || 0);
       const tone = getConfidenceTone(leg.confidence);
       const tags = Array.isArray(leg.confidence_tags) ? leg.confidence_tags.slice(0, 2) : [];
+      const reasonParts = Array.isArray(leg.selection_reason_parts) ? leg.selection_reason_parts.slice(0, 3) : [];
+      const reasonHtml = reasonParts.length
+        ? '<div class="parlay-leg-why"><span class="parlay-leg-why-label">Why selected</span><ul>' + reasonParts.map(function (part) { return '<li>' + escHtml(part) + '</li>'; }).join('') + '</ul></div>'
+        : '';
       return '<div class="parlay-leg-card" data-leg-idx="' + i + '" title="Analyze ' + escHtml(leg.player_name) + '" style="cursor:pointer">' +
         '<span class="parlay-leg-rank">#' + (i + 1) + '</span>' +
         '<div class="parlay-leg-player">' + escHtml(leg.player_name) + '</div>' +
@@ -5289,7 +5758,7 @@ function buildSparklineSvg(values, line, width, height) {
         '<div style="display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 2px">' +
         '<span class="finder-badge ' + tone + '">' + escHtml(leg.confidence || 'C') + ' ' + escHtml(String(leg.confidence_score || '')) + '</span>' +
         (leg.confidence_tier ? '<span class="finder-badge">' + escHtml(leg.confidence_tier) + '</span>' : '') +
-        (leg.injury_boost ? '<span class="parlay-leg-inj-boost">🏥 +' + Math.round((leg.hit_rate || 0) - (leg.base_hit_rate || leg.hit_rate || 0)) + '% inj. boost</span>' : '') +
+        (leg.injury_boost ? '<span class="parlay-leg-inj-boost">🏥 +' + Math.round((leg.hit_rate || 0) - (leg.base_hit_rate || leg.hit_rate || 0)) + '% context edge</span>' : '') +
         tags.map(function (tag) { return '<span class="finder-chip">' + escHtml(tag) + '</span>'; }).join('') +
         '</div>' +
         (
@@ -5308,6 +5777,7 @@ function buildSparklineSvg(values, line, width, height) {
         '<div class="parlay-leg-stat-item"><span class="slabel">Odds</span><span class="sval">' + fmtOdds(leg.odds) + '</span></div>' +
         '</div>' +
         '<div class="parlay-leg-hit-bar"><div class="parlay-leg-hit-fill" style="width:' + fp + '%"></div></div>' +
+        reasonHtml +
         '<div class="parlay-leg-analyze-hint" style="font-size:0.72rem;color:var(--muted);margin-top:6px;text-align:center">' + escHtml(leg.confidence_summary || 'Click to analyze →') + '</div>' +
         '</div>';
     }).join('');
@@ -5336,7 +5806,9 @@ function buildSparklineSvg(values, line, width, height) {
       const imgSrc = 'https://cdn.nba.com/headshots/nba/latest/1040x760/' + (p.player_id || '') + '.png';
       const gameTag = p.game_label ? '<span class="parlay-game-label">' + escHtml(p.game_label) + '</span>' : '';
       const tone = getConfidenceTone(p.confidence);
-      const confText = p.confidence ? ('<div class="parlay-conf-cell"><span class="finder-badge ' + tone + '">' + escHtml(p.confidence) + ' ' + escHtml(String(p.confidence_score || '')) + '</span><small>' + escHtml(p.confidence_summary || '') + '</small></div>') : '<span style="opacity:0.35">—</span>';
+      const statusLabel = p.selection_status === 'selected' ? 'Why selected' : 'Why not selected';
+      const reasonText = p.selection_reason || '';
+      const confText = p.confidence ? ('<div class="parlay-conf-cell"><span class="finder-badge ' + tone + '">' + escHtml(p.confidence) + ' ' + escHtml(String(p.confidence_score || '')) + '</span><small>' + escHtml(p.confidence_summary || '') + '</small>' + (reasonText ? '<small class="parlay-selection-note"><strong>' + escHtml(statusLabel) + ':</strong> ' + escHtml(reasonText) + '</small>' : '') + '</div>') : '<span style="opacity:0.35">—</span>';
       return '<tr class="' + (isSel ? 'parlay-selected-row' : '') + '" data-prop-idx="' + idx + '" data-player-id="' + (p.player_id || '') + '" data-player-name="' + escHtml(p.player_name || '') + '" data-stat="' + escHtml(p.stat || '') + '" data-line="' + (p.line || 0) + '" data-side="' + escHtml(p.side || 'OVER') + '" title="Analyze ' + escHtml(p.player_name) + '">' +
         '<td><span style="display:flex;align-items:center;gap:8px"><img src="' + imgSrc + '" style="width:26px;height:26px;border-radius:50%;object-fit:cover;object-position:top" onerror="this.hidden=true">' +
         '<span style="display:flex;flex-direction:column;gap:2px">' +
@@ -5401,7 +5873,7 @@ function buildSparklineSvg(values, line, width, height) {
     }
     parlayInjurySummaryEl.style.display = '';
     parlayInjurySummaryEl.innerHTML =
-      '<div class="parlay-inj-summary-label">🏥 Today\'s injury context used in analysis</div>' +
+      '<div class="parlay-inj-summary-label">🏥 Today\'s lineup context used in analysis</div>' +
       injurySummary.map(function(t) {
         return '<div class="parlay-inj-team-chip">' +
           '<span class="inj-team-name">' + escHtml(t.team_name) + '</span>' +
@@ -5420,7 +5892,7 @@ function buildSparklineSvg(values, line, width, height) {
     var parts = [];
     if (boost) {
       const diff = Math.round((p.hit_rate || 0) - (p.base_hit_rate || p.hit_rate || 0));
-      parts.push('<span class="inj-boost-tag">🏥' + (diff > 0 ? ' +' + diff + '%' : '') + ' boost</span>');
+      parts.push('<span class="inj-boost-tag">🏥' + (diff > 0 ? ' +' + diff + '%' : '') + ' context</span>');
     }
     if (filterUsed.length) {
       parts.push('<span class="inj-names">w/o ' + filterUsed.map(escHtml).join(', ') + '</span>');
@@ -5434,9 +5906,18 @@ function buildSparklineSvg(values, line, width, height) {
 
   // ── Full scrape selected events → analyze → render ───────────────────
   async function runScrape() {
-    const rawKeys = (parlayApiKeys.value || '').trim();
-    if (!rawKeys) { setStatus('Enter at least one API key.', true); return; }
-    const keys = rawKeys.split(',').map(function (k) { return k.trim(); }).filter(Boolean);
+    let keyEntries = [];
+    try {
+      keyEntries = await getRotatingVaultKeysForFeature({
+        minimumKeys: KEY_VAULT_MIN_ROTATING_KEYS,
+        requiredCredits: 1,
+        sourceLabel: 'Parlay Builder',
+      });
+    } catch (error) {
+      setStatus(error.message || 'No usable rotating keys available.', true);
+      return;
+    }
+    const keys = keyEntries.map(function (entry) { return entry.key; });
     if (selectedEventIds.size === 0) { setStatus('Select at least one event first.', true); return; }
     const legs = parseInt(parlayLegsSelect.value) || 2;
     const sport = parlaySportSelect.value;
@@ -5464,7 +5945,7 @@ function buildSparklineSvg(values, line, width, height) {
       fakeStep = Math.min(fakeStep + 3, 75);
       if (fakeStep < 30) setParlayProgress(fakeStep, 'First quarter: pulling lines for ' + totalEvents + ' game(s)…');
       else if (fakeStep < 55) setParlayProgress(fakeStep, useInjuryAware ? 'Second quarter: checking injuries and re-running angles…' : 'Second quarter: analyzing ' + totalEvents * 15 + '+ props…');
-      else setParlayProgress(fakeStep, useInjuryAware ? 'Third quarter: applying lineup-context boosts…' : 'Third quarter: sorting the strongest legs…');
+      else setParlayProgress(fakeStep, useInjuryAware ? 'Third quarter: applying lineup-context edges…' : 'Third quarter: sorting the strongest legs…');
     }, 600);
 
     try {
@@ -5493,7 +5974,7 @@ function buildSparklineSvg(values, line, width, height) {
       renderQuota(cachedQuotaLog);
       const m = cachedScrapeMeta;
       const injBoostCount = (cachedScoredProps || []).filter(function(p){ return p.injury_boost; }).length;
-      const injStatusMsg = useInjuryAware ? (' · 🏥 ' + injBoostCount + ' injury boost' + (injBoostCount !== 1 ? 's' : '')) : '';
+      const injStatusMsg = useInjuryAware ? (' · 🏥 ' + injBoostCount + ' lineup-context edge' + (injBoostCount !== 1 ? 's' : '')) : '';
       setStatus('✓ Done — ' + m.evCount + ' event(s) scraped · ' + m.propCount + ' props found · ' + m.analyzed + ' analyzed' + injStatusMsg, false);
       // Render injury summary panel
       if (useInjuryAware && parlayInjurySummaryEl) renderInjurySummary(data.injury_summary || []);
@@ -5525,9 +6006,18 @@ function buildSparklineSvg(values, line, width, height) {
 
   // ── Step 1: Load today's events ───────────────────────────────────────
   parlayLoadEventsBtn.addEventListener('click', async function () {
-    const rawKeys = (parlayApiKeys.value || '').trim();
-    if (!rawKeys) { setStatus('Enter at least one API key first.', true); return; }
-    const keys = rawKeys.split(',').map(function (k) { return k.trim(); }).filter(Boolean);
+    let keyEntries = [];
+    try {
+      keyEntries = await getRotatingVaultKeysForFeature({
+        minimumKeys: KEY_VAULT_MIN_ROTATING_KEYS,
+        requiredCredits: 1,
+        sourceLabel: 'Parlay event loading',
+      });
+    } catch (error) {
+      setStatus(error.message || 'No usable rotating keys available.', true);
+      return;
+    }
+    const keys = keyEntries.map(function (entry) { return entry.key; });
     saveSettings();
     parlayLoadEventsBtn.disabled = true;
     parlayLoadEventsBtn.textContent = 'Loading…';
@@ -5623,7 +6113,6 @@ function buildSparklineSvg(values, line, width, height) {
    PROP TRACKER
 ═══════════════════════════════════════════════════════════════════════ */
 (function initPropTracker() {
-  const TRACKER_STORAGE_KEY = 'nba-props-tracker-bets';
 
   const trackerPlayerInput = document.getElementById('trackerPlayerInput');
   const trackerStatSelect = document.getElementById('trackerStatSelect');
@@ -5645,6 +6134,21 @@ function buildSparklineSvg(values, line, width, height) {
   let _selectedPlayerName = '';
   let _selectedPlayerId = null;
 
+  function mountTrackerDropdownToBody() {
+    if (trackerPlayerDropdown && trackerPlayerDropdown.parentElement !== document.body) {
+      document.body.appendChild(trackerPlayerDropdown);
+    }
+  }
+
+  function positionTrackerDropdown() {
+    if (!trackerPlayerInput || !trackerPlayerDropdown) return;
+    const rect = trackerPlayerInput.getBoundingClientRect();
+    trackerPlayerDropdown.style.position = 'fixed';
+    trackerPlayerDropdown.style.top = (rect.bottom + 4) + 'px';
+    trackerPlayerDropdown.style.left = rect.left + 'px';
+    trackerPlayerDropdown.style.width = rect.width + 'px';
+  }
+
   function closeDropdown() {
     if (trackerPlayerDropdown) {
       trackerPlayerDropdown.innerHTML = '';
@@ -5658,6 +6162,8 @@ function buildSparklineSvg(values, line, width, height) {
   function openDropdown(results) {
     if (!trackerPlayerDropdown) return;
     if (!results.length) { closeDropdown(); return; }
+    mountTrackerDropdownToBody();
+    positionTrackerDropdown();
     trackerPlayerDropdown.innerHTML = results.map(function (p) {
       return '<li role="option" class="tracker-player-option" data-id="' + p.id + '" data-name="' + esc(p.full_name) + '" style="padding:8px 12px;cursor:pointer;list-style:none;border-bottom:1px solid var(--border,#333)">'
         + esc(p.full_name) + (p.is_active ? '' : ' <small style="opacity:.5">(inactive)</small>') + '</li>';
@@ -5700,19 +6206,46 @@ function buildSparklineSvg(values, line, width, height) {
     trackerPlayerInput.addEventListener('keydown', function (e) {
       if (e.key === 'Escape') closeDropdown();
     });
+    window.addEventListener('resize', positionTrackerDropdown);
+    window.addEventListener('scroll', positionTrackerDropdown, true);
   }
 
   // ── State ─────────────────────────────────────────────────────────────
   // bet = { id, player_name, player_id, stat, line, side, odds, book,
   //         current_val, games_count, last_updated, status }
   let bets = [];
+  let trackerPersistPromise = Promise.resolve();
 
   // ── Persist ───────────────────────────────────────────────────────────
   function saveBets() {
-    try { localStorage.setItem(TRACKER_STORAGE_KEY, JSON.stringify(bets)); } catch (e) { }
+    const snapshot = Array.isArray(bets) ? bets.map(function (bet) { return { ...bet }; }) : [];
+    trackerPersistPromise = trackerPersistPromise
+      .catch(function () { })
+      .then(async function () {
+        const response = await fetch('/api/tracker/props', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ entries: snapshot }),
+        });
+        if (!response.ok) {
+          let detail = 'Failed to save tracker props.';
+          try {
+            const data = await response.json();
+            detail = data.detail || detail;
+          } catch (e) { }
+          throw new Error(detail);
+        }
+      })
+      .catch(function (error) {
+        console.error('Tracker persistence failed:', error);
+      });
+    return trackerPersistPromise;
   }
-  function loadBets() {
-    try { return JSON.parse(localStorage.getItem(TRACKER_STORAGE_KEY) || '[]'); } catch (e) { return []; }
+  async function loadBets() {
+    const response = await fetch('/api/tracker/props');
+    if (!response.ok) throw new Error('Failed to load tracker props.');
+    const data = await response.json();
+    return Array.isArray(data.entries) ? data.entries : [];
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────
@@ -5727,6 +6260,16 @@ function buildSparklineSvg(values, line, width, height) {
   function showEmpty(v) {
     if (trackerEmpty) trackerEmpty.style.display = v ? '' : 'none';
     if (trackerCards) trackerCards.style.display = v ? 'none' : '';
+  }
+
+  function isDuplicateBet(candidate, existing) {
+    const idMatch = candidate.player_id && existing.player_id
+      ? String(existing.player_id) === String(candidate.player_id)
+      : (existing.player_name || '').toLowerCase() === String(candidate.player_name || '').toLowerCase();
+    return idMatch &&
+      existing.stat === candidate.stat &&
+      parseFloat(existing.line) === parseFloat(candidate.line) &&
+      existing.side === candidate.side;
   }
 
   // ── Compute status from current val vs line ────────────────────────────
@@ -5968,30 +6511,19 @@ function buildSparklineSvg(values, line, width, height) {
       last_updated: null,
     };
 
-    let stored = [];
-    try { stored = JSON.parse(localStorage.getItem('nba-props-tracker-bets') || '[]'); } catch (e) { stored = []; }
-    if (!Array.isArray(stored)) stored = [];
+    const stored = Array.isArray(bets) ? bets.slice() : [];
 
     // Dupe check: prefer player_id match when both sides have one, else fall back
     // to name match — prevents null-id props from all blocking each other.
-    const isDupe = stored.some(function (b) {
-      const idMatch = newBet.player_id && b.player_id
-        ? String(b.player_id) === String(newBet.player_id)
-        : (b.player_name || '').toLowerCase() === newBet.player_name.toLowerCase();
-      return idMatch && b.stat === newBet.stat &&
-        parseFloat(b.line) === newBet.line && b.side === newBet.side;
-    });
+    const isDupe = stored.some(function (b) { return isDuplicateBet(newBet, b); });
 
     if (isDupe) {
       _showTrackerToast(prop.player_name + ' already in Tracker');
       return false;
     }
 
-    stored.unshift(newBet);
-    try { localStorage.setItem('nba-props-tracker-bets', JSON.stringify(stored)); } catch (e) { }
-
-    // Keep the IIFE-scoped bets in sync so renderAll sees the new entry
-    bets = stored;
+    bets = [newBet].concat(stored);
+    saveBets();
 
     _showTrackerToast(prop.player_name + ' added to Tracker');
     return true;
@@ -6052,6 +6584,12 @@ function buildSparklineSvg(values, line, width, height) {
         status: 'pending',
       };
 
+      const alreadyTracked = bets.some(function (b) { return isDuplicateBet(bet, b); });
+      if (alreadyTracked) {
+        showErr(playerName + ' is already in Prop Tracker for this line.');
+        return;
+      }
+
       bets.unshift(bet);
       saveBets();
       try { renderAll(); } catch (e) { console.error('Tracker renderAll error:', e); }
@@ -6104,8 +6642,15 @@ function buildSparklineSvg(values, line, width, height) {
   });
 
   // ── Init: restore from localStorage ───────────────────────────────────
-  bets = loadBets();
-  renderAll();
+  (async function initTrackerState() {
+    try {
+      bets = await loadBets();
+    } catch (e) {
+      console.error('Tracker load failed:', e);
+      bets = [];
+    }
+    renderAll();
+  })();
 
   // Auto-refresh every 30s when live/upcoming game
   setInterval(async function () {
@@ -6880,6 +7425,7 @@ function buildSparklineSvg(values, line, width, height) {
   const btSideSelect   = document.getElementById('btSideSelect');
   const btTierSelect   = document.getElementById('btTierSelect');
   const btOddsInput    = document.getElementById('btOddsInput');
+  const btPlayerDropdown = document.getElementById('btPlayerDropdown');
   const btLogBtn       = document.getElementById('btLogBtn');
   const btLogError     = document.getElementById('btLogError');
   const btRefreshBtn   = document.getElementById('btRefreshBtn');
@@ -6909,6 +7455,88 @@ function buildSparklineSvg(values, line, width, height) {
     if (t === 'high')  return '#60a5fa';
     if (t === 'medium') return 'var(--warning,#f59e0b)';
     return 'var(--bad,#f87171)';
+  }
+
+  let btAutocompleteDebounce = null;
+  let btSelectedPlayerName = '';
+
+  function mountBtDropdownToBody() {
+    if (btPlayerDropdown && btPlayerDropdown.parentElement !== document.body) {
+      document.body.appendChild(btPlayerDropdown);
+    }
+  }
+
+  function positionBtDropdown() {
+    if (!btPlayerInput || !btPlayerDropdown) return;
+    const rect = btPlayerInput.getBoundingClientRect();
+    btPlayerDropdown.style.position = 'fixed';
+    btPlayerDropdown.style.top = (rect.bottom + 4) + 'px';
+    btPlayerDropdown.style.left = rect.left + 'px';
+    btPlayerDropdown.style.width = rect.width + 'px';
+  }
+
+  function closeBtDropdown() {
+    if (btPlayerDropdown) {
+      btPlayerDropdown.innerHTML = '';
+      btPlayerDropdown.style.display = 'none';
+    }
+    if (btPlayerInput) {
+      btPlayerInput.setAttribute('aria-expanded', 'false');
+    }
+  }
+
+  function openBtDropdown(results) {
+    if (!btPlayerDropdown) return;
+    if (!results.length) {
+      closeBtDropdown();
+      return;
+    }
+    mountBtDropdownToBody();
+    positionBtDropdown();
+    btPlayerDropdown.innerHTML = results.map(function (p) {
+      return '<li role="option" class="tracker-player-option" data-name="' + esc(p.full_name) + '" style="padding:8px 12px;cursor:pointer;list-style:none;border-bottom:1px solid var(--border,#333)">' +
+        esc(p.full_name) + (p.is_active ? '' : ' <small style="opacity:.5">(inactive)</small>') + '</li>';
+    }).join('');
+    btPlayerDropdown.style.display = 'block';
+    if (btPlayerInput) btPlayerInput.setAttribute('aria-expanded', 'true');
+    btPlayerDropdown.querySelectorAll('.tracker-player-option').forEach(function (li) {
+      li.addEventListener('mousedown', function (e) {
+        e.preventDefault();
+        btSelectedPlayerName = li.dataset.name || '';
+        if (btPlayerInput) btPlayerInput.value = btSelectedPlayerName;
+        closeBtDropdown();
+      });
+    });
+  }
+
+  if (btPlayerInput) {
+    btPlayerInput.addEventListener('input', function () {
+      const q = btPlayerInput.value.trim();
+      btSelectedPlayerName = '';
+      clearTimeout(btAutocompleteDebounce);
+      if (q.length < 2) {
+        closeBtDropdown();
+        return;
+      }
+      btAutocompleteDebounce = setTimeout(async function () {
+        try {
+          const r = await fetch('/api/players/search?q=' + encodeURIComponent(q));
+          if (!r.ok) return;
+          const data = await r.json();
+          openBtDropdown((data.results || []).slice(0, 8));
+        } catch (e) {
+          closeBtDropdown();
+        }
+      }, 220);
+    });
+    btPlayerInput.addEventListener('blur', function () {
+      setTimeout(closeBtDropdown, 200);
+    });
+    btPlayerInput.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') closeBtDropdown();
+    });
+    window.addEventListener('resize', positionBtDropdown);
+    window.addEventListener('scroll', positionBtDropdown, true);
   }
 
   // ── Render aggregate stats row ────────────────────────────────────────
@@ -7112,9 +7740,12 @@ function buildSparklineSvg(values, line, width, height) {
     btLogBtn.textContent = 'Logging…';
 
     try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(function () { ctrl.abort(); }, 12000);
       const r = await fetch('/api/backtest/log', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: ctrl.signal,
         body: JSON.stringify({
           player, stat, line, side,
           confidence_tier: tier,
@@ -7123,13 +7754,16 @@ function buildSparklineSvg(values, line, width, height) {
           odds: isNaN(odds) ? 1.91 : odds,
         }),
       });
+      clearTimeout(timer);
       if (!r.ok) throw new Error(await r.text());
       if (btPlayerInput) btPlayerInput.value = '';
       if (btLineInput)   btLineInput.value   = '';
       if (btOddsInput)   btOddsInput.value   = '';
+      btSelectedPlayerName = '';
+      closeBtDropdown();
       await loadAndRender();
     } catch (err) {
-      showBtError('Log failed: ' + err.message);
+      showBtError('Log failed: ' + (err && err.name === 'AbortError' ? 'request timed out' : err.message));
     } finally {
       btLogBtn.disabled = false;
       btLogBtn.textContent = 'Log Prediction';
@@ -7246,22 +7880,23 @@ function passesAdvancedMarketFilters(item) {
 // ══════════════════════════════════════════════════════════════════════
 
 (function initKeyVault() {
-  const kvLabelInput    = document.getElementById('kvLabelInput');
   const kvKeyInput      = document.getElementById('kvKeyInput');
   const kvProviderSelect = document.getElementById('kvProviderSelect');
   const kvAddBtn        = document.getElementById('kvAddBtn');
+  const kvRefreshAllBtn = document.getElementById('kvRefreshAllBtn');
   const kvKeyList       = document.getElementById('kvKeyList');
   const kvActiveLabel   = document.getElementById('kvActiveLabel');
+  const kvVaultSummary  = document.getElementById('kvVaultSummary');
   const kvStatus        = document.getElementById('keyVaultStatus');
 
   if (!kvKeyList) return;
 
   // ── Helpers ───────────────────────────────────────────────────────────
   function loadVault() {
-    try { return JSON.parse(localStorage.getItem(KEY_VAULT_STORAGE) || '[]'); } catch { return []; }
+    return loadOddsKeyVault(null);
   }
   function saveVault(vault) {
-    localStorage.setItem(KEY_VAULT_STORAGE, JSON.stringify(vault));
+    saveOddsKeyVault(vault);
   }
   function getActiveId() {
     return localStorage.getItem(KEY_VAULT_ACTIVE_STORAGE) || '';
@@ -7275,18 +7910,17 @@ function passesAdvancedMarketFilters(item) {
   }
   function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
   function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+  function nextAutoLabel(vault, provider) {
+    const prefix = provider === 'odds_api' ? 'Odds API Key' : 'API Key';
+    const used = new Set(vault.map(entry => String(entry.label || '')));
+    let idx = vault.filter(entry => entry.provider === provider).length + 1;
+    while (used.has(`${prefix} ${idx}`)) idx += 1;
+    return `${prefix} ${idx}`;
+  }
 
   // Push active key into Market Scanner + Parlay Builder inputs
   function syncActiveKeyToPages(key) {
-    const oddsInput = document.getElementById('oddsApiKeyInput');
-    if (oddsInput && key) { oddsInput.value = key; oddsInput.dispatchEvent(new Event('input')); }
-    const parlayInput = document.getElementById('parlayApiKeys');
-    if (parlayInput && key) {
-      // Parlay uses comma-separated multi-keys. Prepend as primary if not already present.
-      const existing = parlayInput.value.split(',').map(s => s.trim()).filter(Boolean);
-      if (!existing.includes(key)) { parlayInput.value = [key, ...existing].join(','); }
-      parlayInput.dispatchEvent(new Event('input'));
-    }
+    return key;
   }
 
   function setKvStatus(msg, tone = 'neutral') {
@@ -7300,9 +7934,16 @@ function passesAdvancedMarketFilters(item) {
     const vault = loadVault();
     const activeId = getActiveId();
 
+    const oddsVault = vault.filter(k => k.provider === 'odds_api');
+    const usableCount = oddsVault.filter(k => Number(k.remaining) >= KEY_VAULT_MIN_USABLE_CREDITS).length;
+    const lowCount = oddsVault.filter(k => Number.isFinite(Number(k.remaining)) && Number(k.remaining) < KEY_VAULT_MIN_USABLE_CREDITS).length;
     if (kvActiveLabel) {
-      const active = vault.find(k => k.id === activeId);
-      kvActiveLabel.textContent = active ? `Active: ${esc(active.label)}` : 'No active key selected';
+      kvActiveLabel.textContent = usableCount >= KEY_VAULT_MIN_ROTATING_KEYS
+        ? `Rotation ready: ${usableCount} usable keys`
+        : `Rotation needs ${Math.max(KEY_VAULT_MIN_ROTATING_KEYS - usableCount, 0)} more usable key${Math.max(KEY_VAULT_MIN_ROTATING_KEYS - usableCount, 0) === 1 ? '' : 's'}`;
+    }
+    if (kvVaultSummary) {
+      kvVaultSummary.textContent = `${oddsVault.length} saved Odds API key${oddsVault.length === 1 ? '' : 's'} • ${usableCount} usable • ${lowCount} low-credit • minimum rotating pool: ${KEY_VAULT_MIN_ROTATING_KEYS}`;
     }
 
     if (!vault.length) {
@@ -7334,35 +7975,48 @@ function passesAdvancedMarketFilters(item) {
             <code style="font-size:.78rem;opacity:0.55;letter-spacing:.05em">${esc(maskKey(entry.key))}</code>
           </div>
           <div style="display:flex;gap:8px;flex-shrink:0">
-            ${!isActive ? `<button class="secondary-btn kv-activate-btn" data-id="${esc(entry.id)}" style="padding:6px 14px;font-size:.8rem" type="button">Use this key</button>` : ''}
             <button class="secondary-btn kv-credits-btn" data-id="${esc(entry.id)}" style="padding:6px 14px;font-size:.8rem" type="button" title="Check remaining credits">💳 Credits</button>
             <button class="text-btn kv-delete-btn" data-id="${esc(entry.id)}" style="padding:6px 10px;font-size:.8rem;color:var(--bad);opacity:0.7" type="button" title="Remove key">✕</button>
           </div>
         </div>`;
     }).join('');
 
-    // Bind buttons
-    kvKeyList.querySelectorAll('.kv-activate-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const id = btn.dataset.id;
-        setActiveId(id);
-        const vault = loadVault();
-        const entry = vault.find(k => k.id === id);
-        if (entry) {
-          syncActiveKeyToPages(entry.key);
-          setKvStatus(`"${entry.label}" is now active`, 'good');
-          setTimeout(() => setKvStatus('Ready'), 2500);
-        }
-        renderVault();
-      });
+    kvKeyList.querySelectorAll('.kv-key-row').forEach((row, index) => {
+      const entry = vault[index];
+      if (!entry) return;
+      row.classList.remove('kv-active');
+      row.style.background = 'var(--panel-strong)';
+      row.style.borderColor = 'var(--border)';
+      const activateBtn = row.querySelector('.kv-activate-btn');
+      if (activateBtn) activateBtn.remove();
+      const badges = row.querySelector('div[style*="margin-bottom:2px"]');
+      if (badges && !badges.querySelector('[data-kv-credit-badge]')) {
+        const creditBadge = document.createElement('span');
+        creditBadge.className = 'small-badge';
+        creditBadge.dataset.kvCreditBadge = '1';
+        creditBadge.textContent = Number.isFinite(Number(entry.remaining)) ? `Credits ${entry.remaining}` : 'Credits unknown';
+        badges.appendChild(creditBadge);
+      }
+      const legacyActiveBadge = Array.from(row.querySelectorAll('.small-badge')).find(el => /active/i.test(el.textContent || ''));
+      if (legacyActiveBadge) legacyActiveBadge.remove();
+      const codeEl = row.querySelector('code');
+      if (codeEl && !row.querySelector('[data-kv-credit-meta]')) {
+        const meta = document.createElement('div');
+        meta.className = 'small-meta';
+        meta.dataset.kvCreditMeta = '1';
+        meta.style.marginTop = '6px';
+        meta.textContent = Number.isFinite(Number(entry.remaining))
+          ? `Remaining ${entry.remaining} • Used ${entry.used ?? '—'} • Checked ${entry.last_checked_at ? new Date(entry.last_checked_at).toLocaleString() : 'just now'}`
+          : 'Balance not checked yet';
+        codeEl.insertAdjacentElement('afterend', meta);
+      }
     });
 
+    // Bind buttons
     kvKeyList.querySelectorAll('.kv-delete-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         if (!confirm('Remove this key from the vault?')) return;
-        const vault = loadVault().filter(k => k.id !== btn.dataset.id);
-        saveVault(vault);
-        if (getActiveId() === btn.dataset.id) setActiveId('');
+        deleteOddsKeyVaultEntry(btn.dataset.id);
         renderVault();
       });
     });
@@ -7376,16 +8030,14 @@ function passesAdvancedMarketFilters(item) {
         btn.textContent = 'Checking…';
         btn.disabled = true;
         try {
-          const r = await fetch('/api/odds/check-quota', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ api_key: entry.key })
+          const refreshed = await refreshOddsVaultEntryCredits(entry, {
+            force: true,
+            onLowCredits: async (lowEntry) => promptDeleteLowCreditVaultKey(lowEntry, 'rotation'),
           });
-          const data = await r.json();
-          if (!r.ok) throw new Error(data.detail || 'Failed');
-          const used = data.quota?.used ?? '?';
-          const remaining = data.quota?.remaining ?? '?';
+          const used = refreshed?.used ?? '?';
+          const remaining = refreshed?.remaining ?? '?';
           setKvStatus(`"${entry.label}" — Used: ${used} • Remaining: ${remaining}`, 'good');
+          renderVault();
           setTimeout(() => setKvStatus('Ready'), 5000);
         } catch (err) {
           setKvStatus('Credits check failed: ' + (err.message || 'Unknown error'), 'bad');
@@ -7400,34 +8052,92 @@ function passesAdvancedMarketFilters(item) {
 
   // ── Add key ───────────────────────────────────────────────────────────
   kvAddBtn?.addEventListener('click', () => {
-    const label = (kvLabelInput?.value || '').trim();
-    const key   = (kvKeyInput?.value || '').trim();
+    const rawKeys = (kvKeyInput?.value || '').trim();
     const provider = kvProviderSelect?.value || 'odds_api';
 
-    if (!label) { setKvStatus('Please enter a label for this key.', 'bad'); return; }
-    if (!key)   { setKvStatus('Please enter the API key value.', 'bad'); return; }
+    if (!rawKeys) { setKvStatus('Please paste at least one API key.', 'bad'); return; }
 
-    const vault = loadVault();
-    if (vault.some(k => k.key === key)) {
-      setKvStatus('That key is already saved.', 'bad');
+    const parsedKeys = rawKeys
+      .split(/[\s,]+/)
+      .map(part => part.trim())
+      .filter(Boolean);
+    if (!parsedKeys.length) {
+      setKvStatus('Please paste at least one valid API key.', 'bad');
       return;
     }
 
-    const newEntry = { id: uid(), label, key, provider, added: new Date().toISOString() };
-    vault.push(newEntry);
+    const vault = loadVault();
+    const seenExisting = new Set(vault.map(entry => entry.key));
+    const uniqueIncoming = [...new Set(parsedKeys)];
+    const addedEntries = [];
+    let duplicateCount = 0;
+    uniqueIncoming.forEach(key => {
+      if (seenExisting.has(key)) {
+        duplicateCount += 1;
+        return;
+      }
+      const newEntry = {
+        id: uid(),
+        label: nextAutoLabel(vault, provider),
+        key,
+        provider,
+        added: new Date().toISOString(),
+        remaining: null,
+        used: null,
+        last_cost: null,
+        last_checked_at: null,
+      };
+      vault.push(newEntry);
+      seenExisting.add(key);
+      addedEntries.push(newEntry);
+    });
+
+    if (!addedEntries.length) {
+      setKvStatus('Those keys are already saved in the vault.', 'bad');
+      return;
+    }
+
+    invalidateEligibleVaultKeyCache();
     saveVault(vault);
 
     // Auto-activate if first key
-    if (vault.length === 1) {
-      setActiveId(newEntry.id);
-      syncActiveKeyToPages(newEntry.key);
+    if (vault.length === addedEntries.length) {
+      setActiveId(addedEntries[0].id);
+      syncActiveKeyToPages(addedEntries[0].key);
     }
 
-    if (kvLabelInput) kvLabelInput.value = '';
     if (kvKeyInput) kvKeyInput.value = '';
-    setKvStatus(`"${label}" saved!`, 'good');
+    const duplicateText = duplicateCount ? ` ${duplicateCount} duplicate${duplicateCount === 1 ? '' : 's'} skipped.` : '';
+    setKvStatus(`${addedEntries.length} key${addedEntries.length === 1 ? '' : 's'} saved.${duplicateText} Add at least ${KEY_VAULT_MIN_ROTATING_KEYS} usable keys for automatic rotation.`, 'good');
     setTimeout(() => setKvStatus('Ready'), 2500);
     renderVault();
+  });
+
+  kvRefreshAllBtn?.addEventListener('click', async () => {
+    const oddsVault = loadVault().filter(entry => entry.provider === 'odds_api');
+    if (!oddsVault.length) {
+      setKvStatus('Add Odds API keys first.', 'bad');
+      return;
+    }
+    const orig = kvRefreshAllBtn.textContent;
+    kvRefreshAllBtn.disabled = true;
+    kvRefreshAllBtn.textContent = 'Checking…';
+    setKvStatus('Checking all key balances…', 'working');
+    try {
+      for (const entry of oddsVault) {
+        await refreshOddsVaultEntryCredits(entry, {
+          force: true,
+          onLowCredits: async (lowEntry) => promptDeleteLowCreditVaultKey(lowEntry, 'rotation'),
+        });
+      }
+      renderVault();
+      setKvStatus('All key balances checked.', 'good');
+    } catch (error) {
+      setKvStatus(error.message || 'Failed to refresh balances.', 'bad');
+    } finally {
+      kvRefreshAllBtn.disabled = false;
+      kvRefreshAllBtn.textContent = orig;
+    }
   });
 
   // ── Init: render vault and sync active key on load ────────────────────
