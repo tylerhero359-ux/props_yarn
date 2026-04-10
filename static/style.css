@@ -2608,6 +2608,39 @@ body.sidebar-collapsed .theme-toggle {
   line-height: 1.6;
 }
 
+.decision-lens-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.decision-lens-card {
+  padding: 14px 16px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.028), rgba(255,255,255,0.012)),
+    rgba(255,255,255,0.026);
+}
+
+.decision-lens-card p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.5;
+  font-size: 0.92rem;
+}
+
+.decision-lens-grid.compact .decision-lens-card {
+  padding: 12px 13px;
+  border-radius: 16px;
+}
+
+.decision-lens-grid.compact .decision-lens-card p {
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
 .insight-bullet-list.compact-bullets {
   gap: 8px;
   padding-left: 20px;
@@ -2787,6 +2820,10 @@ body.sidebar-collapsed .theme-toggle {
 }
 
 @media (max-width: 900px) {
+  .decision-lens-grid {
+    grid-template-columns: 1fr;
+  }
+
   .analyzer-insight-grid .section-head {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -6676,6 +6713,7 @@ textarea:focus {
 .controls-grid,
 .team-search-grid,
 .analysis-hero-grid,
+.overview-main-stack,
 .overview-grid,
 .insight-strip,
 .overview-board-grid,
@@ -6683,6 +6721,20 @@ textarea:focus {
 .analyzer-insight-grid,
 .prop-tracker-grid {
   gap: 18px !important;
+}
+
+.insight-strip {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.overview-main-stack {
+  width: 100%;
+  display: grid;
+  gap: 18px;
+}
+
+.overview-grid {
+  grid-template-columns: 1fr;
 }
 
 .hero-copy h1 {
@@ -9587,6 +9639,519 @@ body.light-theme {
   gap: 16px;
 }
 
+.today-team-row.with-logos {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 22px;
+}
+
+.today-team-side,
+.today-team-home {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
+.today-team-home {
+  justify-content: flex-end;
+  text-align: right;
+}
+
+.today-team-side > div,
+.today-team-home > div {
+  min-width: 0;
+}
+
+.today-team-logo-shell {
+  position: relative;
+  width: 88px;
+  height: 88px;
+  flex: 0 0 88px;
+  display: grid;
+  place-items: center;
+  border-radius: 26px;
+  background:
+    radial-gradient(circle at 30% 22%, rgba(255,255,255,0.14), transparent 42%),
+    linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.018)),
+    rgba(13, 18, 28, 0.92);
+  border: 1px solid rgba(210, 173, 109, 0.18);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.08),
+    0 14px 24px rgba(0,0,0,0.24);
+  overflow: hidden;
+}
+
+.today-team-logo-shell::after {
+  content: "";
+  position: absolute;
+  inset: 8px;
+  border-radius: 20px;
+  border: 1px solid rgba(255,255,255,0.06);
+  background:
+    radial-gradient(circle at 50% 0%, rgba(210,173,109,0.10), transparent 58%);
+  pointer-events: none;
+}
+
+.today-team-logo {
+  position: relative;
+  z-index: 1;
+  width: 68px;
+  height: 68px;
+  object-fit: contain;
+  object-position: center;
+  filter:
+    drop-shadow(0 6px 10px rgba(0,0,0,0.18))
+    saturate(1.02)
+    contrast(1.02);
+  transform: scale(0.96);
+}
+
+.overview-current-card,
+.overview-actions-card,
+.today-overview-card {
+  position: relative;
+  overflow: hidden;
+}
+
+.overview-current-card::before,
+.overview-actions-card::before,
+.today-overview-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(circle at top right, rgba(210,173,109,0.10), transparent 24%),
+    linear-gradient(180deg, rgba(255,255,255,0.022), transparent 44%);
+  pointer-events: none;
+}
+
+.overview-current-card > *,
+.overview-actions-card > *,
+.today-overview-card > * {
+  position: relative;
+  z-index: 1;
+}
+
+.overview-grid,
+.overview-lower-grid {
+  align-items: start;
+}
+
+.overview-current-card .section-head,
+.overview-actions-card .section-head,
+.today-overview-card .section-head {
+  margin-bottom: 14px;
+}
+
+.overview-current-card .spotlight-pill,
+.today-overview-card .small-meta,
+.overview-actions-card .small-meta {
+  background: rgba(255,255,255,0.045);
+  border: 1px solid rgba(210, 173, 109, 0.10);
+  border-radius: 999px;
+  padding: 8px 12px;
+}
+
+.overview-board-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.overview-board-tab {
+  min-height: 40px;
+  padding: 9px 14px;
+  border-radius: 999px;
+  border: 1px solid rgba(210, 173, 109, 0.10);
+  background: rgba(255,255,255,0.03);
+  color: rgba(238, 241, 247, 0.76);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  transition: background 0.18s ease, border-color 0.18s ease, color 0.18s ease, transform 0.18s ease;
+}
+
+.overview-board-tab:hover {
+  transform: translateY(-1px);
+  border-color: rgba(210, 173, 109, 0.20);
+  color: rgba(250, 249, 244, 0.92);
+}
+
+.overview-board-tab.active {
+  background:
+    linear-gradient(180deg, rgba(210,173,109,0.20), rgba(210,173,109,0.10)),
+    rgba(255,255,255,0.04);
+  border-color: rgba(210, 173, 109, 0.26);
+  color: #fff8eb;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+}
+
+.overview-board-stack {
+  position: relative;
+}
+
+.overview-board-column {
+  padding: 16px;
+  border-radius: 22px;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.026), rgba(255,255,255,0.010)),
+    rgba(255,255,255,0.016);
+  border: 1px solid rgba(210, 173, 109, 0.08);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+  min-height: 0;
+}
+
+.overview-board-column:not(.active) {
+  display: none;
+}
+
+.overview-board-column.active .overview-best-bets-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  align-items: stretch;
+}
+
+.overview-board-column.active .overview-best-bets-list.board-empty-state {
+  grid-template-columns: 1fr;
+}
+
+.mini-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+
+.mini-section-head h3 {
+  margin: 0;
+  font-size: 0.92rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: rgba(247, 238, 222, 0.86);
+}
+
+.overview-best-bets-list {
+  gap: 10px;
+}
+
+.overview-best-bet-card {
+  position: relative;
+  overflow: hidden;
+  min-height: 0;
+  border-radius: 20px;
+  padding: 14px 16px 14px;
+  background:
+    radial-gradient(circle at top right, rgba(210,173,109,0.10), transparent 22%),
+    linear-gradient(180deg, rgba(18,24,36,0.94), rgba(8,12,18,0.96));
+  border: 1px solid rgba(210, 173, 109, 0.12);
+  box-shadow:
+    0 16px 28px rgba(0,0,0,0.20),
+    inset 0 1px 0 rgba(255,255,255,0.04);
+  display: grid;
+  gap: 10px;
+}
+
+.overview-board-column.active .overview-best-bets-list .overview-best-bet-card:first-child {
+  grid-column: 1 / -1;
+  padding: 18px 18px 16px;
+  background:
+    radial-gradient(circle at top right, rgba(210,173,109,0.14), transparent 24%),
+    linear-gradient(180deg, rgba(20,27,40,0.98), rgba(10,15,24,0.98));
+  border-color: rgba(210, 173, 109, 0.18);
+  box-shadow:
+    0 20px 36px rgba(0,0,0,0.24),
+    inset 0 1px 0 rgba(255,255,255,0.05);
+}
+
+.overview-board-column.active .overview-best-bets-list .overview-best-bet-card:first-child .overview-best-bet-avatar {
+  width: 60px;
+  height: 60px;
+  flex-basis: 60px;
+  border-radius: 18px;
+}
+
+.overview-board-column.active .overview-best-bets-list .overview-best-bet-card:first-child .overview-best-bet-copy strong {
+  font-size: 1.08rem;
+}
+
+.overview-board-column.active .overview-best-bets-list .overview-best-bet-card:first-child .overview-best-bet-summary {
+  -webkit-line-clamp: 3;
+}
+
+.overview-best-bet-card::after {
+  content: "";
+  position: absolute;
+  inset: 9px;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,0.04);
+  pointer-events: none;
+}
+
+.overview-best-bet-head {
+  align-items: flex-start;
+  margin-bottom: -2px;
+}
+
+.overview-best-bet-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+}
+
+.overview-best-bet-detail-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.overview-best-bet-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(124, 154, 255, 0.08);
+  border: 1px solid rgba(124, 154, 255, 0.14);
+  color: rgba(231, 238, 255, 0.88);
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.overview-best-bet-chip.stat {
+  background: rgba(210, 173, 109, 0.10);
+  border-color: rgba(210, 173, 109, 0.18);
+  color: #f6e7c5;
+}
+
+.overview-best-bet-player {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.overview-best-bet-avatar {
+  width: 52px;
+  height: 52px;
+  flex: 0 0 52px;
+  border-radius: 16px;
+  object-fit: cover;
+  border: 1px solid rgba(210, 173, 109, 0.18);
+  background:
+    radial-gradient(circle at 35% 28%, rgba(255,255,255,0.14), transparent 45%),
+    linear-gradient(180deg, rgba(210,173,109,0.14), rgba(255,255,255,0.02));
+}
+
+.overview-best-bet-copy {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.overview-best-bet-card strong {
+  font-family: var(--font-display);
+  font-size: 0.98rem;
+  letter-spacing: -0.03em;
+}
+
+.overview-best-bet-card small {
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.overview-best-bet-summary {
+  margin: 0;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+  font-size: 0.84rem;
+  color: rgba(226, 232, 240, 0.78);
+  line-height: 1.42;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.overview-best-bet-metrics {
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.overview-best-bet-metrics span {
+  padding: 6px 9px;
+  background: rgba(14, 24, 40, 0.78);
+  border-color: rgba(113, 131, 180, 0.16);
+  color: rgba(230, 235, 245, 0.82);
+  font-size: 0.74rem;
+}
+
+.overview-best-bet-grade {
+  min-width: 112px;
+  padding: 10px 12px;
+  border-radius: 16px;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.032), rgba(255,255,255,0.014)),
+    rgba(10, 18, 30, 0.84);
+  border: 1px solid rgba(113, 131, 180, 0.16);
+  text-align: right;
+  display: grid;
+  gap: 3px;
+}
+
+.overview-grade-label {
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.10em;
+  color: rgba(210, 173, 109, 0.78);
+}
+
+.overview-best-bet-grade strong {
+  font-size: 0.90rem;
+  letter-spacing: -0.02em;
+}
+
+.overview-best-bet-grade small {
+  display: block;
+  color: rgba(215, 221, 231, 0.72);
+}
+
+.overview-rank {
+  width: 34px;
+  height: 34px;
+  border-radius: 12px;
+  background:
+    linear-gradient(180deg, rgba(210,173,109,0.28), rgba(210,173,109,0.14)),
+    rgba(255,255,255,0.04);
+  border: 1px solid rgba(210, 173, 109, 0.18);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+}
+
+.today-overview-card .today-overview-list {
+  gap: 12px;
+}
+
+.today-overview-list .today-game-card.compact {
+  min-height: 0;
+  padding: 16px;
+  border-radius: 24px;
+  background:
+    radial-gradient(circle at top right, rgba(210,173,109,0.08), transparent 20%),
+    linear-gradient(180deg, rgba(16,21,31,0.98), rgba(8,12,18,0.98));
+}
+
+.today-overview-list .today-game-card.compact .today-game-head {
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+
+.today-overview-list .today-game-card.compact .trust-diagnostics {
+  margin-top: 0;
+  margin-bottom: 10px;
+}
+
+.today-overview-list .today-game-card.compact .today-market-row {
+  margin-bottom: 10px;
+  gap: 6px;
+}
+
+.today-overview-list .today-game-card.compact .today-market-pill {
+  font-size: 0.70rem;
+  padding: 6px 10px;
+}
+
+.today-overview-list .today-game-card.compact .today-team-row.with-logos {
+  gap: 14px;
+}
+
+.today-overview-list .today-game-card.compact .today-team-logo-shell {
+  width: 64px;
+  height: 64px;
+  flex-basis: 64px;
+  border-radius: 20px;
+}
+
+.today-overview-list .today-game-card.compact .today-team-logo-shell::after {
+  inset: 6px;
+  border-radius: 14px;
+}
+
+.today-overview-list .today-game-card.compact .today-team-logo {
+  width: 46px;
+  height: 46px;
+}
+
+.today-overview-list .today-game-card.compact .today-team-row strong {
+  font-size: 1.05rem;
+  letter-spacing: -0.03em;
+}
+
+.today-overview-list .today-game-card.compact .today-team-row small {
+  max-width: 16ch;
+}
+
+.today-overview-list .today-game-card.compact .today-game-time,
+.today-overview-list .today-game-card.compact .today-game-scoreline {
+  min-height: 42px;
+  padding: 8px 12px;
+  border-radius: 16px;
+}
+
+.today-overview-list .today-game-card.compact:hover {
+  transform: translateY(-2px) scale(1.01);
+}
+
+@media (max-width: 900px) {
+  .overview-board-column {
+    padding: 12px;
+  }
+
+  .overview-main-stack {
+    width: 100%;
+  }
+
+  .overview-best-bet-card {
+    min-height: 0;
+  }
+
+  .overview-board-column.active .overview-best-bets-list {
+    grid-template-columns: 1fr;
+  }
+
+  .overview-board-column.active .overview-best-bets-list .overview-best-bet-card:first-child {
+    grid-column: auto;
+  }
+
+  .overview-board-tabs {
+    gap: 8px;
+  }
+
+  .overview-board-tab {
+    flex: 1 1 calc(33.333% - 6px);
+    justify-content: center;
+    text-align: center;
+  }
+
+  .overview-best-bet-main {
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+
+  .overview-best-bet-grade {
+    width: 100%;
+    text-align: left;
+  }
+}
+
 .today-game-card .availability-tag,
 .today-game-card .small-badge,
 .today-game-card .spotlight-pill {
@@ -10156,6 +10721,34 @@ body.light-theme {
     padding: 16px;
   }
 
+  .today-team-row.with-logos {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+
+  .today-team-side,
+  .today-team-home {
+    justify-content: flex-start;
+    text-align: left;
+  }
+
+  .today-team-logo-shell {
+    width: 72px;
+    height: 72px;
+    flex-basis: 72px;
+    border-radius: 22px;
+  }
+
+  .today-team-logo-shell::after {
+    inset: 7px;
+    border-radius: 16px;
+  }
+
+  .today-team-logo {
+    width: 54px;
+    height: 54px;
+  }
+
   .today-game-head,
   .today-game-main,
   .today-game-actions {
@@ -10214,5 +10807,283 @@ body.light-theme {
 
   .sidebar-brand-shell {
     padding-bottom: 12px;
+  }
+}
+
+/* ---- Pass 6: mobile polish across scanner, analyzer, tracker, backtest, and vault ---- */
+@media (max-width: 900px) {
+  .analyzer-dashboard-view .controls-top,
+  .tracker-hero,
+  .tracker-toolbar,
+  #backtestSection .tracker-add-panel,
+  .market-panel,
+  .parlay-panel {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .tracker-hero {
+    gap: 14px;
+    align-items: flex-start;
+  }
+
+  .tracker-refresh-btn {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .tracker-toolbar {
+    gap: 12px;
+  }
+
+  .tracker-toolbar > div:first-child,
+  .backtest-toolbar {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  .tracker-toolbar-summary {
+    width: 100%;
+    justify-content: center;
+    text-align: center;
+  }
+
+  #backtestLogWrap,
+  #backtestStats,
+  #backtestSection .tracker-add-panel {
+    padding-left: 16px !important;
+    padding-right: 16px !important;
+  }
+
+  #kvKeyList .kv-key-row,
+  .market-slip-action-row,
+  .market-slip-footer,
+  .parlay-action-row {
+    gap: 10px;
+  }
+}
+
+@media (max-width: 767px) {
+  .dashboard-layout {
+    gap: 12px;
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+
+  .workspace-header,
+  .tool-intro-card,
+  .market-panel,
+  .parlay-panel,
+  .tracker-hero,
+  .tracker-toolbar,
+  .tracker-add-panel,
+  #backtestSection,
+  .selected-player,
+  .roster-panel,
+  .chart-card,
+  .table-card,
+  .today-game-card,
+  .market-slip-card,
+  .parlay-ticket,
+  .parlay-leg-card {
+    border-radius: 20px;
+  }
+
+  .dashboard-view {
+    gap: 12px;
+  }
+
+  .analyzer-command-panel,
+  .analyzer-ticket-bar,
+  .analyzer-filter-card {
+    padding: 16px;
+  }
+
+  .analyzer-ticket-bar .sticky-action-row,
+  .analyzer-action-stack,
+  .parlay-action-row,
+  .parlay-config-row,
+  .today-game-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+    width: 100%;
+  }
+
+  .analyzer-action-stack .primary-btn,
+  .analyzer-action-stack .secondary-btn,
+  .analyzer-ticket-bar .sticky-action-row .secondary-btn,
+  .analyzer-ticket-bar .sticky-action-row .icon-btn,
+  .parlay-action-row > button,
+  .parlay-action-row > .field-inline,
+  .today-game-actions > * {
+    width: 100%;
+  }
+
+  .market-results-shell,
+  .today-board-shell {
+    gap: 12px;
+  }
+
+  .market-slips-header {
+    gap: 8px;
+  }
+
+  .market-slip-card {
+    min-height: 0;
+  }
+
+  .market-slip-head,
+  .market-slip-body,
+  .market-slip-footer {
+    padding: 16px;
+  }
+
+  .market-slip-meta-band,
+  .market-slip-angle-row,
+  .market-slip-quick-actions {
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .market-results-table {
+    min-width: 820px;
+  }
+
+  .market-results-table-wrap,
+  .parlay-all-props-table-wrap {
+    margin-left: -4px;
+    margin-right: -4px;
+    padding-bottom: 4px;
+  }
+
+  .tracker-add-grid,
+  #backtestSection .tracker-add-grid {
+    grid-template-columns: 1fr !important;
+    gap: 10px;
+  }
+
+  .tracker-add-btn-wrap,
+  .tracker-field-player {
+    width: 100%;
+  }
+
+  .tracker-add-btn-wrap .secondary-btn,
+  .tracker-add-btn-wrap .primary-btn,
+  #backtestSection .tracker-add-btn-wrap .secondary-btn,
+  #backtestSection .tracker-add-btn-wrap .primary-btn {
+    width: 100%;
+  }
+
+  .tracker-toolbar > div:first-child,
+  .backtest-toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .tracker-cards {
+    gap: 12px;
+  }
+
+  .tracker-card-inner {
+    padding: 14px;
+    border-radius: 18px;
+  }
+
+  .tracker-card-top,
+  .tracker-value-row,
+  .tracker-card-meta {
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .tracker-card-meta .tracker-meta-item {
+    min-width: calc(50% - 6px);
+  }
+
+  .backtest-breakdown-grid,
+  .kv-health-grid {
+    grid-template-columns: 1fr;
+  }
+
+  #kvKeyList .kv-key-row {
+    padding: 14px;
+    border-radius: 18px;
+  }
+
+  #kvKeyList .kv-key-actions,
+  #kvKeyList .kv-key-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .market-inspect-tray {
+    left: 10px;
+    right: 10px;
+    bottom: max(10px, env(safe-area-inset-bottom));
+    gap: 8px;
+    padding-left: 0;
+    padding-right: 0;
+    scroll-snap-type: x proximity;
+  }
+
+  .market-inspect-chat-card {
+    width: min(92vw, 360px);
+    flex: 0 0 min(92vw, 360px);
+    max-height: 68vh;
+    scroll-snap-align: end;
+  }
+
+  .prop-slip-drawer {
+    left: 10px;
+    right: 10px;
+    bottom: max(10px, env(safe-area-inset-bottom));
+  }
+}
+
+@media (max-width: 520px) {
+  .workspace-header,
+  .tool-intro-card,
+  .market-panel,
+  .parlay-panel,
+  .tracker-hero,
+  .tracker-toolbar,
+  .tracker-add-panel,
+  #backtestSection {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  .market-slip-player img,
+  .tracker-avatar-strip img,
+  .mini-player-avatar,
+  .player-card img {
+    width: 48px;
+    height: 48px;
+    border-radius: 16px;
+  }
+
+  .market-slip-line strong,
+  .parlay-combined-odds,
+  .tracker-current-val {
+    font-size: 1.05rem;
+  }
+
+  .today-game-time,
+  .today-game-scoreline,
+  .small-badge,
+  .availability-tag,
+  .spotlight-pill,
+  .market-slip-pill,
+  .chart-chip {
+    font-size: 0.74rem;
+  }
+
+  .tracker-card-meta .tracker-meta-item {
+    min-width: 100%;
+  }
+
+  .market-results-table {
+    min-width: 760px;
   }
 }

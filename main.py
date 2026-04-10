@@ -48,6 +48,7 @@ from identity_utils import (
 )
 from injury_service import InjuryReportService
 from player_data_service import PlayerDataService
+from persistence_utils import load_json_snapshot, save_json_snapshot
 from schedule_service import ScheduleDataService
 from runtime_utils import (
     build_timed_call,
@@ -93,6 +94,7 @@ PERSISTENT_CACHE_PATH = PERSISTENT_CACHE_DIR / "persistent_cache.json"
 BACKTEST_PERSIST_PATH = PERSISTENT_CACHE_DIR / "backtest_log.json"
 KEY_VAULT_PERSIST_PATH = PERSISTENT_CACHE_DIR / "key_vault.json"
 FAVORITES_PERSIST_PATH = PERSISTENT_CACHE_DIR / "favorites.json"
+TRACKER_PERSIST_PATH = PERSISTENT_CACHE_DIR / "tracker_props.json"
 PERSISTENT_CACHE_ENABLED = os.getenv("NBA_PERSISTENT_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 PERSISTENT_CACHE_MAX_ROSTERS = max(30, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_ROSTERS", "120")))
 PERSISTENT_CACHE_MAX_PLAYER_INFO = max(100, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_PLAYER_INFO", "600")))
@@ -3770,6 +3772,7 @@ def _startup_warm_cache() -> None:
     _load_key_vault_state()
     _load_backtest_log()
     _load_favorites_state()
+    _load_tracker_state()
     start_hybrid_refresh_workers()
     warm_cache_on_startup()
 
@@ -5991,34 +5994,29 @@ _KEY_VAULT_LOCK = threading.Lock()
 _KEY_VAULT_STATE: dict[str, Any] = {"entries": [], "active_id": ""}
 _FAVORITES_LOCK = threading.Lock()
 _FAVORITES_STATE: list[dict[str, Any]] = []
+_TRACKER_LOCK = threading.RLock()
+_TRACKER_STATE: list[dict[str, Any]] = []
 
 
 def _save_backtest_log() -> None:
-    if not PERSISTENT_CACHE_ENABLED:
-        return
-    try:
-        PERSISTENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    def _payload_factory() -> dict[str, Any]:
         with _BACKTEST_LOCK:
-            payload = {
-                "version": 1,
-                "saved_at": time.time(),
-                "entries": list(_BACKTEST_LOG),
-            }
-        temp_path = BACKTEST_PERSIST_PATH.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        temp_path.replace(BACKTEST_PERSIST_PATH)
-    except Exception as exc:
-        LOGGER.warning("Backtest log save failed: %s", exc)
+            return {"entries": list(_BACKTEST_LOG)}
+
+    save_json_snapshot(
+        enabled=PERSISTENT_CACHE_ENABLED,
+        path=BACKTEST_PERSIST_PATH,
+        payload_factory=_payload_factory,
+        on_error=lambda exc: LOGGER.warning("Backtest log save failed: %s", exc),
+    )
 
 
 def _load_backtest_log() -> None:
-    if not PERSISTENT_CACHE_ENABLED or not BACKTEST_PERSIST_PATH.exists():
-        return
-    try:
-        payload = json.loads(BACKTEST_PERSIST_PATH.read_text(encoding="utf-8"))
+    def _extract_entries(payload: dict[str, Any]) -> Any:
         entries = payload.get("entries") or []
-        if not isinstance(entries, list):
-            return
+        return entries if isinstance(entries, list) else []
+
+    def _apply_entries(entries: Any) -> None:
         with _BACKTEST_LOCK:
             _BACKTEST_LOG.clear()
             for raw in entries:
@@ -6045,80 +6043,123 @@ def _load_backtest_log() -> None:
                     "notes": str(raw.get("notes") or ""),
                 }
                 _BACKTEST_LOG.append(entry)
-    except Exception as exc:
-        LOGGER.warning("Backtest log load failed: %s", exc)
+
+    load_json_snapshot(
+        enabled=PERSISTENT_CACHE_ENABLED,
+        path=BACKTEST_PERSIST_PATH,
+        extract_entries=_extract_entries,
+        apply_entries=_apply_entries,
+        on_error=lambda exc: LOGGER.warning("Backtest log load failed: %s", exc),
+    )
 
 
 def _save_key_vault_state() -> None:
-    if not PERSISTENT_CACHE_ENABLED:
-        return
-    try:
-        PERSISTENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    def _payload_factory() -> dict[str, Any]:
         with _KEY_VAULT_LOCK:
-            payload = {
-                "version": 1,
-                "saved_at": time.time(),
+            return {
                 "entries": list(_KEY_VAULT_STATE.get("entries") or []),
                 "active_id": str(_KEY_VAULT_STATE.get("active_id") or ""),
             }
-        temp_path = KEY_VAULT_PERSIST_PATH.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        temp_path.replace(KEY_VAULT_PERSIST_PATH)
-    except Exception as exc:
-        LOGGER.warning("Key vault save failed: %s", exc)
+
+    save_json_snapshot(
+        enabled=PERSISTENT_CACHE_ENABLED,
+        path=KEY_VAULT_PERSIST_PATH,
+        payload_factory=_payload_factory,
+        on_error=lambda exc: LOGGER.warning("Key vault save failed: %s", exc),
+    )
 
 
 def _save_favorites_state() -> None:
-    if not PERSISTENT_CACHE_ENABLED:
-        return
-    try:
-        PERSISTENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    def _payload_factory() -> dict[str, Any]:
         with _FAVORITES_LOCK:
-            payload = {
-                "version": 1,
-                "saved_at": time.time(),
-                "entries": list(_FAVORITES_STATE[:24]),
-            }
-        temp_path = FAVORITES_PERSIST_PATH.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        temp_path.replace(FAVORITES_PERSIST_PATH)
-    except Exception as exc:
-        LOGGER.warning("Favorites save failed: %s", exc)
+            return {"entries": list(_FAVORITES_STATE[:24])}
+
+    save_json_snapshot(
+        enabled=PERSISTENT_CACHE_ENABLED,
+        path=FAVORITES_PERSIST_PATH,
+        payload_factory=_payload_factory,
+        on_error=lambda exc: LOGGER.warning("Favorites save failed: %s", exc),
+    )
+
+
+def _save_tracker_state() -> None:
+    def _payload_factory() -> dict[str, Any]:
+        with _TRACKER_LOCK:
+            return {"entries": list(_TRACKER_STATE)}
+
+    save_json_snapshot(
+        enabled=PERSISTENT_CACHE_ENABLED,
+        path=TRACKER_PERSIST_PATH,
+        payload_factory=_payload_factory,
+        on_error=lambda exc: LOGGER.warning("Tracker save failed: %s", exc),
+    )
 
 
 def _load_key_vault_state() -> None:
-    if not PERSISTENT_CACHE_ENABLED or not KEY_VAULT_PERSIST_PATH.exists():
-        return
-    try:
-        payload = json.loads(KEY_VAULT_PERSIST_PATH.read_text(encoding="utf-8"))
+    def _extract_entries(payload: dict[str, Any]) -> Any:
         entries = payload.get("entries") or []
         active_id = str(payload.get("active_id") or "")
         if not isinstance(entries, list):
-            return
-        sanitized = [entry for entry in entries if isinstance(entry, dict)]
+            entries = []
+        return {"entries": [entry for entry in entries if isinstance(entry, dict)], "active_id": active_id}
+
+    def _apply_entries(state: Any) -> None:
+        entries = list((state or {}).get("entries") or [])
+        active_id = str((state or {}).get("active_id") or "")
         with _KEY_VAULT_LOCK:
-            _KEY_VAULT_STATE["entries"] = sanitized
+            _KEY_VAULT_STATE["entries"] = entries
             _KEY_VAULT_STATE["active_id"] = active_id
-        LOGGER.info("Loaded %s key vault entrie(s) from persistent storage", len(sanitized))
-    except Exception as exc:
-        LOGGER.warning("Key vault load failed: %s", exc)
+        LOGGER.info("Loaded %s key vault entrie(s) from persistent storage", len(entries))
+
+    load_json_snapshot(
+        enabled=PERSISTENT_CACHE_ENABLED,
+        path=KEY_VAULT_PERSIST_PATH,
+        extract_entries=_extract_entries,
+        apply_entries=_apply_entries,
+        on_error=lambda exc: LOGGER.warning("Key vault load failed: %s", exc),
+    )
 
 
 def _load_favorites_state() -> None:
-    if not PERSISTENT_CACHE_ENABLED or not FAVORITES_PERSIST_PATH.exists():
-        return
-    try:
-        payload = json.loads(FAVORITES_PERSIST_PATH.read_text(encoding="utf-8"))
+    def _extract_entries(payload: dict[str, Any]) -> Any:
         entries = payload.get("entries") or []
-        if not isinstance(entries, list):
-            return
+        return entries if isinstance(entries, list) else []
+
+    def _apply_entries(entries: Any) -> None:
         with _FAVORITES_LOCK:
             _FAVORITES_STATE.clear()
             for entry in entries[:24]:
                 if isinstance(entry, dict):
                     _FAVORITES_STATE.append(entry)
-    except Exception as exc:
-        LOGGER.warning("Favorites load failed: %s", exc)
+
+    load_json_snapshot(
+        enabled=PERSISTENT_CACHE_ENABLED,
+        path=FAVORITES_PERSIST_PATH,
+        extract_entries=_extract_entries,
+        apply_entries=_apply_entries,
+        on_error=lambda exc: LOGGER.warning("Favorites load failed: %s", exc),
+    )
+
+
+def _load_tracker_state() -> None:
+    def _extract_entries(payload: dict[str, Any]) -> Any:
+        entries = payload.get("entries") or []
+        return entries if isinstance(entries, list) else []
+
+    def _apply_entries(entries: Any) -> None:
+        with _TRACKER_LOCK:
+            _TRACKER_STATE.clear()
+            for entry in entries[:250]:
+                if isinstance(entry, dict):
+                    _TRACKER_STATE.append(entry)
+
+    load_json_snapshot(
+        enabled=PERSISTENT_CACHE_ENABLED,
+        path=TRACKER_PERSIST_PATH,
+        extract_entries=_extract_entries,
+        apply_entries=_apply_entries,
+        on_error=lambda exc: LOGGER.warning("Tracker load failed: %s", exc),
+    )
 
 
 def _backtest_new_id() -> str:
@@ -6506,6 +6547,30 @@ def favorites_put(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         _FAVORITES_STATE.clear()
         _FAVORITES_STATE.extend(sanitized)
     _save_favorites_state()
+    return {"ok": True, "count": len(sanitized), "entries": sanitized}
+
+
+@app.get("/api/tracker/props")
+def tracker_props_get() -> dict[str, Any]:
+    with _TRACKER_LOCK:
+        entries = list(_TRACKER_STATE)
+    return {"ok": True, "entries": entries}
+
+
+@app.put("/api/tracker/props")
+def tracker_props_put(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    entries = payload.get("entries") or []
+    if not isinstance(entries, list):
+        raise HTTPException(status_code=400, detail="entries must be a list")
+    sanitized: list[dict[str, Any]] = []
+    for raw in entries[:250]:
+        if not isinstance(raw, dict):
+            continue
+        sanitized.append(copy.deepcopy(raw))
+    with _TRACKER_LOCK:
+        _TRACKER_STATE.clear()
+        _TRACKER_STATE.extend(sanitized)
+    _save_tracker_state()
     return {"ok": True, "count": len(sanitized), "entries": sanitized}
 
 

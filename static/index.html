@@ -162,7 +162,8 @@ tailwind.config = {
 </div>
 </div>
 </header>
-<section class="overview-grid grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(320px,0.92fr)]">
+<section class="overview-main-stack">
+<section class="overview-grid grid gap-4">
 <article class="card glass overview-current-card rounded-[28px] border border-white/10 backdrop-blur-xl">
 <div class="section-head">
 <div>
@@ -180,6 +181,7 @@ tailwind.config = {
 </div>
 </div>
 </article>
+</section>
 <article class="card glass overview-actions-card overview-best-bets-card rounded-[28px] border border-white/10 backdrop-blur-xl">
 <div class="section-head">
 <div>
@@ -188,25 +190,30 @@ tailwind.config = {
 </div>
 <span class="small-meta" id="overviewBestBetsMeta">Populated by your latest Market Scanner run.</span>
 </div>
-<div class="overview-board-grid grid gap-4 xl:grid-cols-3">
-<div class="overview-board-column">
-<div class="mini-section-head"><h3>Top 5 plays</h3></div>
+<div class="overview-board-tabs" id="overviewBoardTabs" role="tablist" aria-label="Today's board lanes">
+<button aria-selected="true" class="overview-board-tab active" data-board-tab="top" role="tab" type="button">Top plays</button>
+<button aria-selected="false" class="overview-board-tab" data-board-tab="caution" role="tab" type="button">Use caution</button>
+<button aria-selected="false" class="overview-board-tab" data-board-tab="boost" role="tab" type="button">Lineup context</button>
+</div>
+<div class="overview-board-stack">
+<div class="overview-board-column active" data-board-panel="top" role="tabpanel">
+<div class="mini-section-head"><h3>Top 5 plays</h3><span class="small-badge" id="overviewTopCount">0</span></div>
 <div class="overview-best-bets-list empty-state-panel compact grid gap-3" id="overviewBestBets">
 <div class="empty-icon">⭐</div>
 <strong>No best bets saved yet.</strong>
 <span>Run Market Scanner to pin the strongest current board edges here.</span>
 </div>
 </div>
-<div class="overview-board-column">
-<div class="mini-section-head"><h3>Use caution</h3></div>
+<div class="overview-board-column" data-board-panel="caution" hidden role="tabpanel">
+<div class="mini-section-head"><h3>Use caution</h3><span class="small-badge" id="overviewCautionCount">0</span></div>
 <div class="overview-best-bets-list empty-state-panel compact grid gap-3" id="overviewCautionBoard">
 <div class="empty-icon">⚠️</div>
 <strong>No caution spots yet.</strong>
 <span>Risky plays will appear here after a board scan.</span>
 </div>
 </div>
-<div class="overview-board-column">
-<div class="mini-section-head"><h3>Lineup context</h3></div>
+<div class="overview-board-column" data-board-panel="boost" hidden role="tabpanel">
+<div class="mini-section-head"><h3>Lineup context</h3><span class="small-badge" id="overviewBoostCount">0</span></div>
 <div class="overview-best-bets-list empty-state-panel compact grid gap-3" id="overviewBoostBoard">
 <div class="empty-icon">📈</div>
 <strong>No lineup-context edges yet.</strong>
@@ -215,7 +222,6 @@ tailwind.config = {
 </div>
 </div>
 </article>
-</section>
 <section class="insight-strip grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
 <article class="metric-card card glass rounded-3xl border border-white/10 bg-slate-950/40 p-4 sm:p-5 rounded-[28px] backdrop-blur-xl">
 <span class="metric-label">Average</span>
@@ -291,6 +297,7 @@ tailwind.config = {
 <strong>No matchup loaded yet.</strong>
 <span>Analyze a player prop to load the next opponent and defense-vs-position read.</span>
 </div>
+</section>
 </section>
 </section>
 <section class="dashboard-view gap-4 analyzer-dashboard-view" data-view="analyzer">

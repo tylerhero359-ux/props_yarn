@@ -82,6 +82,10 @@ const overviewTodayGames = document.getElementById('overviewTodayGames');
 const overviewTodayMeta = document.getElementById('overviewTodayMeta');
 const overviewBestBets = document.getElementById('overviewBestBets');
 const overviewBestBetsMeta = document.getElementById('overviewBestBetsMeta');
+const overviewBoardTabsEl = document.getElementById('overviewBoardTabs');
+const overviewTopCountEl = document.getElementById('overviewTopCount');
+const overviewCautionCountEl = document.getElementById('overviewCautionCount');
+const overviewBoostCountEl = document.getElementById('overviewBoostCount');
 const interpretationTone = document.getElementById('interpretationTone');
 const interpretationBody = document.getElementById('interpretationBody');
 const opportunityTone = document.getElementById('opportunityTone');
@@ -164,6 +168,7 @@ let activeView = 'overview';
 let statusBannerTimer = null;
 let activeWorkCount = 0;
 let latestTodayGamesPayload = null;
+let overviewBoardTab = 'top';
 let currentGameLogPayload = null;
 let activeGameLogView = 'recent';
 let currentMarketResultsPayload = null;
@@ -174,6 +179,9 @@ let currentExpertFilters = loadStoredExpertFilters();
 const currentExpertSettings = { min_minutes: 22, min_fga: 10, min_h2h_games: 2, min_h2h_hit_rate: 60 };
 let currentMarketInspectKey = '';
 let currentMarketInspectKeys = [];
+const marketTeamInjuryCache = new Map();
+const analyzerGameContextCache = new Map();
+const todayGameContextCache = new Map();
 
 // ── Market advanced filters (bookmaker + odds range) ──────────────────
 let currentMarketBookFilter = '';
@@ -1420,6 +1428,22 @@ function updateSelectedCardStyles() {
   });
 }
 
+function setOverviewBoardTab(tabKey = 'top') {
+  overviewBoardTab = ['top', 'caution', 'boost'].includes(tabKey) ? tabKey : 'top';
+  if (overviewBoardTabsEl) {
+    overviewBoardTabsEl.querySelectorAll('.overview-board-tab').forEach(btn => {
+      const active = btn.dataset.boardTab === overviewBoardTab;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+  }
+  document.querySelectorAll('[data-board-panel]').forEach(panel => {
+    const active = panel.dataset.boardPanel === overviewBoardTab;
+    panel.classList.toggle('active', active);
+    panel.hidden = !active;
+  });
+}
+
 function setSelectedPlayer(player) {
   const previousId = selectedPlayer?.id ?? null;
   const nextId = player?.id ?? null;
@@ -1428,6 +1452,7 @@ function setSelectedPlayer(player) {
   selectedPlayer = player;
 
   if (changedPlayer) {
+    resetAnalyzerFiltersState();
     clearAnalysisForNewSelection();
     setStatus('Player selected');
   }
@@ -1673,7 +1698,6 @@ function renderSearchResults(results) {
         <div>${escapeHtml(player.full_name)}</div>
         <small>${player.is_active ? 'Active player' : 'Inactive player'}</small>
       </div>
-      ${Array.isArray(bet.history) && bet.history.length ? `<div class="tracker-history-row">${getTrackerHistoryLabels(bet)}</div>` : ''}
     </div>
   `).join('');
 
@@ -1694,6 +1718,45 @@ function renderSearchResults(results) {
   });
 }
 
+function getTodayGameKey(game) {
+  return `${game?.away?.team_id || game?.away?.abbreviation || 'away'}-${game?.home?.team_id || game?.home?.abbreviation || 'home'}-${game?.game_label || game?.status_text || ''}`;
+}
+
+function buildTodayTrustDiagnostics(game, hasMarketContext) {
+  const items = [];
+  const teams = [
+    { abbr: game?.away?.abbreviation || 'Away', availability: game?.away?.availability || null, injuries: Array.isArray(game?.away?.injury_players) ? game.away.injury_players : [] },
+    { abbr: game?.home?.abbreviation || 'Home', availability: game?.home?.availability || null, injuries: Array.isArray(game?.home?.injury_players) ? game.home.injury_players : [] },
+  ];
+
+  const pendingTeams = teams.filter(team => /pending report/i.test(String(team.availability?.headline || team.availability?.status || '')));
+  const unavailableTeams = teams.filter(team => /report unavailable/i.test(String(team.availability?.headline || team.availability?.status || '')));
+  if (pendingTeams.length) {
+    items.push({ tone: 'warning', label: `${pendingTeams.map(team => team.abbr).join('/')} report pending` });
+  } else if (unavailableTeams.length) {
+    items.push({ tone: 'bad', label: `${unavailableTeams.map(team => team.abbr).join('/')} report unavailable` });
+  } else {
+    items.push({ tone: 'good', label: 'Official reports loaded' });
+  }
+
+  if (hasMarketContext) {
+    items.push({ tone: 'good', label: 'Market context loaded' });
+  } else if (game?.__marketContextPending) {
+    items.push({ tone: 'neutral', label: 'Market context loading' });
+  } else if (game?.__marketContextAttempted) {
+    items.push({ tone: 'neutral', label: 'Market context unavailable' });
+  }
+
+  const totalListedAbsences = teams.reduce((sum, team) => sum + team.injuries.length, 0);
+  if (totalListedAbsences > 0) {
+    items.push({ tone: totalListedAbsences >= 4 ? 'warning' : 'neutral', label: `${totalListedAbsences} listed absence${totalListedAbsences === 1 ? '' : 's'}` });
+  } else if (!pendingTeams.length && !unavailableTeams.length) {
+    items.push({ tone: 'good', label: 'Clean reports' });
+  }
+
+  return items.slice(0, 4);
+}
+
 function buildTodayGameCard(game, compact = false) {
   const statusClass = game.status_category || 'scheduled';
   const homeSummary = game.home.availability?.headline || 'Clean report';
@@ -1711,19 +1774,7 @@ function buildTodayGameCard(game, compact = false) {
   const homeSpreadValue = Number.isFinite(Number(marketContext.market_home_spread))
     ? `${Number(marketContext.market_home_spread) > 0 ? '+' : ''}${Number(marketContext.market_home_spread).toFixed(1)}`
     : '—';
-  const trustDiagnostics = buildTrustDiagnostics({
-    availability: game.home.availability?.headline && /pending report|report unavailable/i.test(game.home.availability.headline)
-      ? game.home.availability
-      : (game.away.availability?.headline && /pending report|report unavailable/i.test(game.away.availability.headline) ? game.away.availability : null),
-    environment: hasMarketContext ? {
-      market_game_total: marketContext.market_game_total,
-      market_spread: marketContext.market_home_spread ?? marketContext.market_away_spread,
-    } : null,
-    teamInjuryNames: [
-      ...((game.home.injury_players || []).map(p => p.full_name || p.short_name).filter(Boolean)),
-      ...((game.away.injury_players || []).map(p => p.full_name || p.short_name).filter(Boolean)),
-    ],
-  });
+  const trustDiagnostics = buildTodayTrustDiagnostics(game, hasMarketContext);
   const marketRow = hasMarketContext
     ? `<div class="today-market-row">
         <span class="today-market-pill">GT ${escapeHtml(gameTotalValue)}</span>
@@ -1758,6 +1809,8 @@ function buildTodayGameCard(game, compact = false) {
   const awayInj = injChips(game.away);
   const homeInj = injChips(game.home);
   const gameKey = (game.away.team_id || '') + '-' + (game.home.team_id || '');
+  const awayLogo = game.away?.team_id ? getTeamLogo(game.away.team_id) : '';
+  const homeLogo = game.home?.team_id ? getTeamLogo(game.home.team_id) : '';
 
   return `
     <article class="today-game-card ${compact ? 'compact' : ''} ${statusClass}" data-game-key="${gameKey}">
@@ -1768,15 +1821,21 @@ function buildTodayGameCard(game, compact = false) {
       ${renderTrustDiagnostics(trustDiagnostics, true)}
       ${marketRow}
       <div class="today-game-main">
-        <div class="today-team-row">
-          <div>
+        <div class="today-team-row with-logos">
+          <div class="today-team-side">
+            ${awayLogo ? `<span class="today-team-logo-shell"><img class="today-team-logo" src="${awayLogo}" alt="${escapeHtml(game.away.abbreviation)} logo" onerror="this.parentElement.style.display='none'"></span>` : ''}
+            <div>
             <strong>${escapeHtml(game.away.abbreviation)}</strong>
             <small>${escapeHtml(awaySummary)}</small>
+            </div>
           </div>
           ${scoreLine}
           <div class="today-team-home">
+            <div>
             <strong>${escapeHtml(game.home.abbreviation)}</strong>
             <small>${escapeHtml(homeSummary)}</small>
+            </div>
+            ${homeLogo ? `<span class="today-team-logo-shell"><img class="today-team-logo" src="${homeLogo}" alt="${escapeHtml(game.home.abbreviation)} logo" onerror="this.parentElement.style.display='none'"></span>` : ''}
           </div>
         </div>
         ${compact ? '' : `
@@ -2519,7 +2578,29 @@ function mergeMarketEnvironmentIntoItem(item, marketContextResult) {
 }
 
 async function fetchAnalyzerGameContext(source) {
+  const requestData = getGameContextRequestData(source);
+  if (!requestData) return null;
+
+  const existingEnvironment = source?.environment && typeof source.environment === 'object' ? source.environment : {};
+  const hasExistingMarketContext =
+    Number.isFinite(Number(existingEnvironment.market_team_total)) ||
+    Number.isFinite(Number(existingEnvironment.market_game_total)) ||
+    Number.isFinite(Number(existingEnvironment.market_spread));
+  if (hasExistingMarketContext) {
+    return { ok: true, environment: existingEnvironment, context: existingEnvironment.market_context || null };
+  }
+
   const settings = getOddsApiSettings();
+  const cacheKey = JSON.stringify({
+    requestData,
+    sport: settings.sport || 'basketball_nba',
+    regions: settings.regions || 'us',
+    odds_format: settings.odds_format || 'decimal',
+  });
+  if (analyzerGameContextCache.has(cacheKey)) {
+    return analyzerGameContextCache.get(cacheKey);
+  }
+
   let keyEntry = null;
   try {
     keyEntry = await pickRandomVaultKeyForFeature({
@@ -2530,8 +2611,6 @@ async function fetchAnalyzerGameContext(source) {
     console.warn(error.message || error);
     return null;
   }
-  const requestData = getGameContextRequestData(source);
-  if (!requestData) return null;
 
   const response = await fetch('/api/odds/game-context', {
     method: 'POST',
@@ -2546,6 +2625,7 @@ async function fetchAnalyzerGameContext(source) {
   });
   const result = await response.json();
   if (!response.ok || !result?.ok) return null;
+  analyzerGameContextCache.set(cacheKey, result);
   return result;
 }
 
@@ -2557,6 +2637,11 @@ async function enrichTodayGamesWithMarketContext(payload) {
     game?.away?.full_name
   );
   if (!pendingGames.length) return false;
+
+  pendingGames.forEach(game => {
+    game.__marketContextPending = true;
+    game.__marketContextAttempted = true;
+  });
 
   let keyEntries = [];
   try {
@@ -2574,8 +2659,20 @@ async function enrichTodayGamesWithMarketContext(payload) {
   const settings = getOddsApiSettings();
   let changed = false;
   await Promise.allSettled(pendingGames.map(async (game, index) => {
+    const cacheKey = `${game?.away?.full_name || ''}|${game?.home?.full_name || ''}|${settings.sport || 'basketball_nba'}|${settings.regions || 'us'}|${settings.odds_format || 'decimal'}`;
+    if (todayGameContextCache.has(cacheKey)) {
+      const cached = todayGameContextCache.get(cacheKey) || {};
+      game.market_context = cached.context || {};
+      game.market_environment = cached.environment || {};
+      game.__marketContextPending = false;
+      changed = true;
+      return;
+    }
     const keyEntry = keyEntries[index % keyEntries.length];
-    if (!keyEntry?.key) return;
+    if (!keyEntry?.key) {
+      game.__marketContextPending = false;
+      return;
+    }
     const response = await fetch('/api/odds/game-context', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2591,11 +2688,16 @@ async function enrichTodayGamesWithMarketContext(payload) {
       })
     });
     const result = await response.json();
+    game.__marketContextPending = false;
     if (!response.ok || !result?.ok) return;
     game.market_context = result.context || {};
     game.market_environment = result.environment || {};
+    todayGameContextCache.set(cacheKey, result);
     changed = true;
   }));
+  pendingGames.forEach(game => {
+    game.__marketContextPending = false;
+  });
   return changed;
 }
 
@@ -2888,6 +2990,93 @@ function getMarketItemKey(item) {
   return [playerId, stat, line, side].join('|');
 }
 
+function buildDecisionLensData({
+  selectedSide = 'Lean',
+  marketSide = '',
+  hitRate = null,
+  average = null,
+  line = null,
+  confidenceSummary = '',
+  modelProbability = null,
+  impliedProbability = null,
+  marketDisagrees = false,
+  marketPenalty = null,
+  teamContext = {},
+  teamInjuryNames = [],
+  environment = {},
+}) {
+  const toMaybeNumber = (value) => {
+    if (value === null || value === undefined || value === '') return null;
+    const num = Number(value);
+    return Number.isFinite(num) ? num : null;
+  };
+  const side = String(selectedSide || 'Lean').toUpperCase();
+  const market = String(marketSide || '').toUpperCase();
+  const hit = toMaybeNumber(hitRate);
+  const avg = toMaybeNumber(average);
+  const propLine = toMaybeNumber(line);
+  const modelProb = toMaybeNumber(modelProbability);
+  const impliedProb = toMaybeNumber(impliedProbability);
+  const penalty = toMaybeNumber(marketPenalty);
+  const impactCount = Number(teamContext?.impact_count || 0);
+  const lineupNames = (teamInjuryNames || []).filter(Boolean);
+  const teamTotal = toMaybeNumber(environment?.market_team_total);
+  const gameTotal = toMaybeNumber(environment?.market_game_total);
+  const spread = toMaybeNumber(environment?.market_spread);
+
+  let modelText = confidenceSummary || 'Model signal unavailable.';
+  if (Number.isFinite(hit) && Number.isFinite(avg) && Number.isFinite(propLine)) {
+    modelText = `${side} is backed by ${hit.toFixed(1)}% recent sample hit rate, with ${avg.toFixed(1)} against a ${propLine.toFixed(1)} line.`;
+  } else if (Number.isFinite(hit) && Number.isFinite(propLine)) {
+    modelText = `${side} is backed by ${hit.toFixed(1)}% of the recent sample at the current ${propLine.toFixed(1)} line.`;
+  }
+
+  let marketText = 'Market context is unavailable for this read.';
+  if (Number.isFinite(modelProb) || Number.isFinite(impliedProb) || market) {
+    if (marketDisagrees && market) {
+      marketText = `The betting market leans ${market}, while the model still prefers ${side}${Number.isFinite(penalty) && penalty > 0 ? `, so a ${penalty.toFixed(1)}-point market penalty is applied` : ''}.`;
+    } else if (market) {
+      marketText = `The betting market is generally aligned with ${side}${Number.isFinite(impliedProb) ? ` at ${impliedProb.toFixed(1)}% implied` : ''}.`;
+    } else {
+      marketText = `Model probability ${Number.isFinite(modelProb) ? `${modelProb.toFixed(1)}%` : '—'} vs implied ${Number.isFinite(impliedProb) ? `${impliedProb.toFixed(1)}%` : '—'}.`;
+    }
+  }
+  const marketEnvironmentBits = [];
+  if (Number.isFinite(teamTotal)) marketEnvironmentBits.push(`team total ${teamTotal.toFixed(1)}`);
+  if (Number.isFinite(gameTotal)) marketEnvironmentBits.push(`game total ${gameTotal.toFixed(1)}`);
+  if (Number.isFinite(spread)) marketEnvironmentBits.push(`spread ${spread > 0 ? '+' : ''}${spread.toFixed(1)}`);
+  if (marketEnvironmentBits.length) {
+    marketText += ` Market setup: ${marketEnvironmentBits.join(' • ')}.`;
+  }
+
+  let lineupText = 'No major same-team absences are materially changing this read.';
+  if (impactCount > 0 || lineupNames.length) {
+    const namesText = lineupNames.slice(0, 3).join(', ');
+    lineupText = `${teamContext?.impact_summary || teamContext?.summary || `${impactCount || lineupNames.length} same-team absence${(impactCount || lineupNames.length) === 1 ? '' : 's'} are affecting the read.`}${namesText ? ` Key names: ${namesText}${lineupNames.length > 3 ? ' +' + (lineupNames.length - 3) : ''}.` : ''}`;
+  }
+
+  return { modelText, marketText, lineupText };
+}
+
+function renderDecisionLensHtml(lens, variant = '') {
+  if (!lens) return '';
+  return `
+    <div class="decision-lens-grid ${variant}">
+      <div class="decision-lens-card">
+        <span class="insight-summary-label">Model case</span>
+        <p>${escapeHtml(lens.modelText || 'Model context unavailable.')}</p>
+      </div>
+      <div class="decision-lens-card">
+        <span class="insight-summary-label">Market case</span>
+        <p>${escapeHtml(lens.marketText || 'Market context unavailable.')}</p>
+      </div>
+      <div class="decision-lens-card">
+        <span class="insight-summary-label">Lineup case</span>
+        <p>${escapeHtml(lens.lineupText || 'Lineup context unavailable.')}</p>
+      </div>
+    </div>`;
+}
+
 function getMarketInspectDetails(item) {
   const analysis = item?.analysis || {};
   const matchup = analysis.matchup || item?.matchup || {};
@@ -2901,6 +3090,21 @@ function getMarketInspectDetails(item) {
     ? `${bestBet.model_probability}% model vs ${bestBet.implied_probability}% implied`
     : 'Model and market percentages unavailable';
   const lineupNames = (teamContext.players || []).map(p => `${formatPlayerName(p.name)} (${p.status})`).slice(0, 4);
+  const decisionLens = buildDecisionLensData({
+    selectedSide: marketSide,
+    marketSide: bestBet.market_side,
+    hitRate: bestBet.hit_rate ?? analysis?.hit_rate,
+    average: bestBet.average ?? analysis?.average,
+    line: item?.market?.line ?? item?.line,
+    confidenceSummary: bestBet.user_read || bestBet.confidence_summary,
+    modelProbability: bestBet.model_probability,
+    impliedProbability: bestBet.implied_probability,
+    marketDisagrees: bestBet.market_disagrees,
+    marketPenalty: bestBet.market_penalty,
+    teamContext,
+    teamInjuryNames: (teamContext.players || []).map(p => p.name).filter(Boolean),
+    environment,
+  });
   return {
     title: `${item?.player?.full_name || 'Unknown player'} • ${item?.market?.stat || 'Prop'} ${item?.market?.line ?? ''}`,
     subtitle: `${item?.player?.team || ''} vs ${item?.player?.opponent || ''}`.trim(),
@@ -2918,7 +3122,8 @@ function getMarketInspectDetails(item) {
     expertAngles,
     lineupHeadline: teamContext.headline || 'Lineup context unavailable',
     lineupSummary: teamContext.summary || 'No same-team absences flagged in the current context.',
-    lineupNames
+    lineupNames,
+    decisionLens
   };
 }
 
@@ -2929,6 +3134,7 @@ function closeMarketInspectTrayItem(key) {
     currentMarketInspectKey = currentMarketInspectKeys[0] || '';
   }
   renderMarketInspectTray();
+  syncMarketInspectState();
 }
 
 function openMarketInspectTrayItem(item) {
@@ -2938,6 +3144,20 @@ function openMarketInspectTrayItem(item) {
   currentMarketInspectKey = key;
   currentMarketInspectKeys = [key, ...currentMarketInspectKeys.filter(entry => entry !== key)].slice(0, 4);
   renderMarketInspectTray();
+  syncMarketInspectState();
+}
+
+function syncMarketInspectState() {
+  if (!marketResults) return;
+  const openKeys = new Set(currentMarketInspectKeys);
+  marketResults.querySelectorAll('[data-item-key]').forEach(node => {
+    node.classList.toggle('is-inspected', openKeys.has(node.dataset.itemKey || ''));
+  });
+  marketResults.querySelectorAll('[data-action="inspect"][data-index]').forEach(btn => {
+    const row = btn.closest('[data-item-key]');
+    const key = row?.dataset?.itemKey || '';
+    btn.textContent = openKeys.has(key) ? 'Opened' : 'Inspect';
+  });
 }
 
 function renderMarketInspectTray() {
@@ -2996,6 +3216,7 @@ function renderMarketInspectTray() {
             <strong>TT ${escapeHtml(details.teamTotal)} • Spr ${escapeHtml(details.spread)} • GT ${escapeHtml(details.gameTotal)}</strong>
             <small>Spread and totals loaded into scanner context</small>
           </div>
+          ${renderDecisionLensHtml(details.decisionLens, 'compact')}
           <div class="market-inspect-lineup">
             <span class="small-label">Lineup context</span>
             <div class="market-inspect-lineup-card">
@@ -3035,6 +3256,55 @@ function renderMarketInspectTray() {
         setStatus('Error');
       }
     });
+  });
+}
+
+function applyMarketInjuryDataToCell(cell, data) {
+  if (!cell) return;
+  const injured = Array.isArray(data?.players) ? data.players : [];
+  if (!injured.length) {
+    cell.innerHTML = '<span style="opacity:0.35">Clean</span>';
+    return;
+  }
+  const outPlayers = injured.filter(p => p.is_unavailable);
+  const riskyPlayers = injured.filter(p => !p.is_unavailable);
+  let html = '';
+  if (outPlayers.length) {
+    html += '<span style="color:rgba(255,100,80,0.85);font-weight:600">' + outPlayers.map(p => escapeHtml(p.lookup_name || p.display_name)).join(', ') + ' OUT</span><br>';
+  }
+  if (riskyPlayers.length) {
+    html += '<span style="opacity:0.6">' + riskyPlayers.map(p => escapeHtml(p.lookup_name || p.display_name)).join(', ') + ' Q</span>';
+  }
+  cell.innerHTML = html || '<span style="opacity:0.35">Clean</span>';
+}
+
+function populateMarketInjuryCells(results) {
+  const teamNameByIndex = new Map();
+  results.forEach((item, index) => {
+    const teamName = String(item?.player?.team_name || item?.player?.team || '').trim();
+    if (!teamName) return;
+    teamNameByIndex.set(index, teamName);
+    const cached = marketTeamInjuryCache.get(teamName);
+    if (cached) {
+      const cell = document.getElementById('market-inj-' + index);
+      applyMarketInjuryDataToCell(cell, cached);
+    }
+  });
+
+  const uniqueTeams = Array.from(new Set(teamNameByIndex.values())).filter(teamName => !marketTeamInjuryCache.has(teamName));
+  uniqueTeams.forEach(teamName => {
+    fetch('/api/team-injuries?team_name=' + encodeURIComponent(teamName))
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (!data) return;
+        marketTeamInjuryCache.set(teamName, data);
+        teamNameByIndex.forEach((entryTeamName, index) => {
+          if (entryTeamName !== teamName) return;
+          const cell = document.getElementById('market-inj-' + index);
+          applyMarketInjuryDataToCell(cell, data);
+        });
+      })
+      .catch(() => {});
   });
 }
 
@@ -3259,27 +3529,6 @@ function renderMarketResults(payload) {
     </div>
   `;
 
-  // Async-populate injury cells for market scanner rows
-  results.forEach((item, index) => {
-    const teamName = item.player?.team_name || item.player?.team || '';
-    if (!teamName) return;
-    fetch('/api/team-injuries?team_name=' + encodeURIComponent(teamName))
-      .then(r => r.ok ? r.json() : null)
-      .then(data => {
-        const cell = document.getElementById('market-inj-' + index);
-        if (!cell || !data) return;
-        const injured = (data.players || []);
-        if (!injured.length) { cell.innerHTML = '<span style="opacity:0.35">Clean</span>'; return; }
-        const outPlayers = injured.filter(p => p.is_unavailable);
-        const riskyPlayers = injured.filter(p => !p.is_unavailable);
-        let html = '';
-        if (outPlayers.length) html += '<span style="color:rgba(255,100,80,0.85);font-weight:600">' + outPlayers.map(p => escapeHtml(p.lookup_name || p.display_name)).join(', ') + ' OUT</span><br>';
-        if (riskyPlayers.length) html += '<span style="opacity:0.6">' + riskyPlayers.map(p => escapeHtml(p.lookup_name || p.display_name)).join(', ') + ' Q</span>';
-        cell.innerHTML = html || '<span style="opacity:0.35">Clean</span>';
-      })
-      .catch(() => {});
-  });
-
   marketResults.querySelectorAll('.market-inline-btn').forEach(btn => {
     btn.addEventListener('click', (event) => {
       event.preventDefault();
@@ -3289,7 +3538,6 @@ function renderMarketResults(payload) {
       if (btn.dataset.action === 'inspect') {
         openMarketInspectTrayItem(item);
       }
-      renderMarketResults(currentMarketResultsPayload || payload);
     });
   });
 
@@ -3321,6 +3569,9 @@ function renderMarketResults(payload) {
       renderMarketResults(currentMarketResultsPayload || payload);
     });
   });
+
+  syncMarketInspectState();
+  populateMarketInjuryCells(results);
 }
 
 
@@ -4030,10 +4281,27 @@ function renderOverviewBestBets() {
           <span class="overview-rank">#${index + 1}</span>
           <span class="finder-badge ${(item.best_bet.traffic_light?.tone || item.best_bet.confidence_tone || '')}">${escapeHtml(item.best_bet.display_side || item.best_bet.side)} • ${escapeHtml(item.best_bet.traffic_light?.label || item.best_bet.confidence || '')}</span>
         </div>
-        <strong>${escapeHtml(item.player.full_name)}</strong>
-        <small>${escapeHtml(item.market.stat)} ${item.market.line} • ${escapeHtml(item.player.team || '')}${item.player.opponent ? ` vs ${escapeHtml(item.player.opponent)}` : ''}</small>
-        <div class="overview-best-bet-metrics"><span>Edge ${item.best_bet.edge ?? '—'}%</span><span>EV ${item.best_bet.ev ?? '—'}%</span></div>
-        <p>${escapeHtml(item.best_bet.explanation || item.best_bet.user_read || 'Latest board note.')}</p>
+        <div class="overview-best-bet-main">
+          <div class="overview-best-bet-player">
+            <img class="overview-best-bet-avatar" src="${getPlayerImage(item.player.id)}" alt="${escapeHtml(item.player.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
+            <div class="overview-best-bet-copy">
+              <strong>${escapeHtml(item.player.full_name)}</strong>
+              <small>${escapeHtml(item.market.stat)} ${item.market.line} • ${escapeHtml(item.player.team || '')}${item.player.opponent ? ` vs ${escapeHtml(item.player.opponent)}` : ''}</small>
+              <div class="overview-best-bet-detail-row">
+                <span class="overview-best-bet-chip stat">${escapeHtml(item.market.stat)} ${item.market.line}</span>
+                <span class="overview-best-bet-chip">Edge ${item.best_bet.edge ?? '—'}%</span>
+                <span class="overview-best-bet-chip">EV ${item.best_bet.ev ?? '—'}%</span>
+                <span class="overview-best-bet-chip">Hit ${item.best_bet.hit_rate ?? item.analysis?.hit_rate ?? '—'}%</span>
+              </div>
+            </div>
+          </div>
+          <div class="overview-best-bet-grade">
+            <span class="overview-grade-label">Board read</span>
+            <strong>${escapeHtml(item.best_bet.display_side || item.best_bet.side || 'Lean')}</strong>
+            <small>${escapeHtml(item.best_bet.traffic_light?.label || item.best_bet.confidence || 'Playable')}</small>
+          </div>
+        </div>
+        <p class="overview-best-bet-summary">${escapeHtml(item.best_bet.explanation || item.best_bet.user_read || 'Latest board note.')}</p>
       </button>
     `).join('');
     node.querySelectorAll('.overview-best-bet-card').forEach((card, idx) => card.addEventListener('click', async () => focusMarketPlayerEnhanced(items[idx])));
@@ -4042,10 +4310,20 @@ function renderOverviewBestBets() {
   const strongest = results.slice(0, 5);
   const caution = results.filter(item => ['yellow', 'red'].includes(item.best_bet.traffic_light?.tone || '') || item.analysis?.availability?.is_risky || item.availability?.is_risky || (item.analysis?.matchup?.vs_position?.lean_tone === 'bad')).slice(0, 3);
   const boosts = results.filter(item => Number(item.analysis?.team_context?.impact_count || item.team_context?.impact_count || 0) > 0 || /context|expanded|thin|rise/i.test(String(item.analysis?.team_context?.headline || item.team_context?.headline || ''))).slice(0, 3);
+  if (overviewTopCountEl) overviewTopCountEl.textContent = String(strongest.length);
+  if (overviewCautionCountEl) overviewCautionCountEl.textContent = String(caution.length);
+  if (overviewBoostCountEl) overviewBoostCountEl.textContent = String(boosts.length);
   renderBoard(overviewBestBets, strongest, '⭐', 'No best bets saved yet.', 'Run Market Scanner to pin the strongest current board edges here.');
   renderBoard(overviewCautionBoardEl, caution, '⚠️', 'No caution spots yet.', 'Risky plays will appear here after a board scan.');
   renderBoard(overviewBoostBoardEl, boosts, '📈', 'No lineup-context edges yet.', 'Plays with strong teammate-absence context will appear here.');
+  setOverviewBoardTab(overviewBoardTab);
 }
+
+overviewBoardTabsEl?.querySelectorAll('.overview-board-tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    setOverviewBoardTab(btn.dataset.boardTab || 'top');
+  });
+});
 
 // buildTodayGameCard defined above (with injury panel)
 
@@ -4149,6 +4427,21 @@ function renderInterpretationPanels(payload) {
   }
   if (interpretationBody) {
     const bullets = Array.isArray(interpretation.bullets) ? interpretation.bullets : [];
+    const decisionLens = buildDecisionLensData({
+      selectedSide: payload?.recommended_side,
+      marketSide: confidence.market_side,
+      hitRate: payload?.hit_rate,
+      average: payload?.average,
+      line: payload?.line,
+      confidenceSummary: confidence.summary || interpretation.summary,
+      modelProbability: confidence.model_probability,
+      impliedProbability: confidence.implied_probability,
+      marketDisagrees: confidence.market_disagrees,
+      marketPenalty: confidence.market_penalty,
+      teamContext,
+      teamInjuryNames: (teamContext.players || []).map(item => item.name).filter(Boolean),
+      environment,
+    });
     const trustDiagnostics = buildTrustDiagnostics({
       availability: payload?.availability || null,
       environment,
@@ -4166,6 +4459,7 @@ function renderInterpretationPanels(payload) {
         <strong>${escapeHtml(interpretation.headline || 'Quick read unavailable')}</strong>
         <p>${escapeHtml(interpretation.summary || 'Analyze a player prop to generate a simple read.')}</p>
       </div>${renderTrustDiagnostics(trustDiagnostics)}
+      ${renderDecisionLensHtml(decisionLens)}
       <ul class="insight-bullet-list compact-bullets">${bullets.length ? bullets.map(item => `<li>${escapeHtml(item)}</li>`).join('') : '<li>Analyze a player prop to fill this section.</li>'}</ul>`;
   }
   if (opportunityBody) {
@@ -5520,6 +5814,34 @@ async function analyzePlayerProp(options = {}) {
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.detail || 'Failed to analyze player prop.');
 
+    const priorAvailability = selectedPlayer?.availability && typeof selectedPlayer.availability === 'object'
+      ? selectedPlayer.availability
+      : null;
+    const priorMatchup = selectedPlayer?.matchup && typeof selectedPlayer.matchup === 'object'
+      ? selectedPlayer.matchup
+      : {};
+    const priorEnvironment = selectedPlayer?.environment && typeof selectedPlayer.environment === 'object'
+      ? selectedPlayer.environment
+      : {};
+
+    payload.availability = payload.availability || priorAvailability;
+    payload.matchup = {
+      ...priorMatchup,
+      ...(payload.matchup || {}),
+      next_game: {
+        ...(priorMatchup?.next_game || {}),
+        ...((payload.matchup || {}).next_game || {}),
+      },
+      vs_position: {
+        ...(priorMatchup?.vs_position || {}),
+        ...((payload.matchup || {}).vs_position || {}),
+      },
+    };
+    payload.environment = {
+      ...priorEnvironment,
+      ...(payload.environment || {}),
+    };
+
     try {
       const marketContextResult = await fetchAnalyzerGameContext(payload);
       if (marketContextResult?.environment) {
@@ -6175,6 +6497,21 @@ function buildSparklineSvg(values, line, width, height) {
         teamInjuryNames: leg.team_injury_player_names || [],
         marketDisagrees: leg.market_disagrees,
       });
+      const decisionLens = buildDecisionLensData({
+        selectedSide: leg.side,
+        marketSide: leg.market_side,
+        hitRate: leg.hit_rate,
+        average: leg.average,
+        line: leg.line,
+        confidenceSummary: leg.confidence_summary,
+        modelProbability: leg.model_probability,
+        impliedProbability: leg.implied_probability ?? leg.fair_probability,
+        marketDisagrees: leg.market_disagrees,
+        marketPenalty: leg.market_penalty,
+        teamContext: leg.team_context || {},
+        teamInjuryNames: leg.team_injury_player_names || [],
+        environment: leg.environment || {},
+      });
       const reasonHtml = reasonParts.length
         ? '<div class="parlay-leg-why"><span class="parlay-leg-why-label">Why selected</span><ul>' + reasonParts.map(function (part) { return '<li>' + escHtml(part) + '</li>'; }).join('') + '</ul></div>'
         : '';
@@ -6210,6 +6547,7 @@ function buildSparklineSvg(values, line, width, height) {
         '</div>' +
         '<div class="parlay-leg-hit-bar"><div class="parlay-leg-hit-fill" style="width:' + fp + '%"></div></div>' +
         reasonHtml +
+        renderDecisionLensHtml(decisionLens, 'compact') +
         '<div class="parlay-leg-analyze-hint" style="font-size:0.72rem;color:var(--muted);margin-top:6px;text-align:center">' + escHtml(leg.confidence_summary || 'Click to analyze →') + '</div>' +
         '</div>';
     }).join('');
