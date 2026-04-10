@@ -92,6 +92,7 @@ PERSISTENT_CACHE_DIR = BASE_DIR / ".runtime_cache"
 PERSISTENT_CACHE_PATH = PERSISTENT_CACHE_DIR / "persistent_cache.json"
 BACKTEST_PERSIST_PATH = PERSISTENT_CACHE_DIR / "backtest_log.json"
 KEY_VAULT_PERSIST_PATH = PERSISTENT_CACHE_DIR / "key_vault.json"
+FAVORITES_PERSIST_PATH = PERSISTENT_CACHE_DIR / "favorites.json"
 PERSISTENT_CACHE_ENABLED = os.getenv("NBA_PERSISTENT_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 PERSISTENT_CACHE_MAX_ROSTERS = max(30, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_ROSTERS", "120")))
 PERSISTENT_CACHE_MAX_PLAYER_INFO = max(100, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_PLAYER_INFO", "600")))
@@ -1349,7 +1350,11 @@ def build_prop_analysis_payload(
     variance_data = stat_summary.get("variance") or {}
 
     team_name = TEAM_LOOKUP.get(resolved_team_id, {}).get("full_name") if resolved_team_id else None
-    availability = build_availability_payload(player_name=player["full_name"], team_name=team_name)
+    availability = build_availability_payload(
+        player_name=player["full_name"],
+        team_name=team_name,
+        game_date=str((next_game or {}).get("game_date") or "") or None,
+    )
     vs_position = build_position_matchup(opponent_team_id=int((next_game or {}).get("opponent_team_id") or 0), position_code=position_code or "", stat=stat, season=season, season_type=season_type) if next_game and position_code else None
     h2h_payload = build_h2h_payload_from_rows(filtered_pool or enriched_rows, next_game, stat, line)
     analysis_source_rows = filtered_pool or enriched_rows or season_rows
@@ -1561,8 +1566,8 @@ def fetch_latest_injury_report_payload() -> dict[str, Any]:
     return INJURY_SERVICE.fetch_latest_report_payload()
 
 
-def build_availability_payload(player_name: str, team_name: str | None = None) -> dict[str, Any]:
-    return INJURY_SERVICE.build_availability_payload(player_name, team_name=team_name)
+def build_availability_payload(player_name: str, team_name: str | None = None, game_date: str | None = None) -> dict[str, Any]:
+    return INJURY_SERVICE.build_availability_payload(player_name, team_name=team_name, game_date=game_date)
 
 
 def build_team_availability_summary(team_name: str | None, report_payload: dict[str, Any] | None = None, game_date: str | None = None) -> dict[str, Any]:
@@ -3763,6 +3768,8 @@ def resolve_team_next_game(team_id: int | None, primary_player_id: int, season: 
 @app.on_event("startup")
 def _startup_warm_cache() -> None:
     _load_key_vault_state()
+    _load_backtest_log()
+    _load_favorites_state()
     start_hybrid_refresh_workers()
     warm_cache_on_startup()
 
@@ -4284,6 +4291,11 @@ def market_scan(
                 "confidence_tier": confidence_engine.get("tier"),
                 "confidence_tags": confidence_engine.get("tags") or [],
                 "confidence_components": confidence_engine.get("components") or {},
+                "market_side": confidence_engine.get("market_side"),
+                "market_disagrees": confidence_engine.get("market_disagrees"),
+                "market_penalty": confidence_engine.get("market_penalty"),
+                "market_support_pct": confidence_engine.get("market_support_pct"),
+                "ranking_score": confidence_engine.get("ranking_score"),
                 "playable": not availability.get("is_unavailable", False),
                 "user_read": analysis.get("interpretation", {}).get("market_takeaway") or confidence_engine["summary"],
             },
@@ -4296,6 +4308,7 @@ def market_scan(
 
     results.sort(
         key=lambda item: (
+            item["best_bet"].get("ranking_score") if item["best_bet"].get("ranking_score") is not None else float("-inf"),
             item["best_bet"].get("ev") if item["best_bet"].get("ev") is not None else float("-inf"),
             item["best_bet"].get("edge") if item["best_bet"].get("edge") is not None else float("-inf"),
             item["analysis"].get("hit_rate") if item["analysis"].get("hit_rate") is not None else float("-inf"),
@@ -5972,10 +5985,68 @@ def debug_injury_report_raw() -> dict[str, Any]:
 # In-memory store (resets on restart). Frontend can persist via localStorage.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_BACKTEST_LOCK = threading.Lock()
+_BACKTEST_LOCK = threading.RLock()
 _BACKTEST_LOG: list[dict[str, Any]] = []   # [{id, player, stat, line, side, confidence_score, confidence_tier, model_prob, result, hit, odds, ev, logged_at, resolved_at}]
 _KEY_VAULT_LOCK = threading.Lock()
 _KEY_VAULT_STATE: dict[str, Any] = {"entries": [], "active_id": ""}
+_FAVORITES_LOCK = threading.Lock()
+_FAVORITES_STATE: list[dict[str, Any]] = []
+
+
+def _save_backtest_log() -> None:
+    if not PERSISTENT_CACHE_ENABLED:
+        return
+    try:
+        PERSISTENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with _BACKTEST_LOCK:
+            payload = {
+                "version": 1,
+                "saved_at": time.time(),
+                "entries": list(_BACKTEST_LOG),
+            }
+        temp_path = BACKTEST_PERSIST_PATH.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temp_path.replace(BACKTEST_PERSIST_PATH)
+    except Exception as exc:
+        LOGGER.warning("Backtest log save failed: %s", exc)
+
+
+def _load_backtest_log() -> None:
+    if not PERSISTENT_CACHE_ENABLED or not BACKTEST_PERSIST_PATH.exists():
+        return
+    try:
+        payload = json.loads(BACKTEST_PERSIST_PATH.read_text(encoding="utf-8"))
+        entries = payload.get("entries") or []
+        if not isinstance(entries, list):
+            return
+        with _BACKTEST_LOCK:
+            _BACKTEST_LOG.clear()
+            for raw in entries:
+                if not isinstance(raw, dict):
+                    continue
+                entry = {
+                    "id": str(raw.get("id") or _backtest_new_id()),
+                    "player": str(raw.get("player") or ""),
+                    "stat": str(raw.get("stat") or ""),
+                    "line": float(raw.get("line") or 0),
+                    "side": str(raw.get("side") or ""),
+                    "confidence_score": int(raw.get("confidence_score") or 0),
+                    "confidence_tier": str(raw.get("confidence_tier") or ""),
+                    "model_prob": float(raw.get("model_prob") or 0.5),
+                    "odds": raw.get("odds"),
+                    "result": str(raw.get("result") or "pending"),
+                    "actual_value": raw.get("actual_value"),
+                    "logged_at": str(raw.get("logged_at") or ""),
+                    "resolved_at": raw.get("resolved_at"),
+                    "event_date": str(raw.get("event_date") or ""),
+                    "source": str(raw.get("source") or ""),
+                    "market_side": str(raw.get("market_side") or ""),
+                    "market_disagrees": bool(raw.get("market_disagrees")) if raw.get("market_disagrees") is not None else False,
+                    "notes": str(raw.get("notes") or ""),
+                }
+                _BACKTEST_LOG.append(entry)
+    except Exception as exc:
+        LOGGER.warning("Backtest log load failed: %s", exc)
 
 
 def _save_key_vault_state() -> None:
@@ -5997,6 +6068,24 @@ def _save_key_vault_state() -> None:
         LOGGER.warning("Key vault save failed: %s", exc)
 
 
+def _save_favorites_state() -> None:
+    if not PERSISTENT_CACHE_ENABLED:
+        return
+    try:
+        PERSISTENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with _FAVORITES_LOCK:
+            payload = {
+                "version": 1,
+                "saved_at": time.time(),
+                "entries": list(_FAVORITES_STATE[:24]),
+            }
+        temp_path = FAVORITES_PERSIST_PATH.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temp_path.replace(FAVORITES_PERSIST_PATH)
+    except Exception as exc:
+        LOGGER.warning("Favorites save failed: %s", exc)
+
+
 def _load_key_vault_state() -> None:
     if not PERSISTENT_CACHE_ENABLED or not KEY_VAULT_PERSIST_PATH.exists():
         return
@@ -6015,6 +6104,23 @@ def _load_key_vault_state() -> None:
         LOGGER.warning("Key vault load failed: %s", exc)
 
 
+def _load_favorites_state() -> None:
+    if not PERSISTENT_CACHE_ENABLED or not FAVORITES_PERSIST_PATH.exists():
+        return
+    try:
+        payload = json.loads(FAVORITES_PERSIST_PATH.read_text(encoding="utf-8"))
+        entries = payload.get("entries") or []
+        if not isinstance(entries, list):
+            return
+        with _FAVORITES_LOCK:
+            _FAVORITES_STATE.clear()
+            for entry in entries[:24]:
+                if isinstance(entry, dict):
+                    _FAVORITES_STATE.append(entry)
+    except Exception as exc:
+        LOGGER.warning("Favorites load failed: %s", exc)
+
+
 def _backtest_new_id() -> str:
     import uuid
     return str(uuid.uuid4())[:8]
@@ -6025,7 +6131,27 @@ def _compute_backtest_stats(entries: list[dict[str, Any]]) -> dict[str, Any]:
     resolved = [e for e in entries if e.get("result") in ("hit", "miss")]
     total = len(resolved)
     if total == 0:
-        return {"total": 0, "pending": len(entries) - total}
+        pending_only = [e for e in entries if e.get("result") == "pending"]
+        return {
+            "total": 0,
+            "pending": len(entries) - total,
+            "logged_total": len(entries),
+            "recent_form": [],
+            "by_result": {},
+            "by_side": {},
+            "by_stat": {},
+            "by_tier": {},
+            "by_market_alignment": {},
+            "top_players": [
+                {"player": player, "total": count}
+                for player, count in sorted(
+                    ((str(p or "Unknown"), sum(1 for e in pending_only if str(e.get("player") or "Unknown") == str(p or "Unknown"))) for p in {e.get("player") for e in pending_only}),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )[:5]
+                if count > 0
+            ],
+        }
 
     hits = sum(1 for e in resolved if e["result"] == "hit")
     win_rate = round(hits / total * 100, 1)
@@ -6088,8 +6214,45 @@ def _compute_backtest_stats(entries: list[dict[str, Any]]) -> dict[str, Any]:
         for sd, v in side_stats.items()
     }
 
+    alignment_stats: dict[str, dict[str, int]] = {}
+    for e in resolved:
+        alignment = "Against market" if e.get("market_disagrees") else ("Market aligned" if e.get("market_side") else "No market context")
+        alignment_stats.setdefault(alignment, {"hits": 0, "total": 0})
+        alignment_stats[alignment]["total"] += 1
+        if e["result"] == "hit":
+            alignment_stats[alignment]["hits"] += 1
+    alignment_summary = {
+        key: {
+            "win_rate": round(value["hits"] / value["total"] * 100, 1),
+            "total": value["total"],
+        }
+        for key, value in alignment_stats.items()
+    }
+
+    player_stats: dict[str, dict[str, int]] = {}
+    for e in resolved:
+        player = str(e.get("player") or "Unknown")
+        player_stats.setdefault(player, {"hits": 0, "total": 0})
+        player_stats[player]["total"] += 1
+        if e["result"] == "hit":
+            player_stats[player]["hits"] += 1
+    top_players = [
+        {
+            "player": player,
+            "win_rate": round(values["hits"] / values["total"] * 100, 1),
+            "total": values["total"],
+        }
+        for player, values in sorted(player_stats.items(), key=lambda item: (item[1]["total"], item[1]["hits"]), reverse=True)[:6]
+    ]
+
+    recent_form = [
+        1 if e.get("result") == "hit" else 0
+        for e in sorted(resolved, key=lambda entry: str(entry.get("resolved_at") or entry.get("logged_at") or ""))[-10:]
+    ]
+
     return {
         "total": total,
+        "logged_total": len(entries),
         "pending": len(entries) - total,
         "hits": hits,
         "misses": total - hits,
@@ -6098,6 +6261,14 @@ def _compute_backtest_stats(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "by_tier": tier_summary,
         "by_stat": stat_summary,
         "by_side": side_summary,
+        "by_result": {
+            "hit": hits,
+            "miss": total - hits,
+            "pending": len(entries) - total,
+        },
+        "by_market_alignment": alignment_summary,
+        "top_players": top_players,
+        "recent_form": recent_form,
     }
 
 
@@ -6121,9 +6292,15 @@ def backtest_log_prediction(payload: dict = Body(...)) -> dict[str, Any]:
         "actual_value": None,
         "logged_at": datetime.utcnow().isoformat() + "Z",
         "resolved_at": None,
+        "event_date": str(payload.get("event_date") or ""),
+        "source": str(payload.get("source") or ""),
+        "market_side": str(payload.get("market_side") or ""),
+        "market_disagrees": bool(payload.get("market_disagrees")) if payload.get("market_disagrees") is not None else False,
+        "notes": str(payload.get("notes") or ""),
     }
     with _BACKTEST_LOCK:
         _BACKTEST_LOG.append(entry)
+        _save_backtest_log()
     return {"ok": True, "id": entry["id"], "entry": entry}
 
 
@@ -6149,6 +6326,7 @@ def backtest_resolve_prediction(payload: dict = Body(...)) -> dict[str, Any]:
                 entry["result"] = "hit" if hit else "miss"
                 entry["actual_value"] = actual_value
                 entry["resolved_at"] = datetime.utcnow().isoformat() + "Z"
+                _save_backtest_log()
                 return {"ok": True, "entry": entry}
     raise HTTPException(status_code=404, detail=f"No prediction found with id={pred_id}")
 
@@ -6162,6 +6340,80 @@ def backtest_get_log(limit: int = Query(200, ge=1, le=1000)) -> dict[str, Any]:
     return {"stats": stats, "entries": entries}
 
 
+@app.post("/api/backtest/import")
+def backtest_import_entries(payload: dict = Body(...)) -> dict[str, Any]:
+    raw_entries = payload.get("entries") or []
+    if not isinstance(raw_entries, list) or not raw_entries:
+        raise HTTPException(status_code=400, detail="entries list is required")
+
+    added = 0
+    skipped = 0
+    imported: list[dict[str, Any]] = []
+    with _BACKTEST_LOCK:
+        existing_keys = {
+            (
+                str(e.get("player") or "").strip().lower(),
+                str(e.get("stat") or "").strip().upper(),
+                float(e.get("line") or 0),
+                str(e.get("side") or "").strip().upper(),
+                str(e.get("logged_at") or "").strip(),
+            )
+            for e in _BACKTEST_LOG
+        }
+        for raw in raw_entries:
+            if not isinstance(raw, dict):
+                skipped += 1
+                continue
+            player = str(raw.get("player") or "").strip()
+            stat = str(raw.get("stat") or "").strip().upper()
+            side = str(raw.get("side") or "").strip().upper()
+            if not player or not stat or not side:
+                skipped += 1
+                continue
+            try:
+                line = float(raw.get("line") or 0)
+            except Exception:
+                skipped += 1
+                continue
+            logged_at = str(raw.get("logged_at") or datetime.utcnow().isoformat() + "Z").strip()
+            dedupe_key = (player.lower(), stat, line, side, logged_at)
+            if dedupe_key in existing_keys:
+                skipped += 1
+                continue
+            actual_raw = raw.get("actual_value")
+            try:
+                actual_value = float(actual_raw) if actual_raw not in (None, "", "null") else None
+            except Exception:
+                actual_value = None
+            entry = {
+                "id": str(raw.get("id") or _backtest_new_id()),
+                "player": player,
+                "stat": stat,
+                "line": line,
+                "side": side,
+                "confidence_score": int(float(raw.get("confidence_score") or 0)),
+                "confidence_tier": str(raw.get("confidence_tier") or ""),
+                "model_prob": float(raw.get("model_prob") or 0.5),
+                "odds": raw.get("odds"),
+                "result": str(raw.get("result") or "pending"),
+                "actual_value": actual_value,
+                "logged_at": logged_at,
+                "resolved_at": raw.get("resolved_at"),
+                "event_date": str(raw.get("event_date") or ""),
+                "source": str(raw.get("source") or ""),
+                "market_side": str(raw.get("market_side") or ""),
+                "market_disagrees": bool(raw.get("market_disagrees")) if raw.get("market_disagrees") is not None else False,
+                "notes": str(raw.get("notes") or ""),
+            }
+            _BACKTEST_LOG.append(entry)
+            existing_keys.add(dedupe_key)
+            imported.append(entry)
+            added += 1
+        if added:
+            _save_backtest_log()
+    return {"ok": True, "added": added, "skipped": skipped, "entries": imported}
+
+
 @app.delete("/api/backtest/log/{entry_id}")
 def backtest_delete_entry(entry_id: str) -> dict[str, Any]:
     """Delete a single backtest entry by ID."""
@@ -6169,6 +6421,8 @@ def backtest_delete_entry(entry_id: str) -> dict[str, Any]:
         before = len(_BACKTEST_LOG)
         _BACKTEST_LOG[:] = [e for e in _BACKTEST_LOG if e["id"] != entry_id]
         after = len(_BACKTEST_LOG)
+        if before != after:
+            _save_backtest_log()
     if before == after:
         raise HTTPException(status_code=404, detail=f"No entry found with id={entry_id}")
     return {"ok": True, "deleted": entry_id}
@@ -6180,6 +6434,7 @@ def backtest_clear_log() -> dict[str, Any]:
     with _BACKTEST_LOCK:
         count = len(_BACKTEST_LOG)
         _BACKTEST_LOG.clear()
+        _save_backtest_log()
     return {"ok": True, "cleared": count}
 
 
@@ -6219,6 +6474,39 @@ def key_vault_put(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         _KEY_VAULT_STATE["active_id"] = active_id
     _save_key_vault_state()
     return {"ok": True, "count": len(sanitized), "active_id": active_id}
+
+
+@app.get("/api/favorites")
+def favorites_get() -> dict[str, Any]:
+    with _FAVORITES_LOCK:
+        entries = list(_FAVORITES_STATE)
+    return {"ok": True, "entries": entries}
+
+
+@app.put("/api/favorites")
+def favorites_put(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    entries = payload.get("entries") or []
+    if not isinstance(entries, list):
+        raise HTTPException(status_code=400, detail="entries must be a list")
+    sanitized: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for raw in entries[:24]:
+        if not isinstance(raw, dict):
+            continue
+        item_type = str(raw.get("type") or "").strip()
+        item_key = str(raw.get("key") or "").strip()
+        if not item_type or not item_key:
+            continue
+        dedupe = f"{item_type}:{item_key}"
+        if dedupe in seen_keys:
+            continue
+        seen_keys.add(dedupe)
+        sanitized.append(raw)
+    with _FAVORITES_LOCK:
+        _FAVORITES_STATE.clear()
+        _FAVORITES_STATE.extend(sanitized)
+    _save_favorites_state()
+    return {"ok": True, "count": len(sanitized), "entries": sanitized}
 
 
 @app.post("/api/odds/game-context")

@@ -1147,6 +1147,38 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 </div>
 <div class="small-meta" id="trackerAddError" style="color:var(--bad);display:none"></div>
 </section>
+<section class="tracker-toolbar card glass rounded-[24px] border border-white/10 backdrop-blur-xl">
+  <label class="field-inline">
+    <span class="small-label">Sort</span>
+    <select class="market-api-input" id="trackerSortSelect">
+      <option value="closest">Closest to cash</option>
+      <option value="danger">Biggest risk</option>
+      <option value="live">Live first</option>
+      <option value="recent">Recently updated</option>
+      <option value="player">Player A-Z</option>
+    </select>
+  </label>
+  <label class="field-inline">
+    <span class="small-label">Group</span>
+    <select class="market-api-input" id="trackerGroupSelect">
+      <option value="game">By game</option>
+      <option value="status">By status</option>
+      <option value="none">No grouping</option>
+    </select>
+  </label>
+  <label class="field-inline">
+    <span class="small-label">Filter</span>
+    <select class="market-api-input" id="trackerFilterSelect">
+      <option value="all">All props</option>
+      <option value="live">Live only</option>
+      <option value="active">In progress</option>
+      <option value="pending">Pending only</option>
+      <option value="hit">Hit only</option>
+      <option value="busted">Busted only</option>
+    </select>
+  </label>
+  <div class="tracker-toolbar-summary" id="trackerBoardSummary">Standing by</div>
+</section>
 <div class="tracker-cards" id="trackerCards"></div>
 <div class="bet-finder-state empty-state-panel compact" id="trackerEmpty">
 <div class="empty-icon">📡</div>
@@ -1228,13 +1260,59 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
       <div id="btTierBreakdown" style="margin-top:12px"></div>
       <!-- Stat breakdown -->
       <div id="btStatBreakdown" style="margin-top:8px"></div>
+      <div class="backtest-breakdown-grid" style="margin-top:12px">
+        <div id="btSideBreakdown"></div>
+        <div id="btAlignmentBreakdown"></div>
+        <div id="btTopPlayers"></div>
+        <div id="btRecentForm"></div>
+      </div>
     </div>
 
     <!-- Log table -->
     <div id="backtestLogWrap" style="padding:0 20px 16px">
+      <div class="backtest-toolbar">
+        <label class="field-inline">
+          <span class="small-label">Search</span>
+          <input class="market-api-input" id="btFilterSearch" placeholder="Find player or note" type="text"/>
+        </label>
+        <label class="field-inline">
+          <span class="small-label">Result</span>
+          <select class="market-api-input" id="btFilterResult">
+            <option value="all">All</option>
+            <option value="pending">Pending</option>
+            <option value="hit">Hit</option>
+            <option value="miss">Miss</option>
+          </select>
+        </label>
+        <label class="field-inline">
+          <span class="small-label">Stat</span>
+          <select class="market-api-input" id="btFilterStat">
+            <option value="all">All stats</option>
+          </select>
+        </label>
+        <label class="field-inline">
+          <span class="small-label">Tier</span>
+          <select class="market-api-input" id="btFilterTier">
+            <option value="all">All tiers</option>
+          </select>
+        </label>
+        <label class="field-inline">
+          <span class="small-label">Side</span>
+          <select class="market-api-input" id="btFilterSide">
+            <option value="all">All sides</option>
+            <option value="OVER">Over</option>
+            <option value="UNDER">Under</option>
+          </select>
+        </label>
+      </div>
       <div id="backtestLog" style="margin-top:12px"></div>
       <div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap">
         <button class="secondary-btn" id="btRefreshBtn" style="font-size:12px;padding:6px 14px" type="button">↻ Refresh log</button>
+        <button class="secondary-btn" id="btExportBtn" style="font-size:12px;padding:6px 14px" type="button">Export CSV</button>
+        <label class="secondary-btn" style="font-size:12px;padding:6px 14px;cursor:pointer">
+          Import CSV
+          <input accept=".csv,text/csv" id="btImportInput" style="display:none" type="file"/>
+        </label>
         <button class="secondary-btn" id="btClearBtn" style="font-size:12px;padding:6px 14px;color:var(--bad)" type="button">Clear all</button>
       </div>
     </div>
@@ -1274,6 +1352,28 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 
     <!-- Saved keys list -->
     <div class="card rounded-[28px] border border-white/10 p-5">
+      <div class="kv-health-grid" id="kvHealthGrid">
+        <div class="kv-health-card">
+          <span class="small-label">Pool health</span>
+          <strong id="kvHealthHeadline">Waiting for keys</strong>
+          <small id="kvHealthDetail">Add and check keys to see vault health.</small>
+        </div>
+        <div class="kv-health-card">
+          <span class="small-label">Healthy</span>
+          <strong id="kvHealthyCount">0</strong>
+          <small>Ready for rotation</small>
+        </div>
+        <div class="kv-health-card">
+          <span class="small-label">Soft-disabled</span>
+          <strong id="kvSoftDisabledCount">0</strong>
+          <small>Low-credit reserve</small>
+        </div>
+        <div class="kv-health-card">
+          <span class="small-label">Unchecked</span>
+          <strong id="kvUncheckedCount">0</strong>
+          <small>Run Check credits</small>
+        </div>
+      </div>
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px">
         <div>
           <p class="section-kicker" style="margin:0">Saved Keys</p>

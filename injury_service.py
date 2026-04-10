@@ -565,10 +565,16 @@ class InjuryReportService:
                 fuzzy = team_fuzzy
         return fuzzy[0] if fuzzy else None
 
-    def search_report_payload_for_player(self, report_payload: dict[str, Any], player_name: str, team_name: str | None = None) -> dict[str, Any] | None:
+    def search_report_payload_for_player(
+        self,
+        report_payload: dict[str, Any],
+        player_name: str,
+        team_name: str | None = None,
+        game_date: str | None = None,
+    ) -> dict[str, Any] | None:
         player_key = normalize_report_person_name(player_name)
         wanted_team = str(team_name or "").strip()
-        rows = report_payload.get("rows") or []
+        rows = self.get_team_rows(report_payload, wanted_team, game_date=game_date) if wanted_team and game_date else (report_payload.get("rows") or [])
         candidates = [row for row in rows if row.get("player_key") == player_key]
 
         if wanted_team:
@@ -831,11 +837,11 @@ class InjuryReportService:
     def fetch_latest_report_payload(self) -> dict[str, Any]:
         return self.timed_call("fetch_latest_injury_report_payload")(self._fetch_latest_report_payload_impl)()
 
-    def build_availability_payload(self, player_name: str, team_name: str | None = None) -> dict[str, Any]:
+    def build_availability_payload(self, player_name: str, team_name: str | None = None, game_date: str | None = None) -> dict[str, Any]:
         report_payload = self.fetch_latest_report_payload()
         report_label = str(report_payload.get("report_label") or "")
         team_name = str(team_name or "").strip()
-        cache_key = (normalize_report_person_name(player_name), team_name, report_label)
+        cache_key = (normalize_report_person_name(player_name), team_name, str(game_date or "").strip(), report_label)
         cached = self.availability_cache.get(cache_key)
         if cached:
             return dict(cached)
@@ -856,7 +862,12 @@ class InjuryReportService:
             self.availability_cache[cache_key] = dict(result)
             return result
 
-        matched_row = self.search_report_payload_for_player(report_payload, player_name=player_name, team_name=team_name or None)
+        matched_row = self.search_report_payload_for_player(
+            report_payload,
+            player_name=player_name,
+            team_name=team_name or None,
+            game_date=game_date,
+        )
         if matched_row:
             status = str(matched_row.get("status") or "Unknown").strip()
             tone = "good" if status in self.good_statuses else "bad" if status in self.unavailable_statuses else "warning" if status in self.risky_statuses else "neutral"
@@ -876,7 +887,8 @@ class InjuryReportService:
             self.availability_cache[cache_key] = dict(result)
             return result
 
-        if team_name and team_name in set(report_payload.get("pending_teams") or []):
+        pending_teams = self.get_pending_teams(report_payload, game_date=game_date) if team_name else set()
+        if team_name and team_name in pending_teams:
             result = {
                 "status": "Pending report",
                 "tone": "warning",
