@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -11,6 +12,7 @@ import re
 import datetime as dt
 import time
 import threading
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -22,9 +24,19 @@ try:
     import pdfplumber  # type: ignore
 except Exception:
     pdfplumber = None
+try:
+    import psycopg2  # type: ignore
+    from psycopg2.extras import Json as PgJson  # type: ignore
+except Exception:
+    psycopg2 = None
+    PgJson = None
+try:
+    from dotenv import load_dotenv  # type: ignore
+except Exception:
+    load_dotenv = None
 
 from fastapi import Body, FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from nba_api.stats.endpoints import (
     CommonPlayerInfo,
@@ -38,6 +50,8 @@ from nba_api.stats.endpoints import (
 from nba_api.stats.static import players as static_players
 from nba_api.stats.static import teams as static_teams
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+from uuid import uuid4
 from identity_utils import (
     PlayerSearchIndex,
     build_player_name_variants,
@@ -63,6 +77,9 @@ LOGGER = logging.getLogger("nba_props_app")
 if not LOGGER.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
 
+if load_dotenv:
+    load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+
 NBA_TIMING_ENABLED = os.getenv("NBA_TIMING_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 NBA_TIMING_LOG_ALL = os.getenv("NBA_TIMING_LOG_ALL", "0").strip().lower() in {"1", "true", "yes", "on"}
 NBA_TIMING_SLOW_MS = float(os.getenv("NBA_TIMING_SLOW_MS", "800"))
@@ -86,7 +103,9 @@ WARM_CACHE_PRELOAD_TODAYS_GAMES = os.getenv("NBA_WARM_CACHE_PRELOAD_TODAYS_GAMES
 WARM_CACHE_PRELOAD_INJURIES = os.getenv("NBA_WARM_CACHE_PRELOAD_INJURIES", "1").strip().lower() not in {"0", "false", "no", "off"}
 WARM_CACHE_PRELOAD_PLAYERS = os.getenv("NBA_WARM_CACHE_PRELOAD_PLAYERS", "1").strip().lower() not in {"0", "false", "no", "off"}
 WARM_CACHE_PRELOAD_TEAMS = os.getenv("NBA_WARM_CACHE_PRELOAD_TEAMS", "1").strip().lower() not in {"0", "false", "no", "off"}
+WARM_CACHE_PRELOAD_TEAM_RANKS = os.getenv("NBA_WARM_CACHE_PRELOAD_TEAM_RANKS", "1").strip().lower() not in {"0", "false", "no", "off"}
 WARM_CACHE_PRELOAD_TEAM_ROSTERS = os.getenv("NBA_WARM_CACHE_PRELOAD_TEAM_ROSTERS", "1").strip().lower() not in {"0", "false", "no", "off"}
+WARM_CACHE_PRELOAD_TEAM_RANKS = os.getenv("NBA_WARM_CACHE_PRELOAD_TEAM_RANKS", "1").strip().lower() not in {"0", "false", "no", "off"}
 WARM_CACHE_TEAM_ROSTERS_MAX_WORKERS = max(1, int(os.getenv("NBA_WARM_CACHE_TEAM_ROSTERS_MAX_WORKERS", "2")))
 
 PERSISTENT_CACHE_DIR = BASE_DIR / ".runtime_cache"
@@ -101,14 +120,43 @@ PERSISTENT_CACHE_MAX_PLAYER_INFO = max(100, int(os.getenv("NBA_PERSISTENT_CACHE_
 PERSISTENT_CACHE_MAX_NEXT_GAMES = max(30, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_NEXT_GAMES", "240")))
 PERSISTENT_CACHE_LOCK = Lock()
 
+POSTGRES_DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+POSTGRES_CACHE_ENABLED = os.getenv("NBA_POSTGRES_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+POSTGRES_CACHE_WRITE_ENABLED = os.getenv("NBA_POSTGRES_CACHE_WRITE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+POSTGRES_CACHE_PRELOAD = os.getenv("NBA_POSTGRES_CACHE_PRELOAD", "1").strip().lower() not in {"0", "false", "no", "off"}
+POSTGRES_CACHE_PRELOAD_LIMIT = max(100, int(os.getenv("NBA_POSTGRES_CACHE_PRELOAD_LIMIT", "1500")))
+POSTGRES_CONNECT_TIMEOUT_SECONDS = max(2, int(os.getenv("NBA_POSTGRES_CONNECT_TIMEOUT_SECONDS", "5")))
+POSTGRES_MAX_WRITE_WORKERS = max(1, int(os.getenv("NBA_POSTGRES_MAX_WRITE_WORKERS", "2")))
+POSTGRES_WRITE_EXECUTOR = ThreadPoolExecutor(max_workers=POSTGRES_MAX_WRITE_WORKERS)
+POSTGRES_SOURCE_OF_TRUTH = os.getenv("NBA_POSTGRES_SOURCE_OF_TRUTH", "1").strip().lower() not in {"0", "false", "no", "off"}
+ASYNC_JOB_MAX_WORKERS = max(2, int(os.getenv("NBA_ASYNC_JOB_MAX_WORKERS", "4")))
+ASYNC_JOB_RETENTION = max(50, int(os.getenv("NBA_ASYNC_JOB_RETENTION", "200")))
+ASYNC_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=ASYNC_JOB_MAX_WORKERS)
+ASYNC_JOB_LOCK = Lock()
+ASYNC_JOB_REGISTRY: dict[str, dict[str, Any]] = {}
+POSTGRES_RETENTION_ODDS_DAYS = max(1, int(os.getenv("NBA_POSTGRES_RETENTION_ODDS_DAYS", "14")))
+POSTGRES_RETENTION_MARKET_SCAN_DAYS = max(1, int(os.getenv("NBA_POSTGRES_RETENTION_MARKET_SCAN_DAYS", "30")))
+POSTGRES_RETENTION_PARLAY_DAYS = max(1, int(os.getenv("NBA_POSTGRES_RETENTION_PARLAY_DAYS", "30")))
+POSTGRES_RETENTION_INJURY_DAYS = max(1, int(os.getenv("NBA_POSTGRES_RETENTION_INJURY_DAYS", "30")))
+POSTGRES_RETENTION_BACKTEST_DAYS = max(1, int(os.getenv("NBA_POSTGRES_RETENTION_BACKTEST_DAYS", "365")))
+POSTGRES_DEDUPE_ENABLED = os.getenv("NBA_POSTGRES_DEDUPE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+POSTGRES_BACKFILL_HASHES_ENABLED = os.getenv("NBA_POSTGRES_BACKFILL_HASHES_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+POSTGRES_BACKFILL_HASHES_LIMIT = max(100, int(os.getenv("NBA_POSTGRES_BACKFILL_HASHES_LIMIT", "5000")))
+ODDS_API_MAX_RETRIES = max(0, int(os.getenv("NBA_ODDS_API_MAX_RETRIES", "2")))
+ODDS_API_RETRY_BACKOFF_SECONDS = max(0.2, float(os.getenv("NBA_ODDS_API_RETRY_BACKOFF_SECONDS", "0.8")))
+
 WARM_CACHE_START_LOCK = threading.Lock()
 WARM_CACHE_STARTED = False
+WARM_CACHE_THREAD_LOCK = threading.Lock()
+WARM_CACHE_THREAD_STARTED = False
 
 def _warm_cache_task(name: str, func):
     try:
         start = time.perf_counter()
+        LOGGER.info("Warm-cache task %s started", name)
         func()
         elapsed_ms = (time.perf_counter() - start) * 1000.0
+        LOGGER.info("Warm-cache task %s ready in %.1f ms", name, elapsed_ms)
         if NBA_TIMING_LOG_ALL or elapsed_ms >= NBA_TIMING_SLOW_MS:
             LOGGER.info("TIMING warm_cache:%s took %.1f ms", name, elapsed_ms)
     except Exception as exc:
@@ -135,18 +183,26 @@ def save_persistent_caches() -> None:
 
 
 def load_persistent_caches() -> None:
+    named_targets = {
+        "roster_cache": ROSTER_CACHE,
+        "player_info_cache": PLAYER_INFO_CACHE,
+        "next_game_cache": NEXT_GAME_CACHE,
+        "team_next_game_cache": TEAM_NEXT_GAME_CACHE,
+    }
+    if POSTGRES_SOURCE_OF_TRUTH:
+        named_targets = {"roster_cache": ROSTER_CACHE}
     runtime_load_persistent_caches(
         enabled=PERSISTENT_CACHE_ENABLED,
         cache_path=PERSISTENT_CACHE_PATH,
         cache_lock=PERSISTENT_CACHE_LOCK,
-        named_targets={
-            "roster_cache": ROSTER_CACHE,
-            "player_info_cache": PLAYER_INFO_CACHE,
-            "next_game_cache": NEXT_GAME_CACHE,
-            "team_next_game_cache": TEAM_NEXT_GAME_CACHE,
-        },
+        named_targets=named_targets,
         logger=LOGGER,
     )
+    if PERSISTENT_CACHE_ENABLED and not POSTGRES_SOURCE_OF_TRUTH:
+        for cache in (PLAYER_INFO_CACHE, NEXT_GAME_CACHE, TEAM_NEXT_GAME_CACHE):
+            for entry in cache.values():
+                if isinstance(entry, dict) and "source" not in entry:
+                    entry["source"] = "persistent"
     if PERSISTENT_CACHE_ENABLED and PERSISTENT_CACHE_PATH.exists():
         LOGGER.info(
             "Loaded persistent cache snapshot: %s rosters, %s player info, %s next games, %s team next games",
@@ -155,6 +211,706 @@ def load_persistent_caches() -> None:
             len(NEXT_GAME_CACHE),
             len(TEAM_NEXT_GAME_CACHE),
         )
+
+
+def postgres_available() -> bool:
+    return bool(POSTGRES_DATABASE_URL and POSTGRES_CACHE_ENABLED and psycopg2)
+
+
+def postgres_connect():
+    return psycopg2.connect(POSTGRES_DATABASE_URL, connect_timeout=POSTGRES_CONNECT_TIMEOUT_SECONDS)
+
+
+def _coerce_datetime(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, dt.datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    return None
+
+
+def _datetime_to_ts(value: Any) -> float | None:
+    parsed = _coerce_datetime(value)
+    if not parsed:
+        return None
+    try:
+        return parsed.timestamp()
+    except Exception:
+        return None
+
+
+def _pg_read_latest_injury_report() -> tuple[dict[str, Any] | None, float | None]:
+    if not postgres_available():
+        return None, None
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT payload, report_timestamp, fetched_at
+                FROM injury_reports
+                ORDER BY COALESCE(report_timestamp, fetched_at) DESC NULLS LAST
+                LIMIT 1;
+                """
+            )
+            row = cur.fetchone()
+            if row and isinstance(row[0], dict):
+                payload = row[0]
+                report_ts = _datetime_to_ts(row[1])
+                fetched_ts = _datetime_to_ts(row[2])
+                return payload, (report_ts or fetched_ts)
+    except Exception as exc:
+        LOGGER.debug("Postgres injury report read failed: %s", exc)
+    return None, None
+
+
+def _pg_read_player_info(player_id: int) -> tuple[dict[str, Any] | None, float | None]:
+    if not postgres_available():
+        return None, None
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload, updated_at FROM player_info_cache WHERE player_id = %s;",
+                (int(player_id),),
+            )
+            row = cur.fetchone()
+            if row and isinstance(row[0], dict):
+                return row[0], _datetime_to_ts(row[1])
+    except Exception as exc:
+        LOGGER.debug("Postgres player_info read failed: %s", exc)
+    return None, None
+
+
+def _pg_read_game_log(player_id: int, season: str, season_type: str) -> tuple[list[dict[str, Any]] | None, float | None]:
+    if not postgres_available():
+        return None, None
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT payload, updated_at
+                FROM player_game_logs
+                WHERE player_id = %s AND season = %s AND season_type = %s AND schema_version = %s
+                ORDER BY updated_at DESC
+                LIMIT 1;
+                """,
+                (int(player_id), str(season), str(season_type), str(GAME_LOG_CACHE_SCHEMA_VERSION)),
+            )
+            row = cur.fetchone()
+            if row and isinstance(row[0], dict):
+                rows = row[0].get("rows") or []
+                if isinstance(rows, list) and rows:
+                    return rows, _datetime_to_ts(row[1])
+    except Exception as exc:
+        LOGGER.debug("Postgres game_log read failed: %s", exc)
+    return None, None
+
+
+def _pg_read_team_next_game(team_id: int, season: str, season_type: str) -> tuple[dict[str, Any] | None, float | None]:
+    if not postgres_available():
+        return None, None
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT payload, updated_at
+                FROM team_next_game_cache
+                WHERE team_id = %s AND season = %s AND season_type = %s
+                ORDER BY updated_at DESC
+                LIMIT 1;
+                """,
+                (int(team_id), str(season), str(season_type)),
+            )
+            row = cur.fetchone()
+            if row and isinstance(row[0], dict):
+                return row[0], _datetime_to_ts(row[1])
+    except Exception as exc:
+        LOGGER.debug("Postgres team_next_game read failed: %s", exc)
+    return None, None
+
+
+def init_postgres_cache() -> None:
+    if not postgres_available():
+        return
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS player_info_cache (
+                    player_id INTEGER PRIMARY KEY,
+                    payload JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS player_game_logs (
+                    player_id INTEGER NOT NULL,
+                    season TEXT NOT NULL,
+                    season_type TEXT NOT NULL,
+                    schema_version TEXT NOT NULL,
+                    payload JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (player_id, season, season_type, schema_version)
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS team_next_game_cache (
+                    team_id INTEGER NOT NULL,
+                    season TEXT NOT NULL,
+                    season_type TEXT NOT NULL,
+                    payload JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (team_id, season, season_type)
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS injury_reports (
+                    report_url TEXT PRIMARY KEY,
+                    report_timestamp TIMESTAMPTZ,
+                    report_label TEXT,
+                    payload JSONB NOT NULL,
+                    fetched_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS odds_snapshots (
+                    id BIGSERIAL PRIMARY KEY,
+                    endpoint TEXT NOT NULL,
+                    params JSONB,
+                    payload JSONB NOT NULL,
+                    payload_hash TEXT,
+                    fetched_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS market_scan_runs (
+                    id BIGSERIAL PRIMARY KEY,
+                    payload JSONB NOT NULL,
+                    payload_hash TEXT,
+                    requested_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS parlay_builder_runs (
+                    id BIGSERIAL PRIMARY KEY,
+                    payload JSONB NOT NULL,
+                    payload_hash TEXT,
+                    requested_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bet_finder_runs (
+                    id BIGSERIAL PRIMARY KEY,
+                    payload JSONB NOT NULL,
+                    payload_hash TEXT,
+                    requested_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """
+            )
+            cur.execute("ALTER TABLE odds_snapshots ADD COLUMN IF NOT EXISTS payload_hash TEXT;")
+            cur.execute("ALTER TABLE market_scan_runs ADD COLUMN IF NOT EXISTS payload_hash TEXT;")
+            cur.execute("ALTER TABLE parlay_builder_runs ADD COLUMN IF NOT EXISTS payload_hash TEXT;")
+            cur.execute("ALTER TABLE bet_finder_runs ADD COLUMN IF NOT EXISTS payload_hash TEXT;")
+            cur.execute("CREATE INDEX IF NOT EXISTS odds_snapshots_hash_idx ON odds_snapshots (endpoint, payload_hash);")
+            cur.execute("CREATE INDEX IF NOT EXISTS market_scan_hash_idx ON market_scan_runs (payload_hash);")
+            cur.execute("CREATE INDEX IF NOT EXISTS parlay_runs_hash_idx ON parlay_builder_runs (payload_hash);")
+            cur.execute("CREATE INDEX IF NOT EXISTS bet_finder_hash_idx ON bet_finder_runs (payload_hash);")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS backtest_log_entries (
+                    entry_id TEXT PRIMARY KEY,
+                    payload JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """
+            )
+        LOGGER.info("Postgres cache tables ready")
+    except Exception as exc:
+        LOGGER.warning("Postgres cache init failed: %s", exc)
+
+
+def _submit_pg_write(func, *args) -> None:
+    if not (postgres_available() and POSTGRES_CACHE_WRITE_ENABLED):
+        return
+    try:
+        POSTGRES_WRITE_EXECUTOR.submit(func, *args)
+    except Exception as exc:
+        LOGGER.debug("Postgres cache write skipped: %s", exc)
+
+
+def _prune_async_jobs() -> None:
+    with ASYNC_JOB_LOCK:
+        if len(ASYNC_JOB_REGISTRY) <= ASYNC_JOB_RETENTION:
+            return
+        # Remove oldest finished jobs first
+        finished = [k for k, v in ASYNC_JOB_REGISTRY.items() if v.get("status") in {"done", "error"}]
+        finished.sort(key=lambda k: ASYNC_JOB_REGISTRY[k].get("finished_at") or 0.0)
+        while len(ASYNC_JOB_REGISTRY) > ASYNC_JOB_RETENTION and finished:
+            ASYNC_JOB_REGISTRY.pop(finished.pop(0), None)
+
+
+def submit_async_job(job_type: str, func, payload: dict[str, Any]) -> dict[str, Any]:
+    job_id = uuid4().hex
+    now_ts = time.time()
+    with ASYNC_JOB_LOCK:
+        ASYNC_JOB_REGISTRY[job_id] = {
+            "id": job_id,
+            "type": job_type,
+            "status": "queued",
+            "created_at": now_ts,
+            "started_at": None,
+            "finished_at": None,
+            "result": None,
+            "error": None,
+        }
+
+    def _runner():
+        with ASYNC_JOB_LOCK:
+            ASYNC_JOB_REGISTRY[job_id]["status"] = "running"
+            ASYNC_JOB_REGISTRY[job_id]["started_at"] = time.time()
+        try:
+            result = func(payload)
+            with ASYNC_JOB_LOCK:
+                ASYNC_JOB_REGISTRY[job_id]["status"] = "done"
+                ASYNC_JOB_REGISTRY[job_id]["result"] = result
+                ASYNC_JOB_REGISTRY[job_id]["finished_at"] = time.time()
+        except Exception as exc:
+            with ASYNC_JOB_LOCK:
+                ASYNC_JOB_REGISTRY[job_id]["status"] = "error"
+                ASYNC_JOB_REGISTRY[job_id]["error"] = str(exc)
+                ASYNC_JOB_REGISTRY[job_id]["finished_at"] = time.time()
+        _prune_async_jobs()
+
+    ASYNC_JOB_EXECUTOR.submit(_runner)
+    return {"ok": True, "job_id": job_id, "status": "queued"}
+
+
+def get_async_job(job_id: str) -> dict[str, Any]:
+    with ASYNC_JOB_LOCK:
+        job = ASYNC_JOB_REGISTRY.get(job_id)
+        if not job:
+            return {"ok": False, "error": "Job not found."}
+        return {"ok": True, **job}
+
+
+def _pg_write_player_info(player_id: int, payload: dict[str, Any]) -> None:
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO player_info_cache (player_id, payload, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (player_id)
+                DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW();
+                """,
+                (int(player_id), PgJson(payload)),
+            )
+    except Exception as exc:
+        LOGGER.debug("Postgres player_info write failed: %s", exc)
+
+
+def _pg_write_game_log(player_id: int, season: str, season_type: str, schema_version: str, rows: list[dict[str, Any]]) -> None:
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO player_game_logs (player_id, season, season_type, schema_version, payload, updated_at)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (player_id, season, season_type, schema_version)
+                DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW();
+                """,
+                (int(player_id), str(season), str(season_type), str(schema_version), PgJson({"rows": rows})),
+            )
+    except Exception as exc:
+        LOGGER.debug("Postgres game_log write failed: %s", exc)
+
+
+def _pg_write_team_next_game(team_id: int, season: str, season_type: str, payload: dict[str, Any] | None) -> None:
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO team_next_game_cache (team_id, season, season_type, payload, updated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (team_id, season, season_type)
+                DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW();
+                """,
+                (int(team_id), str(season), str(season_type), PgJson(payload or {})),
+            )
+    except Exception as exc:
+        LOGGER.debug("Postgres team_next_game write failed: %s", exc)
+
+
+def _pg_write_injury_report(payload: dict[str, Any]) -> None:
+    try:
+        report_url = str(payload.get("report_url") or "")
+        if not report_url:
+            return
+        report_timestamp = payload.get("report_timestamp") or None
+        report_label = str(payload.get("report_label") or "")
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO injury_reports (report_url, report_timestamp, report_label, payload, fetched_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (report_url)
+                DO UPDATE SET payload = EXCLUDED.payload, report_timestamp = EXCLUDED.report_timestamp, report_label = EXCLUDED.report_label, fetched_at = NOW();
+                """,
+                (report_url, report_timestamp, report_label, PgJson(payload)),
+            )
+    except Exception as exc:
+        LOGGER.debug("Postgres injury report write failed: %s", exc)
+
+
+def _pg_write_odds_snapshot(endpoint: str, params: dict[str, Any] | None, payload: Any) -> None:
+    try:
+        payload_text = json.dumps({"endpoint": endpoint, "payload": payload}, sort_keys=True, default=str)
+        payload_hash = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+        with postgres_connect() as conn, conn.cursor() as cur:
+            if POSTGRES_DEDUPE_ENABLED:
+                cur.execute(
+                    "SELECT 1 FROM odds_snapshots WHERE endpoint = %s AND payload_hash = %s LIMIT 1;",
+                    (str(endpoint), payload_hash),
+                )
+                if cur.fetchone():
+                    return
+            cur.execute(
+                """
+                INSERT INTO odds_snapshots (endpoint, params, payload, payload_hash, fetched_at)
+                VALUES (%s, %s, %s, %s, NOW());
+                """,
+                (str(endpoint), PgJson(params or {}), PgJson(payload), payload_hash),
+            )
+    except Exception as exc:
+        LOGGER.debug("Postgres odds snapshot write failed: %s", exc)
+
+
+def _pg_write_market_scan_run(payload: dict[str, Any]) -> None:
+    try:
+        payload_text = json.dumps(payload, sort_keys=True, default=str)
+        payload_hash = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+        with postgres_connect() as conn, conn.cursor() as cur:
+            if POSTGRES_DEDUPE_ENABLED:
+                cur.execute(
+                    "SELECT 1 FROM market_scan_runs WHERE payload_hash = %s LIMIT 1;",
+                    (payload_hash,),
+                )
+                if cur.fetchone():
+                    return
+            cur.execute(
+                """
+                INSERT INTO market_scan_runs (payload, payload_hash, requested_at)
+                VALUES (%s, %s, NOW());
+                """,
+                (PgJson(payload), payload_hash),
+            )
+    except Exception as exc:
+        LOGGER.debug("Postgres market scan write failed: %s", exc)
+
+
+def _pg_write_parlay_builder_run(payload: dict[str, Any]) -> None:
+    try:
+        payload_text = json.dumps(payload, sort_keys=True, default=str)
+        payload_hash = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+        with postgres_connect() as conn, conn.cursor() as cur:
+            if POSTGRES_DEDUPE_ENABLED:
+                cur.execute(
+                    "SELECT 1 FROM parlay_builder_runs WHERE payload_hash = %s LIMIT 1;",
+                    (payload_hash,),
+                )
+                if cur.fetchone():
+                    return
+            cur.execute(
+                """
+                INSERT INTO parlay_builder_runs (payload, payload_hash, requested_at)
+                VALUES (%s, %s, NOW());
+                """,
+                (PgJson(payload), payload_hash),
+            )
+    except Exception as exc:
+        LOGGER.debug("Postgres parlay write failed: %s", exc)
+
+
+def _pg_read_parlay_builder_cache(request_payload: dict[str, Any]) -> dict[str, Any] | None:
+    if not postgres_available():
+        return None
+    try:
+        payload_text = json.dumps(request_payload, sort_keys=True, default=str)
+        payload_hash = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT payload
+                FROM parlay_builder_runs
+                WHERE payload_hash = %s
+                ORDER BY requested_at DESC
+                LIMIT 1;
+                """,
+                (payload_hash,),
+            )
+            row = cur.fetchone()
+            if row and isinstance(row[0], dict):
+                cached = copy.deepcopy(row[0])
+                cached["cache_hit"] = True
+                cached["cache_source"] = "postgres"
+                return cached
+    except Exception as exc:
+        LOGGER.debug("Postgres parlay cache read failed: %s", exc)
+    return None
+
+
+def _pg_write_bet_finder_run(payload: dict[str, Any]) -> None:
+    try:
+        payload_text = json.dumps(payload, sort_keys=True, default=str)
+        payload_hash = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+        with postgres_connect() as conn, conn.cursor() as cur:
+            if POSTGRES_DEDUPE_ENABLED:
+                cur.execute(
+                    "SELECT 1 FROM bet_finder_runs WHERE payload_hash = %s LIMIT 1;",
+                    (payload_hash,),
+                )
+                if cur.fetchone():
+                    return
+            cur.execute(
+                """
+                INSERT INTO bet_finder_runs (payload, payload_hash, requested_at)
+                VALUES (%s, %s, NOW());
+                """,
+                (PgJson(payload), payload_hash),
+            )
+    except Exception as exc:
+        LOGGER.debug("Postgres bet finder write failed: %s", exc)
+
+
+def _pg_write_backtest_entries(entries: list[dict[str, Any]]) -> None:
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            for entry in entries:
+                entry_id = str(entry.get("id") or "")
+                if not entry_id:
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO backtest_log_entries (entry_id, payload, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (entry_id)
+                    DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW();
+                    """,
+                    (entry_id, PgJson(entry)),
+                )
+    except Exception as exc:
+        LOGGER.debug("Postgres backtest entry write failed: %s", exc)
+
+
+def _pg_delete_backtest_entry(entry_id: str) -> None:
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM backtest_log_entries WHERE entry_id = %s;", (str(entry_id),))
+    except Exception as exc:
+        LOGGER.debug("Postgres backtest delete failed: %s", exc)
+
+
+def _pg_clear_backtest_entries() -> None:
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM backtest_log_entries;")
+    except Exception as exc:
+        LOGGER.debug("Postgres backtest clear failed: %s", exc)
+
+
+def preload_postgres_cache() -> None:
+    if not (postgres_available() and POSTGRES_CACHE_PRELOAD):
+        return
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT player_id, payload FROM player_info_cache ORDER BY updated_at DESC LIMIT %s;",
+                (POSTGRES_CACHE_PRELOAD_LIMIT,),
+            )
+            for player_id, payload in cur.fetchall():
+                if not isinstance(payload, dict):
+                    continue
+                PLAYER_INFO_CACHE[int(player_id)] = {"timestamp": time.time(), "row": payload}
+            cur.execute(
+                "SELECT player_id, season, season_type, schema_version, payload FROM player_game_logs ORDER BY updated_at DESC LIMIT %s;",
+                (POSTGRES_CACHE_PRELOAD_LIMIT,),
+            )
+            for player_id, season, season_type, schema_version, payload in cur.fetchall():
+                rows = (payload or {}).get("rows") if isinstance(payload, dict) else None
+                if not isinstance(rows, list):
+                    continue
+                GAME_LOG_CACHE[(int(player_id), str(season), str(season_type), str(schema_version))] = {
+                    "timestamp": time.time(),
+                    "rows": rows,
+                }
+            cur.execute(
+                "SELECT team_id, season, season_type, payload FROM team_next_game_cache ORDER BY updated_at DESC LIMIT %s;",
+                (POSTGRES_CACHE_PRELOAD_LIMIT,),
+            )
+            for team_id, season, season_type, payload in cur.fetchall():
+                TEAM_NEXT_GAME_CACHE[(int(team_id), str(season), str(season_type))] = {
+                    "timestamp": time.time(),
+                    "row": payload if isinstance(payload, dict) else {},
+                }
+            cur.execute(
+                """
+                SELECT report_url, report_timestamp, report_label, payload
+                FROM injury_reports
+                ORDER BY report_timestamp DESC NULLS LAST, fetched_at DESC
+                LIMIT 1;
+                """
+            )
+            latest_report = cur.fetchone()
+            if latest_report:
+                report_url, report_timestamp, report_label, payload = latest_report
+                if isinstance(payload, dict):
+                    INJURY_SERVICE.report_cache["timestamp"] = time.time()
+                    INJURY_SERVICE.report_cache["payload"] = {
+                        **payload,
+                        "report_url": report_url or payload.get("report_url"),
+                        "report_timestamp": str(report_timestamp) if report_timestamp else payload.get("report_timestamp"),
+                        "report_label": report_label or payload.get("report_label"),
+                        "source": payload.get("source") or "postgres-preload",
+                    }
+        LOGGER.info(
+            "Postgres cache preload complete: %d player info, %d game logs, %d team next games",
+            len(PLAYER_INFO_CACHE),
+            len(GAME_LOG_CACHE),
+            len(TEAM_NEXT_GAME_CACHE),
+        )
+    except Exception as exc:
+        LOGGER.warning("Postgres cache preload failed: %s", exc)
+
+
+def cleanup_postgres_retention() -> None:
+    if not postgres_available():
+        return
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM odds_snapshots WHERE fetched_at < NOW() - (%s || ' days')::interval;",
+                (str(POSTGRES_RETENTION_ODDS_DAYS),),
+            )
+            cur.execute(
+                "DELETE FROM market_scan_runs WHERE requested_at < NOW() - (%s || ' days')::interval;",
+                (str(POSTGRES_RETENTION_MARKET_SCAN_DAYS),),
+            )
+            cur.execute(
+                "DELETE FROM parlay_builder_runs WHERE requested_at < NOW() - (%s || ' days')::interval;",
+                (str(POSTGRES_RETENTION_PARLAY_DAYS),),
+            )
+            cur.execute(
+                "DELETE FROM injury_reports WHERE fetched_at < NOW() - (%s || ' days')::interval;",
+                (str(POSTGRES_RETENTION_INJURY_DAYS),),
+            )
+            cur.execute(
+                "DELETE FROM backtest_log_entries WHERE updated_at < NOW() - (%s || ' days')::interval;",
+                (str(POSTGRES_RETENTION_BACKTEST_DAYS),),
+            )
+        LOGGER.info("Postgres retention cleanup completed")
+    except Exception as exc:
+        LOGGER.warning("Postgres retention cleanup failed: %s", exc)
+
+
+def backfill_postgres_hashes() -> None:
+    if not (postgres_available() and POSTGRES_BACKFILL_HASHES_ENABLED):
+        return
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM information_schema.columns WHERE table_name='odds_snapshots' AND column_name='payload_hash';"
+            )
+            if not cur.fetchone():
+                LOGGER.info("Postgres hash backfill skipped: odds_snapshots.payload_hash missing")
+                return
+            cur.execute(
+                """
+                SELECT id, endpoint, payload
+                FROM odds_snapshots
+                WHERE payload_hash IS NULL
+                ORDER BY id ASC
+                LIMIT %s;
+                """,
+                (POSTGRES_BACKFILL_HASHES_LIMIT,),
+            )
+            for row_id, endpoint, payload in cur.fetchall():
+                payload_text = json.dumps({"endpoint": endpoint, "payload": payload}, sort_keys=True, default=str)
+                payload_hash = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+                cur.execute(
+                    "UPDATE odds_snapshots SET payload_hash = %s WHERE id = %s;",
+                    (payload_hash, row_id),
+                )
+
+            cur.execute(
+                "SELECT 1 FROM information_schema.columns WHERE table_name='market_scan_runs' AND column_name='payload_hash';"
+            )
+            if not cur.fetchone():
+                LOGGER.info("Postgres hash backfill skipped: market_scan_runs.payload_hash missing")
+                return
+            cur.execute(
+                """
+                SELECT id, payload
+                FROM market_scan_runs
+                WHERE payload_hash IS NULL
+                ORDER BY id ASC
+                LIMIT %s;
+                """,
+                (POSTGRES_BACKFILL_HASHES_LIMIT,),
+            )
+            for row_id, payload in cur.fetchall():
+                payload_text = json.dumps(payload, sort_keys=True, default=str)
+                payload_hash = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+                cur.execute(
+                    "UPDATE market_scan_runs SET payload_hash = %s WHERE id = %s;",
+                    (payload_hash, row_id),
+                )
+
+            cur.execute(
+                "SELECT 1 FROM information_schema.columns WHERE table_name='parlay_builder_runs' AND column_name='payload_hash';"
+            )
+            if not cur.fetchone():
+                LOGGER.info("Postgres hash backfill skipped: parlay_builder_runs.payload_hash missing")
+                return
+            cur.execute(
+                """
+                SELECT id, payload
+                FROM parlay_builder_runs
+                WHERE payload_hash IS NULL
+                ORDER BY id ASC
+                LIMIT %s;
+                """,
+                (POSTGRES_BACKFILL_HASHES_LIMIT,),
+            )
+            for row_id, payload in cur.fetchall():
+                payload_text = json.dumps(payload, sort_keys=True, default=str)
+                payload_hash = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+                cur.execute(
+                    "UPDATE parlay_builder_runs SET payload_hash = %s WHERE id = %s;",
+                    (payload_hash, row_id),
+                )
+        LOGGER.info("Postgres hash backfill completed")
+    except Exception as exc:
+        LOGGER.warning("Postgres hash backfill failed: %s", exc)
 
 
 def preload_team_rosters_for_current_season() -> None:
@@ -179,8 +935,26 @@ def preload_team_rosters_for_current_season() -> None:
         for future in as_completed(futures):
             try:
                 future.result()
-            except Exception:
-                pass
+            except Exception as exc:
+                LOGGER.debug("Postgres team_next_game read failed: %s", exc)
+
+
+def _warm_team_rank_map() -> None:
+    season = current_nba_season()
+    try:
+        build_team_rank_map(season=season, season_type="Regular Season")
+        LOGGER.info("Warm-cache team ranks ready for %s", season)
+    except Exception as exc:
+        LOGGER.warning("Warm-cache team ranks failed for %s: %s", season, exc)
+
+
+def is_nba_game_day() -> bool:
+    """Return True if there are NBA games scheduled today."""
+    try:
+        games = fetch_scoreboard_games(_today_scoreboard_date())
+        return len(games) > 0
+    except Exception:
+        return False
 
 
 def warm_cache_on_startup() -> None:
@@ -206,10 +980,27 @@ def warm_cache_on_startup() -> None:
         tasks.append(("todays_games", lambda: fetch_scoreboard_games(_today_scoreboard_date())))
 
     if WARM_CACHE_PRELOAD_INJURIES:
-        tasks.append(("injuries", lambda: fetch_latest_injury_report_payload()))
+        tasks.append(("injuries", lambda: get_cached_injury_report_payload()))
+
+    # Tighten injury report refresh interval on game days (3 min vs 10 min).
+    # Done after tasks are defined so it runs in the background thread,
+    # not at module import time.
+    def _adjust_injury_ttl() -> None:
+        try:
+            if is_nba_game_day():
+                INJURY_SERVICE.report_ttl_seconds = 180
+                LOGGER.info("Game day detected — injury TTL set to 180s")
+            else:
+                LOGGER.info("Off day — injury TTL stays at %ss", INJURY_SERVICE.report_ttl_seconds)
+        except Exception as exc:
+            LOGGER.warning("Could not detect game day for injury TTL: %s", exc)
+
+    tasks.append(("injury_ttl", _adjust_injury_ttl))
 
     if WARM_CACHE_PRELOAD_TEAM_ROSTERS:
         tasks.append(("team_rosters", preload_team_rosters_for_current_season))
+    if WARM_CACHE_PRELOAD_TEAM_RANKS:
+        tasks.append(("team_ranks", _warm_team_rank_map))
 
     if not tasks:
         return
@@ -230,7 +1021,34 @@ def warm_cache_on_startup() -> None:
             except Exception as exc:
                 LOGGER.warning("Warm-cache future %s failed: %s", future_map[future], exc)
 
-app = FastAPI(title="NBA Props Bar Chart App")
+
+def start_warm_cache_background() -> None:
+    global WARM_CACHE_THREAD_STARTED
+    if not WARM_CACHE_ON_STARTUP_ENABLED:
+        return
+    with WARM_CACHE_THREAD_LOCK:
+        if WARM_CACHE_THREAD_STARTED:
+            return
+        WARM_CACHE_THREAD_STARTED = True
+    thread = threading.Thread(target=warm_cache_on_startup, name="warm-cache-startup", daemon=True)
+    thread.start()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_postgres_cache()
+    preload_postgres_cache()
+    backfill_postgres_hashes()
+    cleanup_postgres_retention()
+    _load_key_vault_state()
+    _load_backtest_log()
+    _load_favorites_state()
+    _load_tracker_state()
+    start_hybrid_refresh_workers()
+    start_warm_cache_background()
+    yield
+
+
+app = FastAPI(title="NBA Props Bar Chart App", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 STAT_MAP = {
@@ -276,7 +1094,7 @@ PLAYER_INFO_CACHE: dict[int, dict[str, Any]] = {}
 NEXT_GAME_CACHE: dict[tuple[int, str, str], dict[str, Any]] = {}
 TEAM_NEXT_GAME_CACHE: dict[tuple[int, str, str], dict[str, Any]] = {}
 POSITION_DASH_CACHE: dict[tuple[str, str, str, int], dict[str, Any]] = {}
-POSITION_SUMMARY_CACHE: dict[tuple[str, int, str], dict[str, Any]] = {}
+POSITION_SUMMARY_CACHE: dict[tuple[str, str, str, str, int], dict[str, Any]] = {}
 POSITION_MATCHUP_CACHE: dict[tuple[int, str, str, str, str], dict[str, Any]] = {}
 POSITION_DASH_FAILURE_META: dict[tuple[str, str, str, int], dict[str, float]] = {}
 POSITION_DASH_FAILURE_COOLDOWN_SECONDS = 300
@@ -294,8 +1112,8 @@ SCOREBOARD_CACHE: dict[str, dict[str, Any]] = {}
 ENRICHED_LOG_CACHE: dict[tuple[int, str, str, int | None], dict[str, Any]] = {}
 ANALYSIS_CACHE_TTL_SECONDS = 7200
 ANALYSIS_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
-TEAM_OPPORTUNITY_CACHE: dict[tuple[str, str, str, str], dict[str, Any]] = {}
-INJURY_REPORT_TTL_SECONDS = 600
+TEAM_OPPORTUNITY_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+INJURY_REPORT_TTL_SECONDS = max(300, int(os.getenv("NBA_INJURY_REPORT_TTL_SECONDS", "1800")))
 REQUEST_LOCK = Lock()
 LAST_REQUEST_TIME = 0.0
 
@@ -594,6 +1412,19 @@ def get_team_next_game_hybrid(team_id: int | None, primary_player_id: int, seaso
 
 
 def build_h2h_payload_from_rows(rows_source: list[dict[str, Any]], next_game: dict[str, Any] | None, stat: str, line: float) -> dict[str, Any]:
+    def _extract_opponent_from_label(label: str) -> str:
+        cleaned = str(label or "").strip().upper()
+        if not cleaned:
+            return ""
+        if cleaned.startswith("VS "):
+            return cleaned.replace("VS ", "", 1).strip()
+        if cleaned.startswith("@ "):
+            return cleaned.replace("@ ", "", 1).strip()
+        if " VS " in cleaned or " @ " in cleaned:
+            parsed = parse_matchup_descriptor(cleaned.replace(" VS ", " vs. ").replace(" @ ", " @ "))
+            return str(parsed.get("opponent_abbreviation") or "").upper().strip()
+        return ""
+
     payload = {
         "opponent_name": next_game.get("opponent_name") if next_game else "",
         "opponent_abbreviation": next_game.get("opponent_abbreviation") if next_game else "",
@@ -603,9 +1434,20 @@ def build_h2h_payload_from_rows(rows_source: list[dict[str, Any]], next_game: di
         "average": 0.0,
         "games": [],
     }
-    if not next_game or not next_game.get("opponent_abbreviation"):
+    if not next_game:
         return payload
     opponent_abbreviation = str(next_game.get("opponent_abbreviation") or "").upper().strip()
+    player_team_abbreviation = str(next_game.get("player_team_abbreviation") or "").upper().strip()
+    if not player_team_abbreviation and rows_source:
+        parsed = parse_matchup_descriptor(str(rows_source[0].get("MATCHUP") or ""))
+        player_team_abbreviation = str(parsed.get("team_abbreviation") or "").upper().strip()
+    if (not opponent_abbreviation or (player_team_abbreviation and opponent_abbreviation == player_team_abbreviation)) and next_game.get("opponent_team_id"):
+        opponent_team = TEAM_LOOKUP.get(int(next_game.get("opponent_team_id") or 0), {})
+        opponent_abbreviation = str(opponent_team.get("abbreviation") or "").upper().strip()
+    if not opponent_abbreviation or (player_team_abbreviation and opponent_abbreviation == player_team_abbreviation):
+        opponent_abbreviation = _extract_opponent_from_label(str(next_game.get("matchup_label") or ""))
+    if not opponent_abbreviation:
+        return payload
     h2h_rows = [row for row in (rows_source or []) if opponent_abbreviation and opponent_abbreviation in str(row.get("MATCHUP") or "").upper()]
     if not h2h_rows:
         return payload
@@ -806,6 +1648,27 @@ def devig_two_way_market(over_odds: float | None, under_odds: float | None) -> d
     }
 
 
+def fair_implied_probabilities(over_odds: float | None, under_odds: float | None) -> dict[str, float | None]:
+    over_raw = decimal_implied_probability(over_odds)
+    under_raw = decimal_implied_probability(under_odds)
+    devig = devig_two_way_market(over_odds, under_odds)
+    if devig:
+        return {
+            "over": devig.get("over_fair_prob"),
+            "under": devig.get("under_fair_prob"),
+            "over_raw": over_raw,
+            "under_raw": under_raw,
+            "hold": devig.get("hold"),
+        }
+    return {
+        "over": over_raw,
+        "under": under_raw,
+        "over_raw": over_raw,
+        "under_raw": under_raw,
+        "hold": None,
+    }
+
+
 def build_event_market_context(event_payload: dict[str, Any]) -> dict[str, Any]:
     home_team = str(event_payload.get("home_team") or "").strip()
     away_team = str(event_payload.get("away_team") or "").strip()
@@ -950,6 +1813,20 @@ def resolve_team_from_text(team_text: str | None) -> dict[str, Any] | None:
     return TEAM_ALIAS_LOOKUP.get(normalize_name(team_text))
 
 
+def canonicalize_team_name(team_name: str | None, team_id: int | None = None) -> str:
+    if team_id:
+        resolved = TEAM_LOOKUP.get(int(team_id))
+        if resolved:
+            return str(resolved.get("full_name") or "").strip()
+    raw = str(team_name or "").strip()
+    if not raw:
+        return ""
+    resolved = resolve_team_from_text(raw)
+    if resolved:
+        return str(resolved.get("full_name") or raw).strip()
+    return raw
+
+
 def resolve_opponent_team_from_matchup(matchup: str, player_team_id: int | None) -> dict[str, Any] | None:
     info = parse_matchup_descriptor(matchup)
     team_abbr = info.get("team_abbreviation", "")
@@ -997,9 +1874,12 @@ def estimate_model_probabilities(
     variance = variance or {}
 
     base = hit_rate_pct / 100.0
+    # Recalibrate so deviations from 50% carry more weight (but avoid extremes).
+    base = 0.5 + (base - 0.5) * 1.20
+    base = clamp(base, 0.02, 0.98)
     edge_term = 0.0
-    scale = max(1.0, max(line, 1.0) * 0.18)
-    edge_term += clamp((average - line) / scale, -0.18, 0.18)
+    scale = max(1.0, max(line, 1.0) * 0.14)
+    edge_term += clamp((average - line) / scale, -0.22, 0.22)
 
     variance_adjustment = 0.0
     if variance:
@@ -1049,6 +1929,47 @@ def estimate_model_probabilities(
         environment_term += 0.02
     market_signal = derive_market_environment_signal(stat, environment)
     environment_term += float(market_signal.get("over_adjustment") or 0.0)
+    # Pace signal: faster pace nudges volume stats upward, slower pace nudges downward.
+    pace_proxy = safe_float_or_none(environment.get("combined_pace_proxy"))
+    if pace_proxy is not None:
+        scoring_stats = {"PTS", "3PM", "PRA", "PR", "PA"}
+        playmaking_stats = {"AST", "PA", "PRA"}
+        rebound_stats = {"REB", "RA", "PR", "PRA"}
+        pace_delta = pace_proxy - 99.5
+        if stat in scoring_stats:
+            environment_term += clamp(pace_delta * 0.004, -0.04, 0.04)
+        elif stat in playmaking_stats:
+            environment_term += clamp(pace_delta * 0.003, -0.03, 0.03)
+        elif stat in rebound_stats:
+            environment_term += clamp(pace_delta * 0.0025, -0.025, 0.025)
+    # Home/away split: mild home boost, mild away drag (most impact on volume stats).
+    is_home = environment.get("is_home")
+    if is_home is not None:
+        scoring_stats = {"PTS", "3PM", "PRA", "PR", "PA"}
+        playmaking_stats = {"AST", "PA", "PRA"}
+        rebound_stats = {"REB", "RA", "PR", "PRA"}
+        home_sign = 1.0 if bool(is_home) else -1.0
+        if stat in scoring_stats:
+            environment_term += 0.015 * home_sign
+        elif stat in playmaking_stats:
+            environment_term += 0.010 * home_sign
+        elif stat in rebound_stats:
+            environment_term += 0.008 * home_sign
+    # Opponent rank weighting: strong opponents slightly suppress, weak opponents slightly lift.
+    opponent_rank = safe_int_score(environment.get("opponent_rank"))
+    if opponent_rank > 0:
+        clamped_rank = min(30, max(1, opponent_rank))
+        rank_strength = (31 - clamped_rank) / 30.0  # 1.0 = strongest, 0.0 = weakest
+        rank_delta = 0.5 - rank_strength  # negative for strong, positive for weak
+        scoring_stats = {"PTS", "3PM", "PRA", "PR", "PA"}
+        playmaking_stats = {"AST", "PA", "PRA"}
+        rebound_stats = {"REB", "RA", "PR", "PRA"}
+        if stat in scoring_stats:
+            environment_term += clamp(rank_delta * 0.06, -0.03, 0.03)
+        elif stat in playmaking_stats:
+            environment_term += clamp(rank_delta * 0.045, -0.022, 0.022)
+        elif stat in rebound_stats:
+            environment_term += clamp(rank_delta * 0.04, -0.02, 0.02)
 
     model_over = clamp(base + edge_term + matchup_term + role_term + environment_term + variance_adjustment, 0.02, 0.98)
     return round(model_over, 4), round(1 - model_over, 4)
@@ -1118,6 +2039,21 @@ def summarize_position_environment(rows: list[dict[str, Any]], stat: str) -> dic
     }
 
 
+def _get_cached_position_summary(cache_key: tuple[str, str, str, str, int], now_ts: float) -> dict[str, Any] | None:
+    cached = POSITION_SUMMARY_CACHE.get(cache_key)
+    if not cached:
+        return None
+    cached_ts = float(cached.get("timestamp") or 0.0)
+    if now_ts - cached_ts > POSITION_DASH_MAX_STALE_SECONDS:
+        return None
+    summary = cached.get("summary")
+    return dict(summary) if isinstance(summary, dict) else None
+
+
+def _set_position_summary_cache(cache_key: tuple[str, str, str, str, int], summary: dict[str, Any], now_ts: float) -> None:
+    POSITION_SUMMARY_CACHE[cache_key] = {"timestamp": now_ts, "summary": dict(summary)}
+
+
 def build_position_matchup(
     opponent_team_id: int,
     position_code: str,
@@ -1142,10 +2078,44 @@ def build_position_matchup(
     league_rows = fetch_position_dash(normalized_season, normalized_season_type, normalized_position, opponent_team_id=0)
     opponent_rows = fetch_position_dash(normalized_season, normalized_season_type, normalized_position, opponent_team_id=int(opponent_team_id))
     league_summary = summarize_position_environment(league_rows, normalized_stat)
+    league_cache_key = (normalized_season, normalized_season_type, normalized_position, normalized_stat, 0)
+    if league_summary:
+        _set_position_summary_cache(league_cache_key, league_summary, now_ts)
+    else:
+        league_summary = _get_cached_position_summary(league_cache_key, now_ts)
+
     opponent_summary = summarize_position_environment(opponent_rows, normalized_stat)
-    if not league_summary or not opponent_summary:
+    opponent_cache_key = (normalized_season, normalized_season_type, normalized_position, normalized_stat, int(opponent_team_id))
+    if opponent_summary:
+        _set_position_summary_cache(opponent_cache_key, opponent_summary, now_ts)
+    else:
+        opponent_summary = _get_cached_position_summary(opponent_cache_key, now_ts)
+
+    if not league_summary:
         POSITION_MATCHUP_CACHE[cache_key] = {"timestamp": now_ts, "payload": None}
         return None
+    # Fallback to league-average when opponent matchup data is unavailable.
+    if not opponent_summary:
+        league_average = float(league_summary.get("per_player_game") or 0.0)
+        if league_average <= 0:
+            POSITION_MATCHUP_CACHE[cache_key] = {"timestamp": now_ts, "payload": None}
+            return None
+        fallback_payload = {
+            "opponent_team_id": int(opponent_team_id),
+            "position_code": normalized_position,
+            "position_label": POSITION_LABELS.get(normalized_position, normalized_position),
+            "stat": normalized_stat,
+            "opponent_value": round(league_average, 2),
+            "league_average": round(league_average, 2),
+            "delta_pct": 0.0,
+            "sample_gp": round(float(league_summary.get("sample_gp") or 0.0), 1),
+            "players_count": int(league_summary.get("players_count") or 0),
+            "lean": "Neutral",
+            "lean_tone": "neutral",
+            "fallback": True,
+        }
+        POSITION_MATCHUP_CACHE[cache_key] = {"timestamp": now_ts, "payload": dict(fallback_payload)}
+        return dict(fallback_payload)
 
     league_average = float(league_summary.get("per_player_game") or 0.0)
     opponent_value = float(opponent_summary.get("per_player_game") or 0.0)
@@ -1195,6 +2165,8 @@ def build_prop_analysis_payload(
     last_n: int,
     season: str,
     season_type: str,
+    over_odds: float | None = None,
+    under_odds: float | None = None,
     team_id: int | None = None,
     player_position: str | None = None,
     location: str = "all",
@@ -1213,10 +2185,18 @@ def build_prop_analysis_payload(
     without_player_names: list[str] | None = None,
     debug: bool = False,
     override_opponent_id: int | None = None,
+    populate_player_info_cache: bool = False,
 ) -> dict[str, Any]:
     player = PLAYER_LOOKUP.get(int(player_id))
     if not player:
         raise HTTPException(status_code=404, detail="Player not found.")
+    if populate_player_info_cache:
+        try:
+            cached_row = fetch_common_player_info(player_id)
+            if isinstance(cached_row, dict) and postgres_available():
+                _submit_pg_write(_pg_write_player_info, player_id, cached_row)
+        except Exception as exc:
+            LOGGER.debug("Postgres game_log read failed: %s", exc)
 
     normalized_without_player_ids = normalize_without_player_ids(without_player_ids)
     if not normalized_without_player_ids and without_player_id:
@@ -1288,7 +2268,7 @@ def build_prop_analysis_payload(
     position_code, position_label = resolve_primary_position(resolved_position)
 
     next_game_meta = {"source": "live", "seconds_ago": None, "refresh_queued": False}
-    if override_opponent_id and override_opponent_id != 0:
+    if override_opponent_id and override_opponent_id != 0 and (resolved_team_id is None or int(override_opponent_id) != int(resolved_team_id)):
         override_opp = TEAM_LOOKUP.get(int(override_opponent_id))
         if override_opp:
             player_team = TEAM_LOOKUP.get(resolved_team_id, {}) if resolved_team_id else {}
@@ -1362,6 +2342,15 @@ def build_prop_analysis_payload(
     analysis_source_rows = filtered_pool or enriched_rows or season_rows
     opportunity = build_opportunity_context(analysis_source_rows, last_n)
     team_context = build_team_opportunity_context(team_name=team_name, player_name=player["full_name"], stat=stat, player_position=resolved_position, team_id=resolved_team_id, season=season)
+    if debug:
+        team_context = {
+            **team_context,
+            "debug": {
+                "resolved_team_name": team_name or "",
+                "matched_injury_rows": list(team_context.get("players") or []),
+                "impact_count": int(team_context.get("impact_count") or 0),
+            },
+        }
     environment = build_game_environment_context(analysis_source_rows, next_game, team_id=resolved_team_id, season=season, season_type=season_type)
     matchup_delta_pct = (vs_position or {}).get("delta_pct") if isinstance(vs_position, dict) else None
     model_over, model_under = estimate_model_probabilities(
@@ -1375,10 +2364,26 @@ def build_prop_analysis_payload(
         environment=environment,
         variance=variance_data,
     )
+    market_probs = fair_implied_probabilities(over_odds, under_odds)
+    implied_over = market_probs.get("over")
+    implied_under = market_probs.get("under")
+    model_over, model_under = apply_market_probability_penalty(
+        model_over,
+        model_under,
+        implied_over=implied_over,
+        implied_under=implied_under,
+    )
     recommended_side = "OVER" if model_over >= model_under else "UNDER"
     side_model_prob = model_over if recommended_side == "OVER" else model_under
     chosen_edge = round((side_model_prob - 0.50) * 100, 1)
-    chosen_ev = side_model_prob - 0.50
+    # Use actual odds-adjusted EV: (prob × decimal_odds) - 1
+    # convert_american_to_decimal is defined later in this file.
+    _chosen_odds_raw = over_odds if recommended_side == "OVER" else under_odds
+    _chosen_decimal = convert_american_to_decimal(_chosen_odds_raw)
+    if _chosen_decimal and _chosen_decimal > 1.0:
+        chosen_ev = round((side_model_prob * _chosen_decimal) - 1.0, 4)
+    else:
+        chosen_ev = round(side_model_prob - 0.50, 4)
     confidence_engine = build_confidence_engine(
         side=recommended_side,
         hit_rate=float(hit_rate),
@@ -1486,7 +2491,7 @@ def build_prop_analysis_payload(
         "filtered_pool_count": len(filtered_pool),
         "season_pool_count": len(season_rows),
         "variance": variance_data,
-        "sample_warning": f"Only {len(values)} games in filtered sample â€” treat recommendation with caution." if len(values) < 5 else None,
+        "sample_warning": f"Only {len(values)} games in filtered sample — treat recommendation with caution." if len(values) < 5 else None,
     }
     freshness = {
         "game_log_seconds_ago": round(time.time() - float((GAME_LOG_CACHE.get((player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)) or {}).get("timestamp") or 0.0), 2) if GAME_LOG_CACHE.get((player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)) else None,
@@ -1499,6 +2504,10 @@ def build_prop_analysis_payload(
         "next_game_source": next_game_meta.get("source"),
         "next_game_refresh_queued": next_game_meta.get("refresh_queued"),
         "injury_report_seconds_ago": INJURY_SERVICE.report_cache_age_seconds(),
+        "injury_report_source": (INJURY_SERVICE.report_cache.get("payload") or {}).get("source"),
+        "game_log_cache_source": (GAME_LOG_CACHE.get((player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)) or {}).get("source"),
+        "player_info_cache_source": (PLAYER_INFO_CACHE.get(player_id) or {}).get("source"),
+        "next_game_cache_source": (TEAM_NEXT_GAME_CACHE.get((resolved_team_id, season, season_type)) or {}).get("source"),
     }
     payload["freshness"] = dict(freshness)
     if debug and DEBUG_METADATA_ENABLED:
@@ -1565,7 +2574,43 @@ def try_direct_report_match(report_text: str, player_name: str, team_name: str |
 
 
 def fetch_latest_injury_report_payload() -> dict[str, Any]:
-    return INJURY_SERVICE.fetch_latest_report_payload()
+    payload = INJURY_SERVICE.fetch_latest_report_payload()
+    if payload.get("ok"):
+        _submit_pg_write(_pg_write_injury_report, payload)
+    return payload
+
+
+def get_cached_injury_report_payload(force: bool = False) -> dict[str, Any]:
+    cached_payload = INJURY_SERVICE.report_cache.get("payload")
+    cached_ts = float(INJURY_SERVICE.report_cache.get("timestamp") or 0.0)
+    if not force:
+        if POSTGRES_SOURCE_OF_TRUTH:
+            pg_payload, pg_ts = _pg_read_latest_injury_report()
+            if isinstance(pg_payload, dict) and pg_payload.get("ok"):
+                pg_age = time.time() - float(pg_ts or 0.0) if pg_ts else None
+                if pg_age is not None and pg_age <= INJURY_REPORT_TTL_SECONDS:
+                    cached_copy = dict(pg_payload)
+                    cached_copy["source"] = cached_copy.get("source") or "postgres"
+                    INJURY_SERVICE.report_cache["timestamp"] = float(pg_ts or time.time())
+                    INJURY_SERVICE.report_cache["payload"] = cached_copy
+                    return cached_copy
+            if isinstance(cached_payload, dict) and cached_payload.get("ok"):
+                age_seconds = INJURY_SERVICE.report_cache_age_seconds()
+                if age_seconds is not None and age_seconds <= INJURY_REPORT_TTL_SECONDS:
+                    return cached_payload
+        else:
+            if isinstance(cached_payload, dict) and cached_payload.get("ok"):
+                age_seconds = INJURY_SERVICE.report_cache_age_seconds()
+                if age_seconds is not None and age_seconds <= INJURY_REPORT_TTL_SECONDS:
+                    return cached_payload
+            pg_payload, pg_ts = _pg_read_latest_injury_report()
+            if isinstance(pg_payload, dict) and pg_payload.get("ok"):
+                cached_copy = dict(pg_payload)
+                cached_copy["source"] = cached_copy.get("source") or "postgres"
+                INJURY_SERVICE.report_cache["timestamp"] = float(pg_ts or time.time())
+                INJURY_SERVICE.report_cache["payload"] = cached_copy
+                return cached_copy
+    return fetch_latest_injury_report_payload()
 
 
 def build_availability_payload(player_name: str, team_name: str | None = None, game_date: str | None = None) -> dict[str, Any]:
@@ -1617,16 +2662,16 @@ def build_confidence_engine(
     raw_line_delta = round(avg_value - line_value, 2) if line is not None and average is not None else 0.0
     line_delta = raw_line_delta if side == 'OVER' else -raw_line_delta
 
-    form_component = max(-12.0, min(16.0, (hit_rate - 50.0) * 0.46))
-    sample_component = max(-4.0, min(6.0, (games_count - 5) * 0.55))
-    ev_component = max(-14.0, min(16.0, ev * 100.0))
-    edge_component = max(-12.0, min(14.0, edge_value * 0.9))
-    line_value_component = max(-9.0, min(10.0, line_delta * 2.2))
+    form_component = max(-10.0, min(14.0, (hit_rate - 50.0) * 0.42))
+    sample_component = max(-4.0, min(6.0, (games_count - 5) * 0.5))
+    ev_component = max(-12.0, min(14.0, ev * 85.0))
+    edge_component = max(-10.0, min(12.0, edge_value * 0.8))
+    line_value_component = max(-8.0, min(9.0, line_delta * 1.8))
 
     matchup_component = 0.0
     tags: list[str] = []
     if matchup_delta_pct is not None:
-        matchup_component = max(-18.0, min(12.0, matchup_value * 0.52))
+        matchup_component = max(-16.0, min(14.0, matchup_value * 0.5))
         if matchup_value >= 10:
             tags.append('Soft position matchup')
         elif matchup_value >= 4:
@@ -1679,21 +2724,27 @@ def build_confidence_engine(
         availability_component -= 12.0
         tags.append('Player status risk')
 
+    # market_component is zeroed here — the same market signal already adjusts
+    # the model probability inside estimate_model_probabilities() via environment_term.
+    # Counting it again in the confidence score would double-penalize/boost every prop.
+    # Tags and summary text from the signal are still applied for UI context.
     market_signal = derive_market_environment_signal(stat, environment)
-    market_component = max(
-        -8.0,
-        min(8.0, float(market_signal.get("over_adjustment") or 0.0) * 100.0 * (1 if side == "OVER" else -1) * 0.75),
-    )
-    if market_component >= 2:
+    market_component = 0.0
+    _raw_market_adj = float(market_signal.get("over_adjustment") or 0.0) * (1 if side == "OVER" else -1)
+    if _raw_market_adj >= 0.02:
         for tag in market_signal.get("support_tags") or []:
             if tag not in tags:
                 tags.append(tag)
-    elif market_component <= -2:
+    elif _raw_market_adj <= -0.02:
         for tag in market_signal.get("caution_tags") or []:
             if tag not in tags:
                 tags.append(tag)
 
-    score = 46.0
+    environment_weight = 0.6
+    schedule_component *= environment_weight
+    # market_component stays 0.0 — no scaling needed
+
+    score = 40.0
     components = {
         'form': round(form_component, 1),
         'sample': round(sample_component, 1),
@@ -1861,6 +2912,41 @@ def apply_market_confidence_adjustment(
         note = f"market leans {market_side.lower()}"
         adjusted["summary"] = f"{summary} • {note}".strip(" •")
     return adjusted
+
+def apply_market_probability_penalty(
+    model_over: float,
+    model_under: float,
+    *,
+    implied_over: float | None,
+    implied_under: float | None,
+) -> tuple[float, float]:
+    """Penalize model probability when it disagrees with market pricing."""
+    try:
+        over_prob = float(implied_over) if implied_over is not None else None
+        under_prob = float(implied_under) if implied_under is not None else None
+    except (TypeError, ValueError):
+        over_prob = None
+        under_prob = None
+
+    if over_prob is None or under_prob is None:
+        return model_over, model_under
+
+    market_side = "OVER" if over_prob >= under_prob else "UNDER"
+    model_side = "OVER" if model_over >= model_under else "UNDER"
+    if market_side == model_side:
+        return model_over, model_under
+
+    gap = max(0.0, abs(over_prob - under_prob))
+    penalty = min(0.12, 0.03 + (gap * 0.7))
+
+    if model_side == "OVER":
+        adjusted_over = clamp(model_over - penalty, 0.02, 0.98)
+        adjusted_under = clamp(1.0 - adjusted_over, 0.02, 0.98)
+    else:
+        adjusted_under = clamp(model_under - penalty, 0.02, 0.98)
+        adjusted_over = clamp(1.0 - adjusted_under, 0.02, 0.98)
+
+    return round(adjusted_over, 4), round(adjusted_under, 4)
 
 def _build_parlay_reason_fragments(prop: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
@@ -2410,6 +3496,19 @@ def build_game_environment_context(season_rows: list[dict[str, Any]], next_game:
         tone = "warning"
         headline = "Busy schedule"
 
+    opponent_rank = None
+    opponent_label = ""
+    try:
+        opp_id = int((next_game or {}).get("opponent_team_id") or 0)
+        if opp_id:
+            rank_map = get_cached_team_rank_map(season=season or current_nba_season(), season_type=season_type or "Regular Season")
+            opponent_rank = rank_map.get(opp_id)
+            if opponent_rank:
+                opponent_label = f"Opp rank {int(opponent_rank)}"
+    except Exception:
+        opponent_rank = None
+        opponent_label = ""
+
     return {
         "headline": headline,
         "tone": tone,
@@ -2417,8 +3516,11 @@ def build_game_environment_context(season_rows: list[dict[str, Any]], next_game:
         "rest_days": rest_days,
         "is_back_to_back": is_back_to_back,
         "games_last7": games_last7,
+        "is_home": (next_game or {}).get("is_home") if next_game else None,
         "venue_label": "Home" if (next_game or {}).get("is_home") else ("Away" if next_game else "TBD"),
         "next_opponent": (next_game or {}).get("opponent_abbreviation") or "",
+        "opponent_rank": opponent_rank,
+        "opponent_rank_label": opponent_label,
     }
 
 
@@ -2695,6 +3797,15 @@ TEAMMATE_IMPACT_CACHE: dict[tuple[int, str, str], dict[str, Any]] = {}
 TEAMMATE_IMPACT_CACHE_TTL_SECONDS = 6 * 60 * 60
 
 
+def get_cached_team_rank_map(season: str, season_type: str = 'Regular Season') -> dict[int, int]:
+    cache_key = (str(season), str(season_type))
+    cached = TEAM_RECORDS_CACHE.get(cache_key)
+    now_ts = time.time()
+    if cached and now_ts - float(cached.get('timestamp') or 0.0) < TEAM_RECORDS_CACHE_TTL_SECONDS:
+        return dict(cached.get('rank_map') or {})
+    return {}
+
+
 def build_team_rank_map(season: str, season_type: str = 'Regular Season') -> dict[int, int]:
     cache_key = (str(season), str(season_type))
     cached = TEAM_RECORDS_CACHE.get(cache_key)
@@ -2703,14 +3814,13 @@ def build_team_rank_map(season: str, season_type: str = 'Regular Season') -> dic
         return dict(cached.get('rank_map') or {})
 
     rows: list[dict[str, Any]] = []
-    for team in TEAM_POOL:
-        team_id = int(team.get('id') or 0)
-        if not team_id:
-            continue
+    team_ids = [int(team.get('id') or 0) for team in TEAM_POOL if int(team.get('id') or 0)]
+
+    def _fetch_team_record(team_id: int) -> dict[str, Any] | None:
         try:
             logs = fetch_team_game_log(team_id=team_id, season=season, season_type=season_type)
         except Exception:
-            continue
+            return None
         wins = 0
         losses = 0
         for row in logs:
@@ -2721,8 +3831,27 @@ def build_team_rank_map(season: str, season_type: str = 'Regular Season') -> dic
                 losses += 1
         games = wins + losses
         pct = (wins / games) if games else 0.0
-        rows.append({'team_id': team_id, 'wins': wins, 'losses': losses, 'win_pct': pct})
+        return {'team_id': team_id, 'wins': wins, 'losses': losses, 'win_pct': pct}
 
+    if len(team_ids) <= 1:
+        for team_id in team_ids:
+            record = _fetch_team_record(team_id)
+            if record:
+                rows.append(record)
+    else:
+        max_workers = min(8, len(team_ids))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_fetch_team_record, team_id) for team_id in team_ids]
+            for future in as_completed(futures):
+                record = future.result()
+                if record:
+                    rows.append(record)
+
+    # NOTE: rank is sorted by win percentage, NOT defensive rating.
+    # Rank 1 = best record, Rank 30 = worst record.
+    # This is a proxy for opponent strength. A future improvement would be
+    # to rank by defensive rating or opponent points-per-game-allowed
+    # using LeagueDashTeamStats for a more accurate signal on player props.
     rows.sort(key=lambda item: (-float(item.get('win_pct') or 0.0), -int(item.get('wins') or 0), TEAM_LOOKUP.get(int(item.get('team_id') or 0), {}).get('full_name', '')))
     rank_map = {int(item['team_id']): idx + 1 for idx, item in enumerate(rows)}
     TEAM_RECORDS_CACHE[cache_key] = {'timestamp': now_ts, 'rank_map': rank_map}
@@ -2826,8 +3955,20 @@ def build_without_player_union_game_ids(player_ids: list[int], season: str, seas
     if not normalized_ids:
         return None
     game_ids: set[str] = set()
-    for teammate_id in normalized_ids:
-        game_ids.update(teammate_absence_game_ids(int(teammate_id), season=season, season_type=season_type))
+    if len(normalized_ids) == 1:
+        game_ids.update(teammate_absence_game_ids(int(normalized_ids[0]), season=season, season_type=season_type))
+        return game_ids
+    max_workers = min(8, len(normalized_ids))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(teammate_absence_game_ids, int(teammate_id), season, season_type)
+            for teammate_id in normalized_ids
+        ]
+        for future in as_completed(futures):
+            try:
+                game_ids.update(future.result() or set())
+            except Exception:
+                pass
     return game_ids
 
 def normalize_opponent_rank_range(opponent_rank_range: str | None) -> tuple[int | None, int | None, str]:
@@ -2984,10 +4125,18 @@ def build_team_opportunity_context(
     team_id: int | None = None,
     season: str | None = None,
 ) -> dict[str, Any]:
-    payload = fetch_latest_injury_report_payload()
-    team_name = str(team_name or '').strip()
+    payload = get_cached_injury_report_payload()
+    team_name = canonicalize_team_name(team_name, team_id=team_id)
     report_label = str(payload.get('report_label') or '')
-    cache_key = (team_name, normalize_report_person_name(player_name), stat, str(player_position or ''), int(team_id or 0), str(season or ''), report_label)
+    cache_key = (
+        normalize_compact_text(team_name),
+        normalize_report_person_name(player_name),
+        stat,
+        str(player_position or ''),
+        int(team_id or 0),
+        str(season or ''),
+        report_label,
+    )
     cached = TEAM_OPPORTUNITY_CACHE.get(cache_key)
     if cached:
         return copy.deepcopy(cached)
@@ -3011,7 +4160,7 @@ def build_team_opportunity_context(
         TEAM_OPPORTUNITY_CACHE[cache_key] = copy.deepcopy(empty)
         return empty
 
-    rows = [row for row in (payload.get('rows') or []) if row.get('team_name') == team_name]
+    rows = INJURY_SERVICE.get_team_rows(payload, team_name)
     if not rows:
         TEAM_OPPORTUNITY_CACHE[cache_key] = copy.deepcopy(empty)
         return empty
@@ -3100,6 +4249,7 @@ def build_team_opportunity_context(
         'summary': angle,
         'listed_count': len(filtered),
         'impact_count': len(impacted),
+        'team_name': team_name,
         'players': [
             {
                 'name': re.sub(r",(?!\s)", ", ", str(row.get('player_display') or '').strip()),
@@ -3315,15 +4465,27 @@ def build_stat_summary_block(rows: list[dict[str, Any]], stat: str, line: float)
     games: list[dict[str, Any]] = []
     hit_count = 0
     values: list[float] = []
+    weighted_hits = 0.0
+    weight_sum = 0.0
+    now_dt = datetime.utcnow()
     for row in rows:
         game_entry = build_game_log_entry(row, stat, line)
         games.append(game_entry)
         values.append(game_entry["value"])
         if game_entry["hit"]:
             hit_count += 1
+        game_dt = parse_game_date_any(game_entry.get("game_date"))
+        if game_dt is None:
+            game_dt = parse_game_date_any(row.get("GAME_DATE"))
+        days_ago = (now_dt - game_dt).days if game_dt is not None else None
+        weight = 1.0 if days_ago is None else pow(0.92, (days_ago / 7.0))
+        weight_sum += weight
+        weighted_hits += weight * (1.0 if game_entry["hit"] else 0.0)
 
     avg = round(sum(values) / len(values), 2) if values else 0
-    hit_rate = round((hit_count / len(values)) * 100, 1) if values else 0
+    raw_hit_rate = round((hit_count / len(values)) * 100, 1) if values else 0
+    weighted_hit_rate = round((weighted_hits / weight_sum) * 100, 1) if weight_sum > 0 else raw_hit_rate
+    hit_rate = weighted_hit_rate
 
     # Variance / distribution metrics
     variance_metrics: dict[str, Any] = {}
@@ -3333,11 +4495,20 @@ def build_stat_summary_block(rows: list[dict[str, Any]], stat: str, line: float)
         median = round(_stats.median(values), 2)
         sorted_vals = sorted(values)
         n = len(sorted_vals)
-        p25 = round(sorted_vals[max(0, int(n * 0.25))], 2)
-        p75 = round(sorted_vals[min(n - 1, int(n * 0.75))], 2)
+        if n >= 4:
+            _quartiles = _stats.quantiles(values, n=4)
+            p25 = round(_quartiles[0], 2)
+            p75 = round(_quartiles[2], 2)
+        else:
+            p25 = round(sorted_vals[0], 2)
+            p75 = round(sorted_vals[-1], 2)
         # Consistency score: 0-100, higher = more consistent
-        # Based on coefficient of variation (lower CV = higher consistency)
-        cv = (std_dev / avg) if avg > 0 else 1.0
+        # Use a floor for low-volume stats so BLK/STL/3PM aren't unfairly penalized
+        # when the raw average is near zero (e.g. avg=0.3 blks → CV explodes otherwise).
+        _LOW_VOL_STATS_CV = {"BLK", "STL", "3PM"}
+        _cv_floor = 0.5 if str(stat or "").upper() in _LOW_VOL_STATS_CV else 0.1
+        _cv_avg = max(float(avg), _cv_floor)
+        cv = round(std_dev / _cv_avg, 3)
         consistency_score = round(max(0, min(100, 100 - (cv * 80))), 1)
         # Over-hit rate above median (games where player exceeded their own median)
         above_median = sum(1 for v in values if v > median)
@@ -3363,6 +4534,8 @@ def build_stat_summary_block(rows: list[dict[str, Any]], stat: str, line: float)
         "hit_count": hit_count,
         "average": avg,
         "hit_rate": hit_rate,
+        "hit_rate_raw": raw_hit_rate,
+        "hit_rate_weighted": weighted_hit_rate,
         "variance": variance_metrics,
     }
     STAT_SUMMARY_CACHE[cache_key] = {"timestamp": now_ts, "payload": copy.deepcopy(payload)}
@@ -3424,7 +4597,31 @@ def odds_api_fetch(endpoint: str, api_key: str, params: dict[str, Any] | None = 
     query = dict(params or {})
     query["apiKey"] = key
     url = f"{ODDS_API_BASE_URL}{endpoint}?{odds_api_build_query(query)}"
-    response = requests.get(url, timeout=(5, 30), headers={"User-Agent": NBA_USER_AGENT, "Accept": "application/json"})
+    attempts = 0
+    last_exc: Exception | None = None
+    response = None
+    while True:
+        try:
+            response = requests.get(url, timeout=(5, 30), headers={"User-Agent": NBA_USER_AGENT, "Accept": "application/json"})
+            if response.ok:
+                break
+            if response.status_code in {408, 429} or response.status_code >= 500:
+                attempts += 1
+                if attempts > ODDS_API_MAX_RETRIES:
+                    break
+                time.sleep(ODDS_API_RETRY_BACKOFF_SECONDS * attempts)
+                continue
+            break
+        except requests.RequestException as exc:
+            last_exc = exc
+            attempts += 1
+            if attempts > ODDS_API_MAX_RETRIES:
+                break
+            time.sleep(ODDS_API_RETRY_BACKOFF_SECONDS * attempts)
+
+    if response is None:
+        raise HTTPException(status_code=503, detail=f"Odds API request failed: {last_exc}") from last_exc
+
     remaining = response.headers.get("x-requests-remaining")
     used = response.headers.get("x-requests-used")
     last = response.headers.get("x-requests-last")
@@ -3438,10 +4635,13 @@ def odds_api_fetch(endpoint: str, api_key: str, params: dict[str, Any] | None = 
     except Exception as exc:
         raise HTTPException(status_code=502, detail="Failed to parse Odds API response.") from exc
 
-    return {
+    payload = {
         "data": data,
         "quota": {"remaining": remaining, "used": used, "last": last},
     }
+    safe_params = dict(params or {})
+    _submit_pg_write(_pg_write_odds_snapshot, endpoint, safe_params, payload)
+    return payload
 
 
 def _fetch_event_odds_payload(
@@ -3616,7 +4816,25 @@ def _position_dash_cache_is_reliable_stale(cached: dict[str, Any] | None, cached
 
 @timed_call("fetch_player_game_log")
 def fetch_player_game_log(player_id: int, season: str, season_type: str) -> list[dict[str, Any]]:
-    return PLAYER_DATA_SERVICE.fetch_player_game_log(player_id, season, season_type)
+    cache_key = (player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)
+    cached = GAME_LOG_CACHE.get(cache_key)
+    if POSTGRES_SOURCE_OF_TRUTH:
+        pg_rows, pg_ts = _pg_read_game_log(player_id, season, season_type)
+        if isinstance(pg_rows, list) and pg_rows:
+            GAME_LOG_CACHE[cache_key] = {"timestamp": float(pg_ts or time.time()), "rows": pg_rows, "source": "postgres"}
+            return pg_rows
+        if cached and isinstance(cached.get("rows"), list):
+            return cached["rows"]
+    else:
+        if cached and isinstance(cached.get("rows"), list):
+            return cached["rows"]
+        pg_rows, pg_ts = _pg_read_game_log(player_id, season, season_type)
+        if isinstance(pg_rows, list) and pg_rows:
+            GAME_LOG_CACHE[cache_key] = {"timestamp": float(pg_ts or time.time()), "rows": pg_rows, "source": "postgres"}
+            return pg_rows
+    rows = PLAYER_DATA_SERVICE.fetch_player_game_log(player_id, season, season_type)
+    _submit_pg_write(_pg_write_game_log, player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION, rows)
+    return rows
 
 
 def fetch_recent_player_game_log(player_id: int, season: str, season_type: str, last_n: int) -> list[dict[str, Any]]:
@@ -3638,7 +4856,24 @@ def fetch_team_roster(team_id: int, season: str) -> list[dict[str, Any]]:
 
 @timed_call("fetch_common_player_info")
 def fetch_common_player_info(player_id: int) -> dict[str, Any]:
-    return PLAYER_DATA_SERVICE.fetch_common_player_info(player_id)
+    cached = PLAYER_INFO_CACHE.get(player_id)
+    if POSTGRES_SOURCE_OF_TRUTH:
+        pg_row, pg_ts = _pg_read_player_info(player_id)
+        if pg_row and isinstance(pg_row, dict):
+            PLAYER_INFO_CACHE[player_id] = {"timestamp": float(pg_ts or time.time()), "row": pg_row, "source": "postgres"}
+            return pg_row
+        if cached and isinstance(cached.get("row"), dict):
+            return cached["row"]
+    else:
+        if cached and isinstance(cached.get("row"), dict):
+            return cached["row"]
+        pg_row, pg_ts = _pg_read_player_info(player_id)
+        if pg_row and isinstance(pg_row, dict):
+            PLAYER_INFO_CACHE[player_id] = {"timestamp": float(pg_ts or time.time()), "row": pg_row, "source": "postgres"}
+            return pg_row
+    row = PLAYER_DATA_SERVICE.fetch_common_player_info(player_id)
+    _submit_pg_write(_pg_write_player_info, player_id, row)
+    return row
 
 
 def fetch_next_game(player_id: int, season: str, season_type: str) -> dict[str, Any] | None:
@@ -3763,18 +4998,44 @@ def build_next_game_payload(next_game_row: dict[str, Any] | None, player_team_id
 
 
 def resolve_team_next_game(team_id: int | None, primary_player_id: int, season: str, season_type: str) -> dict[str, Any] | None:
-    return SCHEDULE_SERVICE.resolve_team_next_game(team_id, primary_player_id, season, season_type)
+    def _is_next_game_stale(row: dict[str, Any] | None) -> bool:
+        if not row:
+            return False
+        raw_date = row.get("game_date") or row.get("GAME_DATE") or row.get("date") or row.get("GAME_DATE_EST")
+        dt = parse_game_date_any(raw_date)
+        if not dt:
+            return False
+        return dt.date() < datetime.now().date()
+
+    if team_id:
+        cache_key = (team_id, season, season_type)
+        cached = TEAM_NEXT_GAME_CACHE.get(cache_key)
+        cached_row = cached.get("row") if cached else None
+        if POSTGRES_SOURCE_OF_TRUTH:
+            pg_row, pg_ts = _pg_read_team_next_game(int(team_id), season, season_type)
+            if pg_row and isinstance(pg_row, dict) and not _is_next_game_stale(pg_row):
+                TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": float(pg_ts or time.time()), "row": pg_row, "source": "postgres"}
+                return pg_row
+            if cached_row and isinstance(cached_row, dict) and not _is_next_game_stale(cached_row):
+                return cached_row
+        else:
+            if cached_row and isinstance(cached_row, dict) and not _is_next_game_stale(cached_row):
+                return cached_row
+            pg_row, pg_ts = _pg_read_team_next_game(int(team_id), season, season_type)
+            if pg_row and isinstance(pg_row, dict) and not _is_next_game_stale(pg_row):
+                TEAM_NEXT_GAME_CACHE[cache_key] = {"timestamp": float(pg_ts or time.time()), "row": pg_row, "source": "postgres"}
+                return pg_row
+    row = SCHEDULE_SERVICE.resolve_team_next_game(team_id, primary_player_id, season, season_type)
+    if _is_next_game_stale(row) and team_id:
+        fallback_row = find_team_next_game_via_scoreboard(team_id, lookahead_days=10)
+        fallback_payload = build_next_game_payload(fallback_row, team_id)
+        if fallback_payload:
+            row = fallback_payload
+    if team_id:
+        _submit_pg_write(_pg_write_team_next_game, team_id, season, season_type, row)
+    return row
 
 
-
-@app.on_event("startup")
-def _startup_warm_cache() -> None:
-    _load_key_vault_state()
-    _load_backtest_log()
-    _load_favorites_state()
-    _load_tracker_state()
-    start_hybrid_refresh_workers()
-    warm_cache_on_startup()
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def root() -> FileResponse:
@@ -3814,7 +5075,7 @@ def get_team_roster(team_id: int, season: str | None = None) -> dict[str, Any]:
     # Fetch injury data for this specific team only — filter by team_name so
     # players with the same normalized name on different teams don't bleed across.
     team_name = str(team.get("full_name") or "")
-    report_payload = fetch_latest_injury_report_payload()
+    report_payload = get_cached_injury_report_payload()
     all_injury_rows = report_payload.get("rows") or []
     # Build lookup: player_key -> row, scoped to this team only
     injury_lookup: dict[str, dict[str, Any]] = {}
@@ -3871,7 +5132,7 @@ def get_team_injury_report(team_id: int) -> dict[str, Any]:
 
     team_name = str(team.get("full_name") or "")
     summary = build_team_availability_summary(team_name)
-    payload = fetch_latest_injury_report_payload()
+    payload = get_cached_injury_report_payload()
 
     # Build full player list with statuses
     rows = [row for row in (payload.get("rows") or []) if row.get("team_name") == team_name]
@@ -3928,10 +5189,10 @@ def bet_finder(
     roster_rows = fetch_team_roster(team_id=team_id, season=selected_season)
     results: list[dict[str, Any]] = []
 
-    for row in roster_rows:
+    def _analyze_row(row: dict[str, Any]) -> dict[str, Any] | None:
         raw_player_id = row.get("PLAYER_ID")
         if raw_player_id in (None, ""):
-            continue
+            return None
 
         player_id = int(raw_player_id)
         try:
@@ -3942,11 +5203,11 @@ def bet_finder(
                 last_n=last_n,
             )
         except HTTPException:
-            continue
+            return None
 
         sample_rows = game_rows
         if len(sample_rows) < min_games:
-            continue
+            return None
 
         values: list[float] = []
         hit_flags: list[bool] = []
@@ -3957,7 +5218,7 @@ def bet_finder(
             hit_flags.append(hit)
 
         if not values:
-            continue
+            return None
 
         hit_count = sum(1 for hit in hit_flags if hit)
         games_count = len(values)
@@ -3967,29 +5228,45 @@ def bet_finder(
         hit_streak = compute_recent_hit_streak(hit_flags)
         last_value = values[0]
 
-        results.append(
-            {
-                "player": {
-                    "id": player_id,
-                    "full_name": str(row.get("PLAYER", "")).strip(),
-                    "team_id": team["id"],
-                    "team_name": team["full_name"],
-                    "team_abbreviation": team["abbreviation"],
-                    "position": str(row.get("POSITION", "")).strip(),
-                    "jersey": str(row.get("NUM", "")).strip(),
-                    "is_active": True,
-                },
-                "stat": stat,
-                "line": line,
-                "games_count": games_count,
-                "hit_count": hit_count,
-                "hit_rate": hit_rate,
-                "average": average,
-                "avg_edge": avg_edge,
-                "last_value": last_value,
-                "hit_streak": hit_streak,
-            }
-        )
+        return {
+            "player": {
+                "id": player_id,
+                "full_name": str(row.get("PLAYER", "")).strip(),
+                "team_id": team["id"],
+                "team_name": team["full_name"],
+                "team_abbreviation": team["abbreviation"],
+                "position": str(row.get("POSITION", "")).strip(),
+                "jersey": str(row.get("NUM", "")).strip(),
+                "is_active": True,
+            },
+            "stat": stat,
+            "line": line,
+            "games_count": games_count,
+            "hit_count": hit_count,
+            "hit_rate": hit_rate,
+            "average": average,
+            "avg_edge": avg_edge,
+            "last_value": last_value,
+            "hit_streak": hit_streak,
+        }
+
+    if not roster_rows:
+        results = []
+    elif len(roster_rows) == 1:
+        candidate = _analyze_row(roster_rows[0])
+        if candidate:
+            results.append(candidate)
+    else:
+        max_workers = min(8, len(roster_rows))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_analyze_row, row) for row in roster_rows]
+            for future in as_completed(futures):
+                try:
+                    candidate = future.result()
+                except Exception:
+                    candidate = None
+                if candidate:
+                    results.append(candidate)
 
     results.sort(
         key=lambda item: (
@@ -4001,7 +5278,7 @@ def bet_finder(
         reverse=True,
     )
 
-    return {
+    payload_out = {
         "team": {
             "id": team["id"],
             "full_name": team["full_name"],
@@ -4015,12 +5292,64 @@ def bet_finder(
         "min_games": min_games,
         "results": results[:limit],
     }
+    payload_store = {
+        "team_id": team["id"],
+        "team_name": team["full_name"],
+        "team_abbreviation": team["abbreviation"],
+        "season": selected_season,
+        "season_type": season_type,
+        "stat": stat,
+        "line": line,
+        "last_n": last_n,
+        "min_games": min_games,
+        "limit": limit,
+        "results": results[:limit],
+    }
+    _submit_pg_write(_pg_write_bet_finder_run, payload_store)
+    return payload_out
 
 
-@app.post("/api/market-scan")
-def market_scan(
-    payload: dict[str, Any] = Body(...),
-) -> dict[str, Any]:
+def _emit_progress(progress_cb, stage: str, **extra: Any) -> None:
+    if not progress_cb:
+        return
+    payload = {"stage": stage}
+    payload.update(extra)
+    progress_cb(payload)
+
+
+def _stream_with_progress(run_func, payload: dict[str, Any]) -> StreamingResponse:
+    def generator():
+        q: queue.Queue = queue.Queue()
+        done = threading.Event()
+
+        def progress_cb(update: dict[str, Any]) -> None:
+            q.put({"type": "progress", **update})
+
+        def runner():
+            try:
+                result = run_func(payload, progress_cb)
+                q.put({"type": "result", "payload": result})
+            except HTTPException as exc:
+                q.put({"type": "error", "status": exc.status_code, "message": exc.detail})
+            except Exception as exc:
+                q.put({"type": "error", "status": 500, "message": str(exc)})
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=runner, name="progress-stream", daemon=True)
+        thread.start()
+
+        while not done.is_set() or not q.empty():
+            try:
+                item = q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            yield json.dumps(item) + "\n"
+
+    return StreamingResponse(generator(), media_type="application/x-ndjson")
+
+
+def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, Any]:
     rows = payload.get("rows") or []
     default_last_n = int(payload.get("last_n") or 10)
     selected_season = str(payload.get("season") or current_nba_season())
@@ -4029,11 +5358,13 @@ def market_scan(
     if not isinstance(rows, list) or not rows:
         raise HTTPException(status_code=400, detail="Please provide at least one market row.")
 
+    _emit_progress(progress_cb, "start", total_rows=len(rows))
+
     errors: list[dict[str, Any]] = []
-    prepared_rows: list[tuple[int, dict[str, Any], float, float, str, str, dict[str, Any] | None, dict[str, Any] | None, int | None]] = []
+    prepared_rows: list[tuple[int, dict[str, Any], float, float, str, str, dict[str, Any] | None, dict[str, Any] | None, int | None, str]] = []
 
     try:
-        fetch_latest_injury_report_payload()
+        get_cached_injury_report_payload()
     except Exception:
         pass
 
@@ -4046,6 +5377,9 @@ def market_scan(
         stat = str(row.get("stat") or "").upper().strip()
         team_text = str(row.get("team") or "").strip()
         opponent_text = str(row.get("opponent") or "").strip()
+        home_team_text = str(row.get("home_team") or "").strip()
+        away_team_text = str(row.get("away_team") or "").strip()
+        input_game_label = str(row.get("game_label") or "").strip()
         if stat not in STAT_MAP:
             errors.append({"row": index, "player_name": player_name, "reason": f"Unsupported stat: {stat}"})
             continue
@@ -4059,19 +5393,45 @@ def market_scan(
 
         team = resolve_team_from_text(team_text) if team_text else None
         opponent = resolve_team_from_text(opponent_text) if opponent_text else None
+        home_team = resolve_team_from_text(home_team_text) if home_team_text else None
+        away_team = resolve_team_from_text(away_team_text) if away_team_text else None
         team_id = int(team["id"]) if team else None
         player = find_player_by_name(player_name, team_id=team_id)
         if not player:
             errors.append({"row": index, "player_name": player_name, "reason": "Player not found."})
             continue
+        player_team_id = int(player.get("team_id") or 0) if player.get("team_id") else 0
+        if player_team_id:
+            player_team = TEAM_LOOKUP.get(player_team_id, {})
+            if not team or int(team.get("id") or 0) != player_team_id:
+                team = player_team
+                team_text = str(player_team.get("abbreviation") or player_team.get("full_name") or team_text)
+        if (not team_text or not opponent_text) and (home_team or away_team):
+            if home_team and player_team_id and int(home_team.get("id") or 0) == player_team_id:
+                team_text = home_team_text or (home_team.get("abbreviation") or "")
+                opponent_text = away_team_text or (away_team.get("abbreviation") if away_team else opponent_text)
+                team = home_team
+                opponent = away_team
+            elif away_team and player_team_id and int(away_team.get("id") or 0) == player_team_id:
+                team_text = away_team_text or (away_team.get("abbreviation") or "")
+                opponent_text = home_team_text or (home_team.get("abbreviation") if home_team else opponent_text)
+                team = away_team
+                opponent = home_team
+            elif home_team and away_team and not team:
+                team_text = away_team_text or (away_team.get("abbreviation") or "")
+                opponent_text = home_team_text or (home_team.get("abbreviation") or "")
+                team = away_team
+                opponent = home_team
+        team_id = int(team["id"]) if team else None
 
         bulk_row = {
             "player_id": int(player["id"]),
             "player_name": player_name or str(player.get("full_name") or ""),
             "stat": stat,
             "line": line,
-            "team_id": team_id,
+            "team_id": team_id or (player_team_id if player_team_id else None),
             "player_position": None,
+            "override_opponent_id": int(opponent["id"]) if opponent and int(opponent.get("id") or 0) != (team_id or player_team_id) else None,
             "over_fair_prob": row.get("over_fair_prob"),
             "under_fair_prob": row.get("under_fair_prob"),
             "consensus_over_fair_prob": row.get("consensus_over_fair_prob"),
@@ -4085,7 +5445,9 @@ def market_scan(
             "market_implied_line": row.get("market_implied_line"),
             "bookmaker_title": row.get("bookmaker_title"),
         }
-        prepared_rows.append((index, bulk_row, over_odds, under_odds, team_text, opponent_text, team, opponent, team_id))
+        prepared_rows.append((index, bulk_row, over_odds, under_odds, team_text, opponent_text, team, opponent, team_id, input_game_label))
+
+    _emit_progress(progress_cb, "prepared", prepared=len(prepared_rows), errors=len(errors))
 
     defaults = {
         "last_n": default_last_n,
@@ -4104,7 +5466,36 @@ def market_scan(
     local_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
     analysis_by_row: dict[int, dict[str, Any]] = {}
 
+    player_ids: set[int] = {int(bulk_row["player_id"]) for _, bulk_row, *_ in prepared_rows}
+    team_ids: set[int] = set()
+    primary_by_team: dict[int, int] = {}
+    for row in prepared_rows:
+        team_id = row[-2]
+        if team_id in (None, ""):
+            continue
+        try:
+            team_id_int = int(team_id)
+        except (TypeError, ValueError):
+            continue
+        team_ids.add(team_id_int)
+        if team_id_int not in primary_by_team:
+            bulk_row = row[1]
+            primary_by_team[team_id_int] = int(bulk_row["player_id"])
+    prefetch_bulk_analysis_context(
+        player_ids=player_ids,
+        season=selected_season,
+        season_type=season_type,
+        team_ids=team_ids,
+        primary_player_by_team=primary_by_team,
+        max_workers=max_workers,
+        label="market_scan",
+    )
+
+    _emit_progress(progress_cb, "analysis_start", total=len(prepared_rows), workers=max_workers)
+
     if max_workers <= 1:
+        step = max(1, len(prepared_rows) // 10) if prepared_rows else 1
+        done = 0
         for row_index, bulk_row, *_ in prepared_rows:
             try:
                 analysis_by_row[row_index] = _build_bulk_prop_item(row_index, bulk_row, defaults, local_cache)
@@ -4112,11 +5503,16 @@ def market_scan(
                 errors.append({"row": row_index, "player_name": bulk_row.get("player_name"), "reason": exc.detail})
             except Exception as exc:
                 errors.append({"row": row_index, "player_name": bulk_row.get("player_name"), "reason": str(exc)})
+            done += 1
+            if done % step == 0 or done == len(prepared_rows):
+                _emit_progress(progress_cb, "analysis_progress", done=done, total=len(prepared_rows))
     else:
         futures: list[tuple[int, dict[str, Any], Any]] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for row_index, bulk_row, *_ in prepared_rows:
                 futures.append((row_index, bulk_row, executor.submit(_build_bulk_prop_item, row_index, bulk_row, defaults, local_cache)))
+            step = max(1, len(futures) // 10) if futures else 1
+            done = 0
             for row_index, bulk_row, future in futures:
                 try:
                     analysis_by_row[row_index] = future.result()
@@ -4124,9 +5520,16 @@ def market_scan(
                     errors.append({"row": row_index, "player_name": bulk_row.get("player_name"), "reason": exc.detail})
                 except Exception as exc:
                     errors.append({"row": row_index, "player_name": bulk_row.get("player_name"), "reason": str(exc)})
+                done += 1
+                if done % step == 0 or done == len(futures):
+                    _emit_progress(progress_cb, "analysis_progress", done=done, total=len(futures))
+
+    _emit_progress(progress_cb, "analysis_done", total=len(analysis_by_row))
 
     results: list[dict[str, Any]] = []
-    for index, bulk_row, over_odds, under_odds, team_text, opponent_text, team, opponent, team_id in prepared_rows:
+    scoring_step = max(1, len(prepared_rows) // 10) if prepared_rows else 1
+    scored_count = 0
+    for index, bulk_row, over_odds, under_odds, team_text, opponent_text, team, opponent, team_id, input_game_label in prepared_rows:
         bulk_item = analysis_by_row.get(index)
         if not bulk_item:
             continue
@@ -4147,8 +5550,9 @@ def market_scan(
             team_context=analysis.get("team_context") or {},
             environment=analysis.get("environment") or {},
         )
-        implied_over = decimal_implied_probability(over_odds)
-        implied_under = decimal_implied_probability(under_odds)
+        market_probs = fair_implied_probabilities(over_odds, under_odds)
+        implied_over = market_probs.get("over")
+        implied_under = market_probs.get("under")
         fair_over = bulk_row.get("consensus_over_fair_prob")
         fair_under = bulk_row.get("consensus_under_fair_prob")
         if fair_over is None:
@@ -4163,6 +5567,12 @@ def market_scan(
             fair_under = float(fair_under) if fair_under is not None else implied_under
         except (TypeError, ValueError):
             fair_under = implied_under
+        model_over, model_under = apply_market_probability_penalty(
+            model_over,
+            model_under,
+            implied_over=implied_over,
+            implied_under=implied_under,
+        )
         over_edge = round((model_over - fair_over) * 100, 1) if fair_over is not None else None
         under_edge = round((model_under - fair_under) * 100, 1) if fair_under is not None else None
         over_ev = round(model_over * over_odds - 1, 3)
@@ -4209,14 +5619,18 @@ def market_scan(
         resolved_team_id = analysis["player"].get("team_id") or team_id
         resolved_team = TEAM_LOOKUP.get(int(resolved_team_id)) if resolved_team_id else None
         resolved_team_abbreviation = (
-            (resolved_team or {}).get("abbreviation")
-            or next_game.get("player_team_abbreviation")
-            or (team.get("abbreviation") if team else team_text)
+            (team.get("abbreviation") if team else None)
+            or (resolved_team or {}).get("abbreviation")
+            or (team_text.strip() if team_text else "")
         )
         resolved_opponent_abbreviation = (
-            next_game.get("opponent_abbreviation")
-            or (opponent.get("abbreviation") if opponent else opponent_text)
+            (opponent.get("abbreviation") if opponent else None)
+            or (opponent_text.strip() if opponent_text else "")
+            or next_game.get("opponent_abbreviation")
         )
+        resolved_matchup_label = input_game_label
+        if not resolved_matchup_label and resolved_team_abbreviation and resolved_opponent_abbreviation:
+            resolved_matchup_label = f"{resolved_team_abbreviation} vs {resolved_opponent_abbreviation}"
 
         results.append({
             "row": index,
@@ -4232,6 +5646,7 @@ def market_scan(
                 "position": analysis["player"].get("position") or "",
                 "jersey": analysis["player"].get("jersey") or "",
             },
+            "game_label": resolved_matchup_label,
             "market": {
                 "stat": str(bulk_row["stat"]),
                 "line": float(bulk_row["line"]),
@@ -4308,6 +5723,9 @@ def market_scan(
                 "vs_position": vs_position,
             },
         })
+        scored_count += 1
+        if scored_count % scoring_step == 0 or scored_count == len(prepared_rows):
+            _emit_progress(progress_cb, "scoring_progress", done=scored_count, total=len(prepared_rows))
 
     results.sort(
         key=lambda item: (
@@ -4323,7 +5741,7 @@ def market_scan(
 
     errors.sort(key=lambda item: int(item.get("row") or 0))
 
-    return {
+    payload_out = {
         "season": selected_season,
         "season_type": season_type,
         "last_n": default_last_n,
@@ -4331,6 +5749,27 @@ def market_scan(
         "results": results,
         "errors": errors,
     }
+    _submit_pg_write(_pg_write_market_scan_run, payload_out)
+    _emit_progress(progress_cb, "done", results=len(results), errors=len(errors))
+    return payload_out
+
+
+@app.post("/api/market-scan")
+def market_scan(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    return _market_scan_core(payload)
+
+@app.post("/api/market-scan/async")
+def market_scan_async(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    return submit_async_job("market_scan", _market_scan_core, payload)
+
+@app.get("/api/jobs/{job_id}")
+def async_job_status(job_id: str) -> dict[str, Any]:
+    return get_async_job(job_id)
+
+
+@app.post("/api/market-scan/stream")
+def market_scan_stream(payload: dict[str, Any] = Body(...)) -> StreamingResponse:
+    return _stream_with_progress(_market_scan_core, payload)
 
 
 @app.post("/api/odds/events")
@@ -4399,8 +5838,7 @@ def odds_player_props_import(payload: dict[str, Any] = Body(...)) -> dict[str, A
     }
 
 
-@app.post("/api/parlay-builder")
-def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str, Any]:
     """
     Scrape selected NBA events + all markets in batches using rotating API keys,
     analyze every prop via the existing bulk engine, rank by hit rate, and build
@@ -4425,6 +5863,14 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     api_keys: list[str] = [str(k).strip() for k in raw_keys if str(k).strip()]
     if not api_keys:
         raise HTTPException(status_code=400, detail="Provide at least one Odds API key in 'api_keys'.")
+
+    cached_run = _pg_read_parlay_builder_cache(payload)
+    if cached_run:
+        return cached_run
+
+    _emit_progress(progress_cb, "start", events_requested=len(payload.get("event_ids") or []))
+
+    _emit_progress(progress_cb, "start", events_requested=len(payload.get("event_ids") or []))
 
     legs = int(payload.get("legs") or 3)
     if legs < 2 or legs > 6:
@@ -4473,8 +5919,10 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         events = events_result["data"] or []
         quota_log.append({"call": "events_list", "quota": events_result["quota"]})
 
+    _emit_progress(progress_cb, "events_resolved", events=len(events))
+
     if not events:
-        return {
+        payload = {
             "legs": legs,
             "parlay": [],
             "parlay_odds": None,
@@ -4487,12 +5935,17 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
             "message": "No events found for today.",
         }
+        _submit_pg_write(_pg_write_parlay_builder_run, payload)
+        return payload
 
     # ── Phase 2: Fetch odds per event in batches, rotating keys ─────────
     all_import_rows: list[dict[str, Any]] = []
     scrape_errors: list[dict[str, Any]] = []
 
+    total_batches = max(1, math.ceil(len(events) / batch_size)) if events else 1
+    batch_index = 0
     for batch_start in range(0, len(events), batch_size):
+        batch_index += 1
         batch = events[batch_start: batch_start + batch_size]
         batch_jobs = [
             {
@@ -4555,9 +6008,17 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
                 continue
             quota_log.append({"call": f"event_{event_id[:8]}", "quota": result.get("quota")})
             all_import_rows.extend(result.get("rows") or [])
+        _emit_progress(
+            progress_cb,
+            "scrape_progress",
+            batch=batch_index,
+            batches=total_batches,
+            events_scraped=min(batch_index * batch_size, len(events)),
+            props_found=len(all_import_rows),
+        )
 
     if not all_import_rows:
-        return {
+        payload = {
             "legs": legs,
             "parlay": [],
             "parlay_odds": None,
@@ -4570,6 +6031,8 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
             "message": "No props found across today's events. Check your API keys or try again later.",
         }
+        _submit_pg_write(_pg_write_parlay_builder_run, payload)
+        return payload
 
     # ── Phase 3a: Pre-warm game-log cache with one bulk LeagueDash call ────
     # This single call fetches season stats for ALL players, warming the cache
@@ -4644,69 +6107,91 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             seen_analysis_keys.add(ak)
             deduped_prepared.append((bulk_row, orig_row))
 
-    # Pre-warm game log cache concurrently for all unique player IDs
-    # This fires off all PlayerGameLog requests in parallel with a short timeout
-    # so the sequential analysis loop below hits cache instead of blocking 1-by-1.
     unique_player_ids: set[int] = {int(br["player_id"]) for br, _ in deduped_prepared}
-    already_cached_ids: set[int] = {
-        pid for pid in unique_player_ids
-        if GAME_LOG_CACHE.get((pid, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)) and
-           (time.time() - float(GAME_LOG_CACHE[(pid, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)].get("timestamp", 0))) < CACHE_TTL_SECONDS
-    }
-    ids_to_fetch = unique_player_ids - already_cached_ids
-    if ids_to_fetch:
-        LOGGER.info("Parlay pre-fetching game logs for %d uncached players", len(ids_to_fetch))
-        def _prefetch_log(pid: int) -> None:
-            try:
-                fetch_player_game_log(player_id=pid, season=season, season_type=season_type)
-            except Exception:
-                pass  # failures are tolerated; analysis loop will handle them
-        prewarm_workers = min(BULK_ANALYSIS_MAX_WORKERS, len(ids_to_fetch), 8)
-        with ThreadPoolExecutor(max_workers=prewarm_workers) as _pre_ex:
-            list(_pre_ex.map(_prefetch_log, ids_to_fetch))
-        LOGGER.info("Parlay game-log pre-warm complete for %d players", len(ids_to_fetch))
+    primary_by_team: dict[int, int] = {}
+    for bulk_row, _ in deduped_prepared:
+        team_id = _resolve_team_id_for_player(int(bulk_row["player_id"]))
+        if team_id and team_id not in primary_by_team:
+            primary_by_team[team_id] = int(bulk_row["player_id"])
+    prefetch_bulk_analysis_context(
+        player_ids=unique_player_ids,
+        season=season,
+        season_type=season_type,
+        team_ids=set(primary_by_team.keys()),
+        primary_player_by_team=primary_by_team,
+        max_workers=BULK_ANALYSIS_MAX_WORKERS,
+        label="parlay_builder",
+    )
 
     max_workers = min(BULK_ANALYSIS_MAX_WORKERS, max(1, len(deduped_prepared)))
 
+    _emit_progress(progress_cb, "analysis_start", total=len(deduped_prepared), workers=max_workers)
+
     if max_workers <= 1:
+        step = max(1, len(deduped_prepared) // 10) if deduped_prepared else 1
+        done = 0
         for idx, (bulk_row, orig_row) in enumerate(deduped_prepared, start=1):
             try:
                 result = _build_bulk_prop_item(idx, bulk_row, defaults, local_cache)
                 analysis_rows.append((result, orig_row))
             except Exception as exc:
                 analysis_errors.append({"player_name": bulk_row["player_name"], "reason": str(exc)})
+            done += 1
+            if done % step == 0 or done == len(deduped_prepared):
+                _emit_progress(progress_cb, "analysis_progress", done=done, total=len(deduped_prepared))
     else:
         futures_list: list[tuple[int, dict[str, Any], dict[str, Any], Any]] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for idx, (bulk_row, orig_row) in enumerate(deduped_prepared, start=1):
                 fut = executor.submit(_build_bulk_prop_item, idx, bulk_row, defaults, local_cache)
                 futures_list.append((idx, bulk_row, orig_row, fut))
+            step = max(1, len(futures_list) // 10) if futures_list else 1
+            done = 0
             for idx, bulk_row, orig_row, fut in futures_list:
                 try:
                     result = fut.result()
                     analysis_rows.append((result, orig_row))
                 except Exception as exc:
                     analysis_errors.append({"player_name": bulk_row["player_name"], "reason": str(exc)})
+                done += 1
+                if done % step == 0 or done == len(futures_list):
+                    _emit_progress(progress_cb, "analysis_progress", done=done, total=len(futures_list))
+
+    _emit_progress(progress_cb, "analysis_done", analyzed=len(analysis_rows), errors=len(analysis_errors))
 
     # ── Phase 4: Score every prop by hit rate, pick best N legs ─────────
     scored: list[dict[str, Any]] = []
-    for result, orig_row in analysis_rows:
+    scoring_step = max(1, len(analysis_rows) // 10) if analysis_rows else 1
+    for idx, (result, orig_row) in enumerate(analysis_rows, start=1):
         analysis = result.get("analysis") or {}
+        if idx % scoring_step == 0 or idx == len(analysis_rows):
+            _emit_progress(progress_cb, "scoring_progress", done=idx, total=len(analysis_rows))
         hit_rate  = float(analysis.get("hit_rate") or 0)
         avg       = float(analysis.get("average") or 0)
         line      = float(result.get("line") or orig_row.get("line") or 0)
         stat      = str(result.get("stat") or orig_row.get("stat") or "")
 
-        # Determine best side purely by hit rate vs 50%
-        # Over hit_rate > 50 → OVER is the stronger side
-        if hit_rate >= 50:
-            side = "OVER"
-            odds = float(orig_row.get("over_odds") or 1.91)
-            side_hit_rate = hit_rate
+        # Prefer the analyzer's recommended side to keep parlay cards consistent
+        # with the Player Analyzer. Fall back to hit-rate if unavailable.
+        recommended_side = str(analysis.get("recommended_side") or "").upper()
+        if recommended_side in {"OVER", "UNDER"}:
+            side = recommended_side
+            if side == "OVER":
+                odds = float(orig_row.get("over_odds") or 1.91)
+                side_hit_rate = hit_rate
+            else:
+                odds = float(orig_row.get("under_odds") or 1.91)
+                side_hit_rate = 100.0 - hit_rate
         else:
-            side = "UNDER"
-            odds = float(orig_row.get("under_odds") or 1.91)
-            side_hit_rate = 100.0 - hit_rate
+            # Over hit_rate > 50 → OVER is the stronger side
+            if hit_rate >= 50:
+                side = "OVER"
+                odds = float(orig_row.get("over_odds") or 1.91)
+                side_hit_rate = hit_rate
+            else:
+                side = "UNDER"
+                odds = float(orig_row.get("under_odds") or 1.91)
+                side_hit_rate = 100.0 - hit_rate
 
         # Skip unavailable players
         availability = analysis.get("availability") or {}
@@ -4718,19 +6203,60 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             continue
 
         matchup = analysis.get("matchup") or {}
-        next_game_info = matchup.get("next_game") or {}
+        next_game_info = copy.deepcopy(matchup.get("next_game") or {})
         vs_position = matchup.get("vs_position") or {}
         matchup_delta_pct = vs_position.get("delta_pct") if isinstance(vs_position, dict) else None
+        # Override matchup based on the actual event when available.
+        event_home = resolve_team_from_text(str(orig_row.get("home_team") or "").strip())
+        event_away = resolve_team_from_text(str(orig_row.get("away_team") or "").strip())
+        player_team_id_int = int((analysis.get("player") or {}).get("team_id") or 0)
+        player_team_abbr = str((analysis.get("player") or {}).get("team_abbreviation") or next_game_info.get("player_team_abbreviation") or "").strip()
+        event_opponent = None
+        is_home = None
+        if player_team_id_int:
+            if event_home and int(event_home.get("id") or 0) == player_team_id_int and event_away:
+                event_opponent = event_away
+                is_home = True
+            elif event_away and int(event_away.get("id") or 0) == player_team_id_int and event_home:
+                event_opponent = event_home
+                is_home = False
+        if not event_opponent and player_team_abbr:
+            home_abbr = str(event_home.get("abbreviation") or "").upper() if event_home else ""
+            away_abbr = str(event_away.get("abbreviation") or "").upper() if event_away else ""
+            if home_abbr and home_abbr == player_team_abbr.upper() and event_away:
+                event_opponent = event_away
+                is_home = True
+            elif away_abbr and away_abbr == player_team_abbr.upper() and event_home:
+                event_opponent = event_home
+                is_home = False
+        if event_opponent and int(event_opponent.get("id") or 0) != player_team_id_int:
+            opp_abbr = str(event_opponent.get("abbreviation") or "").strip()
+            opp_name = str(event_opponent.get("full_name") or "").strip()
+            team_abbr = player_team_abbr or (event_home.get("abbreviation") if event_home else "") or (event_away.get("abbreviation") if event_away else "")
+            matchup_label = None
+            if team_abbr and opp_abbr:
+                matchup_label = f"{team_abbr} vs {opp_abbr}" if is_home else f"{team_abbr} @ {opp_abbr}"
+            next_game_info.update({
+                "opponent_team_id": int(event_opponent.get("id") or 0),
+                "opponent_abbreviation": opp_abbr,
+                "opponent_name": opp_name,
+                "player_team_abbreviation": team_abbr,
+                "is_home": is_home,
+                "is_override": True,
+                "matchup_label": matchup_label or next_game_info.get("matchup_label"),
+            })
         fair_over_prob = orig_row.get("consensus_over_fair_prob")
         fair_under_prob = orig_row.get("consensus_under_fair_prob")
         if fair_over_prob is None:
             fair_over_prob = orig_row.get("over_fair_prob")
         if fair_under_prob is None:
             fair_under_prob = orig_row.get("under_fair_prob")
-        if fair_over_prob is None:
-            fair_over_prob = decimal_implied_probability(orig_row.get("over_odds"))
-        if fair_under_prob is None:
-            fair_under_prob = decimal_implied_probability(orig_row.get("under_odds"))
+        if fair_over_prob is None or fair_under_prob is None:
+            market_probs = fair_implied_probabilities(orig_row.get("over_odds"), orig_row.get("under_odds"))
+            if fair_over_prob is None:
+                fair_over_prob = market_probs.get("over")
+            if fair_under_prob is None:
+                fair_under_prob = market_probs.get("under")
         fair_prob = fair_over_prob if side == "OVER" else fair_under_prob
         try:
             fair_prob = float(fair_prob) if fair_prob is not None else decimal_implied_probability(odds)
@@ -4783,6 +6309,9 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
                         resolved_opponent_abbr = str(candidate.get("abbreviation") or "").strip()
                     break
 
+        matchup_payload = copy.deepcopy(analysis.get("matchup") or {})
+        if next_game_info:
+            matchup_payload["next_game"] = copy.deepcopy(next_game_info)
         scored.append({
             "player_name": result.get("player_name") or "",
             "player_id": result.get("player_id"),
@@ -4805,7 +6334,7 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             "market_key": orig_row.get("market_key") or "",
             "availability_label": availability.get("label") or "Active",
             "availability": copy.deepcopy(availability),
-            "matchup": copy.deepcopy(analysis.get("matchup") or {}),
+            "matchup": matchup_payload,
             "environment": copy.deepcopy(enriched_environment),
             "confidence": confidence_engine.get("grade"),
             "confidence_score": confidence_engine.get("score"),
@@ -4847,7 +6376,16 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
     all_errors = scrape_errors + analysis_errors
 
-    return {
+    _emit_progress(
+        progress_cb,
+        "done",
+        events_scraped=len(events),
+        props_found=len(all_import_rows),
+        props_analyzed=len(scored),
+        errors=len(all_errors),
+    )
+
+    payload = {
         "legs": legs,
         "parlay": parlay_legs,
         "parlay_odds": parlay_odds,
@@ -4860,6 +6398,28 @@ def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         "bookmakers": requested_bookmakers,
         "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
     }
+    if postgres_available() and POSTGRES_CACHE_WRITE_ENABLED:
+        try:
+            _pg_write_parlay_builder_run(payload)
+        except Exception:
+            pass
+    _submit_pg_write(_pg_write_parlay_builder_run, payload)
+    return payload
+
+
+@app.post("/api/parlay-builder")
+def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    return _parlay_builder_core(payload)
+
+
+@app.post("/api/parlay-builder/async")
+def parlay_builder_async(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    return submit_async_job("parlay_builder", _parlay_builder_core, payload)
+
+
+@app.post("/api/parlay-builder/stream")
+def parlay_builder_stream(payload: dict[str, Any] = Body(...)) -> StreamingResponse:
+    return _stream_with_progress(_parlay_builder_core, payload)
 
 
 @app.get("/api/team-injuries")
@@ -4868,7 +6428,7 @@ def get_team_injuries(team_name: str = Query(..., min_length=1)) -> dict[str, An
     Return injured/risky players for a team with their resolved NBA player IDs.
     Used by the injury-aware parlay builder and Player Analyzer lineup-context UI.
     """
-    payload = fetch_latest_injury_report_payload()
+    payload = get_cached_injury_report_payload()
     rows = [row for row in (payload.get("rows") or []) if row.get("team_name") == team_name]
 
     results: list[dict[str, Any]] = []
@@ -4902,8 +6462,7 @@ def get_team_injuries(team_name: str = Query(..., min_length=1)) -> dict[str, An
     }
 
 
-@app.post("/api/parlay-builder-injury-aware")
-def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None) -> dict[str, Any]:
     """
     Injury-aware variant of the parlay builder.
     Identical scraping pipeline as /api/parlay-builder, but after scoring each prop,
@@ -4917,6 +6476,10 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
     api_keys: list[str] = [str(k).strip() for k in raw_keys if str(k).strip()]
     if not api_keys:
         raise HTTPException(status_code=400, detail="Provide at least one Odds API key in 'api_keys'.")
+
+    cached_run = _pg_read_parlay_builder_cache(payload)
+    if cached_run:
+        return cached_run
 
     legs = int(payload.get("legs") or 3)
     if legs < 2 or legs > 6:
@@ -4956,6 +6519,8 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
         events = events_result["data"] or []
         quota_log.append({"call": "events_list", "quota": events_result["quota"]})
 
+    _emit_progress(progress_cb, "events_resolved", events=len(events))
+
     if not events:
         return {"legs": legs, "parlay": [], "parlay_odds": None, "all_props_scored": [],
                 "events_scraped": 0, "props_found": 0, "errors": [], "quota_log": quota_log,
@@ -4965,7 +6530,10 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
     all_import_rows: list[dict[str, Any]] = []
     scrape_errors: list[dict[str, Any]] = []
 
+    total_batches = max(1, math.ceil(len(events) / batch_size)) if events else 1
+    batch_index = 0
     for batch_start in range(0, len(events), batch_size):
+        batch_index += 1
         batch = events[batch_start: batch_start + batch_size]
         batch_jobs = [
             {
@@ -5014,6 +6582,14 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
                 continue
             quota_log.append({"call": f"event_{event_id[:8]}", "quota": result.get("quota")})
             all_import_rows.extend(result.get("rows") or [])
+        _emit_progress(
+            progress_cb,
+            "scrape_progress",
+            batch=batch_index,
+            batches=total_batches,
+            events_scraped=min(batch_index * batch_size, len(events)),
+            props_found=len(all_import_rows),
+        )
 
     if not all_import_rows:
         return {"legs": legs, "parlay": [], "parlay_odds": None, "all_props_scored": [],
@@ -5044,7 +6620,7 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
 
     # ── Pre-fetch injury report once ─────────────────────────────────────
     try:
-        inj_report = fetch_latest_injury_report_payload()
+        inj_report = get_cached_injury_report_payload()
     except Exception:
         inj_report = {"ok": False, "rows": []}
 
@@ -5136,25 +6712,39 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
 
     max_workers = min(BULK_ANALYSIS_MAX_WORKERS, max(1, len(deduped_prepared)))
 
+    _emit_progress(progress_cb, "analysis_start", total=len(deduped_prepared), workers=max_workers)
+
     if max_workers <= 1:
+        step = max(1, len(deduped_prepared) // 10) if deduped_prepared else 1
+        done = 0
         for idx, (bulk_row, orig_row) in enumerate(deduped_prepared, start=1):
             try:
                 result = _build_bulk_prop_item(idx, bulk_row, defaults, local_cache)
                 analysis_rows.append((result, orig_row))
             except Exception as exc:
                 analysis_errors.append({"player_name": bulk_row["player_name"], "reason": str(exc)})
+            done += 1
+            if done % step == 0 or done == len(deduped_prepared):
+                _emit_progress(progress_cb, "analysis_progress", done=done, total=len(deduped_prepared))
     else:
         futures_list: list[tuple[int, dict[str, Any], dict[str, Any], Any]] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for idx, (bulk_row, orig_row) in enumerate(deduped_prepared, start=1):
                 fut = executor.submit(_build_bulk_prop_item, idx, bulk_row, defaults, local_cache)
                 futures_list.append((idx, bulk_row, orig_row, fut))
+            step = max(1, len(futures_list) // 10) if futures_list else 1
+            done = 0
             for idx, bulk_row, orig_row, fut in futures_list:
                 try:
                     result = fut.result()
                     analysis_rows.append((result, orig_row))
                 except Exception as exc:
                     analysis_errors.append({"player_name": bulk_row["player_name"], "reason": str(exc)})
+                done += 1
+                if done % step == 0 or done == len(futures_list):
+                    _emit_progress(progress_cb, "analysis_progress", done=done, total=len(futures_list))
+
+    _emit_progress(progress_cb, "analysis_done", analyzed=len(analysis_rows), errors=len(analysis_errors))
 
     # ── Injury-aware scoring ─────────────────────────────────────────────
     def injury_aware_score(result: dict[str, Any], orig_row: dict[str, Any]) -> dict[str, Any] | None:
@@ -5204,6 +6794,7 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
                     if candidate and int(candidate.get("id") or 0) == int(team_id_raw):
                         team_name = str(candidate.get("full_name") or "")
                         break
+        team_name = canonicalize_team_name(team_name, team_id=int(team_id_raw) if team_id_raw else None)
         LOGGER.debug(
             "injury_aware_score team resolution: player=%s team_id=%s → team_name=%r",
             result.get("player_name"), team_id_raw, team_name
@@ -5261,32 +6852,83 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
                     avg = float(best_usable_combo[2])
                     injury_boost = True
 
-        if hit_rate >= 50:
-            side = "OVER"
-            odds = float(orig_row.get("over_odds") or 1.91)
-            side_hit_rate = hit_rate
+        recommended_side = str(analysis.get("recommended_side") or "").upper()
+        if recommended_side in {"OVER", "UNDER"}:
+            side = recommended_side
+            if side == "OVER":
+                odds = float(orig_row.get("over_odds") or 1.91)
+                side_hit_rate = hit_rate
+            else:
+                odds = float(orig_row.get("under_odds") or 1.91)
+                side_hit_rate = 100.0 - hit_rate
         else:
-            side = "UNDER"
-            odds = float(orig_row.get("under_odds") or 1.91)
-            side_hit_rate = 100.0 - hit_rate
+            if hit_rate >= 50:
+                side = "OVER"
+                odds = float(orig_row.get("over_odds") or 1.91)
+                side_hit_rate = hit_rate
+            else:
+                side = "UNDER"
+                odds = float(orig_row.get("under_odds") or 1.91)
+                side_hit_rate = 100.0 - hit_rate
 
         if odds < 1.40:
             return None
 
         matchup = analysis.get("matchup") or {}
-        next_game_info = matchup.get("next_game") or {}
+        next_game_info = copy.deepcopy(matchup.get("next_game") or {})
         vs_position = matchup.get("vs_position") or {}
         matchup_delta_pct = vs_position.get("delta_pct") if isinstance(vs_position, dict) else None
+        # Override matchup based on the actual event when available.
+        event_home = resolve_team_from_text(str(orig_row.get("home_team") or "").strip())
+        event_away = resolve_team_from_text(str(orig_row.get("away_team") or "").strip())
+        player_team_id_int = int((analysis.get("player") or {}).get("team_id") or 0)
+        player_team_abbr = str((analysis.get("player") or {}).get("team_abbreviation") or next_game_info.get("player_team_abbreviation") or "").strip()
+        event_opponent = None
+        is_home = None
+        if player_team_id_int:
+            if event_home and int(event_home.get("id") or 0) == player_team_id_int and event_away:
+                event_opponent = event_away
+                is_home = True
+            elif event_away and int(event_away.get("id") or 0) == player_team_id_int and event_home:
+                event_opponent = event_home
+                is_home = False
+        if not event_opponent and player_team_abbr:
+            home_abbr = str(event_home.get("abbreviation") or "").upper() if event_home else ""
+            away_abbr = str(event_away.get("abbreviation") or "").upper() if event_away else ""
+            if home_abbr and home_abbr == player_team_abbr.upper() and event_away:
+                event_opponent = event_away
+                is_home = True
+            elif away_abbr and away_abbr == player_team_abbr.upper() and event_home:
+                event_opponent = event_home
+                is_home = False
+        if event_opponent and int(event_opponent.get("id") or 0) != player_team_id_int:
+            opp_abbr = str(event_opponent.get("abbreviation") or "").strip()
+            opp_name = str(event_opponent.get("full_name") or "").strip()
+            team_abbr = player_team_abbr or (event_home.get("abbreviation") if event_home else "") or (event_away.get("abbreviation") if event_away else "")
+            matchup_label = None
+            if team_abbr and opp_abbr:
+                matchup_label = f"{team_abbr} vs {opp_abbr}" if is_home else f"{team_abbr} @ {opp_abbr}"
+            next_game_info.update({
+                "opponent_team_id": int(event_opponent.get("id") or 0),
+                "opponent_abbreviation": opp_abbr,
+                "opponent_name": opp_name,
+                "player_team_abbreviation": team_abbr,
+                "is_home": is_home,
+                "is_override": True,
+                "matchup_label": matchup_label or next_game_info.get("matchup_label"),
+            })
         fair_over_prob = orig_row.get("consensus_over_fair_prob")
         fair_under_prob = orig_row.get("consensus_under_fair_prob")
         if fair_over_prob is None:
             fair_over_prob = orig_row.get("over_fair_prob")
         if fair_under_prob is None:
             fair_under_prob = orig_row.get("under_fair_prob")
-        if fair_over_prob is None:
-            fair_over_prob = decimal_implied_probability(orig_row.get("over_odds"))
-        if fair_under_prob is None:
-            fair_under_prob = decimal_implied_probability(orig_row.get("under_odds"))
+        if fair_over_prob is None or fair_under_prob is None:
+            market_probs = fair_implied_probabilities(orig_row.get("over_odds"), orig_row.get("under_odds"))
+            if fair_over_prob is None:
+                fair_over_prob = market_probs.get("over")
+            if fair_under_prob is None:
+                fair_under_prob = market_probs.get("under")
         fair_prob = fair_over_prob if side == "OVER" else fair_under_prob
         try:
             fair_prob = float(fair_prob) if fair_prob is not None else decimal_implied_probability(odds)
@@ -5298,10 +6940,12 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
             player_team_name=team_name,
             player_team_abbreviation=player_info.get("team_abbreviation") or "",
         )
+        _computed_edge = round((side_hit_rate / 100.0 - fair_prob) * 100.0, 1) if fair_prob is not None else round(abs(avg - line), 1)
+        _computed_ev = max(0.0, (side_hit_rate / 100.0) - fair_prob) if fair_prob is not None else max(0.0, (side_hit_rate / 100.0) - decimal_implied_probability(odds))
         confidence_engine = build_confidence_engine(
             side=side, hit_rate=float(side_hit_rate), games_count=base_games_count,
-            edge=round((side_hit_rate / 100.0 - fair_prob) * 100.0, 1) if fair_prob is not None else round(abs(avg - line), 1),
-            ev=max(0.0, (side_hit_rate / 100.0) - fair_prob) if fair_prob is not None else max(0.0, (side_hit_rate / 100.0) - decimal_implied_probability(odds)),
+            edge=_computed_edge,
+            ev=_computed_ev,
             matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
             availability=availability, opportunity=analysis.get("opportunity") or {},
             team_context=analysis.get("team_context") or {}, environment=enriched_environment,
@@ -5317,6 +6961,9 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
         )
 
         resolved_team_id = player_info.get("team_id")
+        matchup_payload = copy.deepcopy(analysis.get("matchup") or {})
+        if next_game_info:
+            matchup_payload["next_game"] = copy.deepcopy(next_game_info)
         opponent_info    = copy.deepcopy(next_game_info)
         if not opponent_info.get("opponent_team_id"):
             home_candidate = resolve_team_from_text(str(orig_row.get("home_team") or ""))
@@ -5344,12 +6991,15 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
             "base_hit_rate": round(base_hit_rate, 1),
             "average": round(avg, 2),
             "games_count": base_games_count,
+            "hit_count": int(round(base_games_count * side_hit_rate / 100.0)) if base_games_count > 0 else int(analysis.get("hit_count") or 0),
+            "ev": round(_computed_ev * 100.0, 1),
+            "edge": _computed_edge,
             "last_n": last_n,
             "bookmaker": orig_row.get("bookmaker_title") or "N/A",
             "market_key": orig_row.get("market_key") or "",
             "availability_label": availability.get("label") or "Active",
             "availability": copy.deepcopy(availability),
-            "matchup": copy.deepcopy(analysis.get("matchup") or {}),
+            "matchup": matchup_payload,
             "environment": copy.deepcopy(enriched_environment),
             "confidence": confidence_engine.get("grade"),
             "confidence_score": confidence_engine.get("score"),
@@ -5380,10 +7030,13 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
         }
 
     scored: list[dict[str, Any]] = []
-    for result, orig_row in analysis_rows:
+    scoring_step = max(1, len(analysis_rows) // 10) if analysis_rows else 1
+    for idx, (result, orig_row) in enumerate(analysis_rows, start=1):
         item = injury_aware_score(result, orig_row)
         if item:
             scored.append(item)
+        if idx % scoring_step == 0 or idx == len(analysis_rows):
+            _emit_progress(progress_cb, "scoring_progress", done=idx, total=len(analysis_rows))
 
     scored.sort(key=lambda x: (x.get("ranking_score", x["confidence_score"]), x["hit_rate"], x["odds"]), reverse=True)
 
@@ -5410,7 +7063,15 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
             })
 
     all_errors = scrape_errors + analysis_errors
-    return {
+    _emit_progress(
+        progress_cb,
+        "done",
+        events_scraped=len(events),
+        props_found=len(all_import_rows),
+        props_analyzed=len(scored),
+        errors=len(all_errors),
+    )
+    payload = {
         "legs": legs,
         "parlay": parlay_legs,
         "parlay_odds": parlay_odds,
@@ -5424,6 +7085,28 @@ def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str
         "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
         "injury_summary": injury_summary,
     }
+    if postgres_available() and POSTGRES_CACHE_WRITE_ENABLED:
+        try:
+            _pg_write_parlay_builder_run(payload)
+        except Exception:
+            pass
+    _submit_pg_write(_pg_write_parlay_builder_run, payload)
+    return payload
+
+
+@app.post("/api/parlay-builder-injury-aware")
+def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    return _parlay_builder_injury_aware_core(payload)
+
+
+@app.post("/api/parlay-builder-injury-aware/async")
+def parlay_builder_injury_aware_async(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    return submit_async_job("parlay_builder_injury_aware", _parlay_builder_injury_aware_core, payload)
+
+
+@app.post("/api/parlay-builder-injury-aware/stream")
+def parlay_builder_injury_aware_stream(payload: dict[str, Any] = Body(...)) -> StreamingResponse:
+    return _stream_with_progress(_parlay_builder_injury_aware_core, payload)
 
 
 @app.get("/api/todays-games")
@@ -5445,7 +7128,7 @@ def todays_games(game_date: str | None = None) -> dict[str, Any]:
                 fallback_used = True
                 break
 
-    report_payload = fetch_latest_injury_report_payload()
+    report_payload = get_cached_injury_report_payload()
     injury_rows_by_team: dict[str, list[dict[str, Any]]] = {}
     if report_payload.get("ok"):
         involved_teams = {
@@ -5676,6 +7359,9 @@ def tracker_live_stat(player_id: int, stat: str = Query(..., pattern="^(PTS|REB|
                     elif stat == "PR":  live_val = gs("points") + gs("reboundsTotal")
                     elif stat == "PA":  live_val = gs("points") + gs("assists")
                     elif stat == "RA":  live_val = gs("reboundsTotal") + gs("assists")
+                else:
+                    if game_status == "final":
+                        game_status = "no_game"
             except (KeyError, TypeError, StopIteration):
                 pass
 
@@ -5724,6 +7410,8 @@ def player_prop(
     stat: str = Query(..., pattern="^(PTS|REB|AST|3PM|STL|BLK|PRA|PR|PA|RA)$"),
     line: float = Query(..., ge=0),
     last_n: int = Query(10, ge=3, le=30),
+    over_odds: float | None = Query(None, ge=1.01),
+    under_odds: float | None = Query(None, ge=1.01),
     season: str | None = None,
     season_type: str = Query("Regular Season"),
     team_id: int | None = Query(None),
@@ -5742,6 +7430,7 @@ def player_prop(
     without_player_ids: list[int] | None = Query(None),
     without_player_name: str | None = Query(None),
     override_opponent_id: int | None = Query(None),
+    debug: bool = Query(False),
 ) -> dict[str, Any]:
     selected_season = season or current_nba_season()
     stat = stat.upper()
@@ -5752,6 +7441,8 @@ def player_prop(
         last_n=last_n,
         season=selected_season,
         season_type=season_type,
+        over_odds=over_odds,
+        under_odds=under_odds,
         team_id=team_id,
         player_position=player_position,
         location=location,
@@ -5768,11 +7459,14 @@ def player_prop(
         without_player_ids=without_player_ids,
         without_player_name=without_player_name,
         override_opponent_id=override_opponent_id,
+        debug=debug,
+        populate_player_info_cache=True,
     )
 
 BULK_ANALYSIS_ENABLED = os.getenv("NBA_BULK_ANALYSIS_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 BULK_ANALYSIS_MAX_WORKERS = max(1, int(os.getenv("NBA_BULK_ANALYSIS_MAX_WORKERS", "4")))
 BULK_ANALYSIS_MAX_ROWS = max(1, int(os.getenv("NBA_BULK_ANALYSIS_MAX_ROWS", "100")))
+BULK_PREFETCH_MAX_WORKERS = max(1, int(os.getenv("NBA_BULK_PREFETCH_MAX_WORKERS", "6")))
 
 WARM_CACHE_ON_STARTUP_ENABLED = os.getenv("NBA_WARM_CACHE_ON_STARTUP_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 WARM_CACHE_STARTUP_MAX_WORKERS = max(1, int(os.getenv("NBA_WARM_CACHE_STARTUP_MAX_WORKERS", "4")))
@@ -5780,6 +7474,128 @@ WARM_CACHE_PRELOAD_TODAYS_GAMES = os.getenv("NBA_WARM_CACHE_PRELOAD_TODAYS_GAMES
 WARM_CACHE_PRELOAD_INJURIES = os.getenv("NBA_WARM_CACHE_PRELOAD_INJURIES", "1").strip().lower() not in {"0", "false", "no", "off"}
 WARM_CACHE_PRELOAD_PLAYERS = os.getenv("NBA_WARM_CACHE_PRELOAD_PLAYERS", "1").strip().lower() not in {"0", "false", "no", "off"}
 WARM_CACHE_PRELOAD_TEAMS = os.getenv("NBA_WARM_CACHE_PRELOAD_TEAMS", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _cache_is_fresh(entry: dict[str, Any] | None, ttl_seconds: float) -> bool:
+    age_seconds = _cache_age_seconds(entry)
+    return bool(entry) and age_seconds is not None and age_seconds < ttl_seconds
+
+
+def _resolve_team_id_for_player(player_id: int, fallback_team_id: int | None = None) -> int | None:
+    if fallback_team_id not in (None, "", 0):
+        return int(fallback_team_id)
+    cached = PLAYER_INFO_CACHE.get(player_id)
+    if cached and isinstance(cached.get("row"), dict):
+        team_id = cached["row"].get("TEAM_ID")
+        if team_id not in (None, "", 0):
+            return int(team_id)
+    player = PLAYER_LOOKUP.get(player_id)
+    if player:
+        team_id = player.get("team_id")
+        if team_id not in (None, "", 0):
+            return int(team_id)
+    return None
+
+
+def prefetch_bulk_analysis_context(
+    player_ids: set[int],
+    season: str,
+    season_type: str,
+    *,
+    team_ids: set[int] | None = None,
+    primary_player_by_team: dict[int, int] | None = None,
+    max_workers: int | None = None,
+    label: str = "bulk",
+    include_game_logs: bool = True,
+    include_player_info: bool = True,
+    include_team_next_game: bool = True,
+) -> dict[str, int]:
+    if not player_ids:
+        return {"game_logs": 0, "player_info": 0, "team_next_games": 0}
+
+    team_ids = set(team_ids or [])
+    primary_player_by_team = dict(primary_player_by_team or {})
+
+    for pid in player_ids:
+        team_id = _resolve_team_id_for_player(pid)
+        if team_id:
+            team_ids.add(team_id)
+            primary_player_by_team.setdefault(team_id, pid)
+
+    game_log_jobs = []
+    if include_game_logs:
+        for pid in player_ids:
+            cache_key = (pid, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)
+            cached = GAME_LOG_CACHE.get(cache_key)
+            if not _cache_is_fresh(cached, CACHE_TTL_SECONDS):
+                game_log_jobs.append(pid)
+
+    player_info_jobs = []
+    if include_player_info:
+        for pid in player_ids:
+            cached = PLAYER_INFO_CACHE.get(pid)
+            if not _cache_is_fresh(cached, PROFILE_TTL_SECONDS):
+                player_info_jobs.append(pid)
+
+    team_jobs: list[tuple[int, int]] = []
+    if include_team_next_game:
+        for team_id in team_ids:
+            cache_key = (team_id, season, season_type)
+            cached = TEAM_NEXT_GAME_CACHE.get(cache_key)
+            if not _cache_is_fresh(cached, NEXT_GAME_TTL_SECONDS):
+                primary_player_id = primary_player_by_team.get(team_id)
+                if primary_player_id:
+                    team_jobs.append((team_id, primary_player_id))
+
+    total_jobs = len(game_log_jobs) + len(player_info_jobs) + len(team_jobs)
+    if total_jobs == 0:
+        return {"game_logs": 0, "player_info": 0, "team_next_games": 0}
+
+    workers = max(1, min(BULK_PREFETCH_MAX_WORKERS, max_workers or BULK_PREFETCH_MAX_WORKERS, total_jobs))
+
+    def _prefetch_log(pid: int) -> None:
+        try:
+            fetch_player_game_log(player_id=pid, season=season, season_type=season_type)
+        except Exception:
+            pass
+
+    def _prefetch_info(pid: int) -> None:
+        try:
+            fetch_common_player_info(pid)
+        except Exception:
+            pass
+
+    def _prefetch_team_next_game(team_id: int, primary_player_id: int) -> None:
+        try:
+            resolve_team_next_game(team_id=team_id, primary_player_id=primary_player_id, season=season, season_type=season_type)
+        except Exception:
+            pass
+
+    LOGGER.info(
+        "Bulk prefetch (%s): %d game logs, %d player info, %d team next-game (workers=%d)",
+        label,
+        len(game_log_jobs),
+        len(player_info_jobs),
+        len(team_jobs),
+        workers,
+    )
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = []
+        futures.extend(executor.submit(_prefetch_log, pid) for pid in game_log_jobs)
+        futures.extend(executor.submit(_prefetch_info, pid) for pid in player_info_jobs)
+        futures.extend(executor.submit(_prefetch_team_next_game, team_id, primary_pid) for team_id, primary_pid in team_jobs)
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception:
+                pass
+
+    return {
+        "game_logs": len(game_log_jobs),
+        "player_info": len(player_info_jobs),
+        "team_next_games": len(team_jobs),
+    }
 
 
 def _build_bulk_prop_item(row_index: int, row: dict[str, Any], defaults: dict[str, Any], local_cache: dict[tuple[Any, ...], dict[str, Any]]) -> dict[str, Any]:
@@ -5810,6 +7626,8 @@ def _build_bulk_prop_item(row_index: int, row: dict[str, Any], defaults: dict[st
     max_fga = row.get("max_fga", defaults.get("max_fga"))
     h2h_only = bool(row.get("h2h_only", defaults.get("h2h_only", False)))
     debug = bool(row.get("debug", defaults.get("debug", False)))
+    override_opponent_id = row.get("override_opponent_id", defaults.get("override_opponent_id"))
+    override_opponent_id = int(override_opponent_id) if override_opponent_id not in (None, "") else None
 
     player: dict[str, Any] | None = None
     if player_id_raw not in (None, ""):
@@ -5868,7 +7686,7 @@ def _build_bulk_prop_item(row_index: int, row: dict[str, Any], defaults: dict[st
             max_fga=float(max_fga) if max_fga not in (None, "") else None,
             h2h_only=bool(h2h_only),
             debug=bool(debug),
-            override_opponent_id=int(defaults.get("override_opponent_id")) if defaults.get("override_opponent_id") else None,
+            override_opponent_id=override_opponent_id,
         )
         local_cache[cache_key] = copy.deepcopy(analysis)
 
@@ -5899,7 +7717,7 @@ def bulk_player_props(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="defaults must be an object when provided.")
 
     try:
-        fetch_latest_injury_report_payload()
+        get_cached_injury_report_payload()
     except Exception:
         pass
 
@@ -5914,6 +7732,48 @@ def bulk_player_props(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     local_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
     results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
+
+    bulk_player_ids: set[int] = set()
+    bulk_team_ids: set[int] = set()
+    primary_by_team: dict[int, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        team_id = row.get("team_id")
+        try:
+            team_id = int(team_id) if team_id not in (None, "") else None
+        except (TypeError, ValueError):
+            team_id = None
+        player_id = row.get("player_id")
+        player = None
+        if player_id not in (None, ""):
+            try:
+                player_id = int(player_id)
+                player = PLAYER_LOOKUP.get(player_id)
+            except (TypeError, ValueError):
+                player_id = None
+        if not player_id:
+            player_name = str(row.get("player_name") or "").strip()
+            if player_name:
+                player = find_player_by_name(player_name, team_id=team_id)
+                if player:
+                    player_id = int(player["id"])
+        if player_id:
+            bulk_player_ids.add(int(player_id))
+            resolved_team_id = _resolve_team_id_for_player(int(player_id), fallback_team_id=team_id)
+            if resolved_team_id:
+                bulk_team_ids.add(int(resolved_team_id))
+                primary_by_team.setdefault(int(resolved_team_id), int(player_id))
+
+    prefetch_bulk_analysis_context(
+        player_ids=bulk_player_ids,
+        season=str(defaults.get("season") or current_nba_season()),
+        season_type=str(defaults.get("season_type") or "Regular Season"),
+        team_ids=bulk_team_ids,
+        primary_player_by_team=primary_by_team,
+        max_workers=max_workers,
+        label="bulk_props",
+    )
 
     if max_workers <= 1:
         for row_index, row in enumerate(rows, start=1):
@@ -5955,11 +7815,16 @@ def bulk_player_props(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     }
 
 
+@app.post("/api/player-props/bulk/async")
+def bulk_player_props_async(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    return submit_async_job("bulk_player_props", bulk_player_props, payload)
+
+
 @app.get("/api/debug/injury-report-raw")
 def debug_injury_report_raw() -> dict[str, Any]:
     """Debug endpoint: returns raw extracted PDF text and parsed rows so the
     team-assignment logic can be inspected without guessing."""
-    payload = fetch_latest_injury_report_payload()
+    payload = get_cached_injury_report_payload()
     raw_text = str(payload.get("raw_text") or "")
     rows = payload.get("rows") or []
     # Group rows by team so misassignments are obvious
@@ -6291,6 +8156,63 @@ def _compute_backtest_stats(entries: list[dict[str, Any]]) -> dict[str, Any]:
         for e in sorted(resolved, key=lambda entry: str(entry.get("resolved_at") or entry.get("logged_at") or ""))[-10:]
     ]
 
+    # --- Calibration by confidence grade (A/B/C/D/F) ---
+    # This tells you whether the letter grade actually predicts hit rate.
+    # After 50+ resolved entries, A should hit more than B, B more than C, etc.
+    grade_buckets: dict[str, dict[str, int]] = {}
+    for e in resolved:
+        grade = str(e.get("grade") or e.get("confidence") or "?").strip().upper()
+        if not grade or grade not in {"A", "B", "C", "D", "F"}:
+            grade = "?"
+        if grade not in grade_buckets:
+            grade_buckets[grade] = {"hits": 0, "total": 0}
+        grade_buckets[grade]["total"] += 1
+        if e["result"] == "hit":
+            grade_buckets[grade]["hits"] += 1
+    calibration_by_grade = {
+        grade: {
+            "total": v["total"],
+            "hits": v["hits"],
+            "hit_rate": round(v["hits"] / v["total"] * 100, 1) if v["total"] else None,
+        }
+        for grade, v in sorted(grade_buckets.items())
+    }
+
+    # --- Calibration by confidence score band ---
+    # Splits 0-99 score into bands so you can see if score 80-89 hits at a
+    # meaningfully different rate than 70-79 or 90-99.
+    score_band_buckets: dict[str, dict[str, int]] = {}
+    for e in resolved:
+        try:
+            score = int(float(e.get("confidence_score") or 0))
+        except (TypeError, ValueError):
+            score = 0
+        if score >= 90:
+            band = "90-99"
+        elif score >= 80:
+            band = "80-89"
+        elif score >= 70:
+            band = "70-79"
+        elif score >= 60:
+            band = "60-69"
+        elif score >= 50:
+            band = "50-59"
+        else:
+            band = "0-49"
+        if band not in score_band_buckets:
+            score_band_buckets[band] = {"hits": 0, "total": 0}
+        score_band_buckets[band]["total"] += 1
+        if e["result"] == "hit":
+            score_band_buckets[band]["hits"] += 1
+    calibration_by_score_band = {
+        band: {
+            "total": v["total"],
+            "hits": v["hits"],
+            "hit_rate": round(v["hits"] / v["total"] * 100, 1) if v["total"] else None,
+        }
+        for band, v in sorted(score_band_buckets.items(), reverse=True)
+    }
+
     return {
         "total": total,
         "logged_total": len(entries),
@@ -6310,6 +8232,8 @@ def _compute_backtest_stats(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "by_market_alignment": alignment_summary,
         "top_players": top_players,
         "recent_form": recent_form,
+        "calibration_by_grade": calibration_by_grade,
+        "calibration_by_score_band": calibration_by_score_band,
     }
 
 
@@ -6342,6 +8266,7 @@ def backtest_log_prediction(payload: dict = Body(...)) -> dict[str, Any]:
     with _BACKTEST_LOCK:
         _BACKTEST_LOG.append(entry)
         _save_backtest_log()
+    _submit_pg_write(_pg_write_backtest_entries, [entry])
     return {"ok": True, "id": entry["id"], "entry": entry}
 
 
@@ -6368,6 +8293,7 @@ def backtest_resolve_prediction(payload: dict = Body(...)) -> dict[str, Any]:
                 entry["actual_value"] = actual_value
                 entry["resolved_at"] = datetime.utcnow().isoformat() + "Z"
                 _save_backtest_log()
+                _submit_pg_write(_pg_write_backtest_entries, [entry])
                 return {"ok": True, "entry": entry}
     raise HTTPException(status_code=404, detail=f"No prediction found with id={pred_id}")
 
@@ -6379,6 +8305,293 @@ def backtest_get_log(limit: int = Query(200, ge=1, le=1000)) -> dict[str, Any]:
         entries = list(reversed(_BACKTEST_LOG))[:limit]
         stats = _compute_backtest_stats(list(_BACKTEST_LOG))
     return {"stats": stats, "entries": entries}
+
+
+@app.get("/api/history/injury-reports")
+def history_injury_reports(limit: int = Query(25, ge=1, le=200)) -> dict[str, Any]:
+    if not postgres_available():
+        return {"ok": False, "entries": [], "error": "Postgres not configured."}
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT report_url, report_timestamp, report_label, payload, fetched_at
+                FROM injury_reports
+                ORDER BY report_timestamp DESC NULLS LAST, fetched_at DESC
+                LIMIT %s;
+                """,
+                (int(limit),),
+            )
+            entries = []
+            for report_url, report_timestamp, report_label, payload, fetched_at in cur.fetchall():
+                entries.append({
+                    "report_url": report_url,
+                    "report_timestamp": str(report_timestamp) if report_timestamp else "",
+                    "report_label": report_label or "",
+                    "fetched_at": str(fetched_at) if fetched_at else "",
+                    "rows_count": len((payload or {}).get("rows") or []) if isinstance(payload, dict) else 0,
+                })
+        return {"ok": True, "entries": entries}
+    except Exception as exc:
+        return {"ok": False, "entries": [], "error": str(exc)}
+
+
+@app.get("/api/history/injury-reports/{report_url:path}")
+def history_injury_report_payload(report_url: str) -> dict[str, Any]:
+    if not postgres_available():
+        return {"ok": False, "payload": None, "error": "Postgres not configured."}
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload FROM injury_reports WHERE report_url = %s;",
+                (str(report_url),),
+            )
+            row = cur.fetchone()
+            if not row:
+                return {"ok": False, "payload": None, "error": "Report not found."}
+            payload = row[0] if isinstance(row[0], dict) else {}
+        return {"ok": True, "payload": payload}
+    except Exception as exc:
+        return {"ok": False, "payload": None, "error": str(exc)}
+
+
+def _extract_player_display_name(payload: dict[str, Any] | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("DISPLAY_FIRST_LAST", "DISPLAY_LAST_COMMA_FIRST", "PLAYER_NAME", "full_name", "name"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+@app.get("/api/history/player-info")
+def history_player_info(limit: int = Query(25, ge=1, le=200)) -> dict[str, Any]:
+    if not postgres_available():
+        return {"ok": False, "entries": [], "error": "Postgres not configured."}
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT player_id, payload, updated_at
+                FROM player_info_cache
+                ORDER BY updated_at DESC
+                LIMIT %s;
+                """,
+                (int(limit),),
+            )
+            entries = []
+            for player_id, payload, updated_at in cur.fetchall():
+                display_name = _extract_player_display_name(payload)
+                team_abbr = ""
+                if isinstance(payload, dict):
+                    team_abbr = str(payload.get("TEAM_ABBREVIATION") or payload.get("team_abbreviation") or "").strip()
+                entries.append({
+                    "player_id": int(player_id),
+                    "player_name": display_name or f"Player {player_id}",
+                    "team_abbreviation": team_abbr,
+                    "updated_at": str(updated_at) if updated_at else "",
+                })
+        return {"ok": True, "entries": entries}
+    except Exception as exc:
+        return {"ok": False, "entries": [], "error": str(exc)}
+
+
+@app.get("/api/history/player-info/{player_id}")
+def history_player_info_payload(player_id: int) -> dict[str, Any]:
+    if not postgres_available():
+        return {"ok": False, "payload": None, "error": "Postgres not configured."}
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT payload FROM player_info_cache WHERE player_id = %s;", (int(player_id),))
+            row = cur.fetchone()
+            if not row:
+                return {"ok": False, "payload": None, "error": "Player info not found."}
+            payload = row[0] if isinstance(row[0], dict) else {}
+        return {"ok": True, "payload": payload}
+    except Exception as exc:
+        return {"ok": False, "payload": None, "error": str(exc)}
+
+
+@app.get("/api/history/odds-snapshots")
+def history_odds_snapshots(limit: int = Query(50, ge=1, le=500)) -> dict[str, Any]:
+    if not postgres_available():
+        return {"ok": False, "entries": [], "error": "Postgres not configured."}
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, endpoint, params, fetched_at
+                FROM odds_snapshots
+                ORDER BY fetched_at DESC
+                LIMIT %s;
+                """,
+                (int(limit),),
+            )
+            entries = [
+                {
+                    "id": row_id,
+                    "endpoint": endpoint,
+                    "params": params or {},
+                    "fetched_at": str(fetched_at) if fetched_at else "",
+                }
+                for row_id, endpoint, params, fetched_at in cur.fetchall()
+            ]
+        return {"ok": True, "entries": entries}
+    except Exception as exc:
+        return {"ok": False, "entries": [], "error": str(exc)}
+
+
+@app.get("/api/history/odds-snapshots/{snapshot_id}")
+def history_odds_snapshot_payload(snapshot_id: int) -> dict[str, Any]:
+    if not postgres_available():
+        return {"ok": False, "payload": None, "error": "Postgres not configured."}
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT payload FROM odds_snapshots WHERE id = %s;", (int(snapshot_id),))
+            row = cur.fetchone()
+            if not row:
+                return {"ok": False, "payload": None, "error": "Snapshot not found."}
+            payload = row[0] if isinstance(row[0], dict) else {}
+        return {"ok": True, "payload": payload}
+    except Exception as exc:
+        return {"ok": False, "payload": None, "error": str(exc)}
+
+
+@app.get("/api/history/market-scans")
+def history_market_scans(limit: int = Query(25, ge=1, le=200)) -> dict[str, Any]:
+    if not postgres_available():
+        return {"ok": False, "entries": [], "error": "Postgres not configured."}
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, payload, requested_at
+                FROM market_scan_runs
+                ORDER BY requested_at DESC
+                LIMIT %s;
+                """,
+                (int(limit),),
+            )
+            entries = []
+            for row_id, payload, requested_at in cur.fetchall():
+                entries.append({
+                    "id": row_id,
+                    "requested_at": str(requested_at) if requested_at else "",
+                    "count": len((payload or {}).get("results") or []) if isinstance(payload, dict) else 0,
+                    "errors": len((payload or {}).get("errors") or []) if isinstance(payload, dict) else 0,
+                })
+        return {"ok": True, "entries": entries}
+    except Exception as exc:
+        return {"ok": False, "entries": [], "error": str(exc)}
+
+
+@app.get("/api/history/market-scans/{scan_id}")
+def history_market_scan_payload(scan_id: int) -> dict[str, Any]:
+    if not postgres_available():
+        return {"ok": False, "payload": None, "error": "Postgres not configured."}
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT payload FROM market_scan_runs WHERE id = %s;", (int(scan_id),))
+            row = cur.fetchone()
+            if not row:
+                return {"ok": False, "payload": None, "error": "Scan not found."}
+            payload = row[0] if isinstance(row[0], dict) else {}
+        return {"ok": True, "payload": payload}
+    except Exception as exc:
+        return {"ok": False, "payload": None, "error": str(exc)}
+
+
+@app.get("/api/history/parlay-runs")
+def history_parlay_runs(limit: int = Query(25, ge=1, le=200)) -> dict[str, Any]:
+    if not postgres_available():
+        return {"ok": False, "entries": [], "error": "Postgres not configured."}
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, payload, requested_at
+                FROM parlay_builder_runs
+                ORDER BY requested_at DESC
+                LIMIT %s;
+                """,
+                (int(limit),),
+            )
+            entries = []
+            for row_id, payload, requested_at in cur.fetchall():
+                entries.append({
+                    "id": row_id,
+                    "requested_at": str(requested_at) if requested_at else "",
+                    "legs": (payload or {}).get("legs") if isinstance(payload, dict) else None,
+                    "props_found": (payload or {}).get("props_found") if isinstance(payload, dict) else None,
+                    "errors": len((payload or {}).get("errors") or []) if isinstance(payload, dict) else 0,
+                })
+        return {"ok": True, "entries": entries}
+    except Exception as exc:
+        return {"ok": False, "entries": [], "error": str(exc)}
+
+
+@app.get("/api/history/parlay-runs/{run_id}")
+def history_parlay_run_payload(run_id: int) -> dict[str, Any]:
+    if not postgres_available():
+        return {"ok": False, "payload": None, "error": "Postgres not configured."}
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT payload FROM parlay_builder_runs WHERE id = %s;", (int(run_id),))
+            row = cur.fetchone()
+            if not row:
+                return {"ok": False, "payload": None, "error": "Parlay run not found."}
+            payload = row[0] if isinstance(row[0], dict) else {}
+        return {"ok": True, "payload": payload}
+    except Exception as exc:
+        return {"ok": False, "payload": None, "error": str(exc)}
+
+
+@app.get("/api/history/backtest-entries")
+def history_backtest_entries(limit: int = Query(50, ge=1, le=500)) -> dict[str, Any]:
+    if not postgres_available():
+        return {"ok": False, "entries": [], "error": "Postgres not configured."}
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT entry_id, payload, updated_at
+                FROM backtest_log_entries
+                ORDER BY updated_at DESC
+                LIMIT %s;
+                """,
+                (int(limit),),
+            )
+            entries = []
+            for entry_id, payload, updated_at in cur.fetchall():
+                entries.append({
+                    "id": entry_id,
+                    "player": (payload or {}).get("player") if isinstance(payload, dict) else "",
+                    "stat": (payload or {}).get("stat") if isinstance(payload, dict) else "",
+                    "side": (payload or {}).get("side") if isinstance(payload, dict) else "",
+                    "line": (payload or {}).get("line") if isinstance(payload, dict) else None,
+                    "result": (payload or {}).get("result") if isinstance(payload, dict) else "",
+                    "updated_at": str(updated_at) if updated_at else "",
+                })
+        return {"ok": True, "entries": entries}
+    except Exception as exc:
+        return {"ok": False, "entries": [], "error": str(exc)}
+
+
+@app.get("/api/history/backtest-entries/{entry_id}")
+def history_backtest_entry_payload(entry_id: str) -> dict[str, Any]:
+    if not postgres_available():
+        return {"ok": False, "payload": None, "error": "Postgres not configured."}
+    try:
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT payload FROM backtest_log_entries WHERE entry_id = %s;", (str(entry_id),))
+            row = cur.fetchone()
+            if not row:
+                return {"ok": False, "payload": None, "error": "Backtest entry not found."}
+            payload = row[0] if isinstance(row[0], dict) else {}
+        return {"ok": True, "payload": payload}
+    except Exception as exc:
+        return {"ok": False, "payload": None, "error": str(exc)}
 
 
 @app.post("/api/backtest/import")
@@ -6452,6 +8665,8 @@ def backtest_import_entries(payload: dict = Body(...)) -> dict[str, Any]:
             added += 1
         if added:
             _save_backtest_log()
+    if imported:
+        _submit_pg_write(_pg_write_backtest_entries, imported)
     return {"ok": True, "added": added, "skipped": skipped, "entries": imported}
 
 
@@ -6466,6 +8681,7 @@ def backtest_delete_entry(entry_id: str) -> dict[str, Any]:
             _save_backtest_log()
     if before == after:
         raise HTTPException(status_code=404, detail=f"No entry found with id={entry_id}")
+    _submit_pg_write(_pg_delete_backtest_entry, entry_id)
     return {"ok": True, "deleted": entry_id}
 
 
@@ -6476,6 +8692,7 @@ def backtest_clear_log() -> dict[str, Any]:
         count = len(_BACKTEST_LOG)
         _BACKTEST_LOG.clear()
         _save_backtest_log()
+    _submit_pg_write(_pg_clear_backtest_entries)
     return {"ok": True, "cleared": count}
 
 
@@ -6486,7 +8703,16 @@ def odds_check_quota(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     if not api_key:
         raise HTTPException(status_code=400, detail="Missing API key.")
     # Hit the /sports endpoint — it's the cheapest call (costs 0 credits on free tier)
-    result = odds_api_fetch("/sports", api_key, {"all": "false"})
+    try:
+        result = odds_api_fetch("/sports", api_key, {"all": "false"})
+    except Exception as exc:
+        detail = f"Odds API check failed: {exc}"
+        return {
+            "ok": False,
+            "quota": None,
+            "api_key_masked": mask_api_key_for_display(api_key),
+            "error": detail,
+        }
     return {
         "ok": True,
         "quota": result["quota"],

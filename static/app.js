@@ -1,3 +1,34 @@
+/**
+ * apiFetch — drop-in fetch() replacement with timeout + consistent error handling.
+ * All NBA API calls go through this so a slow/hung backend never freezes the UI.
+ *
+ * @param {string} url
+ * @param {RequestInit} [opts]
+ * @param {number} [timeoutMs=20000]
+ * @returns {Promise<any>} parsed JSON
+ * @throws {Error} with a user-readable .message on any failure
+ */
+async function apiFetch(url, opts = {}, timeoutMs = 20000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...opts, signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) {
+      let detail = `Server error ${res.status}`;
+      try { const d = await res.json(); detail = d.detail || d.message || detail; } catch (e) {}
+      throw new Error(detail);
+    }
+    return await res.json();
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === 'AbortError') {
+      throw new Error(`Request timed out after ${timeoutMs / 1000}s — the NBA API may be slow. Try again.`);
+    }
+    throw err;
+  }
+}
+
 const teamSelect = document.getElementById('teamSelect');
 const oppSelect = document.getElementById('oppSelect');
 const playerSearchInput = document.getElementById('playerSearch');
@@ -96,6 +127,10 @@ const marketTone = document.getElementById('marketTone');
 const marketBody = document.getElementById('marketBody');
 const varianceTone = document.getElementById('varianceTone');
 const varianceBody = document.getElementById('varianceBody');
+const decisionStripToneEl = document.getElementById('decisionStripTone');
+const analyzerDecisionStripGrid = document.getElementById('analyzerDecisionStripGrid');
+const analyzerDecisionStrip = document.getElementById('analyzerDecisionStrip');
+const cacheDebugPanel = document.getElementById('cacheDebugPanel');
 
 const RECENT_PLAYERS_KEY = 'nba-props-recent-players';
 const THEME_KEY = 'nba-props-theme';
@@ -104,6 +139,8 @@ const MARKET_RESULTS_KEY = 'nba-props-latest-market-results';
 const MARKET_EXPERT_FILTERS_KEY = 'nba-props-market-expert-filters';
 const ODDS_API_KEY_STORAGE = 'nba-props-odds-api-key';
 const ODDS_API_SETTINGS_STORAGE = 'nba-props-odds-api-settings';
+const INJURY_DEBUG_STORAGE = 'nba-props-injury-debug';
+const CACHE_DEBUG_STORAGE = 'nba-props-cache-debug';
 const LAST_PLAYER_KEY = 'nba-props-last-player';
 const LAST_STAT_KEY = 'nba-props-last-stat';
 const FALLBACK_HEADSHOT = encodeURIComponent(`
@@ -168,6 +205,13 @@ let activeView = 'overview';
 let statusBannerTimer = null;
 let activeWorkCount = 0;
 let latestTodayGamesPayload = null;
+let todayGamesLoadInFlight = false;
+let todayGamesLoadAttempts = 0;
+let todayGamesLastSuccessAt = 0;
+let todayGamesLastErrorAt = 0;
+let todayGamesRetryTimer = null;
+const TODAY_GAMES_CACHE_KEY = 'nba-props-todays-games-cache';
+const TODAY_GAMES_CACHE_TTL_MS = 10 * 60 * 1000;
 let overviewBoardTab = 'top';
 let currentGameLogPayload = null;
 let activeGameLogView = 'recent';
@@ -304,22 +348,14 @@ function saveOddsKeyVault(vault, { activeId = oddsKeyVaultActiveId } = {}) {
   keyVaultSyncPromise = keyVaultSyncPromise
     .catch(function () { })
     .then(async function () {
-      const response = await fetch('/api/key-vault', {
+      const response = await apiFetch('/api/key-vault', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           entries: oddsKeyVaultState,
           active_id: oddsKeyVaultActiveId,
         }),
-      });
-      if (!response.ok) {
-        let detail = 'Failed to save Key Vault.';
-        try {
-          const data = await response.json();
-          detail = data.detail || detail;
-        } catch (e) { }
-        throw new Error(detail);
-      }
+      }, 8000);
     })
     .catch(function (error) {
       console.error('Key Vault save failed:', error);
@@ -411,13 +447,11 @@ async function refreshOddsVaultEntryCredits(entry, { force = false, onLowCredits
   const hasFreshBalance = Number.isFinite(Number(entry.remaining)) && checkedAt && ((Date.now() - checkedAt) < KEY_VAULT_BALANCE_STALE_MS);
   if (!force && hasFreshBalance) return entry;
 
-  const response = await fetch('/api/odds/check-quota', {
+  const data = await apiFetch('/api/odds/check-quota', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ api_key: entry.key })
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.detail || 'Failed to check quota.');
+  }, 10000);
 
   const next = updateOddsKeyVaultEntry(entry.id, {
     remaining: data.quota?.remaining ?? null,
@@ -560,40 +594,85 @@ async function getRotatingVaultKeysForFeature({
 }
 
 // ── Global app toast ─────────────────────────────────────────────────
-function showAppToast(msg, type = 'default') {
-  let el = document.getElementById('_appToast');
-  if (!el) {
-    el = document.createElement('div');
-    el.id = '_appToast';
-    el.style.cssText = [
-      'position:fixed', 'bottom:32px', 'left:50%',
-      'transform:translateX(-50%) translateY(24px)',
-      'padding:11px 26px', 'border-radius:40px',
-      'font-size:.875rem', 'font-weight:700', 'z-index:99999',
-      'opacity:0', 'transition:opacity .22s,transform .22s',
-      'pointer-events:none', 'white-space:nowrap',
-      'display:flex', 'align-items:center', 'gap:8px',
-      'box-shadow:0 8px 32px rgba(0,0,0,0.4)'
-    ].join(';');
-    document.body.appendChild(el);
+function showAppToast(msg, type = 'default', options = {}) {
+  if (type && typeof type === 'object') {
+    options = type;
+    type = options.type || 'default';
   }
-  const colors = {
-    default:  { bg:'#7c6ef5', text:'#fff' },
-    success:  { bg:'#22c55e', text:'#fff' },
-    info:     { bg:'#38bdf8', text:'#0f172a' },
-    warning:  { bg:'#f59e0b', text:'#1a1a1a' },
+  const icons = {
+    default: '•',
+    success: '✓',
+    info: 'i',
+    warning: '!',
+    error: '×'
   };
-  const c = colors[type] || colors.default;
-  el.style.background = c.bg;
-  el.style.color = c.text;
-  el.innerHTML = msg;
-  el.style.opacity = '1';
-  el.style.transform = 'translateX(-50%) translateY(0)';
-  clearTimeout(el._t);
-  el._t = setTimeout(() => {
-    el.style.opacity = '0';
-    el.style.transform = 'translateX(-50%) translateY(24px)';
-  }, 2800);
+  let host = document.getElementById('_appToastHost');
+  if (!host) {
+    host = document.createElement('div');
+    host.id = '_appToastHost';
+    host.className = 'app-toast-host';
+    document.body.appendChild(host);
+  }
+  const normalizedType = ['success', 'warning', 'info', 'error'].includes(type) ? type : 'default';
+  const toast = document.createElement('div');
+  toast.className = `app-toast app-toast--${normalizedType}`;
+  toast.setAttribute('role', 'status');
+  toast.innerHTML = `
+    <span class="app-toast-icon">${icons[normalizedType] || icons.default}</span>
+    <div class="app-toast-body"><span class="app-toast-text"></span></div>
+  `;
+  toast.querySelector('.app-toast-text').textContent = String(msg || '');
+  if (options.actionLabel && typeof options.onAction === 'function') {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'app-toast-action';
+    btn.textContent = options.actionLabel;
+    btn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      try { options.onAction(); } catch (e) {}
+      toast.classList.remove('show');
+      setTimeout(() => toast.remove(), 220);
+    });
+    toast.appendChild(btn);
+  }
+  if (options.undoLabel && typeof options.onUndo === 'function') {
+    const undoBtn = document.createElement('button');
+    undoBtn.type = 'button';
+    undoBtn.className = 'app-toast-action is-undo';
+    undoBtn.textContent = options.undoLabel || 'Undo';
+    undoBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      try { options.onUndo(); } catch (e) {}
+      toast.classList.remove('show');
+      setTimeout(() => toast.remove(), 220);
+    });
+    toast.appendChild(undoBtn);
+  }
+  if (options.persist) {
+    toast.classList.add('is-persistent');
+  }
+  host.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add('show'));
+  const baseDuration = Number(options.duration || 0);
+  let ttl = baseDuration;
+  if (!ttl) {
+    if (normalizedType === 'success') ttl = 2200;
+    else if (normalizedType === 'info') ttl = 2600;
+    else if (normalizedType === 'warning') ttl = 3600;
+    else if (normalizedType === 'error') ttl = 4200;
+    else ttl = 2600;
+    if (options.undoLabel || options.actionLabel) {
+      ttl = Math.max(ttl, 4200);
+    }
+  }
+  if (!options.persist) {
+    setTimeout(() => {
+      toast.classList.remove('show');
+      setTimeout(() => toast.remove(), 240);
+    }, ttl);
+  }
 }
 
 function switchView(view, options = {}) {
@@ -622,7 +701,8 @@ function switchView(view, options = {}) {
 
   document.body.dataset.activeView = view;
   if (view === 'today') {
-    loadTodayGames();
+    const shouldForce = todayGamesLastErrorAt > 0 || !latestTodayGamesPayload;
+    loadTodayGames(shouldForce);
   }
   if (view === 'analyzer') {
     ensureTeamsLoaded();
@@ -674,7 +754,7 @@ function formatStoredTime(value) {
   return `Updated ${date.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}`;
 }
 
-function buildTrustDiagnostics({ availability = null, environment = null, teamContext = null, marketSide = '', selectedSide = '', injuryFilterNames = [], teamInjuryNames = [], marketDisagrees = null } = {}) {
+function buildTrustDiagnostics({ availability = null, environment = null, teamContext = null, marketSide = '', selectedSide = '', injuryFilterNames = [], teamInjuryNames = [], marketDisagrees = null, marketOddsAvailable = false } = {}) {
   const items = [];
   const headline = String(availability?.headline || availability?.status || '').toLowerCase();
   if (availability) {
@@ -694,10 +774,13 @@ function buildTrustDiagnostics({ availability = null, environment = null, teamCo
   const hasMarketContext = Number.isFinite(Number(environment?.market_team_total)) ||
     Number.isFinite(Number(environment?.market_game_total)) ||
     Number.isFinite(Number(environment?.market_spread));
-  items.push({
-    tone: hasMarketContext ? 'good' : 'neutral',
-    label: hasMarketContext ? 'Market context loaded' : 'Market context missing'
-  });
+  if (hasMarketContext) {
+    items.push({ tone: 'good', label: 'Market context loaded' });
+  } else if (marketOddsAvailable) {
+    items.push({ tone: 'neutral', label: 'Market odds loaded' });
+  } else {
+    items.push({ tone: 'neutral', label: 'Market context missing' });
+  }
 
   const filterNames = Array.isArray(injuryFilterNames) ? injuryFilterNames.filter(Boolean) : [];
   const injuryNames = Array.isArray(teamInjuryNames) ? teamInjuryNames.filter(Boolean) : [];
@@ -1501,12 +1584,12 @@ async function loadTeams(force = false) {
     return;
   }
 
-  const response = await fetch('/api/teams');
-  const data = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
+  let data;
+  try {
+    data = await apiFetch('/api/teams', {}, 10000);
+  } catch (err) {
     teamSelect.innerHTML = '<option value="">Failed to load teams</option>';
-    throw new Error(data.detail || 'Failed to load teams.');
+    throw err;
   }
 
   const teams = Array.isArray(data) ? data : (Array.isArray(data.results) ? data.results : (Array.isArray(data.teams) ? data.teams : []));
@@ -1559,12 +1642,7 @@ async function loadRoster(teamId) {
   if (season) params.set('season', season);
 
   const query = params.toString();
-  const response = await fetch(`/api/teams/${teamId}/roster${query ? `?${query}` : ''}`);
-  const payload = await response.json();
-
-  if (!response.ok) {
-    throw new Error(payload.detail || 'Failed to load roster.');
-  }
+  const payload = await apiFetch(`/api/teams/${teamId}/roster${query ? `?${query}` : ''}`, {}, 15000);
 
   rosterPlayers = payload.results || [];
   selectedTeam = payload.team;
@@ -1603,18 +1681,26 @@ function renderRoster(team, season, players) {
     const isRisk = !!player.is_risky && !isOut;
     const cardCls = isOut ? 'player-card player-card--out' : isRisk ? 'player-card player-card--risk' : 'player-card';
     const badge = isOut
-      ? `<span class="inj-badge out">${escapeHtml(injSt)}</span>`
+      ? `<span class="inj-badge out">${escapeHtml(injSt || 'OUT')}</span>`
       : isRisk
-        ? `<span class="inj-badge risk">${escapeHtml(injSt)}</span>`
-        : '';
+        ? `<span class="inj-badge risk">${escapeHtml(injSt || 'Q')}</span>`
+        : `<span class="inj-badge ok">Active</span>`;
+    const hoverLine = player.last_game ? `Last ${player.last_game}` : (player.avg ? `Avg ${player.avg}` : '');
+    const hoverHtml = hoverLine ? `<div class="player-card-hover"><span>${escapeHtml(hoverLine)}</span></div>` : `<div class="player-card-hover"><span>Tap to analyze</span></div>`;
     return `<button class="${cardCls}" data-id="${player.id}">
-      <img src="${getPlayerImage(player.id)}" alt="${escapeHtml(player.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
+      <div class="player-card-avatar">
+        <img src="${getPlayerImage(player.id)}" alt="${escapeHtml(player.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
+      </div>
       <div class="player-card-head">
         <div class="player-card-name">${escapeHtml(player.full_name)}</div>
         <span class="jersey-pill">${escapeHtml(player.jersey || '--')}</span>
       </div>
-      <div class="player-card-meta">${escapeHtml(player.position || 'N/A')} ${badge}</div>
+      <div class="player-card-meta">
+        <span class="player-card-pos">${escapeHtml(player.position || 'N/A')}</span>
+        ${badge}
+      </div>
       <div class="player-card-team">${escapeHtml(player.team_abbreviation || team.abbreviation)}</div>
+      ${hoverHtml}
     </button>`;
   }).join('');
 
@@ -1650,9 +1736,7 @@ async function toggleInjuryPanel(teamId) {
   panel.classList.add('open');
   panel.innerHTML = '<div class="inj-panel-loading">Loading injury report…</div>';
   try {
-    const resp = await fetch('/api/teams/' + teamId + '/injury-report');
-    if (!resp.ok) throw new Error('Failed');
-    const d = await resp.json();
+    const d = await apiFetch('/api/teams/' + teamId + '/injury-report', {}, 12000);
     const ps = d.players || [];
     const rl = d.report_label ? '<span class="inj-report-date">' + escapeHtml(d.report_label) + '</span>' : '';
     if (!ps.length) {
@@ -1679,9 +1763,7 @@ async function toggleInjuryPanel(teamId) {
 }
 
 async function searchPlayers(query) {
-  const response = await fetch(`/api/players/search?q=${encodeURIComponent(query)}`);
-  if (!response.ok) throw new Error('Failed to search players.');
-  return response.json();
+  return apiFetch(`/api/players/search?q=${encodeURIComponent(query)}`, {}, 8000);
 }
 
 function renderSearchResults(results) {
@@ -1937,7 +2019,6 @@ function renderBetFinderResults(payload) {
     const tone = getFinderTone(item.hit_rate);
     const sideGuess = item.average >= payload.line ? 'OVER' : 'UNDER';
     const sideClass = sideGuess.toLowerCase();
-    const availabilityNote = availability.reason || availability.note || 'No official note';
     return `
       <button class="finder-card sportsbook-tile ${tone}" type="button"
         data-id="${item.player.id}"
@@ -2048,12 +2129,7 @@ async function runBetFinder() {
     const season = seasonInput.value.trim();
     if (season) params.set('season', season);
 
-    const response = await fetch(`/api/bet-finder?${params.toString()}`);
-    const payload = await response.json();
-
-    if (!response.ok) {
-      throw new Error(payload.detail || 'Failed to run Bet Finder.');
-    }
+    const payload = await apiFetch(`/api/bet-finder?${params.toString()}`, {}, 30000);
 
     renderBetFinderResults(payload);
     setStatus('Bet Finder ready');
@@ -2150,7 +2226,46 @@ async function hydrateAnalyzerFromPropSelection(prop) {
     const embeddedEnvironment = prop.environment && typeof prop.environment === 'object' ? prop.environment : null;
     const embeddedAvailability = prop.availability && typeof prop.availability === 'object' ? prop.availability : null;
     const embeddedNextGame = embeddedMatchup?.next_game || null;
-    const overrideTeamId = Number(prop.opponent_team_id || embeddedNextGame?.opponent_team_id || 0) || null;
+    const rawOverrideTeamId = Number(prop.opponent_team_id || embeddedNextGame?.opponent_team_id || 0) || null;
+    const teamAbbrUpper = String(prop.team_abbreviation || rosterMatch?.team_abbreviation || '').toUpperCase();
+    const teamIdStr = teamId ? String(teamId) : '';
+    const deriveOpponentId = () => {
+      const options = Array.from((oppSelect?.options || teamSelect?.options || []));
+      const findIdByText = (text) => {
+        const normalized = String(text || '').toUpperCase();
+        if (!normalized) return null;
+        for (const opt of options) {
+          const abbr = String(opt.dataset?.abbreviation || '').toUpperCase();
+          if (abbr && (normalized === abbr || normalized.includes(abbr))) return opt.value;
+          const label = String(opt.textContent || '').toUpperCase();
+          if (label && normalized.includes(label)) return opt.value;
+        }
+        return null;
+      };
+      const homeId = findIdByText(prop.home_team);
+      const awayId = findIdByText(prop.away_team);
+      if (homeId && awayId) {
+        if (teamIdStr && homeId === teamIdStr) return awayId;
+        if (teamIdStr && awayId === teamIdStr) return homeId;
+      }
+      const label = String(prop.game_label || '').toUpperCase();
+      if (label) {
+        const abbrs = (label.match(/[A-Z]{2,3}/g) || []).filter(Boolean);
+        for (const abbr of abbrs) {
+          if (teamAbbrUpper && abbr === teamAbbrUpper) continue;
+          const id = findIdByText(abbr);
+          if (id && (!teamIdStr || id !== teamIdStr)) return id;
+        }
+      }
+      return null;
+    };
+    let overrideTeamId = rawOverrideTeamId;
+    if (overrideTeamId && teamIdStr && String(overrideTeamId) === teamIdStr) {
+      overrideTeamId = null;
+    }
+    if (!overrideTeamId) {
+      overrideTeamId = deriveOpponentId();
+    }
 
     if (typeof oppSelect !== 'undefined' && oppSelect) {
       if (overrideTeamId) {
@@ -2182,6 +2297,8 @@ async function hydrateAnalyzerFromPropSelection(prop) {
       availability: embeddedAvailability || rosterMatch?.availability || null,
       matchup: embeddedMatchup || null,
       environment: embeddedEnvironment || null,
+      market_over_odds: prop.over_odds ?? prop.best_over_odds ?? prop.market_over_odds ?? null,
+      market_under_odds: prop.under_odds ?? prop.best_under_odds ?? prop.market_under_odds ?? null,
     };
 
     if (typeof setSelectedPlayer === 'function') {
@@ -2191,7 +2308,7 @@ async function hydrateAnalyzerFromPropSelection(prop) {
     if (typeof lineInput !== 'undefined' && lineInput) lineInput.value = prop.line;
     if (typeof switchView === 'function') switchView('analyzer');
     if (typeof analyzePlayerProp === 'function') {
-      await analyzePlayerProp({ preserveScroll: true });
+      await analyzePlayerProp({ preserveScroll: true, overrideLastN: prop.last_n || null });
     }
     return true;
   } catch (err) {
@@ -2236,9 +2353,13 @@ function renderMatchup(payload) {
     ? `<div class="override-notice">📌 <strong>Manual opponent override:</strong> ${escapeHtml(nextGame?.opponent_name || nextGame?.opponent_abbreviation || 'Custom opponent')} — defense-vs-position and H2H stats reflect this selection, not the actual scheduled game.</div>`
     : '';
 
+  const formatMaybe = (value, digits = 2) => {
+    const num = Number(value);
+    return Number.isFinite(num) ? num.toFixed(digits) : '—';
+  };
   let summaryText = 'Defense-vs-position data unavailable for this player and stat.';
   if (vsPosition) {
-    summaryText = `${nextGame?.opponent_name || 'This opponent'} allows ${vsPosition.opponent_value.toFixed(2)} ${(getStatLabel(vsPosition.stat) || '').toLowerCase()} per player-game to ${(vsPosition.position_label || 'this position').toLowerCase()}, versus a league baseline of ${vsPosition.league_average.toFixed(2)} (${formatDelta(vsPosition.delta_pct)}%).`;
+    summaryText = `${nextGame?.opponent_name || 'This opponent'} allows ${formatMaybe(vsPosition.opponent_value)} ${(getStatLabel(vsPosition.stat) || '').toLowerCase()} per player-game to ${(vsPosition.position_label || 'this position').toLowerCase()}, versus a league baseline of ${formatMaybe(vsPosition.league_average)} (${Number.isFinite(Number(vsPosition.delta_pct)) ? `${formatDelta(vsPosition.delta_pct)}%` : '—'}).`;
   }
 
   const bodyHtml = `
@@ -2266,17 +2387,17 @@ function renderMatchup(payload) {
       </article>
       <article class="matchup-tile">
         <span class="small-label">Opponent allow rate</span>
-        <strong>${vsPosition ? vsPosition.opponent_value.toFixed(2) : '—'}</strong>
-        <small>${vsPosition ? `League avg ${vsPosition.league_average.toFixed(2)}` : 'No sample'}</small>
+        <strong>${vsPosition ? formatMaybe(vsPosition.opponent_value) : '—'}</strong>
+        <small>${vsPosition ? `League avg ${formatMaybe(vsPosition.league_average)}` : 'No sample'}</small>
       </article>
       <article class="matchup-tile">
         <span class="small-label">Delta vs average</span>
-        <strong class="${leanTone === 'good' ? 'match-good' : leanTone === 'bad' ? 'match-bad' : ''}">${vsPosition ? `${formatDelta(vsPosition.delta_pct)}%` : '—'}</strong>
+        <strong class="${leanTone === 'good' ? 'match-good' : leanTone === 'bad' ? 'match-bad' : ''}">${vsPosition && Number.isFinite(Number(vsPosition.delta_pct)) ? `${formatDelta(vsPosition.delta_pct)}%` : '—'}</strong>
         <small>${escapeHtml(vsPosition?.lean || 'Neutral')}</small>
       </article>
       <article class="matchup-tile">
         <span class="small-label">Sample</span>
-        <strong>${vsPosition ? vsPosition.sample_gp.toFixed(0) : '—'}</strong>
+        <strong>${vsPosition ? formatMaybe(vsPosition.sample_gp, 0) : '—'}</strong>
         <small>${vsPosition ? `player-games vs ${escapeHtml(nextGame?.opponent_abbreviation || '')}` : 'No sample'}</small>
       </article>
     </div>
@@ -2612,7 +2733,7 @@ async function fetchAnalyzerGameContext(source) {
     return null;
   }
 
-  const response = await fetch('/api/odds/game-context', {
+  const result = await apiFetch('/api/odds/game-context', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -2622,9 +2743,8 @@ async function fetchAnalyzerGameContext(source) {
       odds_format: settings.odds_format || 'decimal',
       ...requestData,
     })
-  });
-  const result = await response.json();
-  if (!response.ok || !result?.ok) return null;
+  }, 12000).catch(() => null);
+  if (!result?.ok) return null;
   analyzerGameContextCache.set(cacheKey, result);
   return result;
 }
@@ -2673,7 +2793,7 @@ async function enrichTodayGamesWithMarketContext(payload) {
       game.__marketContextPending = false;
       return;
     }
-    const response = await fetch('/api/odds/game-context', {
+    const result = await apiFetch('/api/odds/game-context', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2686,10 +2806,9 @@ async function enrichTodayGamesWithMarketContext(payload) {
         team_abbreviation: game.away.abbreviation || '',
         opponent_abbreviation: game.home.abbreviation || '',
       })
-    });
-    const result = await response.json();
+    }, 12000).catch(() => null);
     game.__marketContextPending = false;
-    if (!response.ok || !result?.ok) return;
+    if (!result?.ok) return;
     game.market_context = result.context || {};
     game.market_environment = result.environment || {};
     todayGameContextCache.set(cacheKey, result);
@@ -2756,13 +2875,11 @@ async function loadOddsEvents() {
   setOddsQuotaMeta(null);
   if (oddsLoadEventsBtn) oddsLoadEventsBtn.disabled = true;
   try {
-    const response = await fetch('/api/odds/events', {
+    const payload = await apiFetch('/api/odds/events', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ api_key: keyEntry.key, sport: settings.sport })
-    });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.detail || payload.error || 'Failed to load events.');
+    }, 15000);
     renderOddsEvents(payload.events || []);
     setOddsQuotaMeta(payload.quota);
     setOddsApiKeyMeta(payload.api_key_used || keyEntry.key);
@@ -2801,7 +2918,7 @@ async function importOddsPropsAndScan() {
   setOddsApiStatus('Importing props...', 'working');
   if (oddsImportScanBtn) oddsImportScanBtn.disabled = true;
   try {
-    const response = await fetch('/api/odds/player-props-import', {
+    const payload = await apiFetch('/api/odds/player-props-import', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2812,9 +2929,7 @@ async function importOddsPropsAndScan() {
         odds_format: settings.odds_format,
         markets: settings.markets,
       })
-    });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.detail || payload.error || 'Failed to import player props.');
+    }, 30000);
     setOddsQuotaMeta(payload.quota);
     setOddsApiKeyMeta(payload.api_key_used || keyEntry.key);
     const csvRows = Array.isArray(payload.csv_rows) ? payload.csv_rows : [];
@@ -2826,7 +2941,30 @@ async function importOddsPropsAndScan() {
     marketTextarea.value = csvRows.join('\n');
     marketMeta.textContent = `${csvRows.length} imported row(s) • ${payload.event?.away_team || ''} @ ${payload.event?.home_team || ''} • Credits used ${payload.quota?.used ?? '—'} • Remaining ${payload.quota?.remaining ?? '—'}`;
     setOddsApiStatus(`Imported ${csvRows.length} prop row(s)`, 'good');
-    await runMarketScan();
+    const importedRows = Array.isArray(payload.import_rows) ? payload.import_rows : [];
+    const scanRows = importedRows.map(row => ({
+      player_name: row.player_name,
+      stat: row.stat,
+      line: row.line,
+      over_odds: row.over_odds,
+      under_odds: row.under_odds,
+      over_fair_prob: row.over_fair_prob,
+      under_fair_prob: row.under_fair_prob,
+      consensus_over_fair_prob: row.consensus_over_fair_prob,
+      consensus_under_fair_prob: row.consensus_under_fair_prob,
+      hold_percent: row.hold_percent ?? row.consensus_hold_percent,
+      books_count: row.books_count,
+      best_over_odds: row.best_over_odds,
+      best_under_odds: row.best_under_odds,
+      best_over_bookmaker: row.best_over_bookmaker,
+      best_under_bookmaker: row.best_under_bookmaker,
+      market_implied_line: row.market_implied_line,
+      bookmaker_title: row.bookmaker_title,
+      game_label: row.game_label,
+      home_team: row.home_team,
+      away_team: row.away_team,
+    }));
+    await runMarketScan(scanRows.length ? scanRows : null);
   } catch (error) {
     console.error(error);
     setOddsApiStatus('Import failed', 'bad');
@@ -2854,7 +2992,7 @@ function renderMarketEmpty(message = 'Paste your board using the template, then 
   `;
 }
 
-async function focusMarketPlayer(item) {
+async function focusMarketPlayer(item, options = {}) {
   if (!item?.player?.id) return;
 
   const teamId = item.player.team_id;
@@ -2930,19 +3068,26 @@ async function focusMarketPlayer(item) {
     setStatus('Ready');
 
     // Silently refresh in background to get latest data (next game, injury status, etc.)
-    analyzePlayerProp({ preserveScroll: true, forceRefresh: true }).catch(err => {
-      console.warn('Background refresh failed:', err.message || err);
-    });
+    if (!options?.skipRefresh) {
+      analyzePlayerProp({ preserveScroll: true, forceRefresh: true }).catch(err => {
+        console.warn('Background refresh failed:', err.message || err);
+      });
+    }
     return;
   }
 
   // Fallback: no pre-fetched analysis, do a full fetch
-  await analyzePlayerProp();
+  await analyzePlayerProp({ preserveScroll: true });
 }
 
 async function focusMarketPlayerEnhanced(item) {
   if (!item?.player?.id) return;
   const analysis = item.analysis || {};
+  if (analysis && Array.isArray(analysis.games) && analysis.games.length) {
+    await focusMarketPlayer(item, { skipRefresh: true });
+    return;
+  }
+  const marketLastN = analysis?.last_n || currentMarketResultsPayload?.last_n || null;
   const hydrated = await hydrateAnalyzerFromPropSelection({
     player_id: item.player.id,
     player_name: item.player.full_name,
@@ -2958,6 +3103,9 @@ async function focusMarketPlayerEnhanced(item) {
     matchup: analysis.matchup || item.matchup || null,
     environment: analysis.environment || item.environment || null,
     availability: analysis.availability || item.availability || null,
+    last_n: marketLastN,
+    over_odds: item.market?.over_odds,
+    under_odds: item.market?.under_odds,
   });
   if (!hydrated) {
     await focusMarketPlayer(item);
@@ -3036,7 +3184,7 @@ function buildDecisionLensData({
     if (marketDisagrees && market) {
       marketText = `The betting market leans ${market}, while the model still prefers ${side}${Number.isFinite(penalty) && penalty > 0 ? `, so a ${penalty.toFixed(1)}-point market penalty is applied` : ''}.`;
     } else if (market) {
-      marketText = `The betting market is generally aligned with ${side}${Number.isFinite(impliedProb) ? ` at ${impliedProb.toFixed(1)}% implied` : ''}.`;
+      marketText = `The betting market is aligned with ${side}${Number.isFinite(impliedProb) ? ` at ${impliedProb.toFixed(1)}% implied` : ''}. This is a strong confirmation signal that the model read is on the right side; if the market flips the other way, we treat it as a meaningful warning and reduce confidence.`;
     } else {
       marketText = `Model probability ${Number.isFinite(modelProb) ? `${modelProb.toFixed(1)}%` : '—'} vs implied ${Number.isFinite(impliedProb) ? `${impliedProb.toFixed(1)}%` : '—'}.`;
     }
@@ -3105,9 +3253,10 @@ function getMarketInspectDetails(item) {
     teamInjuryNames: (teamContext.players || []).map(p => p.name).filter(Boolean),
     environment,
   });
+  const matchupSubtitle = item?.game_label || `${item?.player?.team || ''} vs ${item?.player?.opponent || ''}`.trim();
   return {
     title: `${item?.player?.full_name || 'Unknown player'} • ${item?.market?.stat || 'Prop'} ${item?.market?.line ?? ''}`,
-    subtitle: `${item?.player?.team || ''} vs ${item?.player?.opponent || ''}`.trim(),
+    subtitle: matchupSubtitle.trim(),
     side: marketSide,
     summary: bestBet.user_read || bestBet.confidence_summary || 'Confidence summary unavailable.',
     availability,
@@ -3312,14 +3461,24 @@ function renderMarketResults(payload) {
   currentMarketResultsPayload = payload;
   const sortKey = currentMarketSort || 'best_ev';
   const filterKey = currentMarketFilter || 'all';
-  const results = [...filterMarketRows(payload.results || [], filterKey)]
+  const rawResults = payload.results || [];
+  let results = [...filterMarketRows(rawResults, filterKey)]
     .filter(item => passesExpertFilters(item))
     .filter(item => passesAdvancedMarketFilters(item))
     .sort((a, b) => compareMarketRows(a, b, sortKey, currentMarketSortDirection));
 
   if (!results.length) {
-    renderMarketEmpty('No rows produced a usable result. Check names and try again.');
-    return;
+    if (rawResults.length) {
+      results = [...rawResults].sort((a, b) => compareMarketRows(a, b, sortKey, currentMarketSortDirection));
+      showAppToast({
+        title: 'Filters hid all results',
+        detail: 'Showing all rows. Clear filters to refine.',
+        tone: 'warning'
+      });
+    } else {
+      renderMarketEmpty('No rows produced a usable result. Check names and try again.');
+      return;
+    }
   }
 
   if (marketSortSelect) marketSortSelect.value = sortKey;
@@ -3335,7 +3494,7 @@ function renderMarketResults(payload) {
   renderMarketInspectTray();
 
   const featured = results.slice(0, 6);
-  marketResults.className = 'market-results-shell';
+  marketResults.className = 'market-results-shell market-balanced';
   marketResults.innerHTML = `
     <div class="market-slips-header">
       <div>
@@ -3351,14 +3510,16 @@ function renderMarketResults(payload) {
     const matchupData = item.analysis?.matchup || item.matchup || {};
     const environment = item.analysis?.environment || {};
     const teamContext = item.analysis?.team_context || {};
-    const matchupLean = matchupData?.vs_position?.lean || 'No matchup';
-    const matchupDetail = matchupData?.next_game?.matchup_label || 'No next opponent';
+    const matchupLabelFallback = item.game_label || (item.player?.team && item.player?.opponent ? `${item.player.team} vs ${item.player.opponent}` : '');
+    const matchupLean = matchupData?.vs_position?.lean || (matchupLabelFallback ? matchupLabelFallback : 'No matchup');
+    const matchupDetail = matchupData?.next_game?.matchup_label || (matchupLabelFallback ? 'Matchup pending' : 'No next opponent');
     const expertAngles = getMarketExpertAngles(item).slice(0, 3);
     const side = (item.best_bet.display_side || item.best_bet.side || 'Lean').toUpperCase();
     const sideClass = side.toLowerCase().includes('under') ? 'under' : 'over';
     const itemKey = getMarketItemKey(item);
     const isInspected = currentMarketInspectKeys.includes(itemKey);
     const availabilityNote = availability.reason || availability.note || 'No official note';
+    const marketOddsAvailable = Number.isFinite(Number(item.market?.over_odds)) || Number.isFinite(Number(item.market?.under_odds));
     const trustDiagnostics = buildTrustDiagnostics({
       availability,
       environment,
@@ -3368,15 +3529,16 @@ function renderMarketResults(payload) {
       injuryFilterNames: item.injury_filter_player_names || [],
       teamInjuryNames: item.team_injury_player_names || [],
       marketDisagrees: item.best_bet.market_disagrees,
+      marketOddsAvailable,
     });
     return `
-          <article class="market-slip-card ${isInspected ? 'is-inspected' : ''}" data-index="${index}" data-item-key="${escapeHtml(itemKey)}">
+          <article class="market-slip-card market-balanced-card ${isInspected ? 'is-inspected' : ''}" data-index="${index}" data-item-key="${escapeHtml(itemKey)}">
             <div class="market-slip-head">
               <div class="market-slip-player">
                 <img src="${getPlayerImage(item.player.id)}" alt="${escapeHtml(item.player.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
                 <div>
                   <strong>${escapeHtml(item.player.full_name)}</strong>
-                  <span>${escapeHtml(item.player.team)} vs ${escapeHtml(item.player.opponent || '')}</span>
+                  <span>${escapeHtml(item.game_label || (item.player.team ? `${item.player.team} vs ${item.player.opponent || ''}` : ''))}</span>
                   <small class="market-slip-statusline">${renderAvailabilityBadge(availability, true)} <span>${escapeHtml(availabilityNote)}</span></small>
                 </div>
               </div>
@@ -3393,6 +3555,11 @@ function renderMarketResults(payload) {
                   <span>Avg</span>
                   <strong>${item.analysis.average}</strong>
                 </span>
+              </div>
+              <div class="market-micro-summary">
+                <span class="market-micro-pill">EV <strong>${item.best_bet.ev ?? '—'}%</strong></span>
+                <span class="market-micro-pill">Edge <strong>${item.best_bet.edge ?? '—'}%</strong></span>
+                <span class="market-micro-pill">Sample <strong>${item.analysis.hit_count}/${item.analysis.games_count}</strong></span>
               </div>
               <p class="market-slip-summary">${escapeHtml(item.best_bet.user_read || item.best_bet.confidence_summary || 'Confidence summary unavailable.')}</p>
               ${renderTrustDiagnostics(trustDiagnostics, true)}
@@ -3464,9 +3631,11 @@ function renderMarketResults(payload) {
     const matchupData = item.analysis?.matchup || item.matchup || {};
     const environment = item.analysis?.environment || {};
     const teamContext = item.analysis?.team_context || {};
-    const matchupLean = matchupData?.vs_position?.lean || 'No matchup';
-    const matchupDetail = matchupData?.next_game?.matchup_label || 'No next opponent';
+    const matchupLabelFallback = item.game_label || (item.player?.team && item.player?.opponent ? `${item.player.team} vs ${item.player.opponent}` : '');
+    const matchupLean = matchupData?.vs_position?.lean || (matchupLabelFallback ? matchupLabelFallback : 'No matchup');
+    const matchupDetail = matchupData?.next_game?.matchup_label || (matchupLabelFallback ? 'Matchup pending' : 'No next opponent');
     const expertAngles = getMarketExpertAngles(item);
+    const marketOddsAvailable = Number.isFinite(Number(item.market?.over_odds)) || Number.isFinite(Number(item.market?.under_odds));
     const trustDiagnostics = buildTrustDiagnostics({
       availability,
       environment,
@@ -3476,6 +3645,7 @@ function renderMarketResults(payload) {
       injuryFilterNames: item.injury_filter_player_names || [],
       teamInjuryNames: item.team_injury_player_names || [],
       marketDisagrees: item.best_bet.market_disagrees,
+      marketOddsAvailable,
     });
     return `
               <tr class="market-row" data-index="${index}" data-item-key="${escapeHtml(getMarketItemKey(item))}">
@@ -3484,7 +3654,7 @@ function renderMarketResults(payload) {
                     <img src="${getPlayerImage(item.player.id)}" alt="${escapeHtml(item.player.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
                     <div>
                       <strong>${escapeHtml(item.player.full_name)}</strong>
-                      <small>${escapeHtml(item.player.team)} vs ${escapeHtml(item.player.opponent || '')}</small>
+                      <small>${escapeHtml(item.game_label || (item.player.team ? `${item.player.team} vs ${item.player.opponent || ''}` : ''))}</small>
                     </div>
                   </div>
                 </td>
@@ -3496,6 +3666,11 @@ function renderMarketResults(payload) {
                     <small>Rank score ${item.best_bet.ranking_score ?? item.best_bet.confidence_score ?? '—'}${Number(item.best_bet.market_penalty || 0) > 0 ? ` • market penalty ${Number(item.best_bet.market_penalty).toFixed(1)}` : ''}</small>
                     <small>${escapeHtml(item.best_bet.user_read || item.best_bet.confidence_summary || 'Confidence summary unavailable.')}</small>
                     ${renderTrustDiagnostics(trustDiagnostics, true)}
+                  </div>
+                  <div class="market-row-micro">
+                    <span>EV <strong>${item.best_bet.ev ?? '—'}%</strong></span>
+                    <span>Edge <strong>${item.best_bet.edge ?? '—'}%</strong></span>
+                    <span>Sample <strong>${item.analysis.hit_count}/${item.analysis.games_count}</strong></span>
                   </div>
                 </td>
                 <td class="${(item.best_bet.edge || 0) >= 0 ? 'hit-value' : 'miss-value'}">${item.best_bet.edge ?? '—'}%</td>
@@ -3574,12 +3749,80 @@ function renderMarketResults(payload) {
   populateMarketInjuryCells(results);
 }
 
+async function streamNdjson(url, payload, onMessage) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  if (!response.ok || !response.body) {
+    let errPayload = null;
+    try { errPayload = await response.json(); } catch (e) { /* noop */ }
+    throw new Error(errPayload?.detail || errPayload?.message || 'Request failed.');
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let msg = null;
+      try { msg = JSON.parse(trimmed); } catch (e) { continue; }
+      if (onMessage) onMessage(msg);
+      if (msg?.type === 'result' || msg?.type === 'error') return msg;
+    }
+  }
+  return null;
+}
 
-async function runMarketScan() {
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function runAsyncJob(endpoint, payload, onTick, timeoutMs = 180000, pollMs = 1000) {
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const start = Date.now();
+  const initPayload = await response.json();
+  if (!response.ok) {
+    throw new Error(initPayload?.detail || initPayload?.message || 'Async job failed to start.');
+  }
+  const jobId = initPayload?.job_id;
+  if (!jobId) throw new Error('Async job did not return a job id.');
+
+  while (true) {
+    const statusResp = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
+    const statusPayload = await statusResp.json();
+    if (!statusResp.ok || !statusPayload?.ok) {
+      throw new Error(statusPayload?.error || 'Async job status failed.');
+    }
+    if (onTick) onTick(statusPayload);
+    if (statusPayload.status === 'done') return statusPayload.result;
+    if (statusPayload.status === 'error') {
+      throw new Error(statusPayload.error || 'Async job failed.');
+    }
+    if (Date.now() - start > timeoutMs) {
+      throw new Error('Async job timed out.');
+    }
+    await sleep(pollMs);
+  }
+}
+
+
+async function runMarketScan(rowsOverride = null) {
   switchView('market');
   let rows;
   try {
-    rows = parseMarketText(marketTextarea.value);
+    rows = Array.isArray(rowsOverride) ? rowsOverride : parseMarketText(marketTextarea.value);
   } catch (error) {
     alert(error.message);
     return;
@@ -3590,23 +3833,57 @@ async function runMarketScan() {
   marketResults.className = 'bet-finder-state empty-state-panel compact';
   marketResults.innerHTML = `
     <div class="empty-icon">⏳</div>
-    <strong>Scanning your board...</strong>
-    <span>Comparing hit rate, implied odds, EV, and matchup context.</span>
+    <div class="market-streaming-head">
+      <strong>Scanning your board...</strong>
+      <div class="streaming-badge market-streaming-badge"><span class="streaming-dot"></span>Live progress</div>
+    </div>
+    <span class="market-streaming-text">Working through the board…</span>
   `;
 
   try {
-    const response = await fetch('/api/market-scan', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        rows,
-        last_n: Number(gamesSelect.value),
-        season: seasonInput.value.trim() || undefined
-      })
-    });
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.detail || 'Market scan failed.');
+    const inputPayload = {
+      rows,
+      last_n: Number(gamesSelect.value),
+      season: seasonInput.value.trim() || undefined
+    };
+    const progressLabel = (msg) => {
+      switch (msg.stage) {
+        case 'start': return `Scanning ${msg.total_rows || rows.length} rows...`;
+        case 'prepared': return `Prepared ${msg.prepared || 0} rows`;
+        case 'analysis_start': return `Analyzing ${msg.total || 0} props...`;
+        case 'analysis_progress': return `Analyzing ${msg.done || 0}/${msg.total || 0}`;
+        case 'analysis_done': return `Analysis complete (${msg.analyzed || 0})`;
+        case 'scoring_progress': return `Scoring ${msg.done || 0}/${msg.total || 0}`;
+        case 'done': return `Scan complete (${msg.results || 0} results)`;
+        default: return 'Scanning market';
+      }
+    };
+    const updateProgress = (msg) => {
+      if (msg?.type !== 'progress') return;
+      const label = progressLabel(msg);
+      setStatus(label);
+      const strong = marketResults.querySelector('strong');
+      const span = marketResults.querySelector('.market-streaming-text');
+      if (strong) strong.textContent = label;
+      if (span) span.textContent = msg.stage === 'done'
+        ? 'Rendering ranked results...'
+        : 'Working through the board...';
+    };
+    let payload = null;
+    try {
+      const streamResult = await streamNdjson('/api/market-scan/stream', inputPayload, updateProgress);
+      if (streamResult?.type === 'error') throw new Error(streamResult.message || 'Market scan failed.');
+      payload = streamResult?.payload || null;
+    } catch (streamError) {
+      payload = await runAsyncJob('/api/market-scan/async', inputPayload, (status) => {
+        if (!status || status.type !== 'market_scan') return;
+        const label = status.status === 'running' ? 'Scanning market...' : 'Queued scan...';
+        setStatus(label);
+        const strong = marketResults.querySelector('strong');
+        const span = marketResults.querySelector('.market-streaming-text');
+        if (strong) strong.textContent = label;
+        if (span) span.textContent = 'Working through the board...';
+      });
     }
     renderMarketResults(payload);
     enrichMarketResultsWithGameContext(payload)
@@ -3657,6 +3934,9 @@ function resetDashboardForNoSelection() {
     marketTone.className = 'spotlight-pill neutral';
     marketTone.textContent = 'Waiting for analysis';
   }
+  if (cacheDebugPanel) {
+    cacheDebugPanel.style.display = 'none';
+  }
   if (environmentBody) {
     environmentBody.className = 'environment-body';
     environmentBody.innerHTML = `
@@ -3676,10 +3956,10 @@ function resetDashboardForNoSelection() {
     marketBody.className = 'environment-body';
     marketBody.innerHTML = `
       <div class="environment-chip-grid">
-        <div class="environment-chip"><span class="small-label">Team total</span><strong>â€”</strong><small>Waiting for analysis</small></div>
-        <div class="environment-chip"><span class="small-label">Spread</span><strong>â€”</strong><small>Waiting for analysis</small></div>
-        <div class="environment-chip"><span class="small-label">Game total</span><strong>â€”</strong><small>Waiting for analysis</small></div>
-        <div class="environment-chip"><span class="small-label">Opponent total</span><strong>â€”</strong><small>Waiting for analysis</small></div>
+        <div class="environment-chip"><span class="small-label">Team total</span><strong>—</strong><small>Waiting for analysis</small></div>
+        <div class="environment-chip"><span class="small-label">Spread</span><strong>—</strong><small>Waiting for analysis</small></div>
+        <div class="environment-chip"><span class="small-label">Game total</span><strong>—</strong><small>Waiting for analysis</small></div>
+        <div class="environment-chip"><span class="small-label">Opponent total</span><strong>—</strong><small>Waiting for analysis</small></div>
       </div>
       <div class="insight-summary neutral compact-summary">
         <span class="insight-summary-label">Market read</span>
@@ -3830,13 +4110,11 @@ oddsCheckBalBtn?.addEventListener('click', async () => {
   oddsCheckBalBtn.textContent = 'Checking…';
   oddsCheckBalBtn.disabled = true;
   try {
-    const r = await fetch('/api/odds/check-quota', {
+    const data = await apiFetch('/api/odds/check-quota', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ api_key: keyEntry.key })
-    });
-    const data = await r.json();
-    if (!r.ok) throw new Error(data.detail || 'Failed');
+    }, 10000);
     setOddsQuotaMeta(data.quota);
     setOddsApiKeyMeta(data.api_key_masked || keyEntry.key);
     setOddsApiStatus('Balance checked', 'good');
@@ -3917,6 +4195,224 @@ themeToggle.addEventListener('click', () => {
   document.addEventListener('keydown', e => { if (e.key === 'Escape' && modal?.style.display === 'block') closeGuide(); });
 })();
 
+// ══════════════════════════════════════════════════════════════════════
+// ── DATA VAULT / HISTORY PANEL ────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+
+(function initHistoryPanel() {
+  const historyType = document.getElementById('historyType');
+  const historyLimit = document.getElementById('historyLimit');
+  const historyRefreshBtn = document.getElementById('historyRefreshBtn');
+  const historyList = document.getElementById('historyList');
+  const historyStatus = document.getElementById('historyStatus');
+
+  if (!historyList) return;
+
+  const typeConfig = {
+    injury: { endpoint: '/api/history/injury-reports', label: 'Injury report', empty: 'No injury reports stored yet.' },
+    odds: { endpoint: '/api/history/odds-snapshots', label: 'Odds snapshot', empty: 'No odds snapshots stored yet.' },
+    market_scan: { endpoint: '/api/history/market-scans', label: 'Market scan', empty: 'No market scans stored yet.' },
+    parlay: { endpoint: '/api/history/parlay-runs', label: 'Parlay run', empty: 'No parlay runs stored yet.' },
+    backtest: { endpoint: '/api/history/backtest-entries', label: 'Backtest entry', empty: 'No backtest entries stored yet.' },
+    player_info: { endpoint: '/api/history/player-info', label: 'Player info', empty: 'No player info cached yet.' },
+  };
+
+  function setHistoryStatus(text, tone = 'neutral') {
+    if (!historyStatus) return;
+    historyStatus.textContent = text;
+    historyStatus.dataset.tone = tone;
+  }
+
+  function renderEmpty(message) {
+    historyList.innerHTML = `
+      <div class="bet-finder-state empty-state-panel compact history-empty">
+        <div class="empty-icon">🗂️</div>
+        <strong>${escapeHtml(message)}</strong>
+        <span>Run a scan or analysis to populate history.</span>
+      </div>`;
+  }
+
+  function formatDate(value) {
+    if (!value) return '—';
+    const parsed = Date.parse(value);
+    if (!Number.isFinite(parsed)) return String(value);
+    return new Date(parsed).toLocaleString();
+  }
+
+  function renderEntries(typeKey, entries) {
+    if (!entries.length) {
+      renderEmpty(typeConfig[typeKey].empty);
+      return;
+    }
+    historyList.innerHTML = entries.map(entry => {
+      if (typeKey === 'injury') {
+        return `
+          <div class="history-row">
+            <div>
+              <strong>${escapeHtml(entry.report_label || 'Injury Report')}</strong>
+              <small>${escapeHtml(entry.report_url || '')}</small>
+            </div>
+            <div class="history-meta">
+              ${escapeHtml(formatDate(entry.report_timestamp))}
+              <small>${escapeHtml(entry.rows_count)} players</small>
+              <button class="text-btn history-view-btn" data-type="injury" data-id="${escapeHtml(entry.report_url || '')}" type="button">View full payload</button>
+            </div>
+          </div>`;
+      }
+      if (typeKey === 'odds') {
+        return `
+          <div class="history-row">
+            <div>
+              <strong>${escapeHtml(entry.endpoint || 'Odds API')}</strong>
+              <small>${escapeHtml(JSON.stringify(entry.params || {}))}</small>
+            </div>
+            <div class="history-meta">
+              ${escapeHtml(formatDate(entry.fetched_at))}
+              <small>#${escapeHtml(entry.id)}</small>
+              <button class="text-btn history-view-btn" data-type="odds" data-id="${escapeHtml(entry.id)}" type="button">View full payload</button>
+            </div>
+          </div>`;
+      }
+      if (typeKey === 'market_scan') {
+        return `
+          <div class="history-row">
+            <div>
+              <strong>Market scan</strong>
+              <small>${escapeHtml(entry.count)} results • ${escapeHtml(entry.errors)} errors</small>
+            </div>
+            <div class="history-meta">
+              ${escapeHtml(formatDate(entry.requested_at))}
+              <small>#${escapeHtml(entry.id)}</small>
+              <button class="text-btn history-view-btn" data-type="market_scan" data-id="${escapeHtml(entry.id)}" type="button">View full payload</button>
+            </div>
+          </div>`;
+      }
+      if (typeKey === 'parlay') {
+        return `
+          <div class="history-row">
+            <div>
+              <strong>Parlay run</strong>
+              <small>${escapeHtml(entry.legs ?? '—')} legs • ${escapeHtml(entry.props_found ?? '—')} props</small>
+            </div>
+            <div class="history-meta">
+              ${escapeHtml(formatDate(entry.requested_at))}
+              <small>#${escapeHtml(entry.id)}</small>
+              <button class="text-btn history-view-btn" data-type="parlay" data-id="${escapeHtml(entry.id)}" type="button">View full payload</button>
+            </div>
+          </div>`;
+      }
+      if (typeKey === 'player_info') {
+        return `
+          <div class="history-row">
+            <div>
+              <strong>${escapeHtml(entry.player_name || 'Player')}</strong>
+              <small>${escapeHtml(entry.team_abbreviation || '—')}</small>
+            </div>
+            <div class="history-meta">
+              ${escapeHtml(formatDate(entry.updated_at))}
+              <small>#${escapeHtml(entry.player_id)}</small>
+              <button class="text-btn history-view-btn" data-type="player_info" data-id="${escapeHtml(entry.player_id)}" type="button">View full payload</button>
+            </div>
+          </div>`;
+      }
+      return `
+        <div class="history-row">
+          <div>
+            <strong>${escapeHtml(entry.player || 'Backtest')}</strong>
+            <small>${escapeHtml(entry.stat || '')} ${escapeHtml(entry.side || '')} ${escapeHtml(entry.line ?? '')}</small>
+          </div>
+          <div class="history-meta">
+            ${escapeHtml(formatDate(entry.updated_at))}
+            <small>${escapeHtml(entry.result || '')}</small>
+            <button class="text-btn history-view-btn" data-type="backtest" data-id="${escapeHtml(entry.id)}" type="button">View full payload</button>
+          </div>
+        </div>`;
+    }).join('');
+    historyList.querySelectorAll('.history-view-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const id = btn.dataset.id;
+        const type = btn.dataset.type;
+        if (!id || !type) return;
+        let endpoint = '';
+        if (type === 'injury') endpoint = `/api/history/injury-reports/${encodeURIComponent(id)}`;
+        if (type === 'odds') endpoint = `/api/history/odds-snapshots/${encodeURIComponent(id)}`;
+        if (type === 'market_scan') endpoint = `/api/history/market-scans/${encodeURIComponent(id)}`;
+        if (type === 'parlay') endpoint = `/api/history/parlay-runs/${encodeURIComponent(id)}`;
+        if (type === 'backtest') endpoint = `/api/history/backtest-entries/${encodeURIComponent(id)}`;
+        if (type === 'player_info') endpoint = `/api/history/player-info/${encodeURIComponent(id)}`;
+        if (!endpoint) return;
+        btn.textContent = 'Loading…';
+        btn.disabled = true;
+        try {
+          const payload = await apiFetch(endpoint, {}, 10000);
+          if (!payload || payload.ok === false) {
+            showAppToast({ title: 'History payload unavailable', detail: payload?.error || 'Request failed', tone: 'warning' });
+            return;
+          }
+          const pretty = JSON.stringify(payload.payload || {}, null, 2);
+          showPayloadModal(pretty);
+        } catch (err) {
+          showAppToast({ title: 'History payload failed', detail: err?.message || 'Request failed', tone: 'warning' });
+        } finally {
+          btn.textContent = 'View full payload';
+          btn.disabled = false;
+        }
+      });
+    });
+  }
+
+  function showPayloadModal(content) {
+    let modal = document.getElementById('historyPayloadModal');
+    if (!modal) {
+      modal = document.createElement('div');
+      modal.id = 'historyPayloadModal';
+      modal.className = 'history-modal';
+      modal.innerHTML = `
+        <div class="history-modal-backdrop" data-close="1"></div>
+        <div class="history-modal-card">
+          <div class="history-modal-head">
+            <strong>Stored payload</strong>
+            <button class="ghost-btn" data-close="1" type="button">Close</button>
+          </div>
+          <pre class="history-modal-body"></pre>
+        </div>`;
+      document.body.appendChild(modal);
+      modal.querySelectorAll('[data-close="1"]').forEach(btn => {
+        btn.addEventListener('click', () => modal.classList.remove('is-open'));
+      });
+    }
+    const pre = modal.querySelector('.history-modal-body');
+    if (pre) pre.textContent = content || '';
+    modal.classList.add('is-open');
+  }
+
+  async function loadHistory() {
+    const typeKey = historyType?.value || 'injury';
+    const limit = Math.max(5, Math.min(200, Number(historyLimit?.value || 25)));
+    const config = typeConfig[typeKey] || typeConfig.injury;
+    setHistoryStatus('Loading…', 'working');
+    try {
+      const payload = await apiFetch(`${config.endpoint}?limit=${limit}`, {}, 12000).catch(() => null);
+      if (!payload || payload.ok === false) {
+        setHistoryStatus(payload?.error || 'History unavailable', 'bad');
+        renderEmpty(payload?.error || 'History unavailable');
+        return;
+      }
+      setHistoryStatus('Ready', 'good');
+      renderEntries(typeKey, payload.entries || []);
+    } catch (err) {
+      setHistoryStatus('History load failed', 'bad');
+      renderEmpty('History load failed');
+    }
+  }
+
+  historyRefreshBtn?.addEventListener('click', loadHistory);
+  historyType?.addEventListener('change', loadHistory);
+  historyLimit?.addEventListener('change', loadHistory);
+
+  loadHistory();
+})();
+
 if (sidebarToggle) {
   sidebarToggle.addEventListener('click', () => {
     const collapsed = !document.body.classList.contains('sidebar-collapsed');
@@ -3960,31 +4456,6 @@ window.addEventListener('keydown', (event) => {
   }
 });
 
-(async function init() {
-  applySavedTheme();
-  renderRecentPlayers();
-  renderSelectedPlayer();
-  renderOverviewSelection();
-  resetDashboardForNoSelection();
-  renderBetFinderEmpty();
-  renderMarketEmpty();
-  renderMarketFilterChips();
-  renderMarketExpertFilterChips();
-  loadStoredOddsApiSettings();
-  setActiveProp(selectedStat);
-  switchView(activeView);
-  setStatus('Loading teams');
-
-  try {
-    await loadTeams();
-    setStatus('Ready');
-  } catch (error) {
-    console.error(error);
-    alert(error.message);
-    setStatus('Error');
-  }
-})();
-
 /* === Premium UX / prediction upgrade overrides === */
 const recommendationToneEl = document.getElementById('recommendationTone');
 const recommendationBodyEl = document.getElementById('recommendationBody');
@@ -4018,6 +4489,31 @@ let upgradedChartPrefs = (() => {
   }
 })();
 
+(async function init() {
+  applySavedTheme();
+  renderRecentPlayers();
+  renderSelectedPlayer();
+  renderOverviewSelection();
+  resetDashboardForNoSelection();
+  renderBetFinderEmpty();
+  renderMarketEmpty();
+  renderMarketFilterChips();
+  renderMarketExpertFilterChips();
+  loadStoredOddsApiSettings();
+  setActiveProp(selectedStat);
+  switchView(activeView);
+  setStatus('Loading teams');
+
+  try {
+    await loadTeams();
+    setStatus('Ready');
+  } catch (error) {
+    console.error(error);
+    alert(error.message);
+    setStatus('Error');
+  }
+})();
+
 function getTeamLogo(teamId) {
   return teamId ? `https://cdn.nba.com/logos/nba/${teamId}/global/L/logo.svg` : '';
 }
@@ -4030,9 +4526,7 @@ async function ensureFavoritesUpgradeLoaded() {
   if (favoritesUpgradeLoadPromise) return favoritesUpgradeLoadPromise;
   favoritesUpgradeLoadPromise = (async () => {
     try {
-      const response = await fetch('/api/favorites');
-      if (!response.ok) throw new Error('Failed to load favorites');
-      const data = await response.json();
+      const data = await apiFetch('/api/favorites', {}, 8000);
       favoritesUpgradeCache = Array.isArray(data.entries) ? data.entries : [];
       if (!favoritesUpgradeCache.length) {
         try {
@@ -4062,19 +4556,11 @@ async function saveFavoritesUpgrade(items, options = {}) {
   if (!options.skipLegacyWrite) {
     localStorage.setItem(FAVORITES_KEY, JSON.stringify(trimmed));
   }
-  const response = await fetch('/api/favorites', {
+  await apiFetch('/api/favorites', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ entries: trimmed }),
-  });
-  if (!response.ok) {
-    let detail = 'Failed to save favorites.';
-    try {
-      const data = await response.json();
-      detail = data.detail || detail;
-    } catch {}
-    throw new Error(detail);
-  }
+  }, 8000);
 }
 
 function getAnalyzerHeroState() {
@@ -4232,7 +4718,7 @@ function saveChartPrefsUpgrade() {
   chartModeBarsBtnEl?.classList.toggle('active', upgradedChartPrefs.mode === 'bars');
   chartModeComboBtnEl?.classList.toggle('active', upgradedChartPrefs.mode === 'combo');
   chartHighlightBtnEl?.classList.toggle('active', !!upgradedChartPrefs.highlight);
-  if (chartHighlightBtnEl) chartHighlightBtnEl.textContent = upgradedChartPrefs.highlight ? 'Highlight O/U' : 'Neutral bars';
+  if (chartHighlightBtnEl) chartHighlightBtnEl.textContent = upgradedChartPrefs.highlight ? 'Hit/Miss colors' : 'Hit/Miss colors';
 }
 
 function updateChartSampleButtonsUpgrade() {
@@ -4329,6 +4815,14 @@ overviewBoardTabsEl?.querySelectorAll('.overview-board-tab').forEach(btn => {
 
 function renderTodayGames(payload) {
   latestTodayGamesPayload = payload;
+  try {
+    localStorage.setItem(TODAY_GAMES_CACHE_KEY, JSON.stringify({
+      savedAt: Date.now(),
+      payload
+    }));
+  } catch (error) {
+    // ignore storage failures
+  }
   const rawGames = payload.games || [];
   const seenGameIds = new Set();
   const games = rawGames.filter(game => {
@@ -4362,6 +4856,175 @@ function renderTodayGames(payload) {
   }
 }
 
+function renderDecisionStrip(payload) {
+  if (!analyzerDecisionStripGrid) return;
+  const isDebug = localStorage.getItem(INJURY_DEBUG_STORAGE) === '1';
+  const cacheDebugOn = localStorage.getItem(CACHE_DEBUG_STORAGE) === '1';
+  const confidence = payload?.confidence || {};
+  const recommendation = payload?.traffic_light || {};
+  const teamContext = payload?.team_context || {};
+  const environment = payload?.environment || {};
+  const matchup = payload?.matchup || {};
+  const vsPosition = matchup?.vs_position || {};
+  const hitRate = Number(payload?.hit_rate || 0);
+  const avg = Number(payload?.average || 0);
+  const line = Number(payload?.line || 0);
+  const diff = Number.isFinite(avg) && Number.isFinite(line) ? avg - line : null;
+  const diffLabel = diff === null ? '—' : `${diff >= 0 ? '+' : ''}${diff.toFixed(1)}`;
+  const gamesCount = Number(payload?.games_count || 0);
+  const sampleLabel = gamesCount ? `${gamesCount}g sample` : 'Sample pending';
+  const side = String(payload?.recommended_side || '').toUpperCase() || 'LEAN';
+  const trafficTone = recommendation.tone === 'green' ? 'good' : recommendation.tone === 'red' ? 'bad' : 'warning';
+  const confidenceText = confidence.grade ? `${confidence.grade} ${confidence.score || ''}`.trim() : '—';
+  const matchupLean = vsPosition?.lean || 'Matchup TBD';
+  const matchupTone = vsPosition?.lean_tone === 'good' ? 'good' : vsPosition?.lean_tone === 'bad' ? 'bad' : 'neutral';
+  const injuryCount = Number(teamContext.impact_count || 0);
+  const injuryText = injuryCount ? `${injuryCount} flagged` : 'No absences';
+  const debugPayload = teamContext?.debug || {};
+  const resolvedTeam = debugPayload.resolved_team_name || teamContext.team_name || '';
+  const matchedRows = Array.isArray(debugPayload.matched_injury_rows) ? debugPayload.matched_injury_rows : [];
+  const debugLabel = isDebug
+    ? `Team ${resolvedTeam || '—'} · rows ${matchedRows.length}`
+    : 'Off';
+  const debugMeta = isDebug
+    ? (matchedRows.length ? matchedRows.map(row => `${row.name} (${row.status})`).slice(0, 3).join(', ') : 'No matched rows')
+    : 'Enable to verify team match';
+  const impliedPct = Number.isFinite(Number(confidence.market_support_pct)) ? `${Number(confidence.market_support_pct).toFixed(1)}%` : '—';
+  const marketLabel = confidence.market_side
+    ? `${confidence.market_side} ${confidence.market_disagrees ? 'disagree' : 'aligned'}`
+    : 'No market';
+  const marketTone = confidence.market_disagrees ? 'warning' : (confidence.market_side ? 'good' : 'neutral');
+  const restLabel = Number.isInteger(environment.rest_days) ? `${environment.rest_days}d rest` : 'Rest TBD';
+
+  analyzerDecisionStripGrid.innerHTML = `
+    <div class="decision-strip-chip ${trafficTone}">
+      <span class="small-label">Recommendation</span>
+      <strong>${escapeHtml(recommendation.label || side || 'Lean')}</strong>
+      <small>${escapeHtml(recommendation.summary || 'Awaiting analysis')}</small>
+    </div>
+    <div class="decision-strip-chip ${trafficTone}">
+      <span class="small-label">Signal</span>
+      <strong>${escapeHtml(side)}</strong>
+      <small>${escapeHtml(confidenceText || '—')}</small>
+    </div>
+    <div class="decision-strip-chip">
+      <span class="small-label">Hit rate</span>
+      <strong>${hitRate ? `${hitRate.toFixed(1)}%` : '—'}</strong>
+      <small>${escapeHtml(sampleLabel)}</small>
+    </div>
+    <div class="decision-strip-chip ${diff !== null && diff >= 0 ? 'good' : 'warning'}">
+      <span class="small-label">Avg vs line</span>
+      <strong>${escapeHtml(diffLabel)}</strong>
+      <small>${escapeHtml(`Avg ${avg ? avg.toFixed(1) : '—'} vs ${line ? line.toFixed(1) : '—'}`)}</small>
+    </div>
+    <div class="decision-strip-chip ${matchupTone}">
+      <span class="small-label">Matchup</span>
+      <strong>${escapeHtml(matchupLean)}</strong>
+      <small>${escapeHtml(restLabel)}</small>
+    </div>
+    <div class="decision-strip-chip ${injuryCount ? 'warning' : 'neutral'}">
+      <span class="small-label">Lineup</span>
+      <strong>${escapeHtml(injuryText)}</strong>
+      <small>${escapeHtml(teamContext.headline || 'Team context')}</small>
+    </div>
+    <div class="decision-strip-chip ${isDebug ? 'warning' : 'neutral'}" id="injuryDebugChip">
+      <span class="small-label">Injury debug</span>
+      <strong>${escapeHtml(debugLabel)}</strong>
+      <small>${escapeHtml(debugMeta)}</small>
+    </div>
+    <div class="decision-strip-chip ${marketTone}">
+      <span class="small-label">Market</span>
+      <strong>${escapeHtml(impliedPct)}</strong>
+      <small>${escapeHtml(marketLabel)}</small>
+    </div>
+    <div class="decision-strip-chip ${cacheDebugOn ? 'warning' : 'neutral'}" id="cacheDebugChip">
+      <span class="small-label">Cache debug</span>
+      <strong>${cacheDebugOn ? 'On' : 'Off'}</strong>
+      <small>Show cache sources</small>
+    </div>
+  `;
+  if (decisionStripToneEl) {
+    decisionStripToneEl.className = `spotlight-pill ${trafficTone}`;
+    decisionStripToneEl.textContent = recommendation.label || 'Decision strip';
+  }
+  const debugChip = analyzerDecisionStripGrid.querySelector('#injuryDebugChip');
+  if (debugChip) {
+    debugChip.addEventListener('click', () => {
+      const next = localStorage.getItem(INJURY_DEBUG_STORAGE) === '1' ? '0' : '1';
+      localStorage.setItem(INJURY_DEBUG_STORAGE, next);
+      if (lastPayload) {
+        renderDecisionStrip(lastPayload);
+      }
+    });
+  }
+  const cacheChip = analyzerDecisionStripGrid.querySelector('#cacheDebugChip');
+  if (cacheChip) {
+    cacheChip.addEventListener('click', () => {
+      const next = localStorage.getItem(CACHE_DEBUG_STORAGE) === '1' ? '0' : '1';
+      localStorage.setItem(CACHE_DEBUG_STORAGE, next);
+      if (lastPayload) {
+        renderDecisionStrip(lastPayload);
+      }
+    });
+  }
+  renderCacheDebugPanel(payload);
+}
+
+function renderCacheDebugPanel(payload) {
+  if (!cacheDebugPanel) return;
+  const enabled = localStorage.getItem(CACHE_DEBUG_STORAGE) === '1';
+  if (!enabled) {
+    cacheDebugPanel.style.display = 'none';
+    return;
+  }
+  const freshness = payload?.freshness || {};
+  const entries = [
+    {
+      label: 'Game log',
+      source: freshness.game_log_cache_source || freshness.game_log_source || 'unknown',
+      age: freshness.game_log_seconds_ago,
+      queued: freshness.game_log_refresh_queued,
+    },
+    {
+      label: 'Player info',
+      source: freshness.player_info_cache_source || freshness.player_info_source || 'unknown',
+      age: freshness.player_info_seconds_ago,
+      queued: freshness.player_info_refresh_queued,
+    },
+    {
+      label: 'Next game',
+      source: freshness.next_game_cache_source || freshness.next_game_source || 'unknown',
+      age: freshness.next_game_seconds_ago,
+      queued: freshness.next_game_refresh_queued,
+    },
+    {
+      label: 'Injury report',
+      source: freshness.injury_report_source || 'unknown',
+      age: freshness.injury_report_seconds_ago,
+      queued: false,
+    },
+  ];
+  const grid = cacheDebugPanel.querySelector('.cache-debug-grid');
+  const pill = cacheDebugPanel.querySelector('.cache-debug-pill');
+  if (pill) {
+    pill.textContent = freshness?.injury_report_source === 'postgres' ? 'Postgres source' : 'Hybrid source';
+  }
+  if (grid) {
+    grid.innerHTML = entries.map(item => {
+      const ageText = typeof item.age === 'number' ? `${item.age.toFixed(1)}s ago` : '—';
+      const queuedText = item.queued ? 'refresh queued' : 'ready';
+      return `
+        <div class="cache-debug-card">
+          <strong>${escapeHtml(item.label)}</strong>
+          <small>Source: ${escapeHtml(String(item.source || 'unknown'))}</small><br/>
+          <small>Age: ${escapeHtml(ageText)} • ${escapeHtml(queuedText)}</small>
+        </div>
+      `;
+    }).join('');
+  }
+  cacheDebugPanel.style.display = '';
+}
+
 function renderInterpretationPanels(payload) {
   const interpretation = payload?.interpretation || {};
   const opportunity = payload?.opportunity || {};
@@ -4369,6 +5032,7 @@ function renderInterpretationPanels(payload) {
   const environment = payload?.environment || {};
   const recommendation = payload?.traffic_light || { label: 'Caution', tone: 'yellow', summary: 'Analyze a prop to generate a clearer read.' };
   const confidence = payload?.confidence || {};
+  renderDecisionStrip(payload);
   const toneMap = { good: 'good', warning: 'warning', bad: 'bad', neutral: 'neutral' };
   const interpretationToneClass = toneMap[interpretation.tone] || 'neutral';
   const opportunityToneClass = opportunity.minutes_trend === 'up' || opportunity.volume_trend === 'up' ? 'good' : (teamContext.impact_count ? 'warning' : 'neutral');
@@ -4504,12 +5168,12 @@ function renderInterpretationPanels(payload) {
       <div class="insight-summary ${environmentToneClass} compact-summary"><span class="insight-summary-label">Schedule read</span><strong>${escapeHtml(environment.headline || 'Schedule spot')}</strong><p class="opportunity-summary">${escapeHtml(environment.summary || 'Schedule context will appear after analysis.')}</p></div>`;
   }
   if (marketBody) {
-    const teamTotalValue = Number.isFinite(Number(environment.market_team_total)) ? Number(environment.market_team_total).toFixed(1) : 'â€”';
-    const gameTotalValue = Number.isFinite(Number(environment.market_game_total)) ? Number(environment.market_game_total).toFixed(1) : 'â€”';
+    const teamTotalValue = Number.isFinite(Number(environment.market_team_total)) ? Number(environment.market_team_total).toFixed(1) : '—';
+    const gameTotalValue = Number.isFinite(Number(environment.market_game_total)) ? Number(environment.market_game_total).toFixed(1) : '—';
     const spreadValue = Number.isFinite(Number(environment.market_spread))
       ? `${Number(environment.market_spread) > 0 ? '+' : ''}${Number(environment.market_spread).toFixed(1)}`
-      : 'â€”';
-    const opponentTotalValue = Number.isFinite(Number(environment.market_opponent_total)) ? Number(environment.market_opponent_total).toFixed(1) : 'â€”';
+      : '—';
+    const opponentTotalValue = Number.isFinite(Number(environment.market_opponent_total)) ? Number(environment.market_opponent_total).toFixed(1) : '—';
     const hasMarketContext = Number.isFinite(Number(environment.market_team_total)) || Number.isFinite(Number(environment.market_game_total)) || Number.isFinite(Number(environment.market_spread));
     const marketSummary = environment.market_summary || 'Market context unavailable for this matchup. Add usable Odds API keys to Key Vault, then run Analyze Prop again.';
     const trustDiagnostics = buildTrustDiagnostics({
@@ -4531,7 +5195,7 @@ function renderInterpretationPanels(payload) {
         <div class="environment-chip"><span class="small-label">Opponent total</span><strong>${escapeHtml(opponentTotalValue)}</strong><small>${escapeHtml(environment.market_opponent_total ? 'Opponent implied points' : 'No opponent total found')}</small></div>
       </div>
       ${renderTrustDiagnostics(trustDiagnostics)}
-      <div class="insight-summary ${hasMarketContext ? 'good' : 'neutral'} compact-summary"><span class="insight-summary-label">Market read</span><strong>${escapeHtml(hasMarketContext ? 'Betting market context loaded' : 'Market context unavailable')}</strong><p class="opportunity-summary">${escapeHtml(marketSummary)}</p><small>${escapeHtml(hasMarketContext ? 'Market context is supportive information, not an automatic over or under trigger.' : 'Add usable Odds API keys to Key Vault and re-run analysis to add market context.')}</small></div>`;
+      <div class="insight-summary ${hasMarketContext ? 'good' : 'neutral'} compact-summary"><span class="insight-summary-label">Market read</span><strong>${escapeHtml(hasMarketContext ? 'Betting market context loaded' : 'Market context unavailable')}</strong><p class="opportunity-summary">${escapeHtml(marketSummary)}</p><small>${escapeHtml(hasMarketContext ? 'Aligned market direction is a strong confirmation of the play; a conflicting market lean triggers a penalty and lowers confidence.' : 'Add usable Odds API keys to Key Vault and re-run analysis to add market context.')}</small></div>`;
   }
 
   // ── Variance / distribution panel ────────────────────────────────────
@@ -4674,6 +5338,51 @@ function createTrendValueLabelPlugin(chartGames, payload) {
     }
   };
 }
+
+function createTrendHitBandPlugin(chartGames, payload) {
+  return {
+    id: 'trendHitBandPlugin',
+    beforeDatasetsDraw(chartInstance) {
+      const { ctx, chartArea, scales: { x } } = chartInstance;
+      if (!chartArea || !x) return;
+      ctx.save();
+      chartGames.forEach((game, index) => {
+        if (!game || game.hit == null) return;
+        const center = x.getPixelForValue(index);
+        const width = Math.min(30, x.getPixelForValue(index + 1) - x.getPixelForValue(index)) || 22;
+        const left = center - width / 2;
+        const color = game.hit ? 'rgba(57,217,138,0.08)' : 'rgba(255,99,99,0.08)';
+        ctx.fillStyle = color;
+        ctx.fillRect(left, chartArea.top + 6, width, chartArea.bottom - chartArea.top - 12);
+      });
+      ctx.restore();
+    }
+  };
+}
+
+function createTrendConfidenceBandPlugin(payload) {
+  return {
+    id: 'trendConfidenceBandPlugin',
+    beforeDatasetsDraw(chartInstance) {
+      const { ctx, chartArea, scales: { y } } = chartInstance;
+      if (!chartArea || !y) return;
+      const p25 = Number(payload?.variance?.p25);
+      const p75 = Number(payload?.variance?.p75);
+      if (!Number.isFinite(p25) || !Number.isFinite(p75)) return;
+      const yTop = y.getPixelForValue(p75);
+      const yBottom = y.getPixelForValue(p25);
+      ctx.save();
+      ctx.fillStyle = 'rgba(96,165,250,0.10)';
+      ctx.strokeStyle = 'rgba(96,165,250,0.22)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.rect(chartArea.left, yTop, chartArea.right - chartArea.left, yBottom - yTop);
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+    }
+  };
+}
 function formatTrendAxisDate(value) {
   if (!value) return '';
   const parsed = new Date(value);
@@ -4733,10 +5442,22 @@ function renderChart(payload) {
   const muted = getMutedColor();
   const linePlugin = createLinePlugin(payload.line);
   const valueLabelPlugin = createTrendValueLabelPlugin(chartGames, payload);
+  const hitBandPlugin = createTrendHitBandPlugin(chartGames, payload);
+  const confidenceBandPlugin = createTrendConfidenceBandPlugin(payload);
   const comboParts = getComboStatParts(payload.stat);
   const isComboMarket = comboParts.length > 1;
 
   if (chart) chart.destroy();
+  const chartWrap = document.querySelector('.chart-wrap');
+  if (chartWrap) {
+    chartWrap.querySelectorAll('.chart-hit-legend').forEach(el => el.remove());
+    if (!isComboMarket) {
+      const legend = document.createElement('div');
+      legend.className = 'chart-hit-legend';
+      legend.innerHTML = '<span class="chart-hit-dot hit"></span>Hit <span class="chart-hit-dot miss"></span>Miss <span class="chart-hit-band"></span>Median band';
+      chartWrap.appendChild(legend);
+    }
+  }
   let datasets = [];
   if (isComboMarket) {
     datasets = comboParts.map((part, index) => ({
@@ -4755,10 +5476,12 @@ function renderChart(payload) {
     }));
     if (upgradedChartPrefs.mode === 'combo') {
       datasets.push({ type: 'line', label: 'Total', data: values, borderColor: accent, backgroundColor: accent, pointBackgroundColor: accent, pointRadius: 3, pointHoverRadius: 4, borderWidth: 2, tension: 0.28, fill: false, yAxisID: 'y' });
+    } else {
+      datasets.push({ type: 'line', label: 'Total', data: values, borderColor: accent, pointBackgroundColor: accent, pointRadius: 3, pointHoverRadius: 4, borderWidth: 2, tension: 0.28, fill: false, yAxisID: 'y' });
     }
   } else {
-    const baseColors = upgradedChartPrefs.highlight ? hits.map(hit => hit ? `${good}CC` : `${bad}CC`) : values.map(() => `${accent}CC`);
-    const baseBorders = upgradedChartPrefs.highlight ? hits.map(hit => hit ? good : bad) : values.map(() => accent);
+    const baseColors = hits.map(hit => hit ? `${good}CC` : `${bad}CC`);
+    const baseBorders = hits.map(hit => hit ? good : bad);
     datasets = [{
       type: 'bar', label: getStatLabel(payload.stat), data: values, backgroundColor: baseColors, borderColor: baseBorders, borderWidth: 1.4, borderRadius: 12, borderSkipped: false, maxBarThickness: 42,
     }];
@@ -4812,7 +5535,7 @@ function renderChart(payload) {
         y: { stacked: isComboMarket, beginAtZero: true, ticks: { color: muted }, grid: { color: document.body.classList.contains('light-theme') ? 'rgba(17,33,63,0.08)' : 'rgba(255,255,255,0.08)' }, border: { display: false } }
       }
     },
-    plugins: [linePlugin, valueLabelPlugin]
+    plugins: [confidenceBandPlugin, hitBandPlugin, linePlugin, valueLabelPlugin]
   });
 }
 
@@ -4831,6 +5554,10 @@ chartSampleBtnsEl.forEach(btn => btn.addEventListener('click', async () => {
   // Slice client-side instantly from the stored full game list — no fetch needed.
   if (lastPayload && lastPayload._allGames) {
     const n = parseInt(btn.dataset.sample, 10);
+    if (lastPayload._allGames.length < n) {
+      await analyzePlayerProp({ preserveScroll: true, preserveSection: true, forceRefresh: true, overrideLastN: n });
+      return;
+    }
     const sliced = lastPayload._allGames.slice(-n);
     const hits = sliced.filter(g => g.hit).length;
     const values = sliced.map(g => g.value);
@@ -4851,7 +5578,8 @@ chartSampleBtnsEl.forEach(btn => btn.addEventListener('click', async () => {
   }
 
   // Fallback: full fetch (no payload loaded yet)
-  await analyzePlayerProp({ preserveScroll: true });
+  const n = parseInt(btn.dataset.sample, 10);
+  await analyzePlayerProp({ preserveScroll: true, preserveSection: true, forceRefresh: true, overrideLastN: n });
 }));
 collapseButtonsEl.forEach(btn => btn.addEventListener('click', () => toggleSectionByIdUpgrade(btn.dataset.collapseTarget)));
 favoritePlayerBtnEl?.addEventListener('click', async () => {
@@ -4866,11 +5594,15 @@ savePropBtnEl?.addEventListener('click', async () => {
   if (!selectedPlayer) return;
   const propKey = `${selectedPlayer.id}:${selectedStat}:${lineInput.value}`;
   const existing = loadFavoritesUpgrade().some(e => `${e.type}:${e.key}` === `prop:${propKey}`);
-  toggleFavoriteUpgrade({ type: 'prop', key: propKey, title: `${selectedPlayer.full_name} • ${selectedStat} ${lineInput.value}`, subtitle: lastPayload?.traffic_light?.summary || lastPayload?.interpretation?.summary || 'Saved from analyzer', stat: selectedStat, line: Number(lineInput.value || 0), player: selectedPlayer });
+  const favoritePayload = { type: 'prop', key: propKey, title: `${selectedPlayer.full_name} • ${selectedStat} ${lineInput.value}`, subtitle: lastPayload?.traffic_light?.summary || lastPayload?.interpretation?.summary || 'Saved from analyzer', stat: selectedStat, line: Number(lineInput.value || 0), player: selectedPlayer };
+  toggleFavoriteUpgrade(favoritePayload);
   if (existing) {
-    showAppToast('❌ Prop removed from Saved Props', 'warning');
+    showAppToast('Prop removed from Saved Props', 'warning', {
+      undoLabel: 'Undo',
+      onUndo: () => toggleFavoriteUpgrade(favoritePayload)
+    });
   } else {
-    showAppToast('✅ Prop saved to Saved Props!', 'success');
+    showAppToast('Prop saved to Saved Props!', 'success');
   }
 });
 analyzeBtn?.addEventListener('click', () => {
@@ -5086,6 +5818,39 @@ function clearAnalysisForNewSelection() {
     recommendationToneEl.className = 'spotlight-pill neutral';
     recommendationToneEl.textContent = 'Waiting for analysis';
   }
+  if (decisionStripToneEl) {
+    decisionStripToneEl.className = 'spotlight-pill neutral';
+    decisionStripToneEl.textContent = 'Waiting for analysis';
+  }
+  if (analyzerDecisionStripGrid) {
+    analyzerDecisionStripGrid.innerHTML = `
+      <div class="decision-strip-chip neutral">
+        <span class="small-label">Recommendation</span>
+        <strong>Awaiting analysis</strong>
+        <small>Run Analyze Prop to populate</small>
+      </div>
+      <div class="decision-strip-chip neutral">
+        <span class="small-label">Hit rate</span>
+        <strong>—</strong>
+        <small>Recent sample</small>
+      </div>
+      <div class="decision-strip-chip neutral">
+        <span class="small-label">Avg vs line</span>
+        <strong>—</strong>
+        <small>Line cushion</small>
+      </div>
+      <div class="decision-strip-chip neutral">
+        <span class="small-label">Lineup</span>
+        <strong>—</strong>
+        <small>Same-team absences</small>
+      </div>
+      <div class="decision-strip-chip neutral">
+        <span class="small-label">Market</span>
+        <strong>—</strong>
+        <small>Alignment status</small>
+      </div>
+    `;
+  }
   if (recommendationBodyEl) {
     recommendationBodyEl.className = 'empty-state-panel compact matchup-empty';
     recommendationBodyEl.innerHTML = `
@@ -5149,9 +5914,9 @@ function clearAnalysisForNewSelection() {
     marketBody.className = 'environment-body';
     marketBody.innerHTML = `
       <div class="environment-chip-grid">
-        <div class="environment-chip"><span class="small-label">Team total</span><strong>â€”</strong><small>Waiting for analysis</small></div>
-        <div class="environment-chip"><span class="small-label">Spread</span><strong>â€”</strong><small>Waiting for analysis</small></div>
-        <div class="environment-chip"><span class="small-label">Game total</span><strong>â€”</strong><small>Waiting for analysis</small></div>
+        <div class="environment-chip"><span class="small-label">Team total</span><strong>—</strong><small>Waiting for analysis</small></div>
+        <div class="environment-chip"><span class="small-label">Spread</span><strong>—</strong><small>Waiting for analysis</small></div>
+        <div class="environment-chip"><span class="small-label">Game total</span><strong>—</strong><small>Waiting for analysis</small></div>
       </div>
       <div class="insight-summary neutral compact-summary"><span class="insight-summary-label">Market read</span><p class="opportunity-summary">Analyze a player prop to load team total, spread, and full-game total.</p></div>
     `;
@@ -5281,6 +6046,24 @@ function toggleMarketSort(sortKey) {
 
 
 async function loadTodayGames(force = false) {
+  if (todayGamesRetryTimer) {
+    clearTimeout(todayGamesRetryTimer);
+    todayGamesRetryTimer = null;
+  }
+  if (todayGamesLoadInFlight) return;
+  if (!latestTodayGamesPayload || force) {
+    try {
+      const cached = JSON.parse(localStorage.getItem(TODAY_GAMES_CACHE_KEY) || 'null');
+      if (cached?.payload && cached?.savedAt && Date.now() - cached.savedAt < TODAY_GAMES_CACHE_TTL_MS) {
+        renderTodayGames(cached.payload);
+        if (todayGamesMeta) {
+          todayGamesMeta.textContent = `Showing cached slate • ${todayGamesMeta.textContent || ''}`.trim();
+        }
+      }
+    } catch (error) {
+      // ignore cache read errors
+    }
+  }
   if (latestTodayGamesPayload && !force) {
     renderTodayGames(latestTodayGamesPayload);
     if (!latestTodayGamesPayload.__marketContextLoaded) {
@@ -5294,23 +6077,38 @@ async function loadTodayGames(force = false) {
     return;
   }
 
+  todayGamesLoadInFlight = true;
   if (todayGamesMeta) todayGamesMeta.textContent = "Loading today's NBA slate...";
   if (overviewTodayMeta) overviewTodayMeta.textContent = "Fetching today's slate...";
   if (todayGamesBoard) todayGamesBoard.innerHTML = `<div class="empty-state-panel compact skeleton-panel today-game-empty"><div class="empty-icon">🗓️</div><strong>Loading games...</strong><span>Pulling the current slate and report context.</span><div class="skeleton-line"></div><div class="skeleton-line short"></div></div>`;
   if (overviewTodayGames) overviewTodayGames.innerHTML = `<div class="empty-state-panel compact skeleton-panel today-game-empty"><div class="empty-icon">🗓️</div><strong>Loading games...</strong><span>Pulling the current slate and report context.</span></div>`;
   try {
-    const response = await fetch('/api/todays-games');
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.detail || "Failed to load today's games.");
+    const payload = await apiFetch('/api/todays-games', {}, 20000);
+    try {
+      renderTodayGames(payload);
+    } catch (renderError) {
+      console.error('Today games render failed:', renderError);
+      if (todayGamesBoard) {
+        todayGamesBoard.innerHTML = `<div class="empty-state-panel compact today-game-empty"><div class="empty-icon">⚠️</div><strong>Could not render today&#39;s games.</strong><span>${escapeHtml(renderError.message || 'Render failed.')}</span></div>`;
+      }
     }
-    renderTodayGames(payload);
+    todayGamesLastSuccessAt = Date.now();
+    todayGamesLastErrorAt = 0;
+    todayGamesLoadAttempts = 0;
     enrichTodayGamesWithMarketContext(payload)
       .then(changed => {
         payload.__marketContextLoaded = true;
         if (changed) renderTodayGames(payload);
       })
       .catch(error => console.warn("Today's Games market context enrichment failed:", error));
+
+    const hasGames = Array.isArray(payload.games) && payload.games.length > 0;
+    if (!hasGames) {
+      todayGamesLoadAttempts += 1;
+      if (todayGamesLoadAttempts <= 2) {
+        todayGamesRetryTimer = setTimeout(() => loadTodayGames(true), 2500);
+      }
+    }
   } catch (error) {
     console.error(error);
     const fallbackMessage = error.message || "Failed to load today's slate.";
@@ -5320,6 +6118,13 @@ async function loadTodayGames(force = false) {
     if (overviewTodayGames) {
       overviewTodayGames.innerHTML = `<div class="empty-state-panel compact today-game-empty"><div class="empty-icon">⚠️</div><strong>Could not load the slate.</strong><span>${escapeHtml(fallbackMessage)}</span></div>`;
     }
+    todayGamesLastErrorAt = Date.now();
+    todayGamesLoadAttempts += 1;
+    if (todayGamesLoadAttempts <= 3) {
+      todayGamesRetryTimer = setTimeout(() => loadTodayGames(true), 2500);
+    }
+  } finally {
+    todayGamesLoadInFlight = false;
   }
 }
 
@@ -5389,9 +6194,8 @@ async function loadInjuryBoostChips(player) {
   }
 
   try {
-    const resp = await fetch('/api/team-injuries?team_name=' + encodeURIComponent(teamName));
-    if (!resp.ok) { injuryBoostGroup.style.display = 'none'; return; }
-    const data = await resp.json();
+    const data = await apiFetch('/api/team-injuries?team_name=' + encodeURIComponent(teamName), {}, 10000).catch(() => null);
+    if (!data) { injuryBoostGroup.style.display = 'none'; return; }
     const players = (data.players || []).filter(p => String(p.player_id) !== String(player?.id || ''));
 
     if (!players.length) {
@@ -5454,9 +6258,7 @@ async function populateAnalyzerWithoutPlayerFilter(force = false) {
     if (!players.length) {
       const season = seasonInput?.value?.trim();
       const query = season ? `?season=${encodeURIComponent(season)}` : '';
-      const response = await fetch(`/api/teams/${teamId}/roster${query}`);
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail || 'Failed to load roster filter');
+      const payload = await apiFetch(`/api/teams/${teamId}/roster${query}`, {}, 15000);
       players = Array.isArray(payload.results) ? payload.results : [];
     }
 
@@ -5777,12 +6579,17 @@ async function analyzePlayerProp(options = {}) {
 
   try {
     await populateAnalyzerWithoutPlayerFilter();
+    const requestedLastN = Number.isFinite(Number(options.overrideLastN)) && Number(options.overrideLastN) > 0
+      ? Number(options.overrideLastN)
+      : 20;
     const params = new URLSearchParams({
       player_id: selectedPlayer.id,
       stat: selectedStat,
       line: lineInput.value,
-      last_n: 20  // always fetch 20 so switching between 5/10/15 is instant client-side
+      last_n: requestedLastN  // keep analyzer aligned with the originating surface
     });
+    if (selectedPlayer.market_over_odds) params.set('over_odds', selectedPlayer.market_over_odds);
+    if (selectedPlayer.market_under_odds) params.set('under_odds', selectedPlayer.market_under_odds);
     if (selectedPlayer.team_id) params.set('team_id', selectedPlayer.team_id);
     if (selectedPlayer.position) params.set('player_position', selectedPlayer.position);
     const season = seasonInput.value.trim();
@@ -5807,12 +6614,12 @@ async function analyzePlayerProp(options = {}) {
     }
     if (filters.h2h_only) params.set('h2h_only', 'true');
 
-    const overrideOppId = oppSelect?.value;
-    if (overrideOppId) params.set('override_opponent_id', overrideOppId);
+    const overrideOppId = oppSelect?.value || selectedPlayer?.matchup?.next_game?.opponent_team_id || selectedPlayer?.opponent_team_id;
+    if (overrideOppId) params.set('override_opponent_id', String(overrideOppId));
 
-    const response = await fetch(`/api/player-prop?${params.toString()}`);
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.detail || 'Failed to analyze player prop.');
+    const response = await apiFetch(`/api/player-prop?${params.toString()}${localStorage.getItem(INJURY_DEBUG_STORAGE) === '1' ? '&debug=true' : ''}`, {}, 25000);
+    const payload = response;
+    if (!payload || typeof payload !== 'object') throw new Error('Failed to analyze player prop.');
 
     const priorAvailability = selectedPlayer?.availability && typeof selectedPlayer.availability === 'object'
       ? selectedPlayer.availability
@@ -6589,6 +7396,7 @@ function buildSparklineSvg(values, line, width, height) {
         '<td class="hit-pct-cell ' + hitClass(p.hit_rate) + '">' + p.hit_rate + '%</td>' +
         '<td>' + (p.average || '—') + '</td><td>' + (p.games_count || '—') + '</td>' +
         '<td>' + confText + '</td>' +
+        '<td><div class="parlay-row-micro"><span>EV <strong>' + (p.ev ?? '—') + '%</strong></span><span>Edge <strong>' + (p.edge ?? '—') + '%</strong></span><span>Sample <strong>' + (p.hit_count || 0) + '/' + (p.games_count || 0) + '</strong></span></div></td>' +
         '<td>' + fmtOdds(p.odds) + '</td>' +
         '<td><div class="parlay-inj-cell">' + renderInjuryCell(p) + '</div></td>' +
         '<td><div class="parlay-action-cell"><button class="parlay-track-btn" data-track-idx="' + idx + '">+ Track</button></div></td>' +
@@ -6701,6 +7509,8 @@ function buildSparklineSvg(values, line, width, height) {
     parlayQuotaList.innerHTML = '';
     const useInjuryAware = parlayInjuryAware && parlayInjuryAware.checked;
     const parlayEndpoint = useInjuryAware ? '/api/parlay-builder-injury-aware' : '/api/parlay-builder';
+    const parlayAsyncEndpoint = useInjuryAware ? '/api/parlay-builder-injury-aware/async' : '/api/parlay-builder/async';
+    const parlayStreamEndpoint = useInjuryAware ? '/api/parlay-builder-injury-aware/stream' : '/api/parlay-builder/stream';
     const totalEvents = selectedEventIds.size;
     setStatus('⏳ Step 1/3 — Fetching odds for ' + totalEvents + ' game(s)…', false);
     setParlayProgress(5, 'Tip-off: connecting to the odds board…');
@@ -6708,39 +7518,65 @@ function buildSparklineSvg(values, line, width, height) {
     if (parlayRebuildBtn) parlayRebuildBtn.disabled = true;
     if (parlayRescrapeBtn) parlayRescrapeBtn.disabled = true;
 
-    // Simulate progress steps while waiting for the single fetch
-    var progressTimer = null;
-    var fakeStep = 5;
-    progressTimer = setInterval(function () {
-      fakeStep = Math.min(fakeStep + 3, 75);
-      if (fakeStep < 30) setParlayProgress(fakeStep, 'First quarter: pulling lines for ' + totalEvents + ' game(s)…');
-      else if (fakeStep < 55) setParlayProgress(fakeStep, useInjuryAware ? 'Second quarter: checking injuries and re-running angles…' : 'Second quarter: analyzing ' + totalEvents * 15 + '+ props…');
-      else setParlayProgress(fakeStep, useInjuryAware ? 'Third quarter: applying lineup-context edges…' : 'Third quarter: sorting the strongest legs…');
-    }, 600);
-
     try {
-      const resp = await fetch(parlayEndpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          api_keys: keys, legs: legs, sport: sport,
-          odds_format: oddsFormat, last_n: lastN,
-          event_ids: Array.from(selectedEventIds),
-          bookmaker: parlayBookmakerSelect ? parlayBookmakerSelect.value : 'draftkings',
-        }),
-      });
-      if (!resp.ok) {
-        const err = await resp.json().catch(function () { return {}; });
-        throw new Error(err.detail || 'Server error ' + resp.status);
+      const inputPayload = {
+        api_keys: keys, legs: legs, sport: sport,
+        odds_format: oddsFormat, last_n: lastN,
+        event_ids: Array.from(selectedEventIds),
+        bookmaker: parlayBookmakerSelect ? parlayBookmakerSelect.value : 'draftkings',
+      };
+      const updateProgress = (msg) => {
+        if (msg?.type !== 'progress') return;
+        let pct = 5;
+        let label = 'Processing parlay…';
+        if (msg.stage === 'events_resolved') {
+          pct = 12;
+          label = 'Events loaded · ' + (msg.events || totalEvents) + ' games';
+        } else if (msg.stage === 'scrape_progress') {
+          const batch = msg.batch || 1;
+          const batches = msg.batches || 1;
+          pct = 15 + Math.round((batch / batches) * 30);
+          label = 'Scraping odds · batch ' + batch + ' of ' + batches;
+        } else if (msg.stage === 'analysis_start') {
+          pct = 55;
+          label = 'Analyzing props · ' + (msg.total || 0) + ' rows';
+        } else if (msg.stage === 'analysis_progress') {
+          const done = msg.done || 0;
+          const total = msg.total || 1;
+          pct = 55 + Math.round((done / total) * 25);
+          label = 'Analyzing ' + done + '/' + total + ' props';
+        } else if (msg.stage === 'analysis_done') {
+          pct = 82;
+          label = 'Analysis complete · scoring edges';
+        } else if (msg.stage === 'scoring_progress') {
+          const done = msg.done || 0;
+          const total = msg.total || 1;
+          pct = 82 + Math.round((done / total) * 16);
+          label = 'Scoring ' + done + '/' + total;
+        } else if (msg.stage === 'done') {
+          pct = 100;
+          label = 'Buzzer beater: parlay ready.';
+        }
+        setParlayProgress(Math.min(100, Math.max(5, pct)), label);
+        setStatus(label, false);
+      };
+      let data = null;
+      try {
+        const streamResult = await streamNdjson(parlayStreamEndpoint, inputPayload, updateProgress);
+        if (streamResult?.type === 'error') throw new Error(streamResult.message || 'Server error');
+        data = streamResult?.payload || null;
+      } catch (streamError) {
+        data = await runAsyncJob(parlayAsyncEndpoint, inputPayload, (status) => {
+          const label = status.status === 'running' ? 'Analyzing parlay...' : 'Queued parlay...';
+          setParlayProgress(60, label);
+          setStatus(label, false);
+        });
       }
-      const data = await resp.json();
 
       cachedScoredProps = data.all_props_scored || [];
       cachedQuotaLog = data.quota_log || [];
       cachedScrapeMeta = { evCount: data.events_scraped || 0, propCount: data.props_found || 0, analyzed: data.props_analyzed || 0, scrapedAt: Date.now() };
-
-      clearInterval(progressTimer);
-      setParlayProgress(90, 'Fourth quarter: building your ticket…');
+      setParlayProgress(95, 'Fourth quarter: building your ticket…');
       renderQuota(cachedQuotaLog);
       const m = cachedScrapeMeta;
       const injBoostCount = (cachedScoredProps || []).filter(function(p){ return p.injury_boost; }).length;
@@ -6763,7 +7599,6 @@ function buildSparklineSvg(values, line, width, height) {
       rebuildFromCache();
       if (typeof hideBanner === 'function') hideBanner();
     } catch (err) {
-      clearInterval(progressTimer);
       setParlayProgress(0, '');
       setStatus('❌ Error: ' + (err.message || 'Unknown'), true);
       show(parlayEmptyState, true);
@@ -6795,16 +7630,11 @@ function buildSparklineSvg(values, line, width, height) {
     show(parlayBuildWrap, false);
 
     try {
-      const resp = await fetch('/api/odds/events', {
+      const data = await apiFetch('/api/odds/events', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ api_key: keys[0], sport: parlaySportSelect.value }),
-      });
-      if (!resp.ok) {
-        const err = await resp.json().catch(function () { return {}; });
-        throw new Error(err.detail || 'Failed to load events');
-      }
-      const data = await resp.json();
+      }, 15000);
       allEvents = (data.events || []).filter(function (e) { return e.id && e.home_team; });
 
       if (!allEvents.length) {
@@ -6964,9 +7794,7 @@ function buildSparklineSvg(values, line, width, height) {
       if (q.length < 2) { closeDropdown(); return; }
       _autocompleteDebounce = setTimeout(async function () {
         try {
-          const r = await fetch('/api/players/search?q=' + encodeURIComponent(q));
-          if (!r.ok) return;
-          const data = await r.json();
+          const data = await apiFetch('/api/players/search?q=' + encodeURIComponent(q), {}, 6000);
           openDropdown((data.results || []).slice(0, 8));
         } catch (e) { closeDropdown(); }
       }, 220);
@@ -6999,19 +7827,11 @@ function buildSparklineSvg(values, line, width, height) {
     trackerPersistPromise = trackerPersistPromise
       .catch(function () { })
       .then(async function () {
-        const response = await fetch('/api/tracker/props', {
+        await apiFetch('/api/tracker/props', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ entries: snapshot }),
-        });
-        if (!response.ok) {
-          let detail = 'Failed to save tracker props.';
-          try {
-            const data = await response.json();
-            detail = data.detail || detail;
-          } catch (e) { }
-          throw new Error(detail);
-        }
+        }, 8000);
       })
       .catch(function (error) {
         console.error('Tracker persistence failed:', error);
@@ -7019,9 +7839,7 @@ function buildSparklineSvg(values, line, width, height) {
     return trackerPersistPromise;
   }
   async function loadBets() {
-    const response = await fetch('/api/tracker/props');
-    if (!response.ok) throw new Error('Failed to load tracker props.');
-    const data = await response.json();
+    const data = await apiFetch('/api/tracker/props', {}, 8000);
     return Array.isArray(data.entries) ? data.entries : [];
   }
 
@@ -7055,7 +7873,12 @@ function buildSparklineSvg(values, line, width, height) {
     const line = parseFloat(bet.line);
     if (val === null || val === undefined) return 'pending';
     const v = parseFloat(val);
+    const isFinal = bet.source === 'FINAL' || bet.game_status === 'final';
     const isLive = bet.source === 'LIVE' || bet.game_status === 'live';
+    if (isFinal) {
+      if (bet.side === 'OVER') return v >= line ? 'hit' : 'busted';
+      if (bet.side === 'UNDER') return v <= line ? 'hit' : 'busted';
+    }
     if (bet.side === 'OVER') return v >= line ? 'hit' : v >= line * 0.85 ? 'close' : 'progress';
     if (bet.side === 'UNDER') {
       // During live games, an UNDER can't be confirmed — player can still score more.
@@ -7075,9 +7898,13 @@ function buildSparklineSvg(values, line, width, height) {
     if (bet.side === 'OVER') {
       return Math.min(100, Math.round((v / line) * 100));
     } else {
-      // UNDER: bar fills as remaining room shrinks; hits 100% when val === 0
-      const pct = Math.max(0, Math.round(((line - v) / line) * 100));
-      return Math.min(100, pct);
+      // UNDER: bar reflects proximity to the line (closer to the line = higher %).
+      if (!Number.isFinite(line) || line <= 0) return 0;
+      if (v <= line) {
+        return Math.min(100, Math.round((v / line) * 100));
+      }
+      const overPct = Math.max(0, 100 - Math.round(((v - line) / line) * 100));
+      return Math.min(100, overPct);
     }
   }
 
@@ -7225,9 +8052,14 @@ function buildSparklineSvg(values, line, width, height) {
         ? (distance <= 0 ? `${Math.abs(distance).toFixed(1)} over` : `${distance.toFixed(1)} away`)
         : (distance <= 0 ? `${Math.abs(distance).toFixed(1)} under` : `${distance.toFixed(1)} above`);
 
+    const stampHtml = (status === 'hit' || status === 'busted')
+      ? `<span class="tracker-stamp ${status === 'hit' ? 'hit' : 'busted'}">${status === 'hit' ? 'WIN' : 'LOSE'}</span>`
+      : '';
+
     return `
 <div class="${cardClass}" data-bet-id="${esc(bet.id)}" id="tracker-card-${esc(bet.id)}">
   <div class="tracker-card-inner">
+    ${stampHtml}
     <div class="tracker-avatar-strip">
       ${imgSrc ? `<img src="${imgSrc}" alt="${esc(bet.player_name)}" onerror="this.style.display='none'">` : '<div style="width:80px;height:80px;display:flex;align-items:center;justify-content:center;font-size:1.8rem;opacity:0.4">🏀</div>'}
     </div>
@@ -7325,6 +8157,9 @@ function buildSparklineSvg(values, line, width, height) {
       const d = await lr.json();
       bet.is_injured = d.is_injured || false;
       bet.injury_status = d.injury_status || '';
+      if (d.game_status === 'no_game' && bet.game_status === 'final') {
+        return;
+      }
       const gs = d.game_status;
       if ((gs === 'live' || gs === 'final') && d.live_val !== null && d.live_val !== undefined) {
         bet.history = Array.isArray(bet.history) ? bet.history : [];
@@ -8542,9 +9377,7 @@ function buildSparklineSvg(values, line, width, height) {
       }
       btAutocompleteDebounce = setTimeout(async function () {
         try {
-          const r = await fetch('/api/players/search?q=' + encodeURIComponent(q));
-          if (!r.ok) return;
-          const data = await r.json();
+          const data = await apiFetch('/api/players/search?q=' + encodeURIComponent(q), {}, 6000);
           openBtDropdown((data.results || []).slice(0, 8));
         } catch (e) {
           closeBtDropdown();
@@ -8704,12 +9537,11 @@ function buildSparklineSvg(values, line, width, height) {
           return;
         }
         try {
-          const r = await fetch('/api/backtest/resolve', {
+          await apiFetch('/api/backtest/resolve', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ id, actual_value: actualVal }),
-          });
-          if (!r.ok) throw new Error(await r.text());
+          }, 8000);
           showBtError('');
           await loadAndRender();
         } catch (err) {
@@ -8742,9 +9574,7 @@ function buildSparklineSvg(values, line, width, height) {
   // ── Load from server and render ───────────────────────────────────────
   async function loadAndRender() {
     try {
-      const r = await fetch('/api/backtest/log?limit=200');
-      if (!r.ok) throw new Error('Fetch failed');
-      const data = await r.json();
+      const data = await apiFetch('/api/backtest/log?limit=200', {}, 8000);
       backtestEntriesCache = data.entries || [];
       backtestStatsCache = data.stats || {};
       populateBacktestFilterOptions(backtestEntriesCache);
@@ -8941,13 +9771,11 @@ function buildSparklineSvg(values, line, width, height) {
           notes: row.notes || '',
         })).filter(entry => entry.player && entry.stat && entry.side);
         if (!entries.length) throw new Error('No usable rows found in that CSV.');
-        const response = await fetch('/api/backtest/import', {
+        const payload = await apiFetch('/api/backtest/import', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ entries }),
-        });
-        const payload = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(payload.detail || 'Import failed.');
+        }, 15000);
         showBtError('');
         showAppToast(`Imported ${payload.added || 0} rows${payload.skipped ? ` • ${payload.skipped} skipped` : ''}.`, 'info');
         await loadAndRender();
@@ -9184,6 +10012,7 @@ function passesAdvancedMarketFilters(item) {
     kvKeyList.querySelectorAll('.kv-key-row').forEach((row, index) => {
       const entry = vault[index];
       if (!entry) return;
+      const health = getVaultHealth(entry);
       row.classList.remove('kv-active');
       row.style.background = 'var(--panel-strong)';
       row.style.borderColor = 'var(--border)';

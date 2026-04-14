@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from pypdf import PdfReader
 
-from identity_utils import normalize_compact_text, normalize_report_person_name
+from identity_utils import normalize_compact_text, normalize_report_person_name, build_player_name_variants, normalize_name
 
 
 @dataclass
@@ -491,7 +491,7 @@ class InjuryReportService:
         now_ts = time.time()
         cached_links = self.links_cache.get("links") or []
         cached_ts = float(self.links_cache.get("timestamp") or 0.0)
-        if cached_links and now_ts - cached_ts < self.report_ttl_seconds:
+        if cached_links and now_ts - cached_ts < self.links_ttl_seconds:
             return list(cached_links)[:limit]
 
         headers = {"User-Agent": "Mozilla/5.0 (compatible; NBAPropsTracker/1.0)"}
@@ -574,27 +574,45 @@ class InjuryReportService:
     ) -> dict[str, Any] | None:
         player_key = normalize_report_person_name(player_name)
         wanted_team = str(team_name or "").strip()
+        wanted_team_norm = normalize_compact_text(wanted_team) if wanted_team else ""
         rows = self.get_team_rows(report_payload, wanted_team, game_date=game_date) if wanted_team and game_date else (report_payload.get("rows") or [])
-        candidates = [row for row in rows if row.get("player_key") == player_key]
+        name_variants = build_player_name_variants(player_name)
+
+        def team_matches(row_team: str | None) -> bool:
+            if not wanted_team_norm:
+                return True
+            return normalize_compact_text(str(row_team or "")) == wanted_team_norm
+
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            row_key = str(row.get("player_key") or "")
+            if row_key == player_key or (name_variants and row_key in name_variants):
+                candidates.append(row)
 
         if wanted_team:
-            team_filtered = [row for row in candidates if row.get("team_name") == wanted_team]
+            team_filtered = [row for row in candidates if team_matches(row.get("team_name"))]
             if team_filtered:
                 candidates = team_filtered
 
         if not candidates:
             token_set = set(player_key.split())
-            fuzzy_matches = []
+            fuzzy_matches: list[tuple[int, dict[str, Any]]] = []
             for row in rows:
                 row_tokens = set(str(row.get("player_key") or "").split())
-                if token_set and token_set.issubset(row_tokens):
-                    fuzzy_matches.append(row)
-            if wanted_team:
-                team_fuzzy = [row for row in fuzzy_matches if row.get("team_name") == wanted_team]
-                if team_fuzzy:
-                    fuzzy_matches = team_fuzzy
+                if not token_set or not row_tokens:
+                    continue
+                overlap = len(token_set.intersection(row_tokens))
+                if overlap <= 0:
+                    continue
+                score = overlap * 10
+                if token_set.issubset(row_tokens):
+                    score += 25
+                if team_matches(row.get("team_name")):
+                    score += 20
+                fuzzy_matches.append((score, row))
             if fuzzy_matches:
-                candidates = fuzzy_matches
+                fuzzy_matches.sort(key=lambda item: item[0], reverse=True)
+                candidates = [row for _, row in fuzzy_matches[:3]]
 
         if not candidates:
             direct_row = self.try_direct_report_match(str(report_payload.get("raw_text") or ""), player_name, team_name)
@@ -618,7 +636,7 @@ class InjuryReportService:
                     current_team = team_hit
                 else:
                     remainder = line
-                if wanted_team and current_team != wanted_team:
+                if wanted_team and normalize_compact_text(current_team or "") != wanted_team_norm:
                     continue
                 for variant in name_variants:
                     if variant and variant.lower() in remainder.lower():
@@ -635,7 +653,24 @@ class InjuryReportService:
                                 "status": row_match.group("status").strip(),
                                 "reason": (row_match.group("reason") or "").strip(),
                             }
-        return candidates[0] if candidates else None
+        if not candidates:
+            return None
+
+        # Final alignment pass: prefer best team match + longest key overlap.
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for row in candidates:
+            row_key = str(row.get("player_key") or "")
+            row_tokens = set(row_key.split())
+            base_score = 5 * len(row_tokens.intersection(set(player_key.split())))
+            if row_key == player_key:
+                base_score += 40
+            if row_key in name_variants:
+                base_score += 20
+            if team_matches(row.get("team_name")):
+                base_score += 15
+            scored.append((base_score, row))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return scored[0][1] if scored else None
 
     def find_player_in_recent_reports(self, player_name: str, team_name: str | None = None, max_reports: int = 8) -> dict[str, Any] | None:
         cache_key = (normalize_report_person_name(player_name), str(team_name or "").strip())
@@ -709,7 +744,10 @@ class InjuryReportService:
         rows = payload.get("rows") or []
         rows_by_team_date: dict[tuple[str, str], list[dict[str, Any]]] = {}
         rows_by_team: dict[str, list[dict[str, Any]]] = {}
+        rows_by_team_date_norm: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        rows_by_team_norm: dict[str, list[dict[str, Any]]] = {}
         pending_by_date: dict[str, set[str]] = {}
+        pending_by_date_norm: dict[str, set[str]] = {}
 
         for row in rows:
             team_name = str(row.get("team_name") or "").strip()
@@ -718,17 +756,27 @@ class InjuryReportService:
             game_date = str(row.get("game_date") or "").strip()
             rows_by_team.setdefault(team_name, []).append(row)
             rows_by_team_date.setdefault((team_name, game_date), []).append(row)
+            norm_team = normalize_compact_text(team_name)
+            if norm_team:
+                rows_by_team_norm.setdefault(norm_team, []).append(row)
+                rows_by_team_date_norm.setdefault((norm_team, game_date), []).append(row)
 
         for entry in (payload.get("pending_entries") or []):
             team_name = str(entry.get("team_name") or "").strip()
             game_date = str(entry.get("game_date") or "").strip()
             if team_name:
                 pending_by_date.setdefault(game_date, set()).add(team_name)
+                norm_team = normalize_compact_text(team_name)
+                if norm_team:
+                    pending_by_date_norm.setdefault(game_date, set()).add(norm_team)
 
         indexes = {
             "rows_by_team_date": rows_by_team_date,
             "rows_by_team": rows_by_team,
+            "rows_by_team_date_norm": rows_by_team_date_norm,
+            "rows_by_team_norm": rows_by_team_norm,
             "pending_by_date": pending_by_date,
+            "pending_by_date_norm": pending_by_date_norm,
         }
         payload["_injury_indexes"] = indexes
         return indexes
@@ -737,14 +785,24 @@ class InjuryReportService:
         indexes = self._ensure_payload_indexes(payload)
         normalized_team_name = str(team_name or "").strip()
         if game_date is None:
-            return list(indexes["rows_by_team"].get(normalized_team_name, []))
-        return list(indexes["rows_by_team_date"].get((normalized_team_name, str(game_date or "").strip()), []))
+            direct = list(indexes["rows_by_team"].get(normalized_team_name, []))
+            if direct:
+                return direct
+            norm_key = normalize_compact_text(normalized_team_name)
+            return list(indexes["rows_by_team_norm"].get(norm_key, []))
+        date_key = str(game_date or "").strip()
+        direct = list(indexes["rows_by_team_date"].get((normalized_team_name, date_key), []))
+        if direct:
+            return direct
+        norm_key = normalize_compact_text(normalized_team_name)
+        return list(indexes["rows_by_team_date_norm"].get((norm_key, date_key), []))
 
     def get_pending_teams(self, payload: dict[str, Any], game_date: str | None = None) -> set[str]:
         indexes = self._ensure_payload_indexes(payload)
         if game_date is None:
-            return set(payload.get("pending_teams") or [])
-        return set(indexes["pending_by_date"].get(str(game_date or "").strip(), set()))
+            raw = set(payload.get("pending_teams") or [])
+            return {normalize_compact_text(name) for name in raw if name} if raw else set()
+        return set(indexes["pending_by_date_norm"].get(str(game_date or "").strip(), set()))
 
     def _build_error_payload(self, exc: Exception) -> dict[str, Any]:
         return {
@@ -790,6 +848,19 @@ class InjuryReportService:
         cached = self.report_cache.get("payload")
         cached_ts = float(self.report_cache.get("timestamp") or 0.0)
         if cached and now_ts - cached_ts < self.report_ttl_seconds:
+            try:
+                links = self.list_recent_report_links(limit=12)
+                latest_url = max(links, key=self.parse_report_timestamp)
+                latest_dt = self.parse_report_timestamp(latest_url)
+                cached_dt = self.parse_report_timestamp(str(cached.get("report_url") or ""))
+                if latest_url and latest_dt > cached_dt and latest_url != cached.get("report_url"):
+                    headers = {"User-Agent": "Mozilla/5.0 (compatible; NBAPropsTracker/1.0)"}
+                    payload = self._fetch_report_pdf_payload(latest_url, latest_dt, headers)
+                    self.report_cache["timestamp"] = now_ts
+                    self.report_cache["payload"] = payload
+                    return payload
+            except Exception:
+                pass
             return cached
 
         if (
@@ -841,7 +912,8 @@ class InjuryReportService:
         report_payload = self.fetch_latest_report_payload()
         report_label = str(report_payload.get("report_label") or "")
         team_name = str(team_name or "").strip()
-        cache_key = (normalize_report_person_name(player_name), team_name, str(game_date or "").strip(), report_label)
+        cache_team_key = normalize_name(team_name) if team_name else ""
+        cache_key = (normalize_report_person_name(player_name), cache_team_key, str(game_date or "").strip(), report_label)
         cached = self.availability_cache.get(cache_key)
         if cached:
             return dict(cached)
@@ -888,7 +960,7 @@ class InjuryReportService:
             return result
 
         pending_teams = self.get_pending_teams(report_payload, game_date=game_date) if team_name else set()
-        if team_name and team_name in pending_teams:
+        if team_name and normalize_compact_text(team_name) in pending_teams:
             result = {
                 "status": "Pending report",
                 "tone": "warning",
@@ -956,7 +1028,7 @@ class InjuryReportService:
             }
 
         pending_teams = self.get_pending_teams(payload, game_date=game_date)
-        if team_name and team_name in pending_teams:
+        if team_name and normalize_compact_text(team_name) in pending_teams:
             return {
                 "team_name": team_name,
                 "headline": "Pending report",
