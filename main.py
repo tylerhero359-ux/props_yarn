@@ -6273,7 +6273,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             hit_rate=float(side_hit_rate),
             games_count=int(analysis.get("games_count") or 0),
             edge=round((side_hit_rate / 100.0 - fair_prob) * 100.0, 1) if fair_prob is not None else round(abs(avg - line), 1),
-            ev=max(0.0, (side_hit_rate / 100.0) - fair_prob) if fair_prob is not None else max(0.0, (side_hit_rate / 100.0) - decimal_implied_probability(odds)),
+            ev=round(((side_hit_rate / 100.0) * odds - 1.0) * 100.0, 1) if (odds and odds > 1.0) else round((side_hit_rate / 100.0 - fair_prob) * 100.0, 1) if fair_prob is not None else 0.0,
             matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
             availability=availability,
             opportunity=analysis.get("opportunity") or {},
@@ -6941,7 +6941,15 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             player_team_abbreviation=player_info.get("team_abbreviation") or "",
         )
         _computed_edge = round((side_hit_rate / 100.0 - fair_prob) * 100.0, 1) if fair_prob is not None else round(abs(avg - line), 1)
-        _computed_ev = max(0.0, (side_hit_rate / 100.0) - fair_prob) if fair_prob is not None else max(0.0, (side_hit_rate / 100.0) - decimal_implied_probability(odds))
+        # True EV: (hit_rate × decimal_odds) - 1, expressed as a percentage
+        # This differs from Edge because it accounts for the payout multiplier,
+        # not just the implied probability gap.
+        _p = side_hit_rate / 100.0
+        if odds and odds > 1.0:
+            _computed_ev = round((_p * odds - 1.0) * 100.0, 1)
+        else:
+            # Fallback: no payout info — use edge as proxy
+            _computed_ev = _computed_edge
         confidence_engine = build_confidence_engine(
             side=side, hit_rate=float(side_hit_rate), games_count=base_games_count,
             edge=_computed_edge,
@@ -6992,7 +7000,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             "average": round(avg, 2),
             "games_count": base_games_count,
             "hit_count": int(round(base_games_count * side_hit_rate / 100.0)) if base_games_count > 0 else int(analysis.get("hit_count") or 0),
-            "ev": round(_computed_ev * 100.0, 1),
+            "ev": _computed_ev,
             "edge": _computed_edge,
             "last_n": last_n,
             "bookmaker": orig_row.get("bookmaker_title") or "N/A",
