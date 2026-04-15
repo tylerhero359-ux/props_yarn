@@ -9175,6 +9175,8 @@ function buildSparklineSvg(values, line, width, height) {
   const btLogBtn       = document.getElementById('btLogBtn');
   const btLogError     = document.getElementById('btLogError');
   const btRefreshBtn   = document.getElementById('btRefreshBtn');
+  const btSyncPgBtn    = document.getElementById('btSyncPgBtn');
+  const btPushPgBtn    = document.getElementById('btPushPgBtn');
   const btExportBtn    = document.getElementById('btExportBtn');
   const btImportInput  = document.getElementById('btImportInput');
   const btClearBtn     = document.getElementById('btClearBtn');
@@ -9186,8 +9188,56 @@ function buildSparklineSvg(values, line, width, height) {
   const btFilterStat   = document.getElementById('btFilterStat');
   const btFilterTier   = document.getElementById('btFilterTier');
   const btFilterSide   = document.getElementById('btFilterSide');
+  const btFilterRange  = document.getElementById('btFilterRange');
+  const btGroupBy      = document.getElementById('btGroupBy');
+  const btPageSize     = document.getElementById('btPageSize');
+  const btPagination   = document.getElementById('btPagination');
+  const btArchiveDays  = document.getElementById('btArchiveDays');
+  const btArchiveBtn   = document.getElementById('btArchiveBtn');
+  const btExportSeasonBtn = document.getElementById('btExportSeasonBtn');
+  const btViewTabs     = document.getElementById('btViewTabs');
 
   if (!btLogBtn) return; // backtest section not mounted
+
+  if (backtestLog) {
+    backtestLog.addEventListener('click', async event => {
+      const resolveBtn = event.target.closest('.bt-resolve-btn');
+      if (resolveBtn) {
+        const id = resolveBtn.dataset.btResolveId;
+        const inputEl = backtestLog.querySelector(`.bt-actual-input[data-bt-resolve-id="${id}"]`);
+        const actualVal = inputEl ? parseFloat(inputEl.value) : NaN;
+        if (!id || isNaN(actualVal)) {
+          showBtError('Enter the actual stat value before resolving.');
+          return;
+        }
+        try {
+          await apiFetch('/api/backtest/resolve', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id, actual_value: actualVal }),
+          }, 8000);
+          showBtError('');
+          await loadAndRender();
+        } catch (err) {
+          showBtError('Resolve failed: ' + err.message);
+        }
+        return;
+      }
+      const deleteBtn = event.target.closest('.bt-delete-btn');
+      if (deleteBtn) {
+        const id = deleteBtn.dataset.btId;
+        if (!id) return;
+        try {
+          const r = await fetch(`/api/backtest/log/${encodeURIComponent(id)}`, { method: 'DELETE' });
+          if (!r.ok) throw new Error(await r.text());
+          await loadAndRender();
+        } catch (err) {
+          showBtError('Delete failed: ' + err.message);
+          await loadAndRender();
+        }
+      }
+    });
+  }
 
   // ── Helpers ───────────────────────────────────────────────────────────
   function esc(s) {
@@ -9218,36 +9268,21 @@ function buildSparklineSvg(values, line, width, height) {
     return `${Number(value).toFixed(1)}%`;
   }
 
-  function populateBacktestFilterOptions(entries) {
-    const populate = function (el, values, labelFormatter) {
-      if (!el) return;
-      const current = el.value || 'all';
-      const options = ['<option value="all">All</option>'].concat(
-        [...values].sort().map(value => `<option value="${esc(value)}">${esc(labelFormatter ? labelFormatter(value) : value)}</option>`)
-      );
-      el.innerHTML = options.join('');
-      if ([...values, 'all'].includes(current)) el.value = current;
-    };
-    populate(btFilterStat, new Set(entries.map(e => String(e.stat || '').trim()).filter(Boolean)), value => value);
-    populate(btFilterTier, new Set(entries.map(e => String(e.confidence_tier || '').trim()).filter(Boolean)), value => value);
+  function populateBacktestFilterOptions() {
+    if (btFilterStat && !btFilterStat.dataset.seeded) {
+      btFilterStat.innerHTML = ['all', 'PTS', 'REB', 'AST', '3PM', 'STL', 'BLK', 'PRA', 'PR', 'PA', 'RA']
+        .map(value => `<option value="${esc(value)}">${esc(value === 'all' ? 'All stats' : value)}</option>`).join('');
+      btFilterStat.dataset.seeded = '1';
+    }
+    if (btFilterTier && !btFilterTier.dataset.seeded) {
+      btFilterTier.innerHTML = ['all', 'Elite', 'High', 'Medium', 'Low']
+        .map(value => `<option value="${esc(value)}">${esc(value === 'all' ? 'All tiers' : value)}</option>`).join('');
+      btFilterTier.dataset.seeded = '1';
+    }
   }
 
   function getFilteredBacktestEntries(entries) {
-    return (entries || []).filter(function (entry) {
-      const haystack = [
-        entry.player,
-        entry.stat,
-        entry.confidence_tier,
-        entry.notes,
-        entry.source,
-      ].join(' ').toLowerCase();
-      if (backtestFilters.search && !haystack.includes(backtestFilters.search)) return false;
-      if (backtestFilters.result !== 'all' && String(entry.result || '').toLowerCase() !== backtestFilters.result) return false;
-      if (backtestFilters.stat !== 'all' && String(entry.stat || '') !== backtestFilters.stat) return false;
-      if (backtestFilters.tier !== 'all' && String(entry.confidence_tier || '') !== backtestFilters.tier) return false;
-      if (backtestFilters.side !== 'all' && String(entry.side || '').toUpperCase() !== backtestFilters.side) return false;
-      return true;
-    });
+    return Array.isArray(entries) ? entries.slice() : [];
   }
 
   function renderMiniBreakdown(targetId, title, items, formatter) {
@@ -9308,13 +9343,20 @@ function buildSparklineSvg(values, line, width, height) {
   let btAutocompleteDebounce = null;
   let btSelectedPlayerName = '';
   let backtestEntriesCache = [];
+  let backtestGroupsCache = [];
   let backtestStatsCache = {};
+  let backtestMetaCache = {};
   const backtestFilters = {
     search: '',
     result: 'all',
     stat: 'all',
     tier: 'all',
     side: 'all',
+    range: 'all',
+    group_by: 'none',
+    view_mode: 'active',
+    page_size: 25,
+    offset: 0,
   };
 
   function mountBtDropdownToBody() {
@@ -9526,68 +9568,100 @@ function buildSparklineSvg(values, line, width, height) {
         </table>
       </div>`;
 
-    // Wire resolve buttons
-    backtestLog.querySelectorAll('.bt-resolve-btn').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const id = btn.dataset.btResolveId;
-        const inputEl = backtestLog.querySelector(`.bt-actual-input[data-bt-resolve-id="${id}"]`);
-        const actualVal = inputEl ? parseFloat(inputEl.value) : NaN;
-        if (!id || isNaN(actualVal)) {
-          showBtError('Enter the actual stat value before resolving.');
-          return;
-        }
-        try {
-          await apiFetch('/api/backtest/resolve', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id, actual_value: actualVal }),
-          }, 8000);
-          showBtError('');
-          await loadAndRender();
-        } catch (err) {
-          showBtError('Resolve failed: ' + err.message);
-        }
-      });
-    });
+  }
 
-    // Wire delete buttons
-    backtestLog.querySelectorAll('.bt-delete-btn').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const id = btn.dataset.btId;
-        if (!id) return;
-        // Optimistically remove the row immediately for instant feedback
-        const row = btn.closest('tr');
-        if (row) row.remove();
-        try {
-          const r = await fetch(`/api/backtest/log/${encodeURIComponent(id)}`, { method: 'DELETE' });
-          if (!r.ok) throw new Error(await r.text());
-          // Reload stats only (log is already visually updated)
-          await loadAndRender();
-        } catch (err) {
-          showBtError('Delete failed: ' + err.message);
-          await loadAndRender(); // re-render to restore consistent state
-        }
-      });
+  function renderBacktestGroupedLog(entries, groups) {
+    if (!backtestLog) return;
+    if (!entries || entries.length === 0) {
+      backtestLog.innerHTML = `<div style="opacity:0.45;font-size:13px;padding:8px 0">No predictions logged yet for this view. Try another range or tab.</div>`;
+      return;
+    }
+    const normalizedGroups = Array.isArray(groups) && groups.length ? groups : [{ label: 'All entries', entries }];
+    const originalGroupBy = backtestFilters.group_by;
+    if (originalGroupBy === 'none') {
+      renderLog(entries);
+      return;
+    }
+    backtestLog.innerHTML = `<div class="backtest-log-stack">${normalizedGroups.map(group => `
+      <div class="backtest-group-card">
+        <div class="backtest-group-label">${esc(group.label || 'Group')}</div>
+        <div class="backtest-group-table" data-bt-group="${esc(group.label || 'group')}"></div>
+      </div>`).join('')}</div>`;
+    const groupContainers = backtestLog.querySelectorAll('.backtest-group-table');
+    groupContainers.forEach((container, idx) => {
+      const group = normalizedGroups[idx];
+      if (!group) return;
+      const previous = backtestFilters.group_by;
+      backtestFilters.group_by = 'none';
+      const temp = document.createElement('div');
+      const previousLog = backtestLog.innerHTML;
+      const targetNode = backtestLog;
+      backtestLog.innerHTML = '';
+      renderLog(group.entries || []);
+      temp.innerHTML = targetNode.innerHTML;
+      backtestLog.innerHTML = previousLog;
+      container.innerHTML = temp.innerHTML;
+      backtestFilters.group_by = previous;
     });
+  }
+
+  function renderBacktestPagination(meta) {
+    if (!btPagination) return;
+    const total = Number(meta?.total_filtered || 0);
+    if (!total) {
+      btPagination.innerHTML = '';
+      return;
+    }
+    const limit = Number(meta?.limit || backtestFilters.page_size || 25);
+    const offset = Number(meta?.offset || 0);
+    const start = Math.min(total, offset + 1);
+    const end = Math.min(total, offset + limit);
+    btPagination.innerHTML = `
+      <div class="backtest-pagination-meta">Showing ${start}-${end} of ${total}</div>
+      <div class="backtest-pagination-actions">
+        <button class="secondary-btn" id="btPrevPageBtn" type="button" ${meta?.has_prev ? '' : 'disabled'}>Previous</button>
+        <button class="secondary-btn" id="btNextPageBtn" type="button" ${meta?.has_next ? '' : 'disabled'}>Next</button>
+      </div>`;
+    const prevBtn = document.getElementById('btPrevPageBtn');
+    const nextBtn = document.getElementById('btNextPageBtn');
+    if (prevBtn) prevBtn.addEventListener('click', async () => { backtestFilters.offset = Math.max(0, offset - limit); await loadAndRender(); });
+    if (nextBtn) nextBtn.addEventListener('click', async () => { backtestFilters.offset = offset + limit; await loadAndRender(); });
   }
 
   // ── Load from server and render ───────────────────────────────────────
   async function loadAndRender() {
     try {
-      const data = await apiFetch('/api/backtest/log?limit=200', {}, 8000);
+      const params = new URLSearchParams({
+        limit: String(backtestFilters.page_size || 25),
+        offset: String(backtestFilters.offset || 0),
+        search: backtestFilters.search || '',
+        result_filter: backtestFilters.result || 'all',
+        stat_filter: backtestFilters.stat || 'all',
+        tier_filter: backtestFilters.tier || 'all',
+        side_filter: backtestFilters.side || 'all',
+        date_range: backtestFilters.range || 'all',
+        view_mode: backtestFilters.view_mode || 'active',
+        group_by: backtestFilters.group_by || 'none',
+      });
+      const data = await apiFetch(`/api/backtest/log?${params.toString()}`, {}, 8000);
       backtestEntriesCache = data.entries || [];
+      backtestGroupsCache = data.groups || [];
       backtestStatsCache = data.stats || {};
-      populateBacktestFilterOptions(backtestEntriesCache);
+      backtestMetaCache = data.meta || {};
+      populateBacktestFilterOptions();
       renderStats(backtestStatsCache);
-      renderLog(backtestEntriesCache);
+      renderBacktestGroupedLog(backtestEntriesCache, backtestGroupsCache);
+      renderBacktestPagination(backtestMetaCache);
     } catch (err) {
       if (backtestLog) backtestLog.innerHTML = `<div style="opacity:0.45;font-size:12px;padding:8px 0">Could not load backtest log: ${esc(err.message)}</div>`;
+      if (btPagination) btPagination.innerHTML = '';
     }
   }
 
   function rerenderBacktestView() {
     renderStats(backtestStatsCache || {});
-    renderLog(backtestEntriesCache || []);
+    renderBacktestGroupedLog(backtestEntriesCache || [], backtestGroupsCache || []);
+    renderBacktestPagination(backtestMetaCache || {});
   }
 
   function parseBacktestCsv(text) {
@@ -9713,34 +9787,154 @@ function buildSparklineSvg(values, line, width, height) {
     btRefreshBtn.addEventListener('click', loadAndRender);
   }
 
+  if (btSyncPgBtn) {
+    btSyncPgBtn.addEventListener('click', async () => {
+      const originalLabel = btSyncPgBtn.textContent;
+      btSyncPgBtn.disabled = true;
+      btSyncPgBtn.textContent = 'Syncing...';
+      try {
+        const payload = await apiFetch('/api/backtest/sync-postgres', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ limit: 5000 }),
+        }, 20000);
+        showBtError('');
+        const fetched = Number(payload.fetched || 0);
+        const added = Number(payload.added || 0);
+        const skipped = Number(payload.skipped || 0);
+        showAppToast(`Postgres sync complete: ${added} added, ${skipped} skipped, ${fetched} fetched.`, 'info');
+        await loadAndRender();
+      } catch (err) {
+        showBtError('Postgres sync failed: ' + err.message);
+      } finally {
+        btSyncPgBtn.disabled = false;
+        btSyncPgBtn.textContent = originalLabel;
+      }
+    });
+  }
+
+  if (btPushPgBtn) {
+    btPushPgBtn.addEventListener('click', async () => {
+      const originalLabel = btPushPgBtn.textContent;
+      btPushPgBtn.disabled = true;
+      btPushPgBtn.textContent = 'Pushing...';
+      try {
+        const payload = await apiFetch('/api/backtest/push-postgres', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        }, 20000);
+        showBtError('');
+        showAppToast(`Pushed ${Number(payload.pushed || 0)} local backtest rows to Postgres.`, 'info');
+      } catch (err) {
+        showBtError('Postgres push failed: ' + err.message);
+      } finally {
+        btPushPgBtn.disabled = false;
+        btPushPgBtn.textContent = originalLabel;
+      }
+    });
+  }
+
   [
     [btFilterSearch, 'search', value => value.trim().toLowerCase()],
     [btFilterResult, 'result', value => value],
     [btFilterStat, 'stat', value => value],
     [btFilterTier, 'tier', value => value],
     [btFilterSide, 'side', value => value],
+    [btFilterRange, 'range', value => value],
+    [btGroupBy, 'group_by', value => value],
+    [btPageSize, 'page_size', value => Number(value || 25)],
   ].forEach(([el, key, transform]) => {
     if (!el) return;
-    const apply = () => {
+    const apply = async () => {
       backtestFilters[key] = transform(el.value || '');
-      rerenderBacktestView();
+      backtestFilters.offset = 0;
+      await loadAndRender();
     };
     el.addEventListener('input', apply);
     el.addEventListener('change', apply);
   });
 
+  if (btViewTabs) {
+    btViewTabs.querySelectorAll('[data-bt-view]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        btViewTabs.querySelectorAll('[data-bt-view]').forEach(node => node.classList.remove('active'));
+        btn.classList.add('active');
+        backtestFilters.view_mode = btn.dataset.btView || 'active';
+        backtestFilters.offset = 0;
+        if (backtestFilters.view_mode === 'pending') backtestFilters.result = 'pending';
+        else if (backtestFilters.view_mode === 'resolved' && backtestFilters.result === 'pending') backtestFilters.result = 'all';
+        else if (backtestFilters.view_mode === 'active' && backtestFilters.result === 'pending') backtestFilters.result = 'all';
+        if (btFilterResult) btFilterResult.value = backtestFilters.result;
+        await loadAndRender();
+      });
+    });
+  }
+
   if (btExportBtn) {
     btExportBtn.addEventListener('click', () => {
-      const csv = buildBacktestCsv(getFilteredBacktestEntries(backtestEntriesCache || []));
-      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `backtest-log-${new Date().toISOString().slice(0, 10)}.csv`;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(url);
+      const params = new URLSearchParams({
+        search: backtestFilters.search || '',
+        result_filter: backtestFilters.result || 'all',
+        stat_filter: backtestFilters.stat || 'all',
+        tier_filter: backtestFilters.tier || 'all',
+        side_filter: backtestFilters.side || 'all',
+        date_range: backtestFilters.range || 'all',
+        view_mode: backtestFilters.view_mode || 'active',
+      });
+      window.location.href = `/api/backtest/export?${params.toString()}`;
+    });
+  }
+
+  if (btExportSeasonBtn) {
+    btExportSeasonBtn.addEventListener('click', () => {
+      const params = new URLSearchParams({
+        search: backtestFilters.search || '',
+        result_filter: backtestFilters.result || 'all',
+        stat_filter: backtestFilters.stat || 'all',
+        tier_filter: backtestFilters.tier || 'all',
+        side_filter: backtestFilters.side || 'all',
+        date_range: 'season',
+        view_mode: 'resolved',
+      });
+      window.location.href = `/api/backtest/export?${params.toString()}`;
+    });
+  }
+
+  if (btArchiveBtn) {
+    btArchiveBtn.addEventListener('click', async () => {
+      const days = Number(btArchiveDays?.value || 90);
+      if (!confirm(`Archive resolved backtest entries older than ${days} days?`)) return;
+      const original = btArchiveBtn.textContent;
+      btArchiveBtn.disabled = true;
+      btArchiveBtn.textContent = 'Archiving...';
+      try {
+        const payload = await apiFetch('/api/backtest/archive', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ older_than_days: days }),
+        }, 20000);
+        const csv = String(payload.csv || '');
+        if (csv) {
+          const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = `backtest-archive-${days}d-${new Date().toISOString().slice(0, 10)}.csv`;
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          URL.revokeObjectURL(url);
+        }
+        showAppToast(`Archived ${Number(payload.archived_count || 0)} rows.`, 'info');
+        backtestFilters.offset = 0;
+        await loadAndRender();
+      } catch (err) {
+        showBtError('Archive failed: ' + err.message);
+      } finally {
+        btArchiveBtn.disabled = false;
+        btArchiveBtn.textContent = original;
+      }
     });
   }
 

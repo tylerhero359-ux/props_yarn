@@ -9482,6 +9482,66 @@ body.light-theme .market-expert-chip.active {
   margin-top: 8px;
 }
 
+.backtest-view-tabs {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 6px 0 14px;
+}
+
+.backtest-view-tabs .secondary-btn.active {
+  background: rgba(255,255,255,0.1);
+  border-color: rgba(255,255,255,0.2);
+}
+
+.backtest-log-stack {
+  display: grid;
+  gap: 12px;
+}
+
+.backtest-group-card {
+  border: 1px solid rgba(255,255,255,0.07);
+  border-radius: 18px;
+  padding: 8px 10px 4px;
+  background: rgba(255,255,255,0.02);
+}
+
+.backtest-group-label {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 4px 4px 8px;
+}
+
+.backtest-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.backtest-pagination-meta {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.backtest-pagination-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.backtest-archive-bar {
+  display: flex;
+  align-items: end;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
 /* Sample warning badge in recommendation panel */
 .sample-warning-badge {
   display: inline-flex;

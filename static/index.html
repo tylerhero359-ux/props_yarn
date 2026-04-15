@@ -1344,6 +1344,11 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 
     <!-- Log table -->
     <div id="backtestLogWrap" style="padding:0 20px 16px">
+      <div class="backtest-view-tabs" id="btViewTabs">
+        <button class="secondary-btn active" data-bt-view="active" type="button">Recent + Pending</button>
+        <button class="secondary-btn" data-bt-view="pending" type="button">Pending</button>
+        <button class="secondary-btn" data-bt-view="resolved" type="button">Resolved</button>
+      </div>
       <div class="backtest-toolbar">
         <label class="field-inline">
           <span class="small-label">Search</span>
@@ -1378,11 +1383,51 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
             <option value="UNDER">Under</option>
           </select>
         </label>
+        <label class="field-inline">
+          <span class="small-label">Range</span>
+          <select class="market-api-input" id="btFilterRange">
+            <option value="all">All time</option>
+            <option value="7d">Last 7 days</option>
+            <option value="30d">Last 30 days</option>
+            <option value="season">This season</option>
+          </select>
+        </label>
+        <label class="field-inline">
+          <span class="small-label">Group</span>
+          <select class="market-api-input" id="btGroupBy">
+            <option value="none">No grouping</option>
+            <option value="date">Group by date</option>
+            <option value="player">Group by player</option>
+          </select>
+        </label>
+        <label class="field-inline">
+          <span class="small-label">Page size</span>
+          <select class="market-api-input" id="btPageSize">
+            <option value="25">25</option>
+            <option value="50">50</option>
+          </select>
+        </label>
       </div>
       <div id="backtestLog" style="margin-top:12px"></div>
+      <div class="backtest-pagination" id="btPagination"></div>
+      <div class="backtest-archive-bar">
+        <label class="field-inline">
+          <span class="small-label">Archive resolved older than</span>
+          <select class="market-api-input" id="btArchiveDays">
+            <option value="30">30 days</option>
+            <option value="60">60 days</option>
+            <option value="90" selected>90 days</option>
+            <option value="180">180 days</option>
+          </select>
+        </label>
+        <button class="secondary-btn" id="btArchiveBtn" style="font-size:12px;padding:6px 14px" type="button">Archive older resolved</button>
+      </div>
       <div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap">
         <button class="secondary-btn" id="btRefreshBtn" style="font-size:12px;padding:6px 14px" type="button">↻ Refresh log</button>
-        <button class="secondary-btn" id="btExportBtn" style="font-size:12px;padding:6px 14px" type="button">Export CSV</button>
+        <button class="secondary-btn" id="btSyncPgBtn" style="font-size:12px;padding:6px 14px" type="button">Sync from Postgres</button>
+        <button class="secondary-btn" id="btPushPgBtn" style="font-size:12px;padding:6px 14px" type="button">Push to Postgres</button>
+        <button class="secondary-btn" id="btExportBtn" style="font-size:12px;padding:6px 14px" type="button">Export current view</button>
+        <button class="secondary-btn" id="btExportSeasonBtn" style="font-size:12px;padding:6px 14px" type="button">Export season</button>
         <label class="secondary-btn" style="font-size:12px;padding:6px 14px;cursor:pointer">
           Import CSV
           <input accept=".csv,text/csv" id="btImportInput" style="display:none" type="file"/>

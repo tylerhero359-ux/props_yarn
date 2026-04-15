@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import csv
 import hashlib
+import io
 import json
 import logging
 import math
@@ -458,6 +460,16 @@ def _submit_pg_write(func, *args) -> None:
         LOGGER.debug("Postgres cache write skipped: %s", exc)
 
 
+def _require_pg_backtest_write(func, *args) -> None:
+    if not (postgres_available() and POSTGRES_CACHE_WRITE_ENABLED):
+        return
+    try:
+        func(*args)
+    except Exception as exc:
+        LOGGER.warning("Postgres backtest write failed: %s", exc)
+        raise HTTPException(status_code=503, detail=f"Backtest Postgres write failed: {exc}")
+
+
 def _prune_async_jobs() -> None:
     with ASYNC_JOB_LOCK:
         if len(ASYNC_JOB_REGISTRY) <= ASYNC_JOB_RETENTION:
@@ -703,39 +715,53 @@ def _pg_write_bet_finder_run(payload: dict[str, Any]) -> None:
 
 
 def _pg_write_backtest_entries(entries: list[dict[str, Any]]) -> None:
-    try:
-        with postgres_connect() as conn, conn.cursor() as cur:
-            for entry in entries:
-                entry_id = str(entry.get("id") or "")
-                if not entry_id:
-                    continue
-                cur.execute(
-                    """
-                    INSERT INTO backtest_log_entries (entry_id, payload, updated_at)
-                    VALUES (%s, %s, NOW())
-                    ON CONFLICT (entry_id)
-                    DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW();
-                    """,
-                    (entry_id, PgJson(entry)),
-                )
-    except Exception as exc:
-        LOGGER.debug("Postgres backtest entry write failed: %s", exc)
+    with postgres_connect() as conn, conn.cursor() as cur:
+        for entry in entries:
+            entry_id = str(entry.get("id") or "")
+            if not entry_id:
+                continue
+            cur.execute(
+                """
+                INSERT INTO backtest_log_entries (entry_id, payload, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (entry_id)
+                DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW();
+                """,
+                (entry_id, PgJson(entry)),
+            )
 
 
 def _pg_delete_backtest_entry(entry_id: str) -> None:
-    try:
-        with postgres_connect() as conn, conn.cursor() as cur:
-            cur.execute("DELETE FROM backtest_log_entries WHERE entry_id = %s;", (str(entry_id),))
-    except Exception as exc:
-        LOGGER.debug("Postgres backtest delete failed: %s", exc)
+    with postgres_connect() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM backtest_log_entries WHERE entry_id = %s;", (str(entry_id),))
 
 
 def _pg_clear_backtest_entries() -> None:
+    with postgres_connect() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM backtest_log_entries;")
+
+
+def _pg_fetch_backtest_entries(limit: int = 5000) -> list[dict[str, Any]]:
+    if not postgres_available():
+        return []
+    entries: list[dict[str, Any]] = []
     try:
         with postgres_connect() as conn, conn.cursor() as cur:
-            cur.execute("DELETE FROM backtest_log_entries;")
+            cur.execute(
+                """
+                SELECT payload
+                FROM backtest_log_entries
+                ORDER BY updated_at DESC
+                LIMIT %s;
+                """,
+                (max(1, int(limit)),),
+            )
+            for (payload,) in cur.fetchall():
+                if isinstance(payload, dict):
+                    entries.append(payload)
     except Exception as exc:
-        LOGGER.debug("Postgres backtest clear failed: %s", exc)
+        LOGGER.debug("Postgres backtest fetch failed: %s", exc)
+    return entries
 
 
 def preload_postgres_cache() -> None:
@@ -1363,7 +1389,7 @@ def start_hybrid_refresh_workers() -> None:
 
 
 def get_player_game_log_hybrid(player_id: int, season: str, season_type: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    cache_key = (player_id, season, season_type)
+    cache_key = (player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)
     cached = GAME_LOG_CACHE.get(cache_key)
     age_seconds = _cache_age_seconds(cached)
     if cached and isinstance(cached.get("rows"), list):
@@ -4818,6 +4844,10 @@ def _position_dash_cache_is_reliable_stale(cached: dict[str, Any] | None, cached
 def fetch_player_game_log(player_id: int, season: str, season_type: str) -> list[dict[str, Any]]:
     cache_key = (player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)
     cached = GAME_LOG_CACHE.get(cache_key)
+    if cached and isinstance(cached.get("rows"), list) and cached["rows"]:
+        cached_ts = float(cached.get("timestamp") or 0.0)
+        if cached_ts and (time.time() - cached_ts) < CACHE_TTL_SECONDS:
+            return cached["rows"]
     if POSTGRES_SOURCE_OF_TRUTH:
         pg_rows, pg_ts = _pg_read_game_log(player_id, season, season_type)
         if isinstance(pg_rows, list) and pg_rows:
@@ -4857,6 +4887,10 @@ def fetch_team_roster(team_id: int, season: str) -> list[dict[str, Any]]:
 @timed_call("fetch_common_player_info")
 def fetch_common_player_info(player_id: int) -> dict[str, Any]:
     cached = PLAYER_INFO_CACHE.get(player_id)
+    if cached and isinstance(cached.get("row"), dict):
+        cached_ts = float(cached.get("timestamp") or 0.0)
+        if cached_ts and (time.time() - cached_ts) < PROFILE_TTL_SECONDS:
+            return cached["row"]
     if POSTGRES_SOURCE_OF_TRUTH:
         pg_row, pg_ts = _pg_read_player_info(player_id)
         if pg_row and isinstance(pg_row, dict):
@@ -5011,6 +5045,10 @@ def resolve_team_next_game(team_id: int | None, primary_player_id: int, season: 
         cache_key = (team_id, season, season_type)
         cached = TEAM_NEXT_GAME_CACHE.get(cache_key)
         cached_row = cached.get("row") if cached else None
+        cached_ts = float((cached or {}).get("timestamp") or 0.0)
+        if cached_row and isinstance(cached_row, dict) and not _is_next_game_stale(cached_row):
+            if cached_ts and (time.time() - cached_ts) < NEXT_GAME_TTL_SECONDS:
+                return cached_row
         if POSTGRES_SOURCE_OF_TRUTH:
             pg_row, pg_ts = _pg_read_team_next_game(int(team_id), season, season_type)
             if pg_row and isinstance(pg_row, dict) and not _is_next_game_stale(pg_row):
@@ -5870,8 +5908,6 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
 
     _emit_progress(progress_cb, "start", events_requested=len(payload.get("event_ids") or []))
 
-    _emit_progress(progress_cb, "start", events_requested=len(payload.get("event_ids") or []))
-
     legs = int(payload.get("legs") or 3)
     if legs < 2 or legs > 6:
         raise HTTPException(status_code=400, detail="'legs' must be between 2 and 6.")
@@ -6398,11 +6434,6 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
         "bookmakers": requested_bookmakers,
         "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
     }
-    if postgres_available() and POSTGRES_CACHE_WRITE_ENABLED:
-        try:
-            _pg_write_parlay_builder_run(payload)
-        except Exception:
-            pass
     _submit_pg_write(_pg_write_parlay_builder_run, payload)
     return payload
 
@@ -7093,11 +7124,6 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
         "injury_summary": injury_summary,
     }
-    if postgres_available() and POSTGRES_CACHE_WRITE_ENABLED:
-        try:
-            _pg_write_parlay_builder_run(payload)
-        except Exception:
-            pass
     _submit_pg_write(_pg_write_parlay_builder_run, payload)
     return payload
 
@@ -8040,6 +8066,249 @@ def _backtest_new_id() -> str:
     return str(uuid.uuid4())[:8]
 
 
+def _merge_backtest_entries(raw_entries: list[Any]) -> tuple[int, int, list[dict[str, Any]]]:
+    added = 0
+    skipped = 0
+    imported: list[dict[str, Any]] = []
+    with _BACKTEST_LOCK:
+        existing_keys = {
+            (
+                str(e.get("player") or "").strip().lower(),
+                str(e.get("stat") or "").strip().upper(),
+                float(e.get("line") or 0),
+                str(e.get("side") or "").strip().upper(),
+                str(e.get("logged_at") or "").strip(),
+            )
+            for e in _BACKTEST_LOG
+        }
+        for raw in raw_entries:
+            if not isinstance(raw, dict):
+                skipped += 1
+                continue
+            player = str(raw.get("player") or "").strip()
+            stat = str(raw.get("stat") or "").strip().upper()
+            side = str(raw.get("side") or "").strip().upper()
+            if not player or not stat or not side:
+                skipped += 1
+                continue
+            try:
+                line = float(raw.get("line") or 0)
+            except Exception:
+                skipped += 1
+                continue
+            logged_at = str(raw.get("logged_at") or datetime.utcnow().isoformat() + "Z").strip()
+            dedupe_key = (player.lower(), stat, line, side, logged_at)
+            if dedupe_key in existing_keys:
+                skipped += 1
+                continue
+            actual_raw = raw.get("actual_value")
+            try:
+                actual_value = float(actual_raw) if actual_raw not in (None, "", "null") else None
+            except Exception:
+                actual_value = None
+            entry = {
+                "id": str(raw.get("id") or _backtest_new_id()),
+                "player": player,
+                "stat": stat,
+                "line": line,
+                "side": side,
+                "confidence_score": int(float(raw.get("confidence_score") or 0)),
+                "confidence_tier": str(raw.get("confidence_tier") or ""),
+                "model_prob": float(raw.get("model_prob") or 0.5),
+                "odds": raw.get("odds"),
+                "result": str(raw.get("result") or "pending"),
+                "actual_value": actual_value,
+                "logged_at": logged_at,
+                "resolved_at": raw.get("resolved_at"),
+                "event_date": str(raw.get("event_date") or ""),
+                "source": str(raw.get("source") or ""),
+                "market_side": str(raw.get("market_side") or ""),
+                "market_disagrees": bool(raw.get("market_disagrees")) if raw.get("market_disagrees") is not None else False,
+                "notes": str(raw.get("notes") or ""),
+            }
+            _BACKTEST_LOG.append(entry)
+            existing_keys.add(dedupe_key)
+            imported.append(entry)
+            added += 1
+        if added:
+            _save_backtest_log()
+    return added, skipped, imported
+
+
+def _backtest_entry_datetime(entry: dict[str, Any]) -> datetime | None:
+    if not isinstance(entry, dict):
+        return None
+    return _coerce_datetime(
+        entry.get("resolved_at")
+        or entry.get("logged_at")
+        or entry.get("event_date")
+    )
+
+
+def _backtest_utc_now() -> datetime:
+    return datetime.now(dt.timezone.utc)
+
+
+def _backtest_normalize_datetime(value: datetime | None) -> datetime | None:
+    if not value:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.timezone.utc)
+    return value.astimezone(dt.timezone.utc)
+
+
+def _backtest_current_season_start(reference: datetime | None = None) -> datetime:
+    now = _backtest_normalize_datetime(reference) or _backtest_utc_now()
+    season_year = now.year if now.month >= 10 else now.year - 1
+    return datetime(season_year, 10, 1, tzinfo=dt.timezone.utc)
+
+
+def _backtest_matches_filters(
+    entry: dict[str, Any],
+    *,
+    search: str = "",
+    result_filter: str = "all",
+    stat_filter: str = "all",
+    tier_filter: str = "all",
+    side_filter: str = "all",
+    date_range: str = "all",
+    view_mode: str = "active",
+) -> bool:
+    haystack = " ".join(
+        [
+            str(entry.get("player") or ""),
+            str(entry.get("stat") or ""),
+            str(entry.get("confidence_tier") or ""),
+            str(entry.get("notes") or ""),
+            str(entry.get("source") or ""),
+        ]
+    ).lower()
+    normalized_search = str(search or "").strip().lower()
+    if normalized_search and normalized_search not in haystack:
+        return False
+
+    result_value = str(entry.get("result") or "").strip().lower()
+    if view_mode == "pending" and result_value != "pending":
+        return False
+    if view_mode == "resolved" and result_value not in {"hit", "miss"}:
+        return False
+    if view_mode == "active":
+        entry_dt = _backtest_normalize_datetime(_backtest_entry_datetime(entry))
+        if result_value != "pending" and entry_dt:
+            if entry_dt < _backtest_utc_now() - timedelta(days=7):
+                return False
+
+    if result_filter != "all" and result_value != str(result_filter).strip().lower():
+        return False
+    if stat_filter != "all" and str(entry.get("stat") or "").strip().upper() != str(stat_filter).strip().upper():
+        return False
+    if tier_filter != "all" and str(entry.get("confidence_tier") or "").strip().lower() != str(tier_filter).strip().lower():
+        return False
+    if side_filter != "all" and str(entry.get("side") or "").strip().upper() != str(side_filter).strip().upper():
+        return False
+
+    if date_range != "all":
+        entry_dt = _backtest_normalize_datetime(_backtest_entry_datetime(entry))
+        if not entry_dt:
+            return False
+        now = _backtest_utc_now()
+        normalized_range = str(date_range).strip().lower()
+        if normalized_range == "7d" and entry_dt < now - timedelta(days=7):
+            return False
+        if normalized_range == "30d" and entry_dt < now - timedelta(days=30):
+            return False
+        if normalized_range == "season" and entry_dt < _backtest_current_season_start(now):
+            return False
+    return True
+
+
+def _backtest_sort_key(entry: dict[str, Any]) -> float:
+    entry_dt = _backtest_normalize_datetime(_backtest_entry_datetime(entry))
+    if not entry_dt:
+        return 0.0
+    try:
+        return entry_dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _filter_backtest_entries(
+    entries: list[dict[str, Any]],
+    *,
+    search: str = "",
+    result_filter: str = "all",
+    stat_filter: str = "all",
+    tier_filter: str = "all",
+    side_filter: str = "all",
+    date_range: str = "all",
+    view_mode: str = "active",
+) -> list[dict[str, Any]]:
+    filtered = [
+        copy.deepcopy(entry)
+        for entry in entries
+        if _backtest_matches_filters(
+            entry,
+            search=search,
+            result_filter=result_filter,
+            stat_filter=stat_filter,
+            tier_filter=tier_filter,
+            side_filter=side_filter,
+            date_range=date_range,
+            view_mode=view_mode,
+        )
+    ]
+    filtered.sort(key=_backtest_sort_key, reverse=True)
+    return filtered
+
+
+def _backtest_group_entries(entries: list[dict[str, Any]], group_by: str = "none") -> list[dict[str, Any]]:
+    normalized_group = str(group_by or "none").strip().lower()
+    if normalized_group not in {"date", "player"}:
+        return [{"label": "All entries", "entries": entries}]
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        if normalized_group == "player":
+            label = str(entry.get("player") or "Unknown player").strip() or "Unknown player"
+        else:
+            entry_dt = _backtest_entry_datetime(entry)
+            label = entry_dt.strftime("%b %d, %Y") if entry_dt else "Unknown date"
+        buckets.setdefault(label, []).append(entry)
+    grouped: list[dict[str, Any]] = []
+    for label, bucket_entries in buckets.items():
+        grouped.append({"label": label, "entries": bucket_entries})
+    grouped.sort(key=lambda group: _backtest_sort_key(group["entries"][0]) if group["entries"] else 0.0, reverse=True)
+    return grouped
+
+
+def _build_backtest_csv(entries: list[dict[str, Any]]) -> str:
+    headers = [
+        "id",
+        "player",
+        "stat",
+        "line",
+        "side",
+        "confidence_tier",
+        "confidence_score",
+        "model_prob",
+        "odds",
+        "result",
+        "actual_value",
+        "logged_at",
+        "resolved_at",
+        "event_date",
+        "source",
+        "market_side",
+        "market_disagrees",
+        "notes",
+    ]
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=headers)
+    writer.writeheader()
+    for entry in entries:
+        writer.writerow({key: entry.get(key) for key in headers})
+    return buffer.getvalue()
+
+
 def _compute_backtest_stats(entries: list[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate hit-rate, ROI, EV accuracy by confidence tier, stat, and odds band."""
     resolved = [e for e in entries if e.get("result") in ("hit", "miss")]
@@ -8274,7 +8543,7 @@ def backtest_log_prediction(payload: dict = Body(...)) -> dict[str, Any]:
     with _BACKTEST_LOCK:
         _BACKTEST_LOG.append(entry)
         _save_backtest_log()
-    _submit_pg_write(_pg_write_backtest_entries, [entry])
+    _require_pg_backtest_write(_pg_write_backtest_entries, [entry])
     return {"ok": True, "id": entry["id"], "entry": entry}
 
 
@@ -8301,18 +8570,57 @@ def backtest_resolve_prediction(payload: dict = Body(...)) -> dict[str, Any]:
                 entry["actual_value"] = actual_value
                 entry["resolved_at"] = datetime.utcnow().isoformat() + "Z"
                 _save_backtest_log()
-                _submit_pg_write(_pg_write_backtest_entries, [entry])
+                _require_pg_backtest_write(_pg_write_backtest_entries, [entry])
                 return {"ok": True, "entry": entry}
     raise HTTPException(status_code=404, detail=f"No prediction found with id={pred_id}")
 
 
 @app.get("/api/backtest/log")
-def backtest_get_log(limit: int = Query(200, ge=1, le=1000)) -> dict[str, Any]:
-    """Return the backtest log and aggregate stats."""
+def backtest_get_log(
+    limit: int = Query(25, ge=1, le=200),
+    offset: int = Query(0, ge=0, le=5000),
+    search: str = Query("", max_length=120),
+    result_filter: str = Query("all"),
+    stat_filter: str = Query("all"),
+    tier_filter: str = Query("all"),
+    side_filter: str = Query("all"),
+    date_range: str = Query("all"),
+    view_mode: str = Query("active"),
+    group_by: str = Query("none"),
+) -> dict[str, Any]:
+    """Return the backtest log with server-side filtering and pagination."""
     with _BACKTEST_LOCK:
-        entries = list(reversed(_BACKTEST_LOG))[:limit]
-        stats = _compute_backtest_stats(list(_BACKTEST_LOG))
-    return {"stats": stats, "entries": entries}
+        all_entries = [copy.deepcopy(entry) for entry in _BACKTEST_LOG]
+    stats = _compute_backtest_stats(all_entries)
+    filtered_entries = _filter_backtest_entries(
+        all_entries,
+        search=search,
+        result_filter=result_filter,
+        stat_filter=stat_filter,
+        tier_filter=tier_filter,
+        side_filter=side_filter,
+        date_range=date_range,
+        view_mode=view_mode,
+    )
+    total_filtered = len(filtered_entries)
+    page_entries = filtered_entries[offset: offset + limit]
+    grouped_entries = _backtest_group_entries(page_entries, group_by=group_by)
+    return {
+        "stats": stats,
+        "entries": page_entries,
+        "groups": grouped_entries,
+        "meta": {
+            "offset": offset,
+            "limit": limit,
+            "returned": len(page_entries),
+            "total_filtered": total_filtered,
+            "has_next": offset + limit < total_filtered,
+            "has_prev": offset > 0,
+            "group_by": group_by,
+            "view_mode": view_mode,
+            "date_range": date_range,
+        },
+    }
 
 
 @app.get("/api/history/injury-reports")
@@ -8607,75 +8915,95 @@ def backtest_import_entries(payload: dict = Body(...)) -> dict[str, Any]:
     raw_entries = payload.get("entries") or []
     if not isinstance(raw_entries, list) or not raw_entries:
         raise HTTPException(status_code=400, detail="entries list is required")
-
-    added = 0
-    skipped = 0
-    imported: list[dict[str, Any]] = []
-    with _BACKTEST_LOCK:
-        existing_keys = {
-            (
-                str(e.get("player") or "").strip().lower(),
-                str(e.get("stat") or "").strip().upper(),
-                float(e.get("line") or 0),
-                str(e.get("side") or "").strip().upper(),
-                str(e.get("logged_at") or "").strip(),
-            )
-            for e in _BACKTEST_LOG
-        }
-        for raw in raw_entries:
-            if not isinstance(raw, dict):
-                skipped += 1
-                continue
-            player = str(raw.get("player") or "").strip()
-            stat = str(raw.get("stat") or "").strip().upper()
-            side = str(raw.get("side") or "").strip().upper()
-            if not player or not stat or not side:
-                skipped += 1
-                continue
-            try:
-                line = float(raw.get("line") or 0)
-            except Exception:
-                skipped += 1
-                continue
-            logged_at = str(raw.get("logged_at") or datetime.utcnow().isoformat() + "Z").strip()
-            dedupe_key = (player.lower(), stat, line, side, logged_at)
-            if dedupe_key in existing_keys:
-                skipped += 1
-                continue
-            actual_raw = raw.get("actual_value")
-            try:
-                actual_value = float(actual_raw) if actual_raw not in (None, "", "null") else None
-            except Exception:
-                actual_value = None
-            entry = {
-                "id": str(raw.get("id") or _backtest_new_id()),
-                "player": player,
-                "stat": stat,
-                "line": line,
-                "side": side,
-                "confidence_score": int(float(raw.get("confidence_score") or 0)),
-                "confidence_tier": str(raw.get("confidence_tier") or ""),
-                "model_prob": float(raw.get("model_prob") or 0.5),
-                "odds": raw.get("odds"),
-                "result": str(raw.get("result") or "pending"),
-                "actual_value": actual_value,
-                "logged_at": logged_at,
-                "resolved_at": raw.get("resolved_at"),
-                "event_date": str(raw.get("event_date") or ""),
-                "source": str(raw.get("source") or ""),
-                "market_side": str(raw.get("market_side") or ""),
-                "market_disagrees": bool(raw.get("market_disagrees")) if raw.get("market_disagrees") is not None else False,
-                "notes": str(raw.get("notes") or ""),
-            }
-            _BACKTEST_LOG.append(entry)
-            existing_keys.add(dedupe_key)
-            imported.append(entry)
-            added += 1
-        if added:
-            _save_backtest_log()
+    added, skipped, imported = _merge_backtest_entries(raw_entries)
     if imported:
-        _submit_pg_write(_pg_write_backtest_entries, imported)
+        _require_pg_backtest_write(_pg_write_backtest_entries, imported)
     return {"ok": True, "added": added, "skipped": skipped, "entries": imported}
+
+
+@app.post("/api/backtest/sync-postgres")
+def backtest_sync_from_postgres(payload: dict = Body(default={})) -> dict[str, Any]:
+    if not postgres_available():
+        return {"ok": False, "added": 0, "skipped": 0, "entries": [], "error": "Postgres not configured."}
+    limit = max(1, min(int(payload.get("limit") or 5000), 20000))
+    pg_entries = _pg_fetch_backtest_entries(limit=limit)
+    if not pg_entries:
+        return {"ok": True, "added": 0, "skipped": 0, "entries": [], "fetched": 0}
+    added, skipped, imported = _merge_backtest_entries(pg_entries)
+    return {"ok": True, "added": added, "skipped": skipped, "entries": imported, "fetched": len(pg_entries)}
+
+
+@app.post("/api/backtest/push-postgres")
+def backtest_push_to_postgres() -> dict[str, Any]:
+    if not postgres_available():
+        return {"ok": False, "pushed": 0, "error": "Postgres not configured."}
+    with _BACKTEST_LOCK:
+        entries = [copy.deepcopy(entry) for entry in _BACKTEST_LOG if isinstance(entry, dict)]
+    if not entries:
+        return {"ok": True, "pushed": 0}
+    _require_pg_backtest_write(_pg_write_backtest_entries, entries)
+    return {"ok": True, "pushed": len(entries)}
+
+
+@app.get("/api/backtest/export")
+def backtest_export_csv(
+    search: str = Query("", max_length=120),
+    result_filter: str = Query("all"),
+    stat_filter: str = Query("all"),
+    tier_filter: str = Query("all"),
+    side_filter: str = Query("all"),
+    date_range: str = Query("all"),
+    view_mode: str = Query("active"),
+) -> StreamingResponse:
+    with _BACKTEST_LOCK:
+        all_entries = [copy.deepcopy(entry) for entry in _BACKTEST_LOG]
+    filtered_entries = _filter_backtest_entries(
+        all_entries,
+        search=search,
+        result_filter=result_filter,
+        stat_filter=stat_filter,
+        tier_filter=tier_filter,
+        side_filter=side_filter,
+        date_range=date_range,
+        view_mode=view_mode,
+    )
+    filename_suffix = str(date_range or view_mode or "backtest").replace("/", "-")
+    csv_payload = _build_backtest_csv(filtered_entries)
+    response = StreamingResponse(iter([csv_payload]), media_type="text/csv")
+    response.headers["Content-Disposition"] = f'attachment; filename="backtest-{filename_suffix}.csv"'
+    return response
+
+
+@app.post("/api/backtest/archive")
+def backtest_archive_entries(payload: dict = Body(default={})) -> dict[str, Any]:
+    older_than_days = max(1, min(int(payload.get("older_than_days") or 90), 3650))
+    archive_pending = bool(payload.get("archive_pending")) if payload.get("archive_pending") is not None else False
+    cutoff = datetime.utcnow() - timedelta(days=older_than_days)
+    archived: list[dict[str, Any]] = []
+    archived_ids: list[str] = []
+    with _BACKTEST_LOCK:
+        keep_entries: list[dict[str, Any]] = []
+        for entry in _BACKTEST_LOG:
+            entry_dt = _backtest_entry_datetime(entry)
+            result_value = str(entry.get("result") or "").strip().lower()
+            eligible = bool(entry_dt and entry_dt < cutoff and (archive_pending or result_value in {"hit", "miss"}))
+            if eligible:
+                archived.append(copy.deepcopy(entry))
+                archived_ids.append(str(entry.get("id") or ""))
+            else:
+                keep_entries.append(entry)
+        if archived:
+            _BACKTEST_LOG[:] = keep_entries
+            _save_backtest_log()
+    for entry_id in archived_ids:
+        if entry_id:
+            _require_pg_backtest_write(_pg_delete_backtest_entry, entry_id)
+    return {
+        "ok": True,
+        "archived_count": len(archived),
+        "older_than_days": older_than_days,
+        "csv": _build_backtest_csv(archived) if archived else "",
+    }
 
 
 @app.delete("/api/backtest/log/{entry_id}")
@@ -8689,7 +9017,7 @@ def backtest_delete_entry(entry_id: str) -> dict[str, Any]:
             _save_backtest_log()
     if before == after:
         raise HTTPException(status_code=404, detail=f"No entry found with id={entry_id}")
-    _submit_pg_write(_pg_delete_backtest_entry, entry_id)
+    _require_pg_backtest_write(_pg_delete_backtest_entry, entry_id)
     return {"ok": True, "deleted": entry_id}
 
 
@@ -8700,7 +9028,7 @@ def backtest_clear_log() -> dict[str, Any]:
         count = len(_BACKTEST_LOG)
         _BACKTEST_LOG.clear()
         _save_backtest_log()
-    _submit_pg_write(_pg_clear_backtest_entries)
+    _require_pg_backtest_write(_pg_clear_backtest_entries)
     return {"ok": True, "cleared": count}
 
 
