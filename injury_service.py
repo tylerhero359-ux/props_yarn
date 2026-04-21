@@ -795,14 +795,26 @@ class InjuryReportService:
         if direct:
             return direct
         norm_key = normalize_compact_text(normalized_team_name)
-        return list(indexes["rows_by_team_date_norm"].get((norm_key, date_key), []))
+        normalized_date_rows = list(indexes["rows_by_team_date_norm"].get((norm_key, date_key), []))
+        if normalized_date_rows:
+            return normalized_date_rows
+        # Fallback: some scoreboards/report sources can differ by one day due to timezone
+        # boundaries. If no date-scoped match exists, return team-scoped rows.
+        direct_team_rows = list(indexes["rows_by_team"].get(normalized_team_name, []))
+        if direct_team_rows:
+            return direct_team_rows
+        return list(indexes["rows_by_team_norm"].get(norm_key, []))
 
     def get_pending_teams(self, payload: dict[str, Any], game_date: str | None = None) -> set[str]:
         indexes = self._ensure_payload_indexes(payload)
         if game_date is None:
             raw = set(payload.get("pending_teams") or [])
             return {normalize_compact_text(name) for name in raw if name} if raw else set()
-        return set(indexes["pending_by_date_norm"].get(str(game_date or "").strip(), set()))
+        date_pending = set(indexes["pending_by_date_norm"].get(str(game_date or "").strip(), set()))
+        if date_pending:
+            return date_pending
+        raw = set(payload.get("pending_teams") or [])
+        return {normalize_compact_text(name) for name in raw if name} if raw else set()
 
     def _build_error_payload(self, exc: Exception) -> dict[str, Any]:
         return {

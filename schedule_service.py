@@ -82,6 +82,7 @@ class ScheduleDataService:
         last_exc: Exception | None = None
 
         while attempts_made < max_attempts:
+            attempts_made += 1
             elapsed = time.monotonic() - start_ts
             remaining_budget = total_budget - elapsed
             if remaining_budget <= 0:
@@ -141,7 +142,6 @@ class ScheduleDataService:
                 self.scoreboard_cache.pop(f"__failure__::{game_date}", None)
                 return enriched_rows
             except Exception as exc:
-                attempts_made += 1
                 last_exc = exc
                 if reliable_stale_exists:
                     self.scoreboard_cache[f"__failure__::{game_date}"] = {"timestamp": time.time(), "error": str(exc)}
@@ -198,7 +198,11 @@ class ScheduleDataService:
         if not team_id:
             return None
 
-        start_date = datetime.now(ZoneInfo("America/New_York")).date()
+        current_date_text = str(self.current_nba_game_date() or "").strip()
+        try:
+            start_date = datetime.strptime(current_date_text, "%Y-%m-%d").date()
+        except Exception:
+            start_date = datetime.now(ZoneInfo("Asia/Manila")).date()
         for offset in range(lookahead_days + 1):
             game_date = (start_date + timedelta(days=offset)).strftime("%Y-%m-%d")
             rows = self.fetch_scoreboard_games(game_date)

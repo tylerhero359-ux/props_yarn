@@ -14,7 +14,7 @@ import re
 import datetime as dt
 import time
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -28,21 +28,25 @@ except Exception:
     pdfplumber = None
 try:
     import psycopg2  # type: ignore
+    from psycopg2 import pool as psycopg2_pool  # type: ignore
     from psycopg2.extras import Json as PgJson  # type: ignore
 except Exception:
     psycopg2 = None
+    psycopg2_pool = None
     PgJson = None
 try:
     from dotenv import load_dotenv  # type: ignore
 except Exception:
     load_dotenv = None
 
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from nba_api.stats.endpoints import (
     CommonPlayerInfo,
     CommonTeamRoster,
+    LeagueDashTeamStats,
     LeagueDashPlayerStats,
     PlayerGameLog,
     PlayerNextNGames,
@@ -52,7 +56,6 @@ from nba_api.stats.endpoints import (
 from nba_api.stats.static import players as static_players
 from nba_api.stats.static import teams as static_teams
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
 from uuid import uuid4
 from identity_utils import (
     PlayerSearchIndex,
@@ -85,6 +88,10 @@ if load_dotenv:
 NBA_TIMING_ENABLED = os.getenv("NBA_TIMING_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 NBA_TIMING_LOG_ALL = os.getenv("NBA_TIMING_LOG_ALL", "0").strip().lower() in {"1", "true", "yes", "on"}
 NBA_TIMING_SLOW_MS = float(os.getenv("NBA_TIMING_SLOW_MS", "800"))
+DEFAULT_SEASON_TYPE = "Combined"
+SEASON_TYPE_REGULAR = "Regular Season"
+SEASON_TYPE_PLAYOFFS = "Playoffs"
+SEASON_TYPE_COMBINED = "Combined"
 
 ANALYSIS_PARALLEL_ENABLED = os.getenv("NBA_ANALYSIS_PARALLEL_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 ANALYSIS_PARALLEL_MAX_WORKERS = max(1, int(os.getenv("NBA_ANALYSIS_PARALLEL_MAX_WORKERS", "4")))
@@ -107,7 +114,6 @@ WARM_CACHE_PRELOAD_PLAYERS = os.getenv("NBA_WARM_CACHE_PRELOAD_PLAYERS", "1").st
 WARM_CACHE_PRELOAD_TEAMS = os.getenv("NBA_WARM_CACHE_PRELOAD_TEAMS", "1").strip().lower() not in {"0", "false", "no", "off"}
 WARM_CACHE_PRELOAD_TEAM_RANKS = os.getenv("NBA_WARM_CACHE_PRELOAD_TEAM_RANKS", "1").strip().lower() not in {"0", "false", "no", "off"}
 WARM_CACHE_PRELOAD_TEAM_ROSTERS = os.getenv("NBA_WARM_CACHE_PRELOAD_TEAM_ROSTERS", "1").strip().lower() not in {"0", "false", "no", "off"}
-WARM_CACHE_PRELOAD_TEAM_RANKS = os.getenv("NBA_WARM_CACHE_PRELOAD_TEAM_RANKS", "1").strip().lower() not in {"0", "false", "no", "off"}
 WARM_CACHE_TEAM_ROSTERS_MAX_WORKERS = max(1, int(os.getenv("NBA_WARM_CACHE_TEAM_ROSTERS_MAX_WORKERS", "2")))
 
 PERSISTENT_CACHE_DIR = BASE_DIR / ".runtime_cache"
@@ -128,6 +134,8 @@ POSTGRES_CACHE_WRITE_ENABLED = os.getenv("NBA_POSTGRES_CACHE_WRITE_ENABLED", "1"
 POSTGRES_CACHE_PRELOAD = os.getenv("NBA_POSTGRES_CACHE_PRELOAD", "1").strip().lower() not in {"0", "false", "no", "off"}
 POSTGRES_CACHE_PRELOAD_LIMIT = max(100, int(os.getenv("NBA_POSTGRES_CACHE_PRELOAD_LIMIT", "1500")))
 POSTGRES_CONNECT_TIMEOUT_SECONDS = max(2, int(os.getenv("NBA_POSTGRES_CONNECT_TIMEOUT_SECONDS", "5")))
+POSTGRES_POOL_MIN_CONNECTIONS = max(1, int(os.getenv("NBA_POSTGRES_POOL_MIN_CONNECTIONS", "2")))
+POSTGRES_POOL_MAX_CONNECTIONS = max(POSTGRES_POOL_MIN_CONNECTIONS, int(os.getenv("NBA_POSTGRES_POOL_MAX_CONNECTIONS", "10")))
 POSTGRES_MAX_WRITE_WORKERS = max(1, int(os.getenv("NBA_POSTGRES_MAX_WRITE_WORKERS", "2")))
 POSTGRES_WRITE_EXECUTOR = ThreadPoolExecutor(max_workers=POSTGRES_MAX_WRITE_WORKERS)
 POSTGRES_SOURCE_OF_TRUTH = os.getenv("NBA_POSTGRES_SOURCE_OF_TRUTH", "1").strip().lower() not in {"0", "false", "no", "off"}
@@ -146,11 +154,21 @@ POSTGRES_BACKFILL_HASHES_ENABLED = os.getenv("NBA_POSTGRES_BACKFILL_HASHES_ENABL
 POSTGRES_BACKFILL_HASHES_LIMIT = max(100, int(os.getenv("NBA_POSTGRES_BACKFILL_HASHES_LIMIT", "5000")))
 ODDS_API_MAX_RETRIES = max(0, int(os.getenv("NBA_ODDS_API_MAX_RETRIES", "2")))
 ODDS_API_RETRY_BACKOFF_SECONDS = max(0.2, float(os.getenv("NBA_ODDS_API_RETRY_BACKOFF_SECONDS", "0.8")))
+ODDS_API_QUERY_AUTH_FALLBACK_ENABLED = os.getenv("NBA_ODDS_API_QUERY_AUTH_FALLBACK_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+APP_TIMEZONE = (os.getenv("APP_TIMEZONE", "Asia/Manila") or "Asia/Manila").strip()
+ALLOWED_ORIGINS_RAW = str(os.getenv("ALLOWED_ORIGINS", "*")).strip()
+RATE_LIMIT_ENABLED = os.getenv("NBA_RATE_LIMIT_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+RATE_LIMIT_WINDOW_SECONDS = max(5, int(os.getenv("NBA_RATE_LIMIT_WINDOW_SECONDS", "60")))
+RATE_LIMIT_HEAVY_MAX_REQUESTS = max(1, int(os.getenv("NBA_RATE_LIMIT_HEAVY_MAX_REQUESTS", "20")))
+RATE_LIMIT_READ_MAX_REQUESTS = max(1, int(os.getenv("NBA_RATE_LIMIT_READ_MAX_REQUESTS", "120")))
 
 WARM_CACHE_START_LOCK = threading.Lock()
 WARM_CACHE_STARTED = False
 WARM_CACHE_THREAD_LOCK = threading.Lock()
 WARM_CACHE_THREAD_STARTED = False
+POSTGRES_CONNECTION_POOL: Any | None = None
+_RATE_LIMIT_LOCK = Lock()
+_RATE_LIMIT_BUCKETS: dict[str, list[float]] = {}
 
 def _warm_cache_task(name: str, func):
     try:
@@ -165,7 +183,7 @@ def _warm_cache_task(name: str, func):
         LOGGER.warning("Warm-cache task %s failed: %s", name, exc)
 
 def _today_scoreboard_date() -> str:
-    return dt.datetime.now().strftime("%m/%d/%Y")
+    return app_now().strftime("%Y-%m-%d")
 
 
 def save_persistent_caches() -> None:
@@ -219,7 +237,71 @@ def postgres_available() -> bool:
     return bool(POSTGRES_DATABASE_URL and POSTGRES_CACHE_ENABLED and psycopg2)
 
 
+def init_postgres_pool() -> None:
+    global POSTGRES_CONNECTION_POOL
+    if POSTGRES_CONNECTION_POOL is not None:
+        return
+    if not postgres_available() or not psycopg2_pool:
+        return
+    try:
+        POSTGRES_CONNECTION_POOL = psycopg2_pool.ThreadedConnectionPool(
+            minconn=POSTGRES_POOL_MIN_CONNECTIONS,
+            maxconn=POSTGRES_POOL_MAX_CONNECTIONS,
+            dsn=POSTGRES_DATABASE_URL,
+            connect_timeout=POSTGRES_CONNECT_TIMEOUT_SECONDS,
+        )
+        LOGGER.info(
+            "Initialized Postgres connection pool (%s-%s)",
+            POSTGRES_POOL_MIN_CONNECTIONS,
+            POSTGRES_POOL_MAX_CONNECTIONS,
+        )
+    except Exception as exc:
+        POSTGRES_CONNECTION_POOL = None
+        LOGGER.warning("Postgres pool init failed; falling back to direct connections: %s", exc)
+
+
+def close_postgres_pool() -> None:
+    global POSTGRES_CONNECTION_POOL
+    pool_obj = POSTGRES_CONNECTION_POOL
+    POSTGRES_CONNECTION_POOL = None
+    if not pool_obj:
+        return
+    try:
+        pool_obj.closeall()
+    except Exception as exc:
+        LOGGER.debug("Postgres pool close failed: %s", exc)
+
+
+@contextmanager
+def _postgres_pool_connection():
+    if not POSTGRES_CONNECTION_POOL:
+        raise RuntimeError("Postgres pool unavailable")
+    conn = POSTGRES_CONNECTION_POOL.getconn()
+    try:
+        yield conn
+        try:
+            conn.commit()
+        except Exception:
+            pass
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            POSTGRES_CONNECTION_POOL.putconn(conn)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def postgres_connect():
+    if POSTGRES_CONNECTION_POOL:
+        return _postgres_pool_connection()
     return psycopg2.connect(POSTGRES_DATABASE_URL, connect_timeout=POSTGRES_CONNECT_TIMEOUT_SECONDS)
 
 
@@ -227,8 +309,6 @@ def _coerce_datetime(value: Any) -> datetime | None:
     if value is None or value == "":
         return None
     if isinstance(value, datetime):
-        return value
-    if isinstance(value, dt.datetime):
         return value
     if isinstance(value, str):
         try:
@@ -246,6 +326,14 @@ def _datetime_to_ts(value: Any) -> float | None:
         return parsed.timestamp()
     except Exception:
         return None
+
+
+def _utc_now_naive() -> datetime:
+    return datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+
+def _utc_iso_z() -> str:
+    return _utc_now_naive().isoformat() + "Z"
 
 
 def _pg_read_latest_injury_report() -> tuple[dict[str, Any] | None, float | None]:
@@ -405,6 +493,7 @@ def init_postgres_cache() -> None:
                     id BIGSERIAL PRIMARY KEY,
                     payload JSONB NOT NULL,
                     payload_hash TEXT,
+                    request_hash TEXT,
                     requested_at TIMESTAMPTZ DEFAULT NOW()
                 );
                 """
@@ -415,6 +504,7 @@ def init_postgres_cache() -> None:
                     id BIGSERIAL PRIMARY KEY,
                     payload JSONB NOT NULL,
                     payload_hash TEXT,
+                    request_hash TEXT,
                     requested_at TIMESTAMPTZ DEFAULT NOW()
                 );
                 """
@@ -431,11 +521,15 @@ def init_postgres_cache() -> None:
             )
             cur.execute("ALTER TABLE odds_snapshots ADD COLUMN IF NOT EXISTS payload_hash TEXT;")
             cur.execute("ALTER TABLE market_scan_runs ADD COLUMN IF NOT EXISTS payload_hash TEXT;")
+            cur.execute("ALTER TABLE market_scan_runs ADD COLUMN IF NOT EXISTS request_hash TEXT;")
             cur.execute("ALTER TABLE parlay_builder_runs ADD COLUMN IF NOT EXISTS payload_hash TEXT;")
+            cur.execute("ALTER TABLE parlay_builder_runs ADD COLUMN IF NOT EXISTS request_hash TEXT;")
             cur.execute("ALTER TABLE bet_finder_runs ADD COLUMN IF NOT EXISTS payload_hash TEXT;")
             cur.execute("CREATE INDEX IF NOT EXISTS odds_snapshots_hash_idx ON odds_snapshots (endpoint, payload_hash);")
             cur.execute("CREATE INDEX IF NOT EXISTS market_scan_hash_idx ON market_scan_runs (payload_hash);")
+            cur.execute("CREATE INDEX IF NOT EXISTS market_scan_request_hash_idx ON market_scan_runs (request_hash);")
             cur.execute("CREATE INDEX IF NOT EXISTS parlay_runs_hash_idx ON parlay_builder_runs (payload_hash);")
+            cur.execute("CREATE INDEX IF NOT EXISTS parlay_runs_request_hash_idx ON parlay_builder_runs (request_hash);")
             cur.execute("CREATE INDEX IF NOT EXISTS bet_finder_hash_idx ON bet_finder_runs (payload_hash);")
             cur.execute(
                 """
@@ -458,6 +552,15 @@ def _submit_pg_write(func, *args) -> None:
         POSTGRES_WRITE_EXECUTOR.submit(func, *args)
     except Exception as exc:
         LOGGER.debug("Postgres cache write skipped: %s", exc)
+
+
+def _payload_hash(payload: Any) -> str:
+    payload_text = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+
+
+def _request_hash(cache_scope: str, request_payload: dict[str, Any]) -> str:
+    return _payload_hash({"cache_scope": str(cache_scope), "request": request_payload})
 
 
 def _require_pg_backtest_write(func, *args) -> None:
@@ -596,8 +699,7 @@ def _pg_write_injury_report(payload: dict[str, Any]) -> None:
 
 def _pg_write_odds_snapshot(endpoint: str, params: dict[str, Any] | None, payload: Any) -> None:
     try:
-        payload_text = json.dumps({"endpoint": endpoint, "payload": payload}, sort_keys=True, default=str)
-        payload_hash = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+        payload_hash = _payload_hash({"endpoint": endpoint, "payload": payload})
         with postgres_connect() as conn, conn.cursor() as cur:
             if POSTGRES_DEDUPE_ENABLED:
                 cur.execute(
@@ -617,59 +719,135 @@ def _pg_write_odds_snapshot(endpoint: str, params: dict[str, Any] | None, payloa
         LOGGER.debug("Postgres odds snapshot write failed: %s", exc)
 
 
-def _pg_write_market_scan_run(payload: dict[str, Any]) -> None:
+def _pg_write_market_scan_run(payload: dict[str, Any], request_hash: str | None = None) -> None:
     try:
-        payload_text = json.dumps(payload, sort_keys=True, default=str)
-        payload_hash = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+        payload_hash = _payload_hash(payload)
+        normalized_request_hash = str(request_hash or "").strip() or None
         with postgres_connect() as conn, conn.cursor() as cur:
             if POSTGRES_DEDUPE_ENABLED:
-                cur.execute(
-                    "SELECT 1 FROM market_scan_runs WHERE payload_hash = %s LIMIT 1;",
-                    (payload_hash,),
-                )
+                if normalized_request_hash:
+                    cur.execute(
+                        "SELECT 1 FROM market_scan_runs WHERE request_hash = %s AND payload_hash = %s LIMIT 1;",
+                        (normalized_request_hash, payload_hash),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT 1 FROM market_scan_runs WHERE payload_hash = %s LIMIT 1;",
+                        (payload_hash,),
+                    )
                 if cur.fetchone():
                     return
             cur.execute(
                 """
-                INSERT INTO market_scan_runs (payload, payload_hash, requested_at)
-                VALUES (%s, %s, NOW());
+                INSERT INTO market_scan_runs (payload, payload_hash, request_hash, requested_at)
+                VALUES (%s, %s, %s, NOW());
                 """,
-                (PgJson(payload), payload_hash),
+                (PgJson(payload), payload_hash, normalized_request_hash),
             )
     except Exception as exc:
         LOGGER.debug("Postgres market scan write failed: %s", exc)
 
 
-def _pg_write_parlay_builder_run(payload: dict[str, Any]) -> None:
+def _pg_write_parlay_builder_run(payload: dict[str, Any], request_hash: str | None = None) -> None:
     try:
-        payload_text = json.dumps(payload, sort_keys=True, default=str)
-        payload_hash = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+        payload_hash = _payload_hash(payload)
+        normalized_request_hash = str(request_hash or "").strip() or None
         with postgres_connect() as conn, conn.cursor() as cur:
             if POSTGRES_DEDUPE_ENABLED:
-                cur.execute(
-                    "SELECT 1 FROM parlay_builder_runs WHERE payload_hash = %s LIMIT 1;",
-                    (payload_hash,),
-                )
+                if normalized_request_hash:
+                    cur.execute(
+                        "SELECT 1 FROM parlay_builder_runs WHERE request_hash = %s AND payload_hash = %s LIMIT 1;",
+                        (normalized_request_hash, payload_hash),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT 1 FROM parlay_builder_runs WHERE payload_hash = %s LIMIT 1;",
+                        (payload_hash,),
+                    )
                 if cur.fetchone():
                     return
             cur.execute(
                 """
-                INSERT INTO parlay_builder_runs (payload, payload_hash, requested_at)
-                VALUES (%s, %s, NOW());
+                INSERT INTO parlay_builder_runs (payload, payload_hash, request_hash, requested_at)
+                VALUES (%s, %s, %s, NOW());
                 """,
-                (PgJson(payload), payload_hash),
+                (PgJson(payload), payload_hash, normalized_request_hash),
             )
     except Exception as exc:
         LOGGER.debug("Postgres parlay write failed: %s", exc)
 
 
-def _pg_read_parlay_builder_cache(request_payload: dict[str, Any]) -> dict[str, Any] | None:
+def _pg_read_market_scan_cache(request_payload: dict[str, Any], *, cache_scope: str = "market_scan") -> dict[str, Any] | None:
     if not postgres_available():
         return None
     try:
-        payload_text = json.dumps(request_payload, sort_keys=True, default=str)
-        payload_hash = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+        request_hash = _request_hash(cache_scope, request_payload)
         with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT payload
+                FROM market_scan_runs
+                WHERE request_hash = %s
+                ORDER BY requested_at DESC
+                LIMIT 1;
+                """,
+                (request_hash,),
+            )
+            row = cur.fetchone()
+            if row and isinstance(row[0], dict):
+                cached = copy.deepcopy(row[0])
+                cached["cache_hit"] = True
+                cached["cache_source"] = "postgres"
+                return cached
+
+            # Backward-compatible fallback for historical rows that only had payload_hash.
+            legacy_payload_hash = _payload_hash(request_payload)
+            cur.execute(
+                """
+                SELECT payload
+                FROM market_scan_runs
+                WHERE payload_hash = %s
+                ORDER BY requested_at DESC
+                LIMIT 1;
+                """,
+                (legacy_payload_hash,),
+            )
+            row = cur.fetchone()
+            if row and isinstance(row[0], dict):
+                cached = copy.deepcopy(row[0])
+                cached["cache_hit"] = True
+                cached["cache_source"] = "postgres_legacy"
+                return cached
+    except Exception as exc:
+        LOGGER.debug("Postgres market scan cache read failed: %s", exc)
+    return None
+
+
+def _pg_read_parlay_builder_cache(request_payload: dict[str, Any], *, cache_scope: str = "parlay_builder") -> dict[str, Any] | None:
+    if not postgres_available():
+        return None
+    try:
+        request_hash = _request_hash(cache_scope, request_payload)
+        with postgres_connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT payload
+                FROM parlay_builder_runs
+                WHERE request_hash = %s
+                ORDER BY requested_at DESC
+                LIMIT 1;
+                """,
+                (request_hash,),
+            )
+            row = cur.fetchone()
+            if row and isinstance(row[0], dict):
+                cached = copy.deepcopy(row[0])
+                cached["cache_hit"] = True
+                cached["cache_source"] = "postgres"
+                return cached
+
+            # Backward-compatible fallback for historical rows that only had payload_hash.
+            legacy_payload_hash = _payload_hash(request_payload)
             cur.execute(
                 """
                 SELECT payload
@@ -678,13 +856,13 @@ def _pg_read_parlay_builder_cache(request_payload: dict[str, Any]) -> dict[str, 
                 ORDER BY requested_at DESC
                 LIMIT 1;
                 """,
-                (payload_hash,),
+                (legacy_payload_hash,),
             )
             row = cur.fetchone()
             if row and isinstance(row[0], dict):
                 cached = copy.deepcopy(row[0])
                 cached["cache_hit"] = True
-                cached["cache_source"] = "postgres"
+                cached["cache_source"] = "postgres_legacy"
                 return cached
     except Exception as exc:
         LOGGER.debug("Postgres parlay cache read failed: %s", exc)
@@ -693,8 +871,7 @@ def _pg_read_parlay_builder_cache(request_payload: dict[str, Any]) -> dict[str, 
 
 def _pg_write_bet_finder_run(payload: dict[str, Any]) -> None:
     try:
-        payload_text = json.dumps(payload, sort_keys=True, default=str)
-        payload_hash = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+        payload_hash = _payload_hash(payload)
         with postgres_connect() as conn, conn.cursor() as cur:
             if POSTGRES_DEDUPE_ENABLED:
                 cur.execute(
@@ -968,7 +1145,7 @@ def preload_team_rosters_for_current_season() -> None:
 def _warm_team_rank_map() -> None:
     season = current_nba_season()
     try:
-        build_team_rank_map(season=season, season_type="Regular Season")
+        build_team_rank_map(season=season, season_type=DEFAULT_SEASON_TYPE)
         LOGGER.info("Warm-cache team ranks ready for %s", season)
     except Exception as exc:
         LOGGER.warning("Warm-cache team ranks failed for %s: %s", season, exc)
@@ -1061,6 +1238,7 @@ def start_warm_cache_background() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    init_postgres_pool()
     init_postgres_cache()
     preload_postgres_cache()
     backfill_postgres_hashes()
@@ -1071,11 +1249,36 @@ async def lifespan(app: FastAPI):
     _load_tracker_state()
     start_hybrid_refresh_workers()
     start_warm_cache_background()
-    yield
+    try:
+        yield
+    finally:
+        close_postgres_pool()
 
 
 app = FastAPI(title="NBA Props Bar Chart App", lifespan=lifespan)
+allowed_origins = ["*"]
+if ALLOWED_ORIGINS_RAW and ALLOWED_ORIGINS_RAW != "*":
+    allowed_origins = [origin.strip() for origin in ALLOWED_ORIGINS_RAW.split(",") if origin.strip()]
+allow_credentials = allowed_origins != ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins or ["*"],
+    allow_credentials=allow_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+try:
+    APP_ZONEINFO = ZoneInfo(APP_TIMEZONE)
+except Exception:
+    LOGGER.warning("Invalid APP_TIMEZONE=%r; defaulting to Asia/Manila", APP_TIMEZONE)
+    APP_TIMEZONE = "Asia/Manila"
+    APP_ZONEINFO = ZoneInfo(APP_TIMEZONE)
+
+
+def app_now() -> datetime:
+    return datetime.now(APP_ZONEINFO)
 
 STAT_MAP = {
     "PTS": "PTS",
@@ -1097,10 +1300,13 @@ POSITION_LABELS = {
     "F": "Forwards",
     "C": "Centers",
 }
+SCORING_STATS = {"PTS", "3PM", "PRA", "PR", "PA"}
+PLAYMAKING_STATS = {"AST", "PA", "PRA"}
+REBOUND_STATS = {"REB", "RA", "PR", "PRA"}
 
 
 def current_nba_game_date() -> str:
-    return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    return app_now().strftime("%Y-%m-%d")
 
 PLAYER_POOL = static_players.get_players()
 TEAM_POOL = sorted(static_teams.get_teams(), key=lambda team: team["full_name"])
@@ -1136,10 +1342,23 @@ TEAM_RECENT_CONTEXT_CACHE: dict[tuple[int, str, str, int], dict[str, Any]] = {}
 TEAM_CONTEXT_TTL_SECONDS = 3600
 SCOREBOARD_CACHE: dict[str, dict[str, Any]] = {}
 ENRICHED_LOG_CACHE: dict[tuple[int, str, str, int | None], dict[str, Any]] = {}
-ANALYSIS_CACHE_TTL_SECONDS = 7200
+ANALYSIS_CACHE_TTL_SECONDS = min(max(1, int(os.getenv("NBA_ANALYSIS_CACHE_TTL_SECONDS", "300"))), 300)
 ANALYSIS_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 TEAM_OPPORTUNITY_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 INJURY_REPORT_TTL_SECONDS = max(300, int(os.getenv("NBA_INJURY_REPORT_TTL_SECONDS", "1800")))
+INJURY_AWARE_BOOST_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+INJURY_AWARE_BOOST_CACHE_TTL_SECONDS = max(
+    300,
+    int(os.getenv("NBA_INJURY_AWARE_BOOST_CACHE_TTL_SECONDS", str(min(INJURY_REPORT_TTL_SECONDS, 1800))))
+)
+INJURY_AWARE_BOOST_CACHE_MAX_ENTRIES = max(250, int(os.getenv("NBA_INJURY_AWARE_BOOST_CACHE_MAX_ENTRIES", "4000")))
+INJURY_AWARE_MAX_COMBO_TRIES = max(1, min(3, int(os.getenv("NBA_INJURY_AWARE_MAX_COMBO_TRIES", "3"))))
+INJURY_AWARE_EARLY_STOP_GAIN_PCT = max(0.0, float(os.getenv("NBA_INJURY_AWARE_EARLY_STOP_GAIN_PCT", "1.6")))
+INJURY_AWARE_EARLY_STOP_MIN_GAMES = max(3, int(os.getenv("NBA_INJURY_AWARE_EARLY_STOP_MIN_GAMES", "8")))
+INJURY_AWARE_LOW_GAIN_CUTOFF_PCT = max(0.0, float(os.getenv("NBA_INJURY_AWARE_LOW_GAIN_CUTOFF_PCT", "0.25")))
+INJURY_AWARE_BASE_HITRATE_EXPAND_THRESHOLD = float(os.getenv("NBA_INJURY_AWARE_BASE_HITRATE_EXPAND_THRESHOLD", "54.0"))
+INJURY_AWARE_HIGH_PRIORITY_SHARE = min(1.0, max(0.05, float(os.getenv("NBA_INJURY_AWARE_HIGH_PRIORITY_SHARE", "0.30"))))
+INJURY_AWARE_BOOST_CACHE_LOCK = Lock()
 REQUEST_LOCK = Lock()
 LAST_REQUEST_TIME = 0.0
 
@@ -1224,7 +1443,6 @@ STAT_SUMMARY_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 DEBUG_METADATA_ENABLED = os.getenv("NBA_DEBUG_METADATA_ENABLED", "0").strip() == "1"
 
 HYBRID_ANALYZER_ENABLED = os.getenv("NBA_HYBRID_ANALYZER_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
-ANALYSIS_CACHE_TTL_SECONDS = min(ANALYSIS_CACHE_TTL_SECONDS, 300)
 HYBRID_ANALYSIS_MAX_STALE_SECONDS = max(ANALYSIS_CACHE_TTL_SECONDS, int(os.getenv("NBA_HYBRID_ANALYSIS_MAX_STALE_SECONDS", "1800")))
 
 
@@ -1251,6 +1469,7 @@ def _build_analysis_cache_key(
     without_player_ids: list[int],
     without_player_name: str | None,
     override_opponent_id: int | None,
+    forced_side: str | None,
     debug: bool,
 ) -> tuple[Any, ...]:
     cached_injury_payload = INJURY_SERVICE.report_cache.get("payload") or {}
@@ -1279,6 +1498,7 @@ def _build_analysis_cache_key(
         tuple(normalize_without_player_ids(without_player_ids)),
         str(without_player_name or "").strip(),
         int(override_opponent_id) if override_opponent_id not in (None, "") else None,
+        str(forced_side or "").strip().upper(),
         bool(debug),
         report_label,
         report_url,
@@ -1304,6 +1524,7 @@ NBA_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+NBA_HTTP_TRUST_ENV = os.getenv("NBA_HTTP_TRUST_ENV", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _cache_age_seconds(entry: dict[str, Any] | None) -> float | None:
@@ -1345,7 +1566,10 @@ def enqueue_hybrid_refresh(job_type: str, key: tuple[Any, ...], **payload: Any) 
 
 def _run_hybrid_refresh_job(job_type: str, key: tuple[Any, ...], payload: dict[str, Any]) -> None:
     if job_type == "game_log":
-        player_id, season, season_type = key
+        if len(key) >= 4:
+            player_id, season, season_type, _schema_version = key[:4]
+        else:
+            player_id, season, season_type = key
         fetch_player_game_log(player_id=int(player_id), season=str(season), season_type=str(season_type))
         return
     if job_type == "player_info":
@@ -1359,6 +1583,9 @@ def _run_hybrid_refresh_job(job_type: str, key: tuple[Any, ...], payload: dict[s
     if job_type == "team_roster":
         team_id, season = key
         fetch_team_roster(team_id=int(team_id), season=str(season))
+        return
+    if job_type == "injury_report":
+        fetch_latest_injury_report_payload()
         return
 
 
@@ -1396,7 +1623,7 @@ def get_player_game_log_hybrid(player_id: int, season: str, season_type: str) ->
         if age_seconds is not None and age_seconds < HYBRID_GAME_LOG_SOFT_TTL_SECONDS:
             return cached["rows"], {"source": "cache-fresh", "seconds_ago": round(age_seconds, 2), "refresh_queued": False}
         if age_seconds is not None and age_seconds < HYBRID_GAME_LOG_MAX_STALE_SECONDS:
-            queued = enqueue_hybrid_refresh("game_log", cache_key)
+            queued = enqueue_hybrid_refresh("game_log", (player_id, season, season_type))
             return cached["rows"], {"source": "cache-stale", "seconds_ago": round(age_seconds, 2), "refresh_queued": bool(queued)}
     rows = fetch_player_game_log(player_id=player_id, season=season, season_type=season_type)
     fresh_age = _cache_age_seconds(GAME_LOG_CACHE.get(cache_key))
@@ -1522,6 +1749,7 @@ NBA_HTTP = create_retry_http_session(
     retry_total=NBA_RETRY_TOTAL,
     backoff_factor=NBA_BACKOFF_FACTOR,
     retry_status_codes=NBA_RETRY_STATUS_CODES,
+    trust_env=NBA_HTTP_TRUST_ENV,
 )
 
 
@@ -1543,7 +1771,7 @@ INJURY_SERVICE = InjuryReportService(
     pdfplumber_module=pdfplumber,
     page_timeout=INJURY_REPORT_PAGE_TIMEOUT,
     pdf_timeout=INJURY_REPORT_PDF_TIMEOUT,
-    report_ttl_seconds=INJURY_REPORT_TTL_SECONDS if 'INJURY_REPORT_TTL_SECONDS' in globals() else 600,
+    report_ttl_seconds=INJURY_REPORT_TTL_SECONDS,
     links_ttl_seconds=INJURY_REPORT_LINKS_TTL_SECONDS,
     failure_cooldown_seconds=INJURY_REPORT_FAILURE_COOLDOWN_SECONDS,
     max_stale_seconds=INJURY_REPORT_MAX_STALE_SECONDS,
@@ -1568,7 +1796,7 @@ def call_nba_with_retries(factory, *, label: str, attempts: int = NBA_RETRY_TOTA
 
 
 def current_nba_season() -> str:
-    now = datetime.now(ZoneInfo("America/New_York"))
+    now = app_now()
     year = now.year
     if now.month >= 10:
         start_year = year
@@ -1638,8 +1866,18 @@ def normalize_line_key(line_value: Any) -> str:
     return f"{numeric:.3f}".rstrip("0").rstrip(".")
 
 
-def safe_mean(values: list[float]) -> float | None:
-    cleaned = [float(v) for v in values if v is not None]
+def safe_mean(values: list[Any]) -> float | None:
+    cleaned: list[float] = []
+    for value in values:
+        if value is None:
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(numeric) or math.isinf(numeric):
+            continue
+        cleaned.append(numeric)
     if not cleaned:
         return None
     return sum(cleaned) / len(cleaned)
@@ -1882,6 +2120,21 @@ def clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(max_value, value))
 
 
+EDGE_DEFINITION_MODEL_FAIR = "model_minus_fair_market_prob_pct"
+
+
+def resolve_fair_probability(fair_prob: float | None, fallback_prob: float | None = None) -> float:
+    if fair_prob is not None:
+        return clamp(float(fair_prob), 0.0, 1.0)
+    if fallback_prob is not None:
+        return clamp(float(fallback_prob), 0.0, 1.0)
+    return 0.5
+
+
+def edge_pct_from_model_and_fair(model_prob: float, fair_prob: float) -> float:
+    return round((float(model_prob) - float(fair_prob)) * 100.0, 1)
+
+
 def estimate_model_probabilities(
     hit_rate_pct: float,
     average: float,
@@ -1914,8 +2167,8 @@ def estimate_model_probabilities(
         p25 = float(variance.get("p25") or 0.0)
         p75 = float(variance.get("p75") or 0.0)
         median_edge_term = clamp((median - line) / scale, -0.18, 0.18)
-        noisy_stats = {"STL", "BLK", "3PM"}
-        median_weight = 0.65 if stat in noisy_stats else 0.45
+        noisy_stats_variance = {"STL", "BLK", "3PM"}
+        median_weight = 0.65 if stat in noisy_stats_variance else 0.45
         edge_term = edge_term * (1 - median_weight) + median_edge_term * median_weight
         consistency_factor = consistency_score / 100.0
         variance_adjustment = clamp((consistency_factor - 0.5) * 0.10, -0.06, 0.06)
@@ -1929,8 +2182,8 @@ def estimate_model_probabilities(
 
     matchup_term = 0.0
     if matchup_delta_pct is not None:
-        noisy_stats = {"STL", "BLK"}
-        matchup_weight = 0.08 if stat in noisy_stats else 0.2
+        noisy_stats_matchup = {"STL", "BLK"}
+        matchup_weight = 0.08 if stat in noisy_stats_matchup else 0.2
         matchup_term = clamp(matchup_delta_pct / 100.0 * matchup_weight, -0.12, 0.12)
 
     role_term = 0.0
@@ -1939,11 +2192,10 @@ def estimate_model_probabilities(
     elif opportunity.get("minutes_trend") == "down":
         role_term -= 0.04
 
-    scoring_stats = {"PTS", "3PM", "PRA", "PR", "PA"}
     if opportunity.get("volume_trend") == "up":
-        role_term += 0.04 if stat in scoring_stats else 0.02
+        role_term += 0.04 if stat in SCORING_STATS else 0.02
     elif opportunity.get("volume_trend") == "down":
-        role_term -= 0.04 if stat in scoring_stats else 0.02
+        role_term -= 0.04 if stat in SCORING_STATS else 0.02
 
     if int(team_context.get("impact_count") or 0) > 0:
         role_term += min(0.03, int(team_context.get("impact_count") or 0) * 0.01)
@@ -1958,28 +2210,22 @@ def estimate_model_probabilities(
     # Pace signal: faster pace nudges volume stats upward, slower pace nudges downward.
     pace_proxy = safe_float_or_none(environment.get("combined_pace_proxy"))
     if pace_proxy is not None:
-        scoring_stats = {"PTS", "3PM", "PRA", "PR", "PA"}
-        playmaking_stats = {"AST", "PA", "PRA"}
-        rebound_stats = {"REB", "RA", "PR", "PRA"}
         pace_delta = pace_proxy - 99.5
-        if stat in scoring_stats:
+        if stat in SCORING_STATS:
             environment_term += clamp(pace_delta * 0.004, -0.04, 0.04)
-        elif stat in playmaking_stats:
+        elif stat in PLAYMAKING_STATS:
             environment_term += clamp(pace_delta * 0.003, -0.03, 0.03)
-        elif stat in rebound_stats:
+        elif stat in REBOUND_STATS:
             environment_term += clamp(pace_delta * 0.0025, -0.025, 0.025)
     # Home/away split: mild home boost, mild away drag (most impact on volume stats).
     is_home = environment.get("is_home")
     if is_home is not None:
-        scoring_stats = {"PTS", "3PM", "PRA", "PR", "PA"}
-        playmaking_stats = {"AST", "PA", "PRA"}
-        rebound_stats = {"REB", "RA", "PR", "PRA"}
         home_sign = 1.0 if bool(is_home) else -1.0
-        if stat in scoring_stats:
+        if stat in SCORING_STATS:
             environment_term += 0.015 * home_sign
-        elif stat in playmaking_stats:
+        elif stat in PLAYMAKING_STATS:
             environment_term += 0.010 * home_sign
-        elif stat in rebound_stats:
+        elif stat in REBOUND_STATS:
             environment_term += 0.008 * home_sign
     # Opponent rank weighting: strong opponents slightly suppress, weak opponents slightly lift.
     opponent_rank = safe_int_score(environment.get("opponent_rank"))
@@ -1987,14 +2233,11 @@ def estimate_model_probabilities(
         clamped_rank = min(30, max(1, opponent_rank))
         rank_strength = (31 - clamped_rank) / 30.0  # 1.0 = strongest, 0.0 = weakest
         rank_delta = 0.5 - rank_strength  # negative for strong, positive for weak
-        scoring_stats = {"PTS", "3PM", "PRA", "PR", "PA"}
-        playmaking_stats = {"AST", "PA", "PRA"}
-        rebound_stats = {"REB", "RA", "PR", "PRA"}
-        if stat in scoring_stats:
+        if stat in SCORING_STATS:
             environment_term += clamp(rank_delta * 0.06, -0.03, 0.03)
-        elif stat in playmaking_stats:
+        elif stat in PLAYMAKING_STATS:
             environment_term += clamp(rank_delta * 0.045, -0.022, 0.022)
-        elif stat in rebound_stats:
+        elif stat in REBOUND_STATS:
             environment_term += clamp(rank_delta * 0.04, -0.02, 0.02)
 
     model_over = clamp(base + edge_term + matchup_term + role_term + environment_term + variance_adjustment, 0.02, 0.98)
@@ -2004,7 +2247,7 @@ def estimate_model_probabilities(
 def fetch_position_dash(season: str, season_type: str, position_code: str, opponent_team_id: int = 0) -> list[dict[str, Any]]:
     normalized_position = str(position_code or "").upper().strip()
     normalized_season = str(season or "").strip()
-    normalized_season_type = str(season_type or "Regular Season").strip()
+    normalized_season_type = normalize_requested_season_type(season_type)
     cache_key = (normalized_season, normalized_season_type, normalized_position, int(opponent_team_id or 0))
     cached = POSITION_DASH_CACHE.get(cache_key)
     now_ts = time.time()
@@ -2014,12 +2257,27 @@ def fetch_position_dash(season: str, season_type: str, position_code: str, oppon
     if not normalized_position:
         return []
 
+    season_parts = season_types_for_analysis(normalized_season_type)
+    if len(season_parts) > 1:
+        merged_rows: list[dict[str, Any]] = []
+        for part in season_parts:
+            merged_rows.extend(
+                fetch_position_dash(
+                    normalized_season,
+                    part,
+                    normalized_position,
+                    opponent_team_id=int(opponent_team_id or 0),
+                )
+            )
+        POSITION_DASH_CACHE[cache_key] = {"timestamp": now_ts, "rows": [dict(row) for row in merged_rows]}
+        return [dict(row) for row in merged_rows]
+
     try:
         throttle_request()
         response = call_nba_with_retries(
             lambda: LeagueDashPlayerStats(
                 season=normalized_season,
-                season_type_all_star=normalized_season_type,
+                season_type_all_star=season_parts[0],
                 per_mode_detailed="PerGame",
                 measure_type_detailed_defense="Base",
                 player_position_abbreviation_nullable=normalized_position,
@@ -2060,6 +2318,8 @@ def summarize_position_environment(rows: list[dict[str, Any]], stat: str) -> dic
         "sample_gp": round(total_gp, 1),
         # LeagueDashPlayerStats returns per-game player rows, so we need a
         # GP-weighted average instead of dividing those per-game values by GP again.
+        "gp_weighted_per_game": round(total_weighted_value / total_gp, 2),
+        # Backward-compatible alias used by existing consumers.
         "per_player_game": round(total_weighted_value / total_gp, 2),
         "total_value": round(total_weighted_value, 1),
     }
@@ -2090,7 +2350,7 @@ def build_position_matchup(
     normalized_position = str(position_code or "").upper().strip()
     normalized_stat = str(stat or "").upper().strip()
     normalized_season = str(season or "").strip()
-    normalized_season_type = str(season_type or "Regular Season").strip()
+    normalized_season_type = normalize_requested_season_type(season_type)
     cache_key = (int(opponent_team_id or 0), normalized_position, normalized_stat, normalized_season, normalized_season_type)
     cached = POSITION_MATCHUP_CACHE.get(cache_key)
     now_ts = time.time()
@@ -2211,8 +2471,10 @@ def build_prop_analysis_payload(
     without_player_names: list[str] | None = None,
     debug: bool = False,
     override_opponent_id: int | None = None,
+    forced_side: str | None = None,
     populate_player_info_cache: bool = False,
 ) -> dict[str, Any]:
+    season_type = normalize_requested_season_type(season_type)
     player = PLAYER_LOOKUP.get(int(player_id))
     if not player:
         raise HTTPException(status_code=404, detail="Player not found.")
@@ -2232,6 +2494,10 @@ def build_prop_analysis_payload(
         fallback_name = str(without_player_name).strip()
         if fallback_name:
             normalized_without_player_names = [fallback_name]
+
+    forced_side_normalized = str(forced_side or "").strip().upper()
+    if forced_side_normalized not in {"OVER", "UNDER"}:
+        forced_side_normalized = ""
 
     analysis_cache_key = _build_analysis_cache_key(
         player_id=player_id,
@@ -2255,6 +2521,7 @@ def build_prop_analysis_payload(
         without_player_ids=normalized_without_player_ids,
         without_player_name=without_player_name,
         override_opponent_id=override_opponent_id,
+        forced_side=forced_side_normalized or None,
         debug=debug,
     )
     now_ts = time.time()
@@ -2399,9 +2666,12 @@ def build_prop_analysis_payload(
         implied_over=implied_over,
         implied_under=implied_under,
     )
-    recommended_side = "OVER" if model_over >= model_under else "UNDER"
+    model_recommended_side = "OVER" if model_over >= model_under else "UNDER"
+    recommended_side = forced_side_normalized or model_recommended_side
     side_model_prob = model_over if recommended_side == "OVER" else model_under
-    chosen_edge = round((side_model_prob - 0.50) * 100, 1)
+    chosen_fair_prob = implied_over if recommended_side == "OVER" else implied_under
+    chosen_fair_prob = resolve_fair_probability(chosen_fair_prob, fallback_prob=0.5)
+    chosen_edge_pct = edge_pct_from_model_and_fair(side_model_prob, chosen_fair_prob)
     # Use actual odds-adjusted EV: (prob × decimal_odds) - 1
     # convert_american_to_decimal is defined later in this file.
     _chosen_odds_raw = over_odds if recommended_side == "OVER" else under_odds
@@ -2409,12 +2679,12 @@ def build_prop_analysis_payload(
     if _chosen_decimal and _chosen_decimal > 1.0:
         chosen_ev = round((side_model_prob * _chosen_decimal) - 1.0, 4)
     else:
-        chosen_ev = round(side_model_prob - 0.50, 4)
+        chosen_ev = round(side_model_prob - chosen_fair_prob, 4)
     confidence_engine = build_confidence_engine(
         side=recommended_side,
         hit_rate=float(hit_rate),
         games_count=int(len(values)),
-        edge=chosen_edge,
+        edge=chosen_edge_pct,
         ev=chosen_ev,
         matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
         availability=availability,
@@ -2500,6 +2770,11 @@ def build_prop_analysis_payload(
         "environment": environment,
         "confidence": confidence_engine,
         "recommended_side": recommended_side,
+        "recommended_side_source": "forced" if forced_side_normalized else "model",
+        "edge": chosen_edge_pct,
+        "edge_pct": chosen_edge_pct,
+        "edge_definition": EDGE_DEFINITION_MODEL_FAIR,
+        "fair_probability": round(chosen_fair_prob * 100.0, 1),
         "traffic_light": {
             "label": traffic_label,
             "tone": traffic_tone,
@@ -2637,6 +2912,124 @@ def get_cached_injury_report_payload(force: bool = False) -> dict[str, Any]:
                 INJURY_SERVICE.report_cache["payload"] = cached_copy
                 return cached_copy
     return fetch_latest_injury_report_payload()
+
+
+def get_cached_injury_report_payload_fast() -> dict[str, Any]:
+    """
+    Non-blocking injury payload accessor for latency-sensitive endpoints.
+    Uses in-memory/Postgres cache only and never triggers a live network refresh.
+    """
+    cached_payload = INJURY_SERVICE.report_cache.get("payload")
+    if isinstance(cached_payload, dict) and cached_payload:
+        cached_age = INJURY_SERVICE.report_cache_age_seconds()
+        if cached_age is None or cached_age > INJURY_REPORT_TTL_SECONDS:
+            enqueue_hybrid_refresh("injury_report", ("latest",))
+        return cached_payload
+    pg_payload, pg_ts = _pg_read_latest_injury_report()
+    if isinstance(pg_payload, dict) and pg_payload:
+        payload_copy = dict(pg_payload)
+        payload_copy["source"] = payload_copy.get("source") or "postgres"
+        INJURY_SERVICE.report_cache["timestamp"] = float(pg_ts or time.time())
+        INJURY_SERVICE.report_cache["payload"] = payload_copy
+        pg_age = max(0.0, time.time() - float(pg_ts or 0.0)) if pg_ts else None
+        if pg_age is None or pg_age > INJURY_REPORT_TTL_SECONDS:
+            enqueue_hybrid_refresh("injury_report", ("latest",))
+        return payload_copy
+    enqueue_hybrid_refresh("injury_report", ("latest",))
+    return {
+        "ok": False,
+        "rows": [],
+        "report_label": "",
+        "report_url": "",
+        "source": "none",
+    }
+
+
+def _get_injury_aware_boost_cache(cache_key: tuple[Any, ...]) -> dict[str, Any] | None:
+    now_ts = time.time()
+    with INJURY_AWARE_BOOST_CACHE_LOCK:
+        cached = INJURY_AWARE_BOOST_CACHE.get(cache_key)
+        if not cached:
+            return None
+        cached_ts = float(cached.get("timestamp") or 0.0)
+        if now_ts - cached_ts > INJURY_AWARE_BOOST_CACHE_TTL_SECONDS:
+            INJURY_AWARE_BOOST_CACHE.pop(cache_key, None)
+            return None
+        payload = cached.get("payload")
+        if isinstance(payload, dict):
+            return copy.deepcopy(payload)
+        if payload is None:
+            return None
+        return None
+
+
+def _set_injury_aware_boost_cache(cache_key: tuple[Any, ...], payload: dict[str, Any] | None) -> None:
+    now_ts = time.time()
+    with INJURY_AWARE_BOOST_CACHE_LOCK:
+        INJURY_AWARE_BOOST_CACHE[cache_key] = {
+            "timestamp": now_ts,
+            "payload": copy.deepcopy(payload) if isinstance(payload, dict) else None,
+        }
+        if len(INJURY_AWARE_BOOST_CACHE) > INJURY_AWARE_BOOST_CACHE_MAX_ENTRIES:
+            stale_keys = sorted(
+                INJURY_AWARE_BOOST_CACHE.items(),
+                key=lambda item: float((item[1] or {}).get("timestamp") or 0.0)
+            )[: max(1, len(INJURY_AWARE_BOOST_CACHE) - INJURY_AWARE_BOOST_CACHE_MAX_ENTRIES)]
+            for stale_key, _ in stale_keys:
+                INJURY_AWARE_BOOST_CACHE.pop(stale_key, None)
+
+
+def _build_injury_combo_plan(
+    *,
+    base_hit_rate: float,
+    priority_rank: int | None = None,
+    priority_pool: int | None = None,
+) -> list[int]:
+    max_plan = max(1, min(3, INJURY_AWARE_MAX_COMBO_TRIES))
+    if max_plan == 1:
+        return [1]
+
+    if priority_rank and priority_pool and priority_pool > 0:
+        percentile = float(priority_rank) / float(max(1, priority_pool))
+        if percentile <= INJURY_AWARE_HIGH_PRIORITY_SHARE:
+            plan_max = 3
+        elif percentile <= 0.60:
+            plan_max = 2
+        else:
+            plan_max = 1
+    else:
+        # Without explicit ranking context, keep it conservative.
+        plan_max = 2 if float(base_hit_rate) < INJURY_AWARE_BASE_HITRATE_EXPAND_THRESHOLD else 1
+
+    if float(base_hit_rate) < INJURY_AWARE_BASE_HITRATE_EXPAND_THRESHOLD:
+        plan_max = min(3, plan_max + 1)
+
+    plan_max = max(1, min(max_plan, plan_max))
+    return list(range(1, plan_max + 1))
+
+
+def _should_stop_injury_combo_search(
+    *,
+    base_hit_rate: float,
+    boosted_hit_rate: float,
+    boosted_games: int,
+    combo_size: int,
+    combo_plan: list[int],
+    priority_rank: int | None = None,
+    priority_pool: int | None = None,
+) -> bool:
+    gain = float(boosted_hit_rate) - float(base_hit_rate)
+    if int(boosted_games) >= INJURY_AWARE_EARLY_STOP_MIN_GAMES and gain >= INJURY_AWARE_EARLY_STOP_GAIN_PCT:
+        return True
+
+    if combo_plan and combo_size == combo_plan[0] and gain <= INJURY_AWARE_LOW_GAIN_CUTOFF_PCT:
+        # Only low-priority rows short-circuit on tiny gain.
+        if not (priority_rank and priority_pool and priority_pool > 0):
+            return True
+        if float(priority_rank) / float(priority_pool) > INJURY_AWARE_HIGH_PRIORITY_SHARE:
+            return True
+
+    return False
 
 
 def build_availability_payload(player_name: str, team_name: str | None = None, game_date: str | None = None) -> dict[str, Any]:
@@ -2787,26 +3180,7 @@ def build_confidence_engine(
     score += sum(components.values())
     score = int(max(0, min(99, round(score))))
 
-    if score >= 85:
-        grade = 'A'
-        tone = 'elite'
-        tier = 'Elite'
-    elif score >= 72:
-        grade = 'B'
-        tone = 'good'
-        tier = 'High'
-    elif score >= 60:
-        grade = 'C'
-        tone = 'warm'
-        tier = 'Medium'
-    elif score >= 48:
-        grade = 'D'
-        tone = 'neutral'
-        tier = 'Low'
-    else:
-        grade = 'F'
-        tone = 'bad'
-        tier = 'Very low'
+    grade, tone, tier = _confidence_band_from_score(score)
 
     summary_parts: list[str] = []
     if injury_component >= 5:
@@ -2974,6 +3348,228 @@ def apply_market_probability_penalty(
 
     return round(adjusted_over, 4), round(adjusted_under, 4)
 
+
+def resolve_market_fair_inputs(
+    market_row: dict[str, Any],
+    over_odds: float | None,
+    under_odds: float | None,
+) -> dict[str, float | None]:
+    market_probs = fair_implied_probabilities(over_odds, under_odds)
+    implied_over = safe_float_or_none(market_probs.get("over"))
+    implied_under = safe_float_or_none(market_probs.get("under"))
+    hold = safe_float_or_none(market_probs.get("hold"))
+
+    fair_over = safe_float_or_none(market_row.get("consensus_over_fair_prob"))
+    fair_under = safe_float_or_none(market_row.get("consensus_under_fair_prob"))
+    if fair_over is None:
+        fair_over = safe_float_or_none(market_row.get("over_fair_prob"))
+    if fair_under is None:
+        fair_under = safe_float_or_none(market_row.get("under_fair_prob"))
+
+    resolved_fair_over = resolve_fair_probability(fair_over, fallback_prob=implied_over)
+    resolved_fair_under = resolve_fair_probability(fair_under, fallback_prob=implied_under)
+    return {
+        "implied_over": implied_over,
+        "implied_under": implied_under,
+        "fair_over": resolved_fair_over,
+        "fair_under": resolved_fair_under,
+        "hold": hold,
+    }
+
+
+CALIBRATION_SAMPLE_BASELINE_GAMES = 20.0
+CALIBRATION_H2H_BASELINE_GAMES = 5.0
+CALIBRATION_HOLD_NEUTRAL = 0.045
+CALIBRATION_HOLD_PENALTY_MULTIPLIER = 1.1
+CALIBRATION_RELIABILITY_MIN = 0.22
+CALIBRATION_RELIABILITY_MAX = 0.92
+CALIBRATION_SHRINK_MIN = 0.08
+CALIBRATION_SHRINK_MAX = 0.72
+
+
+def build_probability_reliability_profile(
+    *,
+    games_count: int,
+    stat: str,
+    variance: dict[str, Any] | None = None,
+    h2h_games_count: int | None = None,
+    market_hold: float | None = None,
+) -> dict[str, float]:
+    variance = variance or {}
+    sample_factor = clamp(float(games_count or 0) / CALIBRATION_SAMPLE_BASELINE_GAMES, 0.0, 1.0)
+    h2h_factor = clamp(float(h2h_games_count or 0) / CALIBRATION_H2H_BASELINE_GAMES, 0.0, 1.0)
+    cv = safe_float_or_none(variance.get("cv"))
+    consistency = safe_float_or_none(variance.get("consistency_score"))
+
+    if cv is None:
+        variance_factor = 0.58
+    else:
+        variance_factor = clamp(1.0 - max(0.0, cv - 0.45) * 0.9, 0.35, 1.0)
+    consistency_factor = clamp((consistency if consistency is not None else 50.0) / 100.0, 0.35, 1.0)
+
+    hold_penalty = 0.0
+    if market_hold is not None:
+        hold_penalty = clamp(
+            max(0.0, market_hold - CALIBRATION_HOLD_NEUTRAL) * CALIBRATION_HOLD_PENALTY_MULTIPLIER,
+            0.0,
+            0.08,
+        )
+
+    stat_noise_penalty = 0.08 if str(stat or "").upper() in {"STL", "BLK", "3PM"} else 0.0
+    reliability = (
+        0.22
+        + (sample_factor * 0.36)
+        + (h2h_factor * 0.12)
+        + (variance_factor * 0.16)
+        + (consistency_factor * 0.14)
+        - hold_penalty
+        - stat_noise_penalty
+    )
+    reliability = clamp(reliability, CALIBRATION_RELIABILITY_MIN, CALIBRATION_RELIABILITY_MAX)
+    shrink_strength = clamp(1.0 - reliability, CALIBRATION_SHRINK_MIN, CALIBRATION_SHRINK_MAX)
+    return {
+        "sample_factor": round(sample_factor, 4),
+        "h2h_factor": round(h2h_factor, 4),
+        "variance_factor": round(variance_factor, 4),
+        "consistency_factor": round(consistency_factor, 4),
+        "hold_penalty": round(hold_penalty, 4),
+        "stat_noise_penalty": round(stat_noise_penalty, 4),
+        "reliability": round(reliability, 4),
+        "shrink_strength": round(shrink_strength, 4),
+    }
+
+
+def calibrate_two_way_probabilities(
+    model_over: float,
+    model_under: float,
+    *,
+    fair_over: float | None,
+    fair_under: float | None,
+    shrink_strength: float,
+) -> tuple[float, float]:
+    anchor_over = safe_float_or_none(fair_over)
+    anchor_under = safe_float_or_none(fair_under)
+    if anchor_over is None and anchor_under is None:
+        anchor_over = 0.5
+        anchor_under = 0.5
+    elif anchor_over is None and anchor_under is not None:
+        anchor_over = clamp(1.0 - anchor_under, 0.0, 1.0)
+    elif anchor_under is None and anchor_over is not None:
+        anchor_under = clamp(1.0 - anchor_over, 0.0, 1.0)
+
+    calibrated_over = (float(model_over) * (1.0 - shrink_strength)) + (float(anchor_over or 0.5) * shrink_strength)
+    calibrated_under = (float(model_under) * (1.0 - shrink_strength)) + (float(anchor_under or 0.5) * shrink_strength)
+    total = calibrated_over + calibrated_under
+    if total <= 0:
+        return clamp(float(model_over), 0.02, 0.98), clamp(float(model_under), 0.02, 0.98)
+    calibrated_over = clamp(calibrated_over / total, 0.02, 0.98)
+    calibrated_under = clamp(1.0 - calibrated_over, 0.02, 0.98)
+    return round(calibrated_over, 4), round(calibrated_under, 4)
+
+
+def compute_side_pricing_metrics(probability: float, fair_probability: float, odds: float | None) -> dict[str, float]:
+    fair_prob = resolve_fair_probability(safe_float_or_none(fair_probability), fallback_prob=decimal_implied_probability(odds))
+    edge_pct = edge_pct_from_model_and_fair(float(probability), fair_prob)
+    if odds and odds > 1.0:
+        ev = round((float(probability) * float(odds)) - 1.0, 4)
+    else:
+        ev = round(float(probability) - fair_prob, 4)
+    return {
+        "edge_pct": edge_pct,
+        "ev": ev,
+        "fair_probability": round(fair_prob, 6),
+    }
+
+
+def risk_adjust_ev(ev_value: float, reliability: float) -> float:
+    reliability_clamped = clamp(float(reliability), 0.0, 1.0)
+    multiplier = 0.52 + (0.48 * reliability_clamped)
+    return round(float(ev_value) * multiplier, 4)
+
+
+def build_shared_market_pricing_snapshot(
+    *,
+    market_row: dict[str, Any],
+    over_odds: float,
+    under_odds: float,
+    hit_rate_pct: float,
+    average: float,
+    line: float,
+    stat: str,
+    matchup_delta_pct: float | None,
+    opportunity: dict[str, Any] | None = None,
+    team_context: dict[str, Any] | None = None,
+    environment: dict[str, Any] | None = None,
+    variance: dict[str, Any] | None = None,
+    games_count: int = 0,
+    h2h_games_count: int | None = None,
+) -> dict[str, Any]:
+    fair_inputs = resolve_market_fair_inputs(market_row, over_odds, under_odds)
+    model_over, model_under = estimate_model_probabilities(
+        hit_rate_pct=float(hit_rate_pct),
+        average=float(average),
+        line=float(line),
+        matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
+        stat=str(stat),
+        opportunity=opportunity or {},
+        team_context=team_context or {},
+        environment=environment or {},
+        variance=variance or {},
+    )
+    raw_over, raw_under = apply_market_probability_penalty(
+        model_over,
+        model_under,
+        implied_over=fair_inputs.get("implied_over"),
+        implied_under=fair_inputs.get("implied_under"),
+    )
+
+    reliability = build_probability_reliability_profile(
+        games_count=int(games_count or 0),
+        stat=str(stat),
+        variance=variance or {},
+        h2h_games_count=h2h_games_count,
+        market_hold=safe_float_or_none(fair_inputs.get("hold")),
+    )
+    calibrated_over, calibrated_under = calibrate_two_way_probabilities(
+        raw_over,
+        raw_under,
+        fair_over=fair_inputs.get("fair_over"),
+        fair_under=fair_inputs.get("fair_under"),
+        shrink_strength=float(reliability["shrink_strength"]),
+    )
+
+    raw_over_metrics = compute_side_pricing_metrics(raw_over, float(fair_inputs["fair_over"]), over_odds)
+    raw_under_metrics = compute_side_pricing_metrics(raw_under, float(fair_inputs["fair_under"]), under_odds)
+    calibrated_over_metrics = compute_side_pricing_metrics(calibrated_over, float(fair_inputs["fair_over"]), over_odds)
+    calibrated_under_metrics = compute_side_pricing_metrics(calibrated_under, float(fair_inputs["fair_under"]), under_odds)
+    adjusted_over_ev = risk_adjust_ev(calibrated_over_metrics["ev"], float(reliability["reliability"]))
+    adjusted_under_ev = risk_adjust_ev(calibrated_under_metrics["ev"], float(reliability["reliability"]))
+
+    return {
+        "market": fair_inputs,
+        "raw": {
+            "over_probability": raw_over,
+            "under_probability": raw_under,
+            "over_edge_pct": raw_over_metrics["edge_pct"],
+            "under_edge_pct": raw_under_metrics["edge_pct"],
+            "over_ev": raw_over_metrics["ev"],
+            "under_ev": raw_under_metrics["ev"],
+        },
+        "calibrated": {
+            "over_probability": calibrated_over,
+            "under_probability": calibrated_under,
+            "over_edge_pct": calibrated_over_metrics["edge_pct"],
+            "under_edge_pct": calibrated_under_metrics["edge_pct"],
+            "over_ev": calibrated_over_metrics["ev"],
+            "under_ev": calibrated_under_metrics["ev"],
+        },
+        "adjusted": {
+            "over_ev": adjusted_over_ev,
+            "under_ev": adjusted_under_ev,
+        },
+        "reliability": reliability,
+    }
+
 def _build_parlay_reason_fragments(prop: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
     try:
@@ -3032,6 +3628,36 @@ def _build_parlay_reason_fragments(prop: dict[str, Any]) -> list[str]:
         reasons.append("matchup context is tougher than average")
 
     return reasons[:4]
+
+
+def compute_side_h2h_metrics(h2h_payload: dict[str, Any] | None, side: str) -> tuple[int, int | None, float | None]:
+    payload = h2h_payload or {}
+    h2h_games_count = max(0, int(payload.get("games_count") or 0))
+    h2h_over_hit_count: int | None = None
+    try:
+        raw_h2h_hit_count = payload.get("hit_count")
+        if raw_h2h_hit_count is not None:
+            h2h_over_hit_count = max(0, min(h2h_games_count, int(raw_h2h_hit_count)))
+    except (TypeError, ValueError):
+        h2h_over_hit_count = None
+    if h2h_over_hit_count is None:
+        try:
+            raw_rate = float(payload.get("hit_rate"))
+            if h2h_games_count > 0:
+                h2h_over_hit_count = max(0, min(h2h_games_count, int(round((raw_rate / 100.0) * h2h_games_count))))
+        except (TypeError, ValueError):
+            h2h_over_hit_count = None
+
+    if h2h_games_count <= 0 or h2h_over_hit_count is None:
+        return h2h_games_count, None, None
+
+    clamped_h2h_over_hits = max(0, min(h2h_games_count, h2h_over_hit_count))
+    if str(side).upper() == "UNDER":
+        h2h_side_hit_count = max(0, h2h_games_count - clamped_h2h_over_hits)
+    else:
+        h2h_side_hit_count = clamped_h2h_over_hits
+    h2h_side_hit_rate = (h2h_side_hit_count / h2h_games_count) * 100.0
+    return h2h_games_count, h2h_side_hit_count, h2h_side_hit_rate
 
 
 def annotate_parlay_selection(scored: list[dict[str, Any]], legs: int) -> list[dict[str, Any]]:
@@ -3212,21 +3838,103 @@ def parse_game_date_any(raw_value: Any) -> datetime | None:
     return None
 
 
+def convert_game_status_text_to_pht(status_text: str, game_date: str | None = None) -> str:
+    raw = str(status_text or "").strip()
+    if not raw:
+        return "TBD"
+    # Scheduled NBA scoreboard text is typically like "7:00 pm ET".
+    match = re.match(r"^\s*(\d{1,2}):(\d{2})\s*([AaPp][Mm])\s*ET\s*$", raw)
+    if not match:
+        return raw
+    try:
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        ampm = match.group(3).upper()
+        if ampm == "PM" and hour != 12:
+            hour += 12
+        elif ampm == "AM" and hour == 12:
+            hour = 0
+
+        if game_date:
+            base_date = datetime.strptime(str(game_date), "%Y-%m-%d").date()
+        else:
+            base_date = app_now().date()
+
+        et_dt = datetime(
+            base_date.year,
+            base_date.month,
+            base_date.day,
+            hour,
+            minute,
+            tzinfo=ZoneInfo("America/New_York"),
+        )
+        pht_dt = et_dt.astimezone(APP_ZONEINFO)
+        hh = pht_dt.strftime("%I").lstrip("0") or "0"
+        mm = pht_dt.strftime("%M")
+        ampm_pht = pht_dt.strftime("%p").lower()
+        return f"{hh}:{mm} {ampm_pht} PHT"
+    except Exception:
+        return raw
+
+
+def normalize_requested_season_type(season_type: str | None) -> str:
+    raw = str(season_type or "").strip().lower()
+    if not raw:
+        return DEFAULT_SEASON_TYPE
+    if raw in {"combined", "all", "all games", "regular+playoffs", "regular season + playoffs", "regular season and playoffs"}:
+        return SEASON_TYPE_COMBINED
+    if raw in {"playoff", "playoffs", "postseason"}:
+        return SEASON_TYPE_PLAYOFFS
+    if raw in {"regular", "regular season"}:
+        return SEASON_TYPE_REGULAR
+    return SEASON_TYPE_REGULAR
+
+
+def season_types_for_analysis(season_type: str | None) -> list[str]:
+    normalized = normalize_requested_season_type(season_type)
+    if normalized == SEASON_TYPE_COMBINED:
+        return [SEASON_TYPE_REGULAR, SEASON_TYPE_PLAYOFFS]
+    return [normalized]
+
+
+def merge_game_log_rows(rows_source: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = [dict(row) for row in (rows_source or []) if isinstance(row, dict)]
+    deduped = dedupe_game_log_rows(rows)
+    deduped.sort(
+        key=lambda row: (
+            parse_game_date_any(row.get("GAME_DATE")) or datetime.min,
+            str(row.get("GAME_ID") or row.get("Game_ID") or ""),
+        ),
+        reverse=True,
+    )
+    return deduped
+
 
 @timed_call("team_game_log")
 def fetch_team_game_log(team_id: int, season: str, season_type: str) -> list[dict[str, Any]]:
-    cache_key = (int(team_id), str(season), str(season_type))
+    normalized_season_type = normalize_requested_season_type(season_type)
+    cache_key = (int(team_id), str(season), str(normalized_season_type))
     cached = TEAM_GAME_LOG_CACHE.get(cache_key)
     now_ts = time.time()
     if cached and now_ts - float(cached.get("timestamp") or 0.0) < TEAM_CONTEXT_TTL_SECONDS:
         return [dict(row) for row in (cached.get("rows") or [])]
 
+    season_parts = season_types_for_analysis(normalized_season_type)
+    if len(season_parts) > 1:
+        merged_rows: list[dict[str, Any]] = []
+        for part in season_parts:
+            merged_rows.extend(fetch_team_game_log(team_id=team_id, season=season, season_type=part))
+        merged_rows = merge_game_log_rows(merged_rows)
+        TEAM_GAME_LOG_CACHE[cache_key] = {"timestamp": now_ts, "rows": merged_rows}
+        return [dict(row) for row in merged_rows]
+
+    source_season_type = season_parts[0]
     try:
         response = call_nba_with_retries(
             lambda: TeamGameLog(
                 team_id=team_id,
                 season=season,
-                season_type_all_star=season_type,
+                season_type_all_star=source_season_type,
                 timeout=12,
             ),
             label="team game log request",
@@ -3333,9 +4041,6 @@ def enrich_environment_with_team_context(environment: dict[str, Any], team_conte
 def derive_market_environment_signal(stat: str | None, environment: dict[str, Any] | None = None) -> dict[str, Any]:
     env = environment or {}
     normalized_stat = str(stat or "").upper().strip()
-    scoring_stats = {"PTS", "3PM", "PRA", "PR", "PA"}
-    playmaking_stats = {"AST", "PA", "PRA"}
-    rebound_stats = {"REB", "RA", "PR", "PRA"}
 
     over_adjustment = 0.0
     support_tags: list[str] = []
@@ -3354,11 +4059,11 @@ def derive_market_environment_signal(stat: str | None, environment: dict[str, An
             caution_tags.append("Low team total")
             summary_bits.append(f"team total {team_total:.1f}")
 
-        if normalized_stat in scoring_stats:
+        if normalized_stat in SCORING_STATS:
             over_adjustment += clamp((team_total - 112.0) * 0.006, -0.04, 0.04)
-        elif normalized_stat in playmaking_stats:
+        elif normalized_stat in PLAYMAKING_STATS:
             over_adjustment += clamp((team_total - 112.0) * 0.0045, -0.03, 0.03)
-        elif normalized_stat in rebound_stats:
+        elif normalized_stat in REBOUND_STATS:
             over_adjustment += clamp((team_total - 112.0) * 0.002, -0.015, 0.015)
 
     if game_total is not None:
@@ -3369,11 +4074,11 @@ def derive_market_environment_signal(stat: str | None, environment: dict[str, An
             caution_tags.append("Low game total")
             summary_bits.append(f"game total {game_total:.1f}")
 
-        if normalized_stat in scoring_stats:
+        if normalized_stat in SCORING_STATS:
             over_adjustment += clamp((game_total - 226.0) * 0.003, -0.025, 0.025)
-        elif normalized_stat in playmaking_stats:
+        elif normalized_stat in PLAYMAKING_STATS:
             over_adjustment += clamp((game_total - 226.0) * 0.0025, -0.02, 0.02)
-        elif normalized_stat in rebound_stats:
+        elif normalized_stat in REBOUND_STATS:
             over_adjustment += clamp((game_total - 226.0) * 0.0015, -0.015, 0.015)
 
     if spread is not None:
@@ -3385,11 +4090,11 @@ def derive_market_environment_signal(stat: str | None, environment: dict[str, An
             caution_tags.append("Blowout risk")
             summary_bits.append(f"spread {spread:+.1f}")
 
-        if abs_spread <= 3.5 and normalized_stat in scoring_stats.union(playmaking_stats):
+        if abs_spread <= 3.5 and normalized_stat in SCORING_STATS.union(PLAYMAKING_STATS):
             over_adjustment += 0.01
-        elif abs_spread >= 10 and normalized_stat in scoring_stats.union(playmaking_stats):
+        elif abs_spread >= 10 and normalized_stat in SCORING_STATS.union(PLAYMAKING_STATS):
             over_adjustment -= 0.02
-        elif abs_spread >= 10 and normalized_stat in rebound_stats:
+        elif abs_spread >= 10 and normalized_stat in REBOUND_STATS:
             over_adjustment -= 0.01
 
     return {
@@ -3527,7 +4232,10 @@ def build_game_environment_context(season_rows: list[dict[str, Any]], next_game:
     try:
         opp_id = int((next_game or {}).get("opponent_team_id") or 0)
         if opp_id:
-            rank_map = get_cached_team_rank_map(season=season or current_nba_season(), season_type=season_type or "Regular Season")
+            rank_map = get_cached_team_rank_map(
+                season=season or current_nba_season(),
+                season_type=normalize_requested_season_type(season_type),
+            )
             opponent_rank = rank_map.get(opp_id)
             if opponent_rank:
                 opponent_label = f"Opp rank {int(opponent_rank)}"
@@ -3823,8 +4531,9 @@ TEAMMATE_IMPACT_CACHE: dict[tuple[int, str, str], dict[str, Any]] = {}
 TEAMMATE_IMPACT_CACHE_TTL_SECONDS = 6 * 60 * 60
 
 
-def get_cached_team_rank_map(season: str, season_type: str = 'Regular Season') -> dict[int, int]:
-    cache_key = (str(season), str(season_type))
+def get_cached_team_rank_map(season: str, season_type: str = DEFAULT_SEASON_TYPE) -> dict[int, int]:
+    normalized_season_type = normalize_requested_season_type(season_type)
+    cache_key = (str(season), str(normalized_season_type))
     cached = TEAM_RECORDS_CACHE.get(cache_key)
     now_ts = time.time()
     if cached and now_ts - float(cached.get('timestamp') or 0.0) < TEAM_RECORDS_CACHE_TTL_SECONDS:
@@ -3832,66 +4541,107 @@ def get_cached_team_rank_map(season: str, season_type: str = 'Regular Season') -
     return {}
 
 
-def build_team_rank_map(season: str, season_type: str = 'Regular Season') -> dict[int, int]:
-    cache_key = (str(season), str(season_type))
+def build_team_rank_map(season: str, season_type: str = DEFAULT_SEASON_TYPE) -> dict[int, int]:
+    normalized_season_type = normalize_requested_season_type(season_type)
+    cache_key = (str(season), str(normalized_season_type))
     cached = TEAM_RECORDS_CACHE.get(cache_key)
     now_ts = time.time()
     if cached and now_ts - float(cached.get('timestamp') or 0.0) < TEAM_RECORDS_CACHE_TTL_SECONDS:
         return dict(cached.get('rank_map') or {})
 
+    rank_map: dict[int, int] = {}
     rows: list[dict[str, Any]] = []
-    team_ids = [int(team.get('id') or 0) for team in TEAM_POOL if int(team.get('id') or 0)]
-
-    def _fetch_team_record(team_id: int) -> dict[str, Any] | None:
-        try:
-            logs = fetch_team_game_log(team_id=team_id, season=season, season_type=season_type)
-        except Exception:
-            return None
-        wins = 0
-        losses = 0
-        for row in logs:
-            wl = str(row.get('WL') or '').upper().strip()
-            if wl == 'W':
-                wins += 1
-            elif wl == 'L':
-                losses += 1
-        games = wins + losses
-        pct = (wins / games) if games else 0.0
-        return {'team_id': team_id, 'wins': wins, 'losses': losses, 'win_pct': pct}
-
-    if len(team_ids) <= 1:
-        for team_id in team_ids:
-            record = _fetch_team_record(team_id)
-            if record:
-                rows.append(record)
-    else:
-        max_workers = min(8, len(team_ids))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_fetch_team_record, team_id) for team_id in team_ids]
-            for future in as_completed(futures):
-                record = future.result()
+    try:
+        dash = call_nba_with_retries(
+            lambda: LeagueDashTeamStats(
+                season=season,
+                season_type_all_star=normalized_season_type,
+                per_mode_detailed="PerGame",
+                timeout=12,
+            ),
+            label=f"league_dash_team_stats:{season}:{normalized_season_type}",
+            attempts=2,
+            base_delay=0.6,
+        )
+        frame = dash.get_data_frames()[0] if dash.get_data_frames() else None
+        source_rows = frame.to_dict(orient="records") if frame is not None and not frame.empty else []
+        for row in source_rows:
+            team_id = row.get("TEAM_ID")
+            try:
+                team_id_int = int(team_id)
+            except Exception:
+                continue
+            def_rating = row.get("DEF_RATING")
+            opp_pts = row.get("OPP_PTS")
+            metric = None
+            try:
+                metric = float(def_rating) if def_rating not in (None, "") else None
+            except Exception:
+                metric = None
+            if metric is None:
+                try:
+                    metric = float(opp_pts) if opp_pts not in (None, "") else None
+                except Exception:
+                    metric = None
+            if metric is None:
+                continue
+            rows.append({"team_id": team_id_int, "metric": metric})
+        rows.sort(
+            key=lambda item: (
+                float(item.get("metric") or 0.0),
+                TEAM_LOOKUP.get(int(item.get("team_id") or 0), {}).get("full_name", ""),
+            )
+        )
+        rank_map = {int(item["team_id"]): idx + 1 for idx, item in enumerate(rows)}
+    except Exception as exc:
+        LOGGER.warning("Team rank map defensive stats fallback triggered: %s", exc)
+        # Fallback keeps behavior available if LeagueDashTeamStats is temporarily unavailable.
+        team_ids = [int(team.get('id') or 0) for team in TEAM_POOL if int(team.get('id') or 0)]
+        def _fetch_team_record(team_id: int) -> dict[str, Any] | None:
+            try:
+                logs = fetch_team_game_log(team_id=team_id, season=season, season_type=normalized_season_type)
+            except Exception:
+                return None
+            wins = 0
+            losses = 0
+            for row in logs:
+                wl = str(row.get('WL') or '').upper().strip()
+                if wl == 'W':
+                    wins += 1
+                elif wl == 'L':
+                    losses += 1
+            games = wins + losses
+            pct = (wins / games) if games else 0.0
+            return {'team_id': team_id, 'wins': wins, 'losses': losses, 'win_pct': pct}
+        if len(team_ids) <= 1:
+            for team_id in team_ids:
+                record = _fetch_team_record(team_id)
                 if record:
                     rows.append(record)
+        else:
+            max_workers = min(8, len(team_ids))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(_fetch_team_record, team_id) for team_id in team_ids]
+                for future in as_completed(futures):
+                    record = future.result()
+                    if record:
+                        rows.append(record)
+        rows.sort(key=lambda item: (-float(item.get('win_pct') or 0.0), -int(item.get('wins') or 0), TEAM_LOOKUP.get(int(item.get('team_id') or 0), {}).get('full_name', '')))
+        rank_map = {int(item['team_id']): idx + 1 for idx, item in enumerate(rows)}
 
-    # NOTE: rank is sorted by win percentage, NOT defensive rating.
-    # Rank 1 = best record, Rank 30 = worst record.
-    # This is a proxy for opponent strength. A future improvement would be
-    # to rank by defensive rating or opponent points-per-game-allowed
-    # using LeagueDashTeamStats for a more accurate signal on player props.
-    rows.sort(key=lambda item: (-float(item.get('win_pct') or 0.0), -int(item.get('wins') or 0), TEAM_LOOKUP.get(int(item.get('team_id') or 0), {}).get('full_name', '')))
-    rank_map = {int(item['team_id']): idx + 1 for idx, item in enumerate(rows)}
     TEAM_RECORDS_CACHE[cache_key] = {'timestamp': now_ts, 'rank_map': rank_map}
     return dict(rank_map)
 
 
-def teammate_absence_game_ids(player_id: int, season: str, season_type: str = 'Regular Season') -> set[str]:
-    cache_key = (int(player_id), str(season), str(season_type))
+def teammate_absence_game_ids(player_id: int, season: str, season_type: str = DEFAULT_SEASON_TYPE) -> set[str]:
+    normalized_season_type = normalize_requested_season_type(season_type)
+    cache_key = (int(player_id), str(season), str(normalized_season_type))
     cached = TEAMMATE_ABSENCE_CACHE.get(cache_key)
     now_ts = time.time()
     if cached and now_ts - float(cached.get('timestamp') or 0.0) < TEAMMATE_ABSENCE_CACHE_TTL_SECONDS:
         return set(cached.get('game_ids') or [])
     try:
-        rows = fetch_player_game_log(player_id=player_id, season=season, season_type=season_type)
+        rows = fetch_player_game_log(player_id=player_id, season=season, season_type=normalized_season_type)
     except Exception:
         rows = []
     game_ids = {str(row.get('GAME_ID') or row.get('Game_ID') or '').strip() for row in rows if str(row.get('GAME_ID') or row.get('Game_ID') or '').strip()}
@@ -3899,8 +4649,9 @@ def teammate_absence_game_ids(player_id: int, season: str, season_type: str = 'R
     return set(game_ids)
 
 
-def teammate_impact_score(player_id: int, season: str, season_type: str = 'Regular Season') -> float:
-    cache_key = (int(player_id), str(season), str(season_type))
+def teammate_impact_score(player_id: int, season: str, season_type: str = DEFAULT_SEASON_TYPE) -> float:
+    normalized_season_type = normalize_requested_season_type(season_type)
+    cache_key = (int(player_id), str(season), str(normalized_season_type))
     cached = TEAMMATE_IMPACT_CACHE.get(cache_key)
     now_ts = time.time()
     if cached and now_ts - float(cached.get('timestamp') or 0.0) < TEAMMATE_IMPACT_CACHE_TTL_SECONDS:
@@ -3908,7 +4659,12 @@ def teammate_impact_score(player_id: int, season: str, season_type: str = 'Regul
 
     score = 0.0
     try:
-        rows = fetch_recent_player_game_log(player_id=player_id, season=season, season_type=season_type, last_n=10)
+        rows = fetch_recent_player_game_log(
+            player_id=player_id,
+            season=season,
+            season_type=normalized_season_type,
+            last_n=10,
+        )
     except Exception:
         rows = []
 
@@ -3976,7 +4732,7 @@ def resolve_without_player_names(player_ids: list[int]) -> list[str]:
     return names
 
 
-def build_without_player_union_game_ids(player_ids: list[int], season: str, season_type: str = 'Regular Season') -> set[str] | None:
+def build_without_player_union_game_ids(player_ids: list[int], season: str, season_type: str = DEFAULT_SEASON_TYPE) -> set[str] | None:
     normalized_ids = normalize_without_player_ids(player_ids)
     if not normalized_ids:
         return None
@@ -4493,7 +5249,7 @@ def build_stat_summary_block(rows: list[dict[str, Any]], stat: str, line: float)
     values: list[float] = []
     weighted_hits = 0.0
     weight_sum = 0.0
-    now_dt = datetime.utcnow()
+    now_dt = _utc_now_naive()
     for row in rows:
         game_entry = build_game_log_entry(row, stat, line)
         games.append(game_entry)
@@ -4573,7 +5329,7 @@ def build_debug_metadata(*, cache_status: dict[str, Any], freshness: dict[str, A
         "cache_status": copy.deepcopy(cache_status),
         "freshness": copy.deepcopy(freshness),
         "timing_enabled": bool(timings_enabled),
-        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_at": _utc_iso_z(),
     }
 
 
@@ -4615,38 +5371,67 @@ def normalize_decimal_price(price: Any, odds_format: str) -> float | None:
     return round(value, 2)
 
 
-def odds_api_fetch(endpoint: str, api_key: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+def odds_api_fetch(
+    endpoint: str,
+    api_key: str,
+    params: dict[str, Any] | None = None,
+    *,
+    allow_query_auth_fallback: bool | None = None,
+) -> dict[str, Any]:
     key = str(api_key or "").strip()
     if not key:
         raise HTTPException(status_code=400, detail="Missing Odds API key.")
 
     query = dict(params or {})
-    query["apiKey"] = key
-    url = f"{ODDS_API_BASE_URL}{endpoint}?{odds_api_build_query(query)}"
-    attempts = 0
-    last_exc: Exception | None = None
-    response = None
-    while True:
-        try:
-            response = requests.get(url, timeout=(5, 30), headers={"User-Agent": NBA_USER_AGENT, "Accept": "application/json"})
-            if response.ok:
+
+    def _request_with(current_query: dict[str, Any], headers: dict[str, str]) -> requests.Response:
+        url = f"{ODDS_API_BASE_URL}{endpoint}?{odds_api_build_query(current_query)}"
+        attempts = 0
+        last_exc: Exception | None = None
+        response: requests.Response | None = None
+        while True:
+            try:
+                response = requests.get(url, timeout=(5, 30), headers=headers)
+                if response.ok:
+                    break
+                if response.status_code in {408, 429} or response.status_code >= 500:
+                    attempts += 1
+                    if attempts > ODDS_API_MAX_RETRIES:
+                        break
+                    time.sleep(ODDS_API_RETRY_BACKOFF_SECONDS * attempts)
+                    continue
                 break
-            if response.status_code in {408, 429} or response.status_code >= 500:
+            except requests.RequestException as exc:
+                last_exc = exc
                 attempts += 1
                 if attempts > ODDS_API_MAX_RETRIES:
                     break
                 time.sleep(ODDS_API_RETRY_BACKOFF_SECONDS * attempts)
-                continue
-            break
-        except requests.RequestException as exc:
-            last_exc = exc
-            attempts += 1
-            if attempts > ODDS_API_MAX_RETRIES:
-                break
-            time.sleep(ODDS_API_RETRY_BACKOFF_SECONDS * attempts)
+        if response is None:
+            raise HTTPException(status_code=503, detail=f"Odds API request failed: {last_exc}") from last_exc
+        return response
 
-    if response is None:
-        raise HTTPException(status_code=503, detail=f"Odds API request failed: {last_exc}") from last_exc
+    header_auth_headers = {
+        "User-Agent": NBA_USER_AGENT,
+        "Accept": "application/json",
+        "X-API-Key": key,
+    }
+    fallback_enabled = ODDS_API_QUERY_AUTH_FALLBACK_ENABLED if allow_query_auth_fallback is None else bool(allow_query_auth_fallback)
+    response = _request_with(query, header_auth_headers)
+    response_text = (response.text or "").strip()
+    missing_key_error = "MISSING_KEY" in response_text or "API key is missing" in response_text
+    if (
+        fallback_enabled
+        and (response.status_code in {400, 401, 403} or missing_key_error)
+        and "apiKey" not in query
+    ):
+        # Optional compatibility fallback for providers that reject header auth.
+        fallback_query = dict(query)
+        fallback_query["apiKey"] = key
+        response = _request_with(
+            fallback_query,
+            {"User-Agent": NBA_USER_AGENT, "Accept": "application/json"},
+        )
 
     remaining = response.headers.get("x-requests-remaining")
     used = response.headers.get("x-requests-used")
@@ -4691,6 +5476,7 @@ def _fetch_event_odds_payload(
                 "dateFormat": "iso",
                 "bookmakers": ",".join(requested_bookmakers),
             },
+            allow_query_auth_fallback=True,
         )
         return {
             "event_id": event_id,
@@ -4842,14 +5628,45 @@ def _position_dash_cache_is_reliable_stale(cached: dict[str, Any] | None, cached
 
 @timed_call("fetch_player_game_log")
 def fetch_player_game_log(player_id: int, season: str, season_type: str) -> list[dict[str, Any]]:
-    cache_key = (player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)
+    normalized_season_type = normalize_requested_season_type(season_type)
+    cache_key = (player_id, season, normalized_season_type, GAME_LOG_CACHE_SCHEMA_VERSION)
     cached = GAME_LOG_CACHE.get(cache_key)
     if cached and isinstance(cached.get("rows"), list) and cached["rows"]:
         cached_ts = float(cached.get("timestamp") or 0.0)
         if cached_ts and (time.time() - cached_ts) < CACHE_TTL_SECONDS:
             return cached["rows"]
+    season_parts = season_types_for_analysis(normalized_season_type)
+    if len(season_parts) > 1:
+        if POSTGRES_SOURCE_OF_TRUTH:
+            pg_rows, pg_ts = _pg_read_game_log(player_id, season, normalized_season_type)
+            if isinstance(pg_rows, list) and pg_rows:
+                GAME_LOG_CACHE[cache_key] = {"timestamp": float(pg_ts or time.time()), "rows": pg_rows, "source": "postgres"}
+                return pg_rows
+            if cached and isinstance(cached.get("rows"), list):
+                return cached["rows"]
+        else:
+            if cached and isinstance(cached.get("rows"), list):
+                return cached["rows"]
+            pg_rows, pg_ts = _pg_read_game_log(player_id, season, normalized_season_type)
+            if isinstance(pg_rows, list) and pg_rows:
+                GAME_LOG_CACHE[cache_key] = {"timestamp": float(pg_ts or time.time()), "rows": pg_rows, "source": "postgres"}
+                return pg_rows
+        merged_rows: list[dict[str, Any]] = []
+        for part in season_parts:
+            try:
+                merged_rows.extend(fetch_player_game_log(player_id=player_id, season=season, season_type=part))
+            except HTTPException as exc:
+                if exc.status_code != 404:
+                    raise
+        merged_rows = merge_game_log_rows(merged_rows)
+        if not merged_rows:
+            raise HTTPException(status_code=404, detail="No game logs found for this player and season.")
+        GAME_LOG_CACHE[cache_key] = {"timestamp": time.time(), "rows": merged_rows}
+        _submit_pg_write(_pg_write_game_log, player_id, season, normalized_season_type, GAME_LOG_CACHE_SCHEMA_VERSION, merged_rows)
+        return merged_rows
+    source_season_type = season_parts[0]
     if POSTGRES_SOURCE_OF_TRUTH:
-        pg_rows, pg_ts = _pg_read_game_log(player_id, season, season_type)
+        pg_rows, pg_ts = _pg_read_game_log(player_id, season, source_season_type)
         if isinstance(pg_rows, list) and pg_rows:
             GAME_LOG_CACHE[cache_key] = {"timestamp": float(pg_ts or time.time()), "rows": pg_rows, "source": "postgres"}
             return pg_rows
@@ -4858,17 +5675,26 @@ def fetch_player_game_log(player_id: int, season: str, season_type: str) -> list
     else:
         if cached and isinstance(cached.get("rows"), list):
             return cached["rows"]
-        pg_rows, pg_ts = _pg_read_game_log(player_id, season, season_type)
+        pg_rows, pg_ts = _pg_read_game_log(player_id, season, source_season_type)
         if isinstance(pg_rows, list) and pg_rows:
             GAME_LOG_CACHE[cache_key] = {"timestamp": float(pg_ts or time.time()), "rows": pg_rows, "source": "postgres"}
             return pg_rows
-    rows = PLAYER_DATA_SERVICE.fetch_player_game_log(player_id, season, season_type)
-    _submit_pg_write(_pg_write_game_log, player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION, rows)
+    rows = PLAYER_DATA_SERVICE.fetch_player_game_log(player_id, season, source_season_type)
+    _submit_pg_write(_pg_write_game_log, player_id, season, source_season_type, GAME_LOG_CACHE_SCHEMA_VERSION, rows)
     return rows
 
 
 def fetch_recent_player_game_log(player_id: int, season: str, season_type: str, last_n: int) -> list[dict[str, Any]]:
-    return PLAYER_DATA_SERVICE.fetch_recent_player_game_log(player_id, season, season_type, last_n)
+    normalized_season_type = normalize_requested_season_type(season_type)
+    cache_key = (player_id, season, normalized_season_type, int(last_n), GAME_LOG_CACHE_SCHEMA_VERSION)
+    cached = RECENT_GAME_LOG_CACHE.get(cache_key)
+    now_ts = time.time()
+    if cached and now_ts - float(cached.get("timestamp") or 0.0) < CACHE_TTL_SECONDS:
+        return cached.get("rows") or []
+    full_rows = fetch_player_game_log(player_id=player_id, season=season, season_type=normalized_season_type)
+    recent_rows = full_rows[:last_n]
+    RECENT_GAME_LOG_CACHE[cache_key] = {"timestamp": time.time(), "rows": recent_rows}
+    return recent_rows
 
 
 def _team_roster_cache_is_reliable_stale(cached: dict[str, Any] | None, cache_timestamp: float | None = None) -> bool:
@@ -4911,7 +5737,25 @@ def fetch_common_player_info(player_id: int) -> dict[str, Any]:
 
 
 def fetch_next_game(player_id: int, season: str, season_type: str) -> dict[str, Any] | None:
-    return PLAYER_DATA_SERVICE.fetch_next_game(player_id, season, season_type)
+    normalized_season_type = normalize_requested_season_type(season_type)
+    season_parts = season_types_for_analysis(normalized_season_type)
+    if len(season_parts) == 1:
+        return PLAYER_DATA_SERVICE.fetch_next_game(player_id, season, season_parts[0])
+    next_games: list[dict[str, Any]] = []
+    for part in season_parts:
+        row = PLAYER_DATA_SERVICE.fetch_next_game(player_id, season, part)
+        if isinstance(row, dict) and row:
+            next_games.append(row)
+    if not next_games:
+        return None
+
+    def _next_game_sort_key(row: dict[str, Any]) -> tuple[datetime, str]:
+        game_dt = parse_game_date_any(row.get("GAME_DATE")) or datetime.max
+        game_time = str(row.get("GAME_TIME") or "")
+        return game_dt, game_time
+
+    next_games.sort(key=_next_game_sort_key)
+    return dict(next_games[0])
 
 
 
@@ -5039,7 +5883,7 @@ def resolve_team_next_game(team_id: int | None, primary_player_id: int, season: 
         dt = parse_game_date_any(raw_date)
         if not dt:
             return False
-        return dt.date() < datetime.now().date()
+        return dt.date() < app_now().date()
 
     if team_id:
         cache_key = (team_id, season, season_type)
@@ -5074,6 +5918,56 @@ def resolve_team_next_game(team_id: int | None, primary_player_id: int, season: 
     return row
 
 
+def _rate_limit_identity(request: Request) -> str:
+    forwarded_for = str(request.headers.get("x-forwarded-for") or "").strip()
+    if forwarded_for:
+        first = forwarded_for.split(",")[0].strip()
+        if first:
+            return first
+    if request.client and request.client.host:
+        return str(request.client.host)
+    return "unknown"
+
+
+def enforce_rate_limit(request: Request, scope: str, *, max_requests: int, window_seconds: int | None = None) -> None:
+    if not RATE_LIMIT_ENABLED:
+        return
+    window = max(1, int(window_seconds or RATE_LIMIT_WINDOW_SECONDS))
+    identity = _rate_limit_identity(request)
+    key = f"{scope}:{identity}"
+    now_ts = time.time()
+    with _RATE_LIMIT_LOCK:
+        timestamps = _RATE_LIMIT_BUCKETS.get(key) or []
+        threshold = now_ts - window
+        timestamps = [ts for ts in timestamps if ts >= threshold]
+        if len(timestamps) >= max_requests:
+            retry_after = max(1, int(window - (now_ts - min(timestamps))))
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded for {scope}. Retry in {retry_after}s.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        timestamps.append(now_ts)
+        _RATE_LIMIT_BUCKETS[key] = timestamps
+
+
+def enforce_heavy_rate_limit(request: Request, scope: str) -> None:
+    enforce_rate_limit(
+        request,
+        scope,
+        max_requests=RATE_LIMIT_HEAVY_MAX_REQUESTS,
+        window_seconds=RATE_LIMIT_WINDOW_SECONDS,
+    )
+
+
+def enforce_read_rate_limit(request: Request, scope: str) -> None:
+    enforce_rate_limit(
+        request,
+        scope,
+        max_requests=RATE_LIMIT_READ_MAX_REQUESTS,
+        window_seconds=RATE_LIMIT_WINDOW_SECONDS,
+    )
+
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def root() -> FileResponse:
@@ -5086,7 +5980,8 @@ def health() -> JSONResponse:
 
 
 @app.get("/api/teams")
-def get_teams() -> dict[str, Any]:
+def get_teams(request: Request) -> dict[str, Any]:
+    enforce_read_rate_limit(request, "teams")
     return {
         "results": [
             {
@@ -5102,7 +5997,8 @@ def get_teams() -> dict[str, Any]:
 
 
 @app.get("/api/teams/{team_id}/roster")
-def get_team_roster(team_id: int, season: str | None = None) -> dict[str, Any]:
+def get_team_roster(request: Request, team_id: int, season: str | None = None) -> dict[str, Any]:
+    enforce_read_rate_limit(request, "team_roster")
     selected_season = season or current_nba_season()
     team = TEAM_LOOKUP.get(team_id)
     if not team:
@@ -5162,7 +6058,8 @@ def get_team_roster(team_id: int, season: str | None = None) -> dict[str, Any]:
 
 
 @app.get("/api/teams/{team_id}/injury-report")
-def get_team_injury_report(team_id: int) -> dict[str, Any]:
+def get_team_injury_report(request: Request, team_id: int) -> dict[str, Any]:
+    enforce_read_rate_limit(request, "team_injury_report")
     """Return injury report rows for a specific team, from the latest official NBA PDF."""
     team = TEAM_LOOKUP.get(team_id)
     if not team:
@@ -5200,7 +6097,8 @@ def get_team_injury_report(team_id: int) -> dict[str, Any]:
 
 
 @app.get("/api/players/search")
-def search_players(q: str = Query(..., min_length=1, max_length=50)) -> dict[str, Any]:
+def search_players(request: Request, q: str = Query(..., min_length=1, max_length=50)) -> dict[str, Any]:
+    enforce_read_rate_limit(request, "player_search")
     return {"results": PLAYER_SEARCH_INDEX.search(q, limit=15)}
 
 
@@ -5213,11 +6111,12 @@ def bet_finder(
     line: float = Query(..., ge=0),
     last_n: int = Query(10, ge=3, le=30),
     season: str | None = None,
-    season_type: str = Query("Regular Season"),
+    season_type: str = Query(DEFAULT_SEASON_TYPE),
     min_games: int = Query(5, ge=1, le=30),
     limit: int = Query(8, ge=1, le=20),
 ) -> dict[str, Any]:
     selected_season = season or current_nba_season()
+    season_type = normalize_requested_season_type(season_type)
     stat = stat.upper()
 
     team = TEAM_LOOKUP.get(team_id)
@@ -5391,10 +6290,16 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
     rows = payload.get("rows") or []
     default_last_n = int(payload.get("last_n") or 10)
     selected_season = str(payload.get("season") or current_nba_season())
-    season_type = str(payload.get("season_type") or "Regular Season")
+    season_type = normalize_requested_season_type(payload.get("season_type"))
+    injury_aware = bool(payload.get("injury_aware"))
 
     if not isinstance(rows, list) or not rows:
         raise HTTPException(status_code=400, detail="Please provide at least one market row.")
+
+    request_hash_value = _request_hash("market_scan", payload)
+    cached_run = _pg_read_market_scan_cache(payload, cache_scope="market_scan")
+    if cached_run:
+        return cached_run
 
     _emit_progress(progress_cb, "start", total_rows=len(rows))
 
@@ -5529,31 +6434,168 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
         label="market_scan",
     )
 
-    _emit_progress(progress_cb, "analysis_start", total=len(prepared_rows), workers=max_workers)
+    injury_report_identity = ""
+    boosted_analysis_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
+    player_lookup_cache: dict[tuple[str, int | None], dict[str, Any] | None] = {}
+    without_player_names_cache: dict[tuple[int, ...], list[str]] = {}
+    teammate_impact_cache: dict[int, float] = {}
+    team_injury_context_cache: dict[str, dict[str, Any]] = {}
+    boosted_analysis_lock = Lock()
+    player_lookup_lock = Lock()
+    without_player_names_lock = Lock()
+    teammate_impact_lock = Lock()
+    team_injury_context_lock = Lock()
+    inj_report: dict[str, Any] = {"ok": False, "rows": []}
 
+    def cached_find_player_by_name(player_name: str, team_id: int | None = None) -> dict[str, Any] | None:
+        cache_key = (str(player_name or "").strip().lower(), team_id)
+        with player_lookup_lock:
+            if cache_key in player_lookup_cache:
+                return player_lookup_cache[cache_key]
+        resolved_player = find_player_by_name(player_name, team_id=team_id)
+        with player_lookup_lock:
+            player_lookup_cache.setdefault(cache_key, resolved_player)
+            return player_lookup_cache[cache_key]
+
+    def cached_without_player_names(player_ids_value: list[int]) -> list[str]:
+        cache_key = tuple(normalize_without_player_ids(player_ids_value))
+        with without_player_names_lock:
+            cached_names = without_player_names_cache.get(cache_key)
+        if cached_names is None:
+            resolved_names = resolve_without_player_names(list(cache_key))
+            with without_player_names_lock:
+                without_player_names_cache.setdefault(cache_key, resolved_names)
+                cached_names = without_player_names_cache.get(cache_key) or []
+        return list(cached_names)
+
+    def cached_teammate_impact(player_id_value: int) -> float:
+        normalized_player_id = int(player_id_value or 0)
+        if normalized_player_id <= 0:
+            return 0.0
+        with teammate_impact_lock:
+            cached_impact = teammate_impact_cache.get(normalized_player_id)
+        if cached_impact is None:
+            resolved_impact = teammate_impact_score(
+                normalized_player_id,
+                season=selected_season,
+                season_type=season_type,
+            )
+            with teammate_impact_lock:
+                teammate_impact_cache.setdefault(normalized_player_id, resolved_impact)
+                cached_impact = teammate_impact_cache.get(normalized_player_id)
+        return float(cached_impact or 0.0)
+
+    def get_injured_context_for_team(team_name_value: str, team_id_value: int | None = None) -> dict[str, Any]:
+        cache_key = canonicalize_team_name(team_name_value, team_id=team_id_value)
+        with team_injury_context_lock:
+            cached_payload = team_injury_context_cache.get(cache_key)
+        if cached_payload is not None:
+            return copy.deepcopy(cached_payload)
+
+        rows_inj = INJURY_SERVICE.get_team_rows(inj_report, team_name_value)
+        ids: list[int] = []
+        names: list[str] = []
+        for row_inj in rows_inj:
+            status = str(row_inj.get("status") or "")
+            if status not in UNAVAILABLE_STATUSES and status not in RISKY_STATUSES:
+                continue
+            raw_display = re.sub(r",(?!\s)", ", ", str(row_inj.get("player_display") or "").strip())
+            if raw_display:
+                names.append(raw_display)
+            parts = [p.strip() for p in raw_display.split(",")]
+            lookup_name = f"{parts[1]} {parts[0]}" if len(parts) == 2 else raw_display
+            player_row = (
+                cached_find_player_by_name(lookup_name, team_id=team_id_value)
+                or cached_find_player_by_name(raw_display, team_id=team_id_value)
+                or cached_find_player_by_name(lookup_name)
+                or cached_find_player_by_name(raw_display)
+            )
+            if player_row:
+                ids.append(int(player_row["id"]))
+
+        deduped_ids = sorted(set(ids), key=lambda teammate_id: (-cached_teammate_impact(teammate_id), teammate_id))
+        deduped_names: list[str] = []
+        seen_names: set[str] = set()
+        for name in names:
+            normalized_name = normalize_name(name)
+            if normalized_name in seen_names:
+                continue
+            seen_names.add(normalized_name)
+            deduped_names.append(name)
+        context_payload = {"ids": deduped_ids, "names": deduped_names}
+        with team_injury_context_lock:
+            team_injury_context_cache.setdefault(cache_key, copy.deepcopy(context_payload))
+            context_payload = copy.deepcopy(team_injury_context_cache[cache_key])
+        return context_payload
+
+    if injury_aware:
+        try:
+            inj_report = get_cached_injury_report_payload()
+        except Exception:
+            inj_report = {"ok": False, "rows": []}
+        injury_report_identity = str(
+            inj_report.get("report_url")
+            or inj_report.get("report_label")
+            or inj_report.get("report_timestamp")
+            or ""
+        )
+
+    def _scanner_analysis_key(bulk_row: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            int(bulk_row.get("player_id") or 0),
+            str(bulk_row.get("stat") or ""),
+            float(bulk_row.get("line") or 0.0),
+            int(default_last_n),
+            str(selected_season),
+            str(season_type),
+            int(bulk_row.get("team_id") or 0),
+            int(bulk_row.get("override_opponent_id") or 0),
+        )
+
+    analysis_key_by_row: dict[int, tuple[Any, ...]] = {}
+    seen_analysis_keys: set[tuple[Any, ...]] = set()
+    unique_analysis_jobs: list[tuple[int, dict[str, Any], tuple[Any, ...]]] = []
+    for row_index, bulk_row, *_ in prepared_rows:
+        analysis_key = _scanner_analysis_key(bulk_row)
+        analysis_key_by_row[row_index] = analysis_key
+        if analysis_key not in seen_analysis_keys:
+            seen_analysis_keys.add(analysis_key)
+            unique_analysis_jobs.append((row_index, bulk_row, analysis_key))
+
+    _emit_progress(
+        progress_cb,
+        "analysis_start",
+        total=len(prepared_rows),
+        unique=len(unique_analysis_jobs),
+        workers=max_workers,
+    )
+
+    analysis_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
     if max_workers <= 1:
-        step = max(1, len(prepared_rows) // 10) if prepared_rows else 1
+        step = max(1, len(unique_analysis_jobs) // 10) if unique_analysis_jobs else 1
         done = 0
-        for row_index, bulk_row, *_ in prepared_rows:
+        for row_index, bulk_row, analysis_key in unique_analysis_jobs:
             try:
-                analysis_by_row[row_index] = _build_bulk_prop_item(row_index, bulk_row, defaults, local_cache)
+                analysis_by_key[analysis_key] = _build_bulk_prop_item(row_index, bulk_row, defaults, local_cache)
             except HTTPException as exc:
                 errors.append({"row": row_index, "player_name": bulk_row.get("player_name"), "reason": exc.detail})
             except Exception as exc:
                 errors.append({"row": row_index, "player_name": bulk_row.get("player_name"), "reason": str(exc)})
             done += 1
-            if done % step == 0 or done == len(prepared_rows):
-                _emit_progress(progress_cb, "analysis_progress", done=done, total=len(prepared_rows))
+            if done % step == 0 or done == len(unique_analysis_jobs):
+                _emit_progress(progress_cb, "analysis_progress", done=done, total=len(unique_analysis_jobs))
     else:
-        futures: list[tuple[int, dict[str, Any], Any]] = []
+        futures: list[tuple[int, dict[str, Any], tuple[Any, ...], Any]] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for row_index, bulk_row, *_ in prepared_rows:
-                futures.append((row_index, bulk_row, executor.submit(_build_bulk_prop_item, row_index, bulk_row, defaults, local_cache)))
+            for row_index, bulk_row, analysis_key in unique_analysis_jobs:
+                futures.append(
+                    (row_index, bulk_row, analysis_key, executor.submit(_build_bulk_prop_item, row_index, bulk_row, defaults, local_cache))
+                )
             step = max(1, len(futures) // 10) if futures else 1
             done = 0
-            for row_index, bulk_row, future in futures:
+            for row_index, bulk_row, analysis_key, future in futures:
                 try:
-                    analysis_by_row[row_index] = future.result()
+                    analysis_by_key[analysis_key] = future.result()
                 except HTTPException as exc:
                     errors.append({"row": row_index, "player_name": bulk_row.get("player_name"), "reason": exc.detail})
                 except Exception as exc:
@@ -5562,214 +6604,561 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
                 if done % step == 0 or done == len(futures):
                     _emit_progress(progress_cb, "analysis_progress", done=done, total=len(futures))
 
-    _emit_progress(progress_cb, "analysis_done", total=len(analysis_by_row))
+    for row_index, analysis_key in analysis_key_by_row.items():
+        item = analysis_by_key.get(analysis_key)
+        if item:
+            analysis_by_row[row_index] = item
 
-    results: list[dict[str, Any]] = []
-    scoring_step = max(1, len(prepared_rows) // 10) if prepared_rows else 1
-    scored_count = 0
-    for index, bulk_row, over_odds, under_odds, team_text, opponent_text, team, opponent, team_id, input_game_label in prepared_rows:
+    _emit_progress(
+        progress_cb,
+        "analysis_done",
+        total=len(analysis_by_row),
+        unique=len(analysis_by_key),
+        deduped=max(0, len(prepared_rows) - len(unique_analysis_jobs)),
+    )
+
+    pass1_metrics_by_row: dict[int, dict[str, Any]] = {}
+    pass1_ranked: list[tuple[float, int]] = []
+    for index, bulk_row, over_odds, under_odds, *_ in prepared_rows:
         bulk_item = analysis_by_row.get(index)
         if not bulk_item:
             continue
-        analysis = bulk_item.get("analysis") or {}
-
-        matchup = analysis.get("matchup", {})
-        next_game = matchup.get("next_game") or {}
-        vs_position = matchup.get("vs_position") or {}
-        availability = analysis.get("availability") or {}
-        matchup_delta_pct = vs_position.get("delta_pct") if isinstance(vs_position, dict) else None
-        model_over, model_under = estimate_model_probabilities(
-            hit_rate_pct=float(analysis["hit_rate"]),
-            average=float(analysis["average"]),
+        analysis_pass1 = bulk_item.get("analysis") or {}
+        if not analysis_pass1:
+            continue
+        matchup_pass1 = analysis_pass1.get("matchup") or {}
+        vs_position_pass1 = matchup_pass1.get("vs_position") or {}
+        matchup_delta_pass1 = vs_position_pass1.get("delta_pct") if isinstance(vs_position_pass1, dict) else None
+        pricing_pass1 = build_shared_market_pricing_snapshot(
+            market_row=bulk_row,
+            over_odds=over_odds,
+            under_odds=under_odds,
+            hit_rate_pct=float(analysis_pass1.get("hit_rate") or 0.0),
+            average=float(analysis_pass1.get("average") or 0.0),
             line=float(bulk_row["line"]),
-            matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
             stat=str(bulk_row["stat"]),
-            opportunity=analysis.get("opportunity") or {},
-            team_context=analysis.get("team_context") or {},
-            environment=analysis.get("environment") or {},
+            matchup_delta_pct=float(matchup_delta_pass1) if matchup_delta_pass1 is not None else None,
+            opportunity=analysis_pass1.get("opportunity") or {},
+            team_context=analysis_pass1.get("team_context") or {},
+            environment=analysis_pass1.get("environment") or {},
+            variance=analysis_pass1.get("variance") or {},
+            games_count=int(analysis_pass1.get("games_count") or 0),
+            h2h_games_count=int((analysis_pass1.get("h2h") or {}).get("games_count") or 0),
         )
-        market_probs = fair_implied_probabilities(over_odds, under_odds)
-        implied_over = market_probs.get("over")
-        implied_under = market_probs.get("under")
-        fair_over = bulk_row.get("consensus_over_fair_prob")
-        fair_under = bulk_row.get("consensus_under_fair_prob")
-        if fair_over is None:
-            fair_over = bulk_row.get("over_fair_prob")
-        if fair_under is None:
-            fair_under = bulk_row.get("under_fair_prob")
-        try:
-            fair_over = float(fair_over) if fair_over is not None else implied_over
-        except (TypeError, ValueError):
-            fair_over = implied_over
-        try:
-            fair_under = float(fair_under) if fair_under is not None else implied_under
-        except (TypeError, ValueError):
-            fair_under = implied_under
-        model_over, model_under = apply_market_probability_penalty(
-            model_over,
-            model_under,
-            implied_over=implied_over,
-            implied_under=implied_under,
-        )
-        over_edge = round((model_over - fair_over) * 100, 1) if fair_over is not None else None
-        under_edge = round((model_under - fair_under) * 100, 1) if fair_under is not None else None
-        over_ev = round(model_over * over_odds - 1, 3)
-        under_ev = round(model_under * under_odds - 1, 3)
-
-        if under_ev > over_ev:
-            best_side = "UNDER"
-            best_edge = under_edge if under_edge is not None else round(under_ev * 100, 1)
-            best_ev = under_ev
-            best_model = model_under
-            best_implied = implied_under
-            market_odds = under_odds
+        model_over_pass1 = float(pricing_pass1["raw"]["over_probability"])
+        model_under_pass1 = float(pricing_pass1["raw"]["under_probability"])
+        calibrated_over_pass1 = float(pricing_pass1["calibrated"]["over_probability"])
+        calibrated_under_pass1 = float(pricing_pass1["calibrated"]["under_probability"])
+        implied_over_pass1 = pricing_pass1["market"].get("implied_over")
+        implied_under_pass1 = pricing_pass1["market"].get("implied_under")
+        fair_over_pass1 = float(pricing_pass1["market"]["fair_over"])
+        fair_under_pass1 = float(pricing_pass1["market"]["fair_under"])
+        over_edge_pass1 = float(pricing_pass1["calibrated"]["over_edge_pct"])
+        under_edge_pass1 = float(pricing_pass1["calibrated"]["under_edge_pct"])
+        over_ev_raw_pass1 = float(pricing_pass1["raw"]["over_ev"])
+        under_ev_raw_pass1 = float(pricing_pass1["raw"]["under_ev"])
+        over_ev_calibrated_pass1 = float(pricing_pass1["calibrated"]["over_ev"])
+        under_ev_calibrated_pass1 = float(pricing_pass1["calibrated"]["under_ev"])
+        over_ev_adjusted_pass1 = float(pricing_pass1["adjusted"]["over_ev"])
+        under_ev_adjusted_pass1 = float(pricing_pass1["adjusted"]["under_ev"])
+        if under_ev_calibrated_pass1 > over_ev_calibrated_pass1:
+            best_side_pass1 = "UNDER"
+            best_edge_pass1 = under_edge_pass1
+            best_ev_pass1 = under_ev_adjusted_pass1
+            best_model_pass1 = calibrated_under_pass1
+            best_implied_pass1 = implied_under_pass1
+            best_market_odds_pass1 = under_odds
+            best_ev_raw_pass1 = under_ev_raw_pass1
+            best_ev_calibrated_pass1 = under_ev_calibrated_pass1
+            best_model_raw_pass1 = model_under_pass1
         else:
-            best_side = "OVER"
-            best_edge = over_edge if over_edge is not None else round(over_ev * 100, 1)
-            best_ev = over_ev
-            best_model = model_over
-            best_implied = implied_over
-            market_odds = over_odds
+            best_side_pass1 = "OVER"
+            best_edge_pass1 = over_edge_pass1
+            best_ev_pass1 = over_ev_adjusted_pass1
+            best_model_pass1 = calibrated_over_pass1
+            best_implied_pass1 = implied_over_pass1
+            best_market_odds_pass1 = over_odds
+            best_ev_raw_pass1 = over_ev_raw_pass1
+            best_ev_calibrated_pass1 = over_ev_calibrated_pass1
+            best_model_raw_pass1 = model_over_pass1
 
-        confidence_engine = build_confidence_engine(
-            side=best_side,
-            hit_rate=float(analysis["hit_rate"]),
-            games_count=int(analysis["games_count"]),
-            edge=best_edge,
-            ev=best_ev,
-            matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
-            availability=availability,
-            opportunity=analysis.get("opportunity") or {},
-            team_context=analysis.get("team_context") or {},
-            environment=analysis.get("environment") or {},
-            stat=str(bulk_row["stat"]),
-            player_position=analysis.get("player", {}).get("position") or '',
-            line=float(bulk_row["line"]),
-            average=float(analysis["average"]),
+        availability_pass1 = analysis_pass1.get("availability") or {}
+        games_count_pass1 = int(analysis_pass1.get("games_count") or 0)
+        hit_rate_pass1 = float(analysis_pass1.get("hit_rate") or 0.0)
+        availability_penalty = -30.0 if availability_pass1.get("is_unavailable") else (-8.0 if availability_pass1.get("is_risky") else 0.0)
+        pre_rank_score = (
+            (best_ev_pass1 * 130.0)
+            + (best_edge_pass1 * 1.15)
+            + (hit_rate_pass1 * 0.15)
+            + (min(games_count_pass1, 20) * 0.55)
+            + availability_penalty
         )
+        pass1_metrics_by_row[index] = {
+            "model_over": model_over_pass1,
+            "model_under": model_under_pass1,
+            "calibrated_over": calibrated_over_pass1,
+            "calibrated_under": calibrated_under_pass1,
+            "implied_over": implied_over_pass1,
+            "implied_under": implied_under_pass1,
+            "fair_over": fair_over_pass1,
+            "fair_under": fair_under_pass1,
+            "over_edge_pct": over_edge_pass1,
+            "under_edge_pct": under_edge_pass1,
+            "over_ev": over_ev_adjusted_pass1,
+            "under_ev": under_ev_adjusted_pass1,
+            "over_ev_raw": over_ev_raw_pass1,
+            "under_ev_raw": under_ev_raw_pass1,
+            "over_ev_calibrated": over_ev_calibrated_pass1,
+            "under_ev_calibrated": under_ev_calibrated_pass1,
+            "best_side": best_side_pass1,
+            "best_edge_pct": best_edge_pass1,
+            "best_ev": best_ev_pass1,
+            "best_ev_raw": best_ev_raw_pass1,
+            "best_ev_calibrated": best_ev_calibrated_pass1,
+            "best_model": best_model_pass1,
+            "best_model_raw": best_model_raw_pass1,
+            "best_implied": best_implied_pass1,
+            "market_odds": best_market_odds_pass1,
+            "matchup_delta_pct": matchup_delta_pass1,
+            "calibration_reliability": float(pricing_pass1["reliability"]["reliability"]),
+            "calibration_shrink": float(pricing_pass1["reliability"]["shrink_strength"]),
+        }
+        pass1_ranked.append((pre_rank_score, index))
 
-        display_side = best_side
-        if availability.get("is_unavailable"):
-            display_side = "AVOID"
-        elif availability.get("is_risky"):
-            display_side = f"{best_side}?"
+    full_scoring_targets: set[int] = set(pass1_metrics_by_row.keys())
+    top_k_full_scoring = len(full_scoring_targets)
+    if injury_aware and pass1_ranked:
+        default_top_k = min(len(pass1_ranked), max(40, int(math.ceil(len(pass1_ranked) * 0.35))))
+        requested_top_k = payload.get("scoring_top_k")
+        top_k_full_scoring = default_top_k
+        try:
+            if requested_top_k not in (None, ""):
+                top_k_full_scoring = max(1, min(len(pass1_ranked), int(requested_top_k)))
+        except (TypeError, ValueError):
+            top_k_full_scoring = default_top_k
+        pass1_ranked.sort(key=lambda item: item[0], reverse=True)
+        full_scoring_targets = {row_index for _, row_index in pass1_ranked[:top_k_full_scoring]}
 
-        resolved_team_id = analysis["player"].get("team_id") or team_id
-        resolved_team = TEAM_LOOKUP.get(int(resolved_team_id)) if resolved_team_id else None
-        resolved_team_abbreviation = (
-            (team.get("abbreviation") if team else None)
-            or (resolved_team or {}).get("abbreviation")
-            or (team_text.strip() if team_text else "")
-        )
-        resolved_opponent_abbreviation = (
-            (opponent.get("abbreviation") if opponent else None)
-            or (opponent_text.strip() if opponent_text else "")
-            or next_game.get("opponent_abbreviation")
-        )
-        resolved_matchup_label = input_game_label
-        if not resolved_matchup_label and resolved_team_abbreviation and resolved_opponent_abbreviation:
-            resolved_matchup_label = f"{resolved_team_abbreviation} vs {resolved_opponent_abbreviation}"
+    pass1_rank_by_row: dict[int, int] = {}
+    if pass1_ranked:
+        sorted_pass1_ranked = sorted(pass1_ranked, key=lambda item: item[0], reverse=True)
+        for rank_position, (_, row_index) in enumerate(sorted_pass1_ranked, start=1):
+            pass1_rank_by_row[row_index] = rank_position
 
-        results.append({
-            "row": index,
-            "player": {
-                "id": analysis["player"]["id"],
-                "full_name": analysis["player"]["full_name"],
-                "team_id": resolved_team_id,
-                "team_name": (resolved_team or {}).get("full_name") or analysis["player"].get("team_name") or team_text,
-                "team_abbreviation": resolved_team_abbreviation,
-                "team": resolved_team_abbreviation,
-                "opponent_name": next_game.get("opponent_name") or (opponent.get("full_name") if opponent else opponent_text),
-                "opponent": resolved_opponent_abbreviation,
-                "position": analysis["player"].get("position") or "",
-                "jersey": analysis["player"].get("jersey") or "",
-            },
-            "game_label": resolved_matchup_label,
-            "market": {
-                "stat": str(bulk_row["stat"]),
-                "line": float(bulk_row["line"]),
-                "over_odds": over_odds,
-                "under_odds": under_odds,
-                "over_fair_prob": round(fair_over, 6) if fair_over is not None else None,
-                "under_fair_prob": round(fair_under, 6) if fair_under is not None else None,
-                "hold_percent": bulk_row.get("hold_percent"),
-                "books_count": bulk_row.get("books_count"),
-                "best_over_odds": bulk_row.get("best_over_odds"),
-                "best_under_odds": bulk_row.get("best_under_odds"),
-                "best_over_bookmaker": bulk_row.get("best_over_bookmaker"),
-                "best_under_bookmaker": bulk_row.get("best_under_bookmaker"),
-                "market_implied_line": bulk_row.get("market_implied_line"),
-                "bookmaker_title": bulk_row.get("bookmaker_title"),
-            },
-            "analysis": {
-                "average": analysis["average"],
-                "hit_rate": analysis["hit_rate"],
-                "hit_count": analysis["hit_count"],
-                "games_count": analysis["games_count"],
-                "last_n": analysis["last_n"],
-                "over_streak": compute_recent_hit_streak([game.get("hit") for game in reversed(analysis["games"])]),
-                "last_value": analysis["games"][-1]["value"] if analysis["games"] else None,
+    _emit_progress(
+        progress_cb,
+        "scoring_pass1_done",
+        candidates=len(pass1_ranked),
+        full_scoring=top_k_full_scoring,
+        injury_aware=injury_aware,
+    )
+
+    def _score_prepared_row(
+        prepared_row: tuple[int, dict[str, Any], float, float, str, str, dict[str, Any] | None, dict[str, Any] | None, int | None, str]
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        index, bulk_row, over_odds, under_odds, team_text, opponent_text, team, opponent, team_id, input_game_label = prepared_row
+        bulk_item = analysis_by_row.get(index)
+        if not bulk_item:
+            return None, None
+        try:
+            analysis = copy.deepcopy(bulk_item.get("analysis") or {})
+            base_hit_rate = float(analysis.get("hit_rate") or 0.0)
+            injury_boost = False
+            injury_filter_player_ids: list[int] = []
+            injury_filter_player_names: list[str] = []
+            team_injury_player_names: list[str] = []
+
+            if injury_aware and index in full_scoring_targets and analysis:
+                player_info_for_injury = analysis.get("player") or {}
+                player_id_for_injury = int(player_info_for_injury.get("id") or bulk_item.get("player_id") or 0)
+                team_id_for_injury = int(player_info_for_injury.get("team_id") or 0) or None
+                priority_rank = pass1_rank_by_row.get(index)
+                priority_pool = len(pass1_ranked)
+                combo_plan = _build_injury_combo_plan(
+                    base_hit_rate=base_hit_rate,
+                    priority_rank=priority_rank,
+                    priority_pool=priority_pool,
+                )
+                team_name_for_injury = canonicalize_team_name(
+                    str(player_info_for_injury.get("team_name") or ""),
+                    team_id=team_id_for_injury,
+                )
+                if team_name_for_injury and player_id_for_injury:
+                    injury_context = get_injured_context_for_team(team_name_for_injury, team_id_value=team_id_for_injury)
+                    injury_ids = list(injury_context.get("ids") or [])
+                    team_injury_player_names = (
+                        cached_without_player_names(injury_ids)
+                        if injury_ids
+                        else list(injury_context.get("names") or [])
+                    )
+                    best_usable_combo: tuple[list[int], dict[str, Any], float, int] | None = None
+                    _cache_sentinel = object()
+                    for max_filters in combo_plan:
+                        candidate_ids = injury_ids[:max_filters]
+                        if not candidate_ids:
+                            break
+                        boost_cache_key = (
+                            player_id_for_injury,
+                            str(bulk_row["stat"]),
+                            float(bulk_row["line"]),
+                            int(default_last_n),
+                            str(selected_season),
+                            str(season_type),
+                            tuple(candidate_ids),
+                            int(bulk_row.get("override_opponent_id") or 0),
+                            injury_report_identity,
+                        )
+                        with boosted_analysis_lock:
+                            boosted_analysis = boosted_analysis_cache.get(boost_cache_key, _cache_sentinel)
+                        if boosted_analysis is _cache_sentinel:
+                            cached_boosted_analysis = _get_injury_aware_boost_cache(boost_cache_key)
+                            if cached_boosted_analysis is not None:
+                                boosted_analysis = cached_boosted_analysis
+                            else:
+                                boosted_analysis = build_prop_analysis_payload(
+                                    player_id=player_id_for_injury,
+                                    stat=str(bulk_row["stat"]),
+                                    line=float(bulk_row["line"]),
+                                    last_n=default_last_n,
+                                    season=selected_season,
+                                    season_type=season_type,
+                                    without_player_ids=candidate_ids,
+                                    override_opponent_id=int(bulk_row.get("override_opponent_id") or 0) or None,
+                                )
+                                _set_injury_aware_boost_cache(boost_cache_key, boosted_analysis)
+                            with boosted_analysis_lock:
+                                boosted_analysis_cache[boost_cache_key] = boosted_analysis if isinstance(boosted_analysis, dict) else None
+                        if not isinstance(boosted_analysis, dict):
+                            continue
+                        boosted_games = int(boosted_analysis.get("games_count") or 0)
+                        boosted_hit_rate = float(boosted_analysis.get("hit_rate") or 0.0)
+                        if boosted_games < 5:
+                            continue
+                        if (
+                            best_usable_combo is None
+                            or boosted_hit_rate > best_usable_combo[2]
+                            or (boosted_hit_rate == best_usable_combo[2] and boosted_games > best_usable_combo[3])
+                        ):
+                            best_usable_combo = (list(candidate_ids), copy.deepcopy(boosted_analysis), boosted_hit_rate, boosted_games)
+                        if _should_stop_injury_combo_search(
+                            base_hit_rate=base_hit_rate,
+                            boosted_hit_rate=boosted_hit_rate,
+                            boosted_games=boosted_games,
+                            combo_size=max_filters,
+                            combo_plan=combo_plan,
+                            priority_rank=priority_rank,
+                            priority_pool=priority_pool,
+                        ):
+                            break
+                    if best_usable_combo is not None and float(best_usable_combo[2]) > base_hit_rate:
+                        injury_filter_player_ids = list(best_usable_combo[0])
+                        injury_filter_player_names = cached_without_player_names(injury_filter_player_ids)
+                        analysis = copy.deepcopy(best_usable_combo[1])
+                        injury_boost = True
+
+            matchup = analysis.get("matchup", {})
+            next_game = matchup.get("next_game") or {}
+            vs_position = matchup.get("vs_position") or {}
+            availability = analysis.get("availability") or {}
+            cached_pass1_metrics = pass1_metrics_by_row.get(index)
+            if cached_pass1_metrics and not injury_boost:
+                matchup_delta_pct = cached_pass1_metrics.get("matchup_delta_pct")
+                model_over = float(cached_pass1_metrics.get("model_over") or 0.0)
+                model_under = float(cached_pass1_metrics.get("model_under") or 0.0)
+                implied_over = cached_pass1_metrics.get("implied_over")
+                implied_under = cached_pass1_metrics.get("implied_under")
+                fair_over = cached_pass1_metrics.get("fair_over")
+                fair_under = cached_pass1_metrics.get("fair_under")
+                over_edge_pct = float(cached_pass1_metrics.get("over_edge_pct") or 0.0)
+                under_edge_pct = float(cached_pass1_metrics.get("under_edge_pct") or 0.0)
+                over_ev = float(cached_pass1_metrics.get("over_ev") or 0.0)
+                under_ev = float(cached_pass1_metrics.get("under_ev") or 0.0)
+                over_ev_raw = float(cached_pass1_metrics.get("over_ev_raw") or over_ev)
+                under_ev_raw = float(cached_pass1_metrics.get("under_ev_raw") or under_ev)
+                over_ev_calibrated = float(cached_pass1_metrics.get("over_ev_calibrated") or over_ev)
+                under_ev_calibrated = float(cached_pass1_metrics.get("under_ev_calibrated") or under_ev)
+                best_side = str(cached_pass1_metrics.get("best_side") or "OVER")
+                best_edge_pct = float(cached_pass1_metrics.get("best_edge_pct") or 0.0)
+                best_ev = float(cached_pass1_metrics.get("best_ev") or 0.0)
+                best_ev_raw = float(cached_pass1_metrics.get("best_ev_raw") or best_ev)
+                best_ev_calibrated = float(cached_pass1_metrics.get("best_ev_calibrated") or best_ev)
+                best_model = float(cached_pass1_metrics.get("best_model") or 0.0)
+                best_model_raw = float(cached_pass1_metrics.get("best_model_raw") or best_model)
+                best_implied = cached_pass1_metrics.get("best_implied")
+                market_odds = float(cached_pass1_metrics.get("market_odds") or (over_odds if best_side != "UNDER" else under_odds))
+                calibrated_over = float(cached_pass1_metrics.get("calibrated_over") or model_over)
+                calibrated_under = float(cached_pass1_metrics.get("calibrated_under") or model_under)
+                calibration_reliability = float(cached_pass1_metrics.get("calibration_reliability") or 0.5)
+                calibration_shrink = float(cached_pass1_metrics.get("calibration_shrink") or 0.0)
+            else:
+                matchup_delta_pct = vs_position.get("delta_pct") if isinstance(vs_position, dict) else None
+                pricing_snapshot = build_shared_market_pricing_snapshot(
+                    market_row=bulk_row,
+                    over_odds=over_odds,
+                    under_odds=under_odds,
+                    hit_rate_pct=float(analysis["hit_rate"]),
+                    average=float(analysis["average"]),
+                    line=float(bulk_row["line"]),
+                    stat=str(bulk_row["stat"]),
+                    matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
+                    opportunity=analysis.get("opportunity") or {},
+                    team_context=analysis.get("team_context") or {},
+                    environment=analysis.get("environment") or {},
+                    variance=analysis.get("variance") or {},
+                    games_count=int(analysis.get("games_count") or 0),
+                    h2h_games_count=int((analysis.get("h2h") or {}).get("games_count") or 0),
+                )
+                implied_over = pricing_snapshot["market"].get("implied_over")
+                implied_under = pricing_snapshot["market"].get("implied_under")
+                fair_over = float(pricing_snapshot["market"]["fair_over"])
+                fair_under = float(pricing_snapshot["market"]["fair_under"])
+                model_over = float(pricing_snapshot["raw"]["over_probability"])
+                model_under = float(pricing_snapshot["raw"]["under_probability"])
+                calibrated_over = float(pricing_snapshot["calibrated"]["over_probability"])
+                calibrated_under = float(pricing_snapshot["calibrated"]["under_probability"])
+                over_edge_pct = float(pricing_snapshot["calibrated"]["over_edge_pct"])
+                under_edge_pct = float(pricing_snapshot["calibrated"]["under_edge_pct"])
+                over_ev_raw = float(pricing_snapshot["raw"]["over_ev"])
+                under_ev_raw = float(pricing_snapshot["raw"]["under_ev"])
+                over_ev_calibrated = float(pricing_snapshot["calibrated"]["over_ev"])
+                under_ev_calibrated = float(pricing_snapshot["calibrated"]["under_ev"])
+                over_ev = float(pricing_snapshot["adjusted"]["over_ev"])
+                under_ev = float(pricing_snapshot["adjusted"]["under_ev"])
+                calibration_reliability = float(pricing_snapshot["reliability"]["reliability"])
+                calibration_shrink = float(pricing_snapshot["reliability"]["shrink_strength"])
+
+                if under_ev_calibrated > over_ev_calibrated:
+                    best_side = "UNDER"
+                    best_edge_pct = under_edge_pct
+                    best_ev = under_ev
+                    best_ev_raw = under_ev_raw
+                    best_ev_calibrated = under_ev_calibrated
+                    best_model = calibrated_under
+                    best_model_raw = model_under
+                    best_implied = implied_under
+                    market_odds = under_odds
+                else:
+                    best_side = "OVER"
+                    best_edge_pct = over_edge_pct
+                    best_ev = over_ev
+                    best_ev_raw = over_ev_raw
+                    best_ev_calibrated = over_ev_calibrated
+                    best_model = calibrated_over
+                    best_model_raw = model_over
+                    best_implied = implied_over
+                    market_odds = over_odds
+
+            confidence_engine = build_confidence_engine(
+                side=best_side,
+                hit_rate=float(analysis["hit_rate"]),
+                games_count=int(analysis["games_count"]),
+                edge=best_edge_pct,
+                ev=best_ev,
+                matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
+                availability=availability,
+                opportunity=analysis.get("opportunity") or {},
+                team_context=analysis.get("team_context") or {},
+                environment=analysis.get("environment") or {},
+                stat=str(bulk_row["stat"]),
+                player_position=analysis.get("player", {}).get("position") or '',
+                line=float(bulk_row["line"]),
+                average=float(analysis["average"]),
+            )
+
+            display_side = best_side
+            if availability.get("is_unavailable"):
+                display_side = "AVOID"
+            elif availability.get("is_risky"):
+                display_side = f"{best_side}?"
+
+            resolved_team_id = analysis["player"].get("team_id") or team_id
+            resolved_team = TEAM_LOOKUP.get(int(resolved_team_id)) if resolved_team_id else None
+            resolved_team_abbreviation = (
+                (team.get("abbreviation") if team else None)
+                or (resolved_team or {}).get("abbreviation")
+                or (team_text.strip() if team_text else "")
+            )
+            resolved_opponent_abbreviation = (
+                (opponent.get("abbreviation") if opponent else None)
+                or (opponent_text.strip() if opponent_text else "")
+                or next_game.get("opponent_abbreviation")
+            )
+            resolved_matchup_label = input_game_label
+            if not resolved_matchup_label and resolved_team_abbreviation and resolved_opponent_abbreviation:
+                resolved_matchup_label = f"{resolved_team_abbreviation} vs {resolved_opponent_abbreviation}"
+
+            result_payload = {
+                "row": index,
+                "player": {
+                    "id": analysis["player"]["id"],
+                    "full_name": analysis["player"]["full_name"],
+                    "team_id": resolved_team_id,
+                    "team_name": (resolved_team or {}).get("full_name") or analysis["player"].get("team_name") or team_text,
+                    "team_abbreviation": resolved_team_abbreviation,
+                    "team": resolved_team_abbreviation,
+                    "opponent_name": next_game.get("opponent_name") or (opponent.get("full_name") if opponent else opponent_text),
+                    "opponent": resolved_opponent_abbreviation,
+                    "position": analysis["player"].get("position") or "",
+                    "jersey": analysis["player"].get("jersey") or "",
+                },
+                "game_label": resolved_matchup_label,
+                "market": {
+                    "stat": str(bulk_row["stat"]),
+                    "line": float(bulk_row["line"]),
+                    "over_odds": over_odds,
+                    "under_odds": under_odds,
+                    "over_fair_prob": round(fair_over, 6) if fair_over is not None else None,
+                    "under_fair_prob": round(fair_under, 6) if fair_under is not None else None,
+                    "hold_percent": bulk_row.get("hold_percent"),
+                    "books_count": bulk_row.get("books_count"),
+                    "best_over_odds": bulk_row.get("best_over_odds"),
+                    "best_under_odds": bulk_row.get("best_under_odds"),
+                    "best_over_bookmaker": bulk_row.get("best_over_bookmaker"),
+                    "best_under_bookmaker": bulk_row.get("best_under_bookmaker"),
+                    "market_implied_line": bulk_row.get("market_implied_line"),
+                    "bookmaker_title": bulk_row.get("bookmaker_title"),
+                },
+                "analysis": {
+                    "average": analysis["average"],
+                    "hit_rate": analysis["hit_rate"],
+                    "hit_count": analysis["hit_count"],
+                    "games_count": analysis["games_count"],
+                    "last_n": analysis["last_n"],
+                    "games": analysis.get("games") or [],
+                    # games[0] is most recent across analyzer payloads.
+                    "over_streak": compute_recent_hit_streak([game.get("hit") for game in (analysis.get("games") or [])]),
+                    "last_value": (analysis.get("games") or [{}])[0].get("value") if (analysis.get("games") or []) else None,
+                    "availability": availability,
+                    "player": analysis.get("player") or {},
+                    "matchup": {
+                        "next_game": next_game,
+                        "vs_position": vs_position,
+                    },
+                    "h2h": analysis.get("h2h") or {},
+                    "opportunity": analysis.get("opportunity") or {},
+                    "team_context": analysis.get("team_context") or {},
+                    "environment": analysis.get("environment") or {},
+                    "interpretation": analysis.get("interpretation") or {},
+                },
+                "model": {
+                    "over_probability": round(calibrated_over * 100, 1),
+                    "under_probability": round(calibrated_under * 100, 1),
+                    "over_probability_raw": round(model_over * 100, 1),
+                    "under_probability_raw": round(model_under * 100, 1),
+                    "over_probability_calibrated": round(calibrated_over * 100, 1),
+                    "under_probability_calibrated": round(calibrated_under * 100, 1),
+                    "over_implied": round(implied_over * 100, 1) if implied_over is not None else None,
+                    "under_implied": round(implied_under * 100, 1) if implied_under is not None else None,
+                    "over_fair_probability": round(fair_over * 100, 1) if fair_over is not None else None,
+                    "under_fair_probability": round(fair_under * 100, 1) if fair_under is not None else None,
+                    "over_edge": over_edge_pct,
+                    "under_edge": under_edge_pct,
+                    "over_edge_pct": over_edge_pct,
+                    "under_edge_pct": under_edge_pct,
+                    "edge_definition": EDGE_DEFINITION_MODEL_FAIR,
+                    "over_ev": round(over_ev * 100, 1),
+                    "under_ev": round(under_ev * 100, 1),
+                    "over_ev_raw": round(over_ev_raw * 100, 1),
+                    "under_ev_raw": round(under_ev_raw * 100, 1),
+                    "over_ev_calibrated": round(over_ev_calibrated * 100, 1),
+                    "under_ev_calibrated": round(under_ev_calibrated * 100, 1),
+                },
+                "best_bet": {
+                    "side": best_side,
+                    "display_side": display_side,
+                    "edge": round(best_edge_pct, 1),
+                    "edge_pct": round(best_edge_pct, 1),
+                    "edge_definition": EDGE_DEFINITION_MODEL_FAIR,
+                    "ev": round(best_ev * 100, 1),
+                    "ev_raw": round(best_ev_raw * 100, 1),
+                    "ev_calibrated": round(best_ev_calibrated * 100, 1),
+                    "model_probability": round(best_model * 100, 1),
+                    "model_probability_raw": round(best_model_raw * 100, 1),
+                    "model_probability_calibrated": round(
+                        (calibrated_under if best_side == "UNDER" else calibrated_over) * 100, 1
+                    ),
+                    "implied_probability": round(best_implied * 100, 1) if best_implied is not None else None,
+                    "odds": market_odds,
+                    "calibration_reliability": round(calibration_reliability * 100, 1),
+                    "calibration_shrink": round(calibration_shrink * 100, 1),
+                    "confidence": confidence_engine["grade"],
+                    "confidence_score": confidence_engine["score"],
+                    "confidence_summary": confidence_engine["summary"],
+                    "confidence_tone": confidence_engine["tone"],
+                    "confidence_tier": confidence_engine.get("tier"),
+                    "confidence_tags": confidence_engine.get("tags") or [],
+                    "confidence_components": confidence_engine.get("components") or {},
+                    "market_side": confidence_engine.get("market_side"),
+                    "market_disagrees": confidence_engine.get("market_disagrees"),
+                    "market_penalty": confidence_engine.get("market_penalty"),
+                    "market_support_pct": confidence_engine.get("market_support_pct"),
+                    "ranking_score": confidence_engine.get("ranking_score"),
+                    "playable": not availability.get("is_unavailable", False),
+                    "user_read": analysis.get("interpretation", {}).get("market_takeaway") or confidence_engine["summary"],
+                },
                 "availability": availability,
                 "matchup": {
                     "next_game": next_game,
                     "vs_position": vs_position,
                 },
-                "h2h": analysis.get("h2h") or {},
-                "opportunity": analysis.get("opportunity") or {},
-                "team_context": analysis.get("team_context") or {},
-                "environment": analysis.get("environment") or {},
-                "interpretation": analysis.get("interpretation") or {},
-            },
-            "model": {
-                "over_probability": round(model_over * 100, 1),
-                "under_probability": round(model_under * 100, 1),
-                "over_implied": round(implied_over * 100, 1) if implied_over is not None else None,
-                "under_implied": round(implied_under * 100, 1) if implied_under is not None else None,
-                "over_fair_probability": round(fair_over * 100, 1) if fair_over is not None else None,
-                "under_fair_probability": round(fair_under * 100, 1) if fair_under is not None else None,
-                "over_edge": over_edge,
-                "under_edge": under_edge,
-                "over_ev": round(over_ev * 100, 1),
-                "under_ev": round(under_ev * 100, 1),
-            },
-            "best_bet": {
-                "side": best_side,
-                "display_side": display_side,
-                "edge": round(best_edge, 1) if best_edge is not None else None,
-                "ev": round(best_ev * 100, 1),
-                "model_probability": round(best_model * 100, 1),
-                "implied_probability": round(best_implied * 100, 1) if best_implied is not None else None,
-                "odds": market_odds,
-                "confidence": confidence_engine["grade"],
-                "confidence_score": confidence_engine["score"],
-                "confidence_summary": confidence_engine["summary"],
-                "confidence_tone": confidence_engine["tone"],
-                "confidence_tier": confidence_engine.get("tier"),
-                "confidence_tags": confidence_engine.get("tags") or [],
-                "confidence_components": confidence_engine.get("components") or {},
-                "market_side": confidence_engine.get("market_side"),
-                "market_disagrees": confidence_engine.get("market_disagrees"),
-                "market_penalty": confidence_engine.get("market_penalty"),
-                "market_support_pct": confidence_engine.get("market_support_pct"),
-                "ranking_score": confidence_engine.get("ranking_score"),
-                "playable": not availability.get("is_unavailable", False),
-                "user_read": analysis.get("interpretation", {}).get("market_takeaway") or confidence_engine["summary"],
-            },
-            "availability": availability,
-            "matchup": {
-                "next_game": next_game,
-                "vs_position": vs_position,
-            },
-        })
-        scored_count += 1
-        if scored_count % scoring_step == 0 or scored_count == len(prepared_rows):
-            _emit_progress(progress_cb, "scoring_progress", done=scored_count, total=len(prepared_rows))
+                "injury_boost": injury_boost,
+                "base_hit_rate": round(base_hit_rate, 1),
+                "injury_filter_player_ids": injury_filter_player_ids,
+                "injury_filter_player_names": injury_filter_player_names,
+                "team_injury_player_names": team_injury_player_names,
+            }
+            return result_payload, None
+        except HTTPException as exc:
+            return None, {"row": index, "player_name": str(bulk_row.get("player_name") or ""), "reason": str(exc.detail)}
+        except Exception as exc:
+            return None, {"row": index, "player_name": str(bulk_row.get("player_name") or ""), "reason": str(exc)}
+
+    results: list[dict[str, Any]] = []
+    scoring_jobs = [row for row in prepared_rows if analysis_by_row.get(row[0])]
+    requested_scoring_workers = payload.get("scoring_workers")
+    scoring_workers = max_workers
+    try:
+        if requested_scoring_workers not in (None, ""):
+            scoring_workers = max(1, min(BULK_ANALYSIS_MAX_WORKERS, int(requested_scoring_workers)))
+    except (TypeError, ValueError):
+        scoring_workers = max_workers
+    scoring_workers = min(scoring_workers, max(1, len(scoring_jobs)))
+    scoring_step = max(1, len(scoring_jobs) // 10) if scoring_jobs else 1
+
+    _emit_progress(progress_cb, "scoring_start", total=len(scoring_jobs), workers=scoring_workers)
+
+    scored_count = 0
+    if scoring_workers <= 1:
+        for prepared_row in scoring_jobs:
+            result_item, error_item = _score_prepared_row(prepared_row)
+            if result_item:
+                results.append(result_item)
+            if error_item:
+                errors.append(error_item)
+            scored_count += 1
+            if scored_count % scoring_step == 0 or scored_count == len(scoring_jobs):
+                _emit_progress(progress_cb, "scoring_progress", done=scored_count, total=len(scoring_jobs))
+    else:
+        with ThreadPoolExecutor(max_workers=scoring_workers) as executor:
+            futures = [executor.submit(_score_prepared_row, prepared_row) for prepared_row in scoring_jobs]
+            for future in as_completed(futures):
+                try:
+                    result_item, error_item = future.result()
+                except Exception as exc:
+                    result_item, error_item = None, {"row": 0, "reason": f"Scoring worker failed: {exc}"}
+                if result_item:
+                    results.append(result_item)
+                if error_item:
+                    errors.append(error_item)
+                scored_count += 1
+                if scored_count % scoring_step == 0 or scored_count == len(scoring_jobs):
+                    _emit_progress(progress_cb, "scoring_progress", done=scored_count, total=len(scoring_jobs))
 
     results.sort(
         key=lambda item: (
             item["best_bet"].get("ranking_score") if item["best_bet"].get("ranking_score") is not None else float("-inf"),
             item["best_bet"].get("ev") if item["best_bet"].get("ev") is not None else float("-inf"),
-            item["best_bet"].get("edge") if item["best_bet"].get("edge") is not None else float("-inf"),
+            item["best_bet"].get("edge_pct") if item["best_bet"].get("edge_pct") is not None else item["best_bet"].get("edge") if item["best_bet"].get("edge") is not None else float("-inf"),
             item["analysis"].get("hit_rate") if item["analysis"].get("hit_rate") is not None else float("-inf"),
             item["best_bet"].get("confidence_score", 0),
             -1 * int(item.get("availability", {}).get("sort_rank", 3) or 3),
@@ -5783,21 +7172,24 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
         "season": selected_season,
         "season_type": season_type,
         "last_n": default_last_n,
+        "injury_aware": injury_aware,
         "template": "player_name,stat,line,over_odds,under_odds",
         "results": results,
         "errors": errors,
     }
-    _submit_pg_write(_pg_write_market_scan_run, payload_out)
+    _submit_pg_write(_pg_write_market_scan_run, payload_out, request_hash_value)
     _emit_progress(progress_cb, "done", results=len(results), errors=len(errors))
     return payload_out
 
 
 @app.post("/api/market-scan")
-def market_scan(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def market_scan(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    enforce_heavy_rate_limit(request, "market_scan")
     return _market_scan_core(payload)
 
 @app.post("/api/market-scan/async")
-def market_scan_async(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def market_scan_async(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    enforce_heavy_rate_limit(request, "market_scan_async")
     return submit_async_job("market_scan", _market_scan_core, payload)
 
 @app.get("/api/jobs/{job_id}")
@@ -5806,7 +7198,8 @@ def async_job_status(job_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/market-scan/stream")
-def market_scan_stream(payload: dict[str, Any] = Body(...)) -> StreamingResponse:
+def market_scan_stream(request: Request, payload: dict[str, Any] = Body(...)) -> StreamingResponse:
+    enforce_heavy_rate_limit(request, "market_scan_stream")
     return _stream_with_progress(_market_scan_core, payload)
 
 
@@ -5814,7 +7207,12 @@ def market_scan_stream(payload: dict[str, Any] = Body(...)) -> StreamingResponse
 def odds_events(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     api_key = str(payload.get("api_key") or "").strip()
     sport = str(payload.get("sport") or "basketball_nba")
-    result = odds_api_fetch(f"/sports/{sport}/events", api_key, {"dateFormat": "iso"})
+    result = odds_api_fetch(
+        f"/sports/{sport}/events",
+        api_key,
+        {"dateFormat": "iso"},
+        allow_query_auth_fallback=True,
+    )
     return {
         "events": result["data"],
         "quota": result["quota"],
@@ -5850,6 +7248,7 @@ def odds_player_props_import(payload: dict[str, Any] = Body(...)) -> dict[str, A
             "dateFormat": "iso",
             "bookmakers": ",".join(requested_bookmakers),
         },
+        allow_query_auth_fallback=True,
     )
     event_payload = result["data"] or {}
     import_rows = build_odds_import_rows(event_payload, odds_format)
@@ -5891,7 +7290,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
       odds_format   str         – "decimal" | "american"
       last_n        int         – recent-game sample size for analysis (default 10)
       season        str         – e.g. "2024-25"
-      season_type   str         – "Regular Season"
+      season_type   str         – "Combined" (Regular Season + Playoffs)
       batch_size    int         – events per batch (default 3, keeps credit bursts small)
     """
     # ── Validate inputs ─────────────────────────────────────────────────
@@ -5902,7 +7301,8 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
     if not api_keys:
         raise HTTPException(status_code=400, detail="Provide at least one Odds API key in 'api_keys'.")
 
-    cached_run = _pg_read_parlay_builder_cache(payload)
+    request_hash_value = _request_hash("parlay_builder", payload)
+    cached_run = _pg_read_parlay_builder_cache(payload, cache_scope="parlay_builder")
     if cached_run:
         return cached_run
 
@@ -5917,7 +7317,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
     odds_format  = str(payload.get("odds_format") or "decimal")
     last_n       = int(payload.get("last_n") or 10)
     season       = str(payload.get("season") or current_nba_season())
-    season_type  = str(payload.get("season_type") or "Regular Season")
+    season_type  = normalize_requested_season_type(payload.get("season_type"))
     batch_size   = max(1, int(payload.get("batch_size") or 3))
     requested_bookmakers = parse_requested_bookmakers(payload.get("bookmakers") or payload.get("bookmaker") or ODDS_DEFAULT_BOOKMAKERS)
     markets      = ",".join(ODDS_PARLAY_MARKETS)
@@ -5948,6 +7348,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
                 f"/sports/{sport}/events",
                 next_key(),
                 {"dateFormat": "iso"},
+                allow_query_auth_fallback=True,
             )
         except HTTPException as exc:
             raise HTTPException(status_code=exc.status_code, detail=f"Failed to fetch events: {exc.detail}")
@@ -5971,7 +7372,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
             "message": "No events found for today.",
         }
-        _submit_pg_write(_pg_write_parlay_builder_run, payload)
+        _submit_pg_write(_pg_write_parlay_builder_run, payload, request_hash_value)
         return payload
 
     # ── Phase 2: Fetch odds per event in batches, rotating keys ─────────
@@ -6067,7 +7468,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
             "message": "No props found across today's events. Check your API keys or try again later.",
         }
-        _submit_pg_write(_pg_write_parlay_builder_run, payload)
+        _submit_pg_write(_pg_write_parlay_builder_run, payload, request_hash_value)
         return payload
 
     # ── Phase 3a: Pre-warm game-log cache with one bulk LeagueDash call ────
@@ -6229,6 +7630,13 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
                 odds = float(orig_row.get("under_odds") or 1.91)
                 side_hit_rate = 100.0 - hit_rate
 
+        h2h_games_count, h2h_side_hit_count, h2h_side_hit_rate = compute_side_h2h_metrics(
+            analysis.get("h2h") or {},
+            side,
+        )
+        ranking_hit_rate = h2h_side_hit_rate if h2h_side_hit_rate is not None else side_hit_rate
+        ranking_source = "h2h" if h2h_side_hit_rate is not None else "recent"
+
         # Skip unavailable players
         availability = analysis.get("availability") or {}
         if availability.get("is_unavailable"):
@@ -6281,23 +7689,51 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
                 "is_override": True,
                 "matchup_label": matchup_label or next_game_info.get("matchup_label"),
             })
-        fair_over_prob = orig_row.get("consensus_over_fair_prob")
-        fair_under_prob = orig_row.get("consensus_under_fair_prob")
-        if fair_over_prob is None:
-            fair_over_prob = orig_row.get("over_fair_prob")
-        if fair_under_prob is None:
-            fair_under_prob = orig_row.get("under_fair_prob")
-        if fair_over_prob is None or fair_under_prob is None:
-            market_probs = fair_implied_probabilities(orig_row.get("over_odds"), orig_row.get("under_odds"))
-            if fair_over_prob is None:
-                fair_over_prob = market_probs.get("over")
-            if fair_under_prob is None:
-                fair_under_prob = market_probs.get("under")
-        fair_prob = fair_over_prob if side == "OVER" else fair_under_prob
-        try:
-            fair_prob = float(fair_prob) if fair_prob is not None else decimal_implied_probability(odds)
-        except (TypeError, ValueError):
-            fair_prob = decimal_implied_probability(odds)
+        pricing_snapshot = build_shared_market_pricing_snapshot(
+            market_row=orig_row,
+            over_odds=float(orig_row.get("over_odds") or 0.0),
+            under_odds=float(orig_row.get("under_odds") or 0.0),
+            hit_rate_pct=float(analysis.get("hit_rate") or 0.0),
+            average=float(analysis.get("average") or 0.0),
+            line=float(line),
+            stat=stat,
+            matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
+            opportunity=analysis.get("opportunity") or {},
+            team_context=analysis.get("team_context") or {},
+            environment=analysis.get("environment") or {},
+            variance=analysis.get("variance") or {},
+            games_count=int(analysis.get("games_count") or 0),
+            h2h_games_count=int((analysis.get("h2h") or {}).get("games_count") or 0),
+        )
+        fair_over_prob = pricing_snapshot["market"].get("fair_over")
+        fair_under_prob = pricing_snapshot["market"].get("fair_under")
+        model_over = float(pricing_snapshot["raw"]["over_probability"])
+        model_under = float(pricing_snapshot["raw"]["under_probability"])
+        calibrated_over = float(pricing_snapshot["calibrated"]["over_probability"])
+        calibrated_under = float(pricing_snapshot["calibrated"]["under_probability"])
+
+        if side == "OVER":
+            model_prob = calibrated_over
+            fair_prob = float(fair_over_prob or 0.5)
+            edge_pct = float(pricing_snapshot["calibrated"]["over_edge_pct"])
+            edge_pct_raw = float(pricing_snapshot["raw"]["over_edge_pct"])
+            ev_decimal = float(pricing_snapshot["calibrated"]["over_ev"])
+            ev_decimal_raw = float(pricing_snapshot["raw"]["over_ev"])
+            ev_decimal_adjusted = float(pricing_snapshot["adjusted"]["over_ev"])
+            calibrated_model_prob = calibrated_over
+            calibrated_edge_pct = float(pricing_snapshot["calibrated"]["over_edge_pct"])
+            calibrated_ev_decimal = float(pricing_snapshot["calibrated"]["over_ev"])
+        else:
+            model_prob = calibrated_under
+            fair_prob = float(fair_under_prob or 0.5)
+            edge_pct = float(pricing_snapshot["calibrated"]["under_edge_pct"])
+            edge_pct_raw = float(pricing_snapshot["raw"]["under_edge_pct"])
+            ev_decimal = float(pricing_snapshot["calibrated"]["under_ev"])
+            ev_decimal_raw = float(pricing_snapshot["raw"]["under_ev"])
+            ev_decimal_adjusted = float(pricing_snapshot["adjusted"]["under_ev"])
+            calibrated_model_prob = calibrated_under
+            calibrated_edge_pct = float(pricing_snapshot["calibrated"]["under_edge_pct"])
+            calibrated_ev_decimal = float(pricing_snapshot["calibrated"]["under_ev"])
         enriched_environment = enrich_environment_with_market_context(
             analysis.get("environment") or {},
             orig_row,
@@ -6308,8 +7744,8 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             side=side,
             hit_rate=float(side_hit_rate),
             games_count=int(analysis.get("games_count") or 0),
-            edge=round((side_hit_rate / 100.0 - fair_prob) * 100.0, 1) if fair_prob is not None else round(abs(avg - line), 1),
-            ev=round(((side_hit_rate / 100.0) * odds - 1.0) * 100.0, 1) if (odds and odds > 1.0) else round((side_hit_rate / 100.0 - fair_prob) * 100.0, 1) if fair_prob is not None else 0.0,
+            edge=edge_pct,
+            ev=ev_decimal,
             matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
             availability=availability,
             opportunity=analysis.get("opportunity") or {},
@@ -6363,9 +7799,18 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             "side": side,
             "odds": odds,
             "hit_rate": round(side_hit_rate, 1),
+            "ranking_hit_rate": round(ranking_hit_rate, 1),
+            "ranking_source": ranking_source,
+            "h2h_games_count": h2h_games_count,
+            "h2h_hit_count": h2h_side_hit_count,
+            "h2h_hit_rate": round(h2h_side_hit_rate, 1) if h2h_side_hit_rate is not None else None,
             "average": round(avg, 2),
             "games_count": int(analysis.get("games_count") or 0),
             "last_n": int(analysis.get("last_n") or last_n),
+            "model_probability": round(model_prob * 100.0, 1),
+            "model_probability_raw": round((model_under if side == "UNDER" else model_over) * 100.0, 1),
+            "model_probability_calibrated": round(calibrated_model_prob * 100.0, 1),
+            "implied_probability": round(fair_prob * 100.0, 1),
             "bookmaker": orig_row.get("bookmaker_title") or "N/A",
             "market_key": orig_row.get("market_key") or "",
             "availability_label": availability.get("label") or "Active",
@@ -6382,22 +7827,40 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             "market_disagrees": confidence_engine.get("market_disagrees"),
             "market_penalty": confidence_engine.get("market_penalty"),
             "ranking_score": confidence_engine.get("ranking_score"),
+            "edge_pct": edge_pct,
+            "edge_definition": EDGE_DEFINITION_MODEL_FAIR,
+            "edge": edge_pct,
+            "edge_raw": edge_pct_raw,
+            "ev": ev_decimal_adjusted,
+            "ev_raw": ev_decimal_raw,
+            "calibrated_edge_pct": calibrated_edge_pct,
+            "calibrated_ev": calibrated_ev_decimal,
+            "calibration_reliability": round(float(pricing_snapshot["reliability"]["reliability"]) * 100.0, 1),
+            "calibration_shrink": round(float(pricing_snapshot["reliability"]["shrink_strength"]) * 100.0, 1),
             "event_id": orig_row.get("event_id") or "",
             "game_label": orig_row.get("game_label") or "",
             "home_team": orig_row.get("home_team") or "",
             "away_team": orig_row.get("away_team") or "",
             "books_count": orig_row.get("books_count") or 1,
             "hold_percent": orig_row.get("hold_percent"),
-            "fair_probability": round(fair_prob * 100.0, 1) if fair_prob is not None else None,
+            "fair_probability": round(fair_prob * 100.0, 1),
             "best_over_odds": orig_row.get("best_over_odds"),
             "best_under_odds": orig_row.get("best_under_odds"),
             "best_over_bookmaker": orig_row.get("best_over_bookmaker"),
             "best_under_bookmaker": orig_row.get("best_under_bookmaker"),
         })
 
-    # Sort by market-adjusted confidence first so sides fighting the market
-    # do not float to the top on raw hit rate alone.
-    scored.sort(key=lambda x: (x.get("ranking_score", x["confidence_score"]), x["hit_rate"], x["odds"]), reverse=True)
+    # Primary rank: opponent-specific H2H side hit rate.
+    # Fallback: regular side hit rate when no H2H sample exists.
+    scored.sort(
+        key=lambda x: (
+            x.get("ranking_hit_rate", x.get("hit_rate", 0)),
+            x.get("h2h_games_count", 0),
+            x.get("ranking_score", x["confidence_score"]),
+            x["odds"],
+        ),
+        reverse=True,
+    )
 
     # Pick top N and annotate why each row was selected or skipped.
     parlay_legs = annotate_parlay_selection(scored, legs)
@@ -6434,22 +7897,25 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
         "bookmakers": requested_bookmakers,
         "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
     }
-    _submit_pg_write(_pg_write_parlay_builder_run, payload)
+    _submit_pg_write(_pg_write_parlay_builder_run, payload, request_hash_value)
     return payload
 
 
 @app.post("/api/parlay-builder")
-def parlay_builder(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def parlay_builder(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    enforce_heavy_rate_limit(request, "parlay_builder")
     return _parlay_builder_core(payload)
 
 
 @app.post("/api/parlay-builder/async")
-def parlay_builder_async(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def parlay_builder_async(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    enforce_heavy_rate_limit(request, "parlay_builder_async")
     return submit_async_job("parlay_builder", _parlay_builder_core, payload)
 
 
 @app.post("/api/parlay-builder/stream")
-def parlay_builder_stream(payload: dict[str, Any] = Body(...)) -> StreamingResponse:
+def parlay_builder_stream(request: Request, payload: dict[str, Any] = Body(...)) -> StreamingResponse:
+    enforce_heavy_rate_limit(request, "parlay_builder_stream")
     return _stream_with_progress(_parlay_builder_core, payload)
 
 
@@ -6508,7 +7974,8 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
     if not api_keys:
         raise HTTPException(status_code=400, detail="Provide at least one Odds API key in 'api_keys'.")
 
-    cached_run = _pg_read_parlay_builder_cache(payload)
+    request_hash_value = _request_hash("parlay_builder_injury_aware", payload)
+    cached_run = _pg_read_parlay_builder_cache(payload, cache_scope="parlay_builder_injury_aware")
     if cached_run:
         return cached_run
 
@@ -6521,7 +7988,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
     odds_format = str(payload.get("odds_format") or "decimal")
     last_n      = int(payload.get("last_n") or 10)
     season      = str(payload.get("season") or current_nba_season())
-    season_type = str(payload.get("season_type") or "Regular Season")
+    season_type = normalize_requested_season_type(payload.get("season_type"))
     batch_size  = max(1, int(payload.get("batch_size") or 3))
     requested_bookmakers = parse_requested_bookmakers(payload.get("bookmakers") or payload.get("bookmaker") or ODDS_DEFAULT_BOOKMAKERS)
     markets     = ",".join(ODDS_PARLAY_MARKETS)
@@ -6544,7 +8011,12 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         events: list[dict[str, Any]] = [{"id": eid} for eid in requested_event_ids]
     else:
         try:
-            events_result = odds_api_fetch(f"/sports/{sport}/events", next_key(), {"dateFormat": "iso"})
+            events_result = odds_api_fetch(
+                f"/sports/{sport}/events",
+                next_key(),
+                {"dateFormat": "iso"},
+                allow_query_auth_fallback=True,
+            )
         except HTTPException as exc:
             raise HTTPException(status_code=exc.status_code, detail=f"Failed to fetch events: {exc.detail}")
         events = events_result["data"] or []
@@ -6553,10 +8025,12 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
     _emit_progress(progress_cb, "events_resolved", events=len(events))
 
     if not events:
-        return {"legs": legs, "parlay": [], "parlay_odds": None, "all_props_scored": [],
-                "events_scraped": 0, "props_found": 0, "errors": [], "quota_log": quota_log,
-                "bookmakers": requested_bookmakers, "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
-                "injury_summary": [], "message": "No events found for today."}
+        payload_out = {"legs": legs, "parlay": [], "parlay_odds": None, "all_props_scored": [],
+                       "events_scraped": 0, "props_found": 0, "errors": [], "quota_log": quota_log,
+                       "bookmakers": requested_bookmakers, "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
+                       "injury_summary": [], "message": "No events found for today."}
+        _submit_pg_write(_pg_write_parlay_builder_run, payload_out, request_hash_value)
+        return payload_out
 
     all_import_rows: list[dict[str, Any]] = []
     scrape_errors: list[dict[str, Any]] = []
@@ -6623,11 +8097,13 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         )
 
     if not all_import_rows:
-        return {"legs": legs, "parlay": [], "parlay_odds": None, "all_props_scored": [],
-                "events_scraped": len(events), "props_found": 0, "errors": scrape_errors,
-                "quota_log": quota_log, "bookmakers": requested_bookmakers,
-                "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers), "injury_summary": [],
-                "message": "No props found across today's events. Check your API keys or try again later."}
+        payload_out = {"legs": legs, "parlay": [], "parlay_odds": None, "all_props_scored": [],
+                       "events_scraped": len(events), "props_found": 0, "errors": scrape_errors,
+                       "quota_log": quota_log, "bookmakers": requested_bookmakers,
+                       "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers), "injury_summary": [],
+                       "message": "No props found across today's events. Check your API keys or try again later."}
+        _submit_pg_write(_pg_write_parlay_builder_run, payload_out, request_hash_value)
+        return payload_out
 
     # Pre-warm caches (same as regular parlay builder)
     try:
@@ -6655,9 +8131,16 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
     except Exception:
         inj_report = {"ok": False, "rows": []}
 
+    injury_report_identity = str(
+        inj_report.get("report_url")
+        or inj_report.get("report_label")
+        or inj_report.get("report_timestamp")
+        or ""
+    )
+
     player_lookup_cache: dict[tuple[str, int | None], dict[str, Any] | None] = {}
     without_player_names_cache: dict[tuple[int, ...], list[str]] = {}
-    boosted_analysis_cache: dict[tuple[int, str, float, int, str, str, tuple[int, ...]], dict[str, Any] | None] = {}
+    boosted_analysis_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
     teammate_impact_cache: dict[int, float] = {}
 
     def cached_find_player_by_name(player_name: str, team_id: int | None = None) -> dict[str, Any] | None:
@@ -6681,26 +8164,47 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         return float(teammate_impact_cache[normalized_player_id])
 
     # Build per-team injured player IDs cache: team_name → list[int]
-    _team_injured_ids_cache: dict[str, list[int]] = {}
+    _team_injury_context_cache: dict[str, dict[str, Any]] = {}
 
-    def get_injured_ids_for_team(team_name: str) -> list[int]:
-        if team_name in _team_injured_ids_cache:
-            return _team_injured_ids_cache[team_name]
+    def get_injured_context_for_team(team_name: str, team_id: int | None = None) -> dict[str, Any]:
+        cache_key = canonicalize_team_name(team_name, team_id=team_id)
+        if cache_key in _team_injury_context_cache:
+            return copy.deepcopy(_team_injury_context_cache[cache_key])
         rows_inj = INJURY_SERVICE.get_team_rows(inj_report, team_name)
         ids: list[int] = []
+        names: list[str] = []
         for row in rows_inj:
             status = str(row.get("status") or "")
             if status not in UNAVAILABLE_STATUSES and status not in RISKY_STATUSES:
                 continue
             raw_disp = re.sub(r",(?!\s)", ", ", str(row.get("player_display") or "").strip())
+            if raw_disp:
+                names.append(raw_disp)
             parts = [p.strip() for p in raw_disp.split(",")]
             name_lk = f"{parts[1]} {parts[0]}" if len(parts) == 2 else raw_disp
-            player = cached_find_player_by_name(name_lk)
+            player = (
+                cached_find_player_by_name(name_lk, team_id=team_id)
+                or cached_find_player_by_name(raw_disp, team_id=team_id)
+                or cached_find_player_by_name(name_lk)
+                or cached_find_player_by_name(raw_disp)
+            )
             if player:
                 ids.append(int(player["id"]))
-        ids.sort(key=lambda teammate_id: (-cached_teammate_impact(teammate_id), teammate_id))
-        _team_injured_ids_cache[team_name] = ids
-        return ids
+        deduped_ids = sorted(set(ids), key=lambda teammate_id: (-cached_teammate_impact(teammate_id), teammate_id))
+        deduped_names = []
+        seen_names: set[str] = set()
+        for name in names:
+            normalized_name = normalize_name(name)
+            if normalized_name in seen_names:
+                continue
+            seen_names.add(normalized_name)
+            deduped_names.append(name)
+        payload = {
+            "ids": deduped_ids,
+            "names": deduped_names,
+        }
+        _team_injury_context_cache[cache_key] = copy.deepcopy(payload)
+        return payload
 
     defaults = {"last_n": last_n, "season": season, "season_type": season_type}
     local_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -6838,29 +8342,49 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         team_injury_player_names: list[str] = []
         base_hit_rate = hit_rate
         base_games_count = int(analysis.get("games_count") or 0)
+        base_over_hit_count = int(analysis.get("hit_count") or 0)
+        active_games_count = base_games_count
+        active_over_hit_count = base_over_hit_count
+        active_h2h_payload: dict[str, Any] = copy.deepcopy(analysis.get("h2h") or {})
 
         if team_name and player_id:
-            inj_ids = get_injured_ids_for_team(team_name)
+            injury_context = get_injured_context_for_team(team_name, team_id=int(team_id_raw) if team_id_raw else None)
+            inj_ids = list(injury_context.get("ids") or [])
             # Collect names for display
-            team_injury_player_names = cached_without_player_names(inj_ids)
-            best_usable_combo: tuple[list[int], float, float, int] | None = None
+            team_injury_player_names = cached_without_player_names(inj_ids) if inj_ids else list(injury_context.get("names") or [])
+            best_usable_combo: tuple[list[int], float, float, int, int, dict[str, Any]] | None = None
+            combo_plan = _build_injury_combo_plan(base_hit_rate=base_hit_rate)
             # Try top 1, top 2, then top 3 impacted absences.
-            for max_filters in [1, 2, 3]:
+            for max_filters in combo_plan:
                 candidate_ids = inj_ids[:max_filters]
                 if not candidate_ids:
                     break
                 try:
-                    boost_cache_key = (player_id, stat, float(line), int(last_n), str(season), str(season_type), tuple(candidate_ids))
+                    boost_cache_key = (
+                        player_id,
+                        stat,
+                        float(line),
+                        int(last_n),
+                        str(season),
+                        str(season_type),
+                        tuple(candidate_ids),
+                        injury_report_identity,
+                    )
                     if boost_cache_key not in boosted_analysis_cache:
-                        boosted_analysis_cache[boost_cache_key] = build_prop_analysis_payload(
-                            player_id=player_id,
-                            stat=stat,
-                            line=line,
-                            last_n=last_n,
-                            season=season,
-                            season_type=season_type,
-                            without_player_ids=candidate_ids,
-                        )
+                        cached_boosted_analysis = _get_injury_aware_boost_cache(boost_cache_key)
+                        if cached_boosted_analysis is not None:
+                            boosted_analysis_cache[boost_cache_key] = cached_boosted_analysis
+                        else:
+                            boosted_analysis_cache[boost_cache_key] = build_prop_analysis_payload(
+                                player_id=player_id,
+                                stat=stat,
+                                line=line,
+                                last_n=last_n,
+                                season=season,
+                                season_type=season_type,
+                                without_player_ids=candidate_ids,
+                            )
+                            _set_injury_aware_boost_cache(boost_cache_key, boosted_analysis_cache[boost_cache_key])
                     boosted_analysis = boosted_analysis_cache[boost_cache_key]
                     if not boosted_analysis:
                         break
@@ -6868,16 +8392,35 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
                     boosted_hr    = float(boosted_analysis.get("hit_rate") or 0)
                     if boosted_games >= 5:
                         boosted_avg = float(boosted_analysis.get("average") or avg)
+                        boosted_over_hit_count = int(boosted_analysis.get("hit_count") or 0)
                         if best_usable_combo is None or boosted_hr > best_usable_combo[1] or (
                             boosted_hr == best_usable_combo[1] and boosted_games > best_usable_combo[3]
                         ):
-                            best_usable_combo = (list(candidate_ids), boosted_hr, boosted_avg, boosted_games)
+                            best_usable_combo = (
+                                list(candidate_ids),
+                                boosted_hr,
+                                boosted_avg,
+                                boosted_games,
+                                boosted_over_hit_count,
+                                copy.deepcopy(boosted_analysis.get("h2h") or {}),
+                            )
+                        if _should_stop_injury_combo_search(
+                            base_hit_rate=base_hit_rate,
+                            boosted_hit_rate=boosted_hr,
+                            boosted_games=boosted_games,
+                            combo_size=max_filters,
+                            combo_plan=combo_plan,
+                        ):
+                            break
                 except Exception:
                     break
             if best_usable_combo is not None:
                 injury_filter_player_ids = list(best_usable_combo[0])
                 injury_filter_player_names = cached_without_player_names(injury_filter_player_ids)
                 base_games_count = int(best_usable_combo[3])
+                active_games_count = int(best_usable_combo[3])
+                active_over_hit_count = int(best_usable_combo[4])
+                active_h2h_payload = copy.deepcopy(best_usable_combo[5] or {})
                 if float(best_usable_combo[1]) > hit_rate:
                     hit_rate = float(best_usable_combo[1])
                     avg = float(best_usable_combo[2])
@@ -6888,19 +8431,31 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             side = recommended_side
             if side == "OVER":
                 odds = float(orig_row.get("over_odds") or 1.91)
-                side_hit_rate = hit_rate
             else:
                 odds = float(orig_row.get("under_odds") or 1.91)
-                side_hit_rate = 100.0 - hit_rate
         else:
             if hit_rate >= 50:
                 side = "OVER"
                 odds = float(orig_row.get("over_odds") or 1.91)
-                side_hit_rate = hit_rate
             else:
                 side = "UNDER"
                 odds = float(orig_row.get("under_odds") or 1.91)
-                side_hit_rate = 100.0 - hit_rate
+
+        # Always compute displayed sample hits/rate from real filtered rows, not from rounded percentages.
+        clamped_games_count = max(0, int(active_games_count))
+        clamped_over_hits = max(0, min(clamped_games_count, int(active_over_hit_count)))
+        if side == "OVER":
+            side_hit_count = clamped_over_hits
+        else:
+            side_hit_count = max(0, clamped_games_count - clamped_over_hits)
+        side_hit_rate = round((side_hit_count / clamped_games_count) * 100.0, 1) if clamped_games_count > 0 else 0.0
+
+        h2h_games_count, h2h_side_hit_count, h2h_side_hit_rate = compute_side_h2h_metrics(
+            active_h2h_payload or {},
+            side,
+        )
+        ranking_hit_rate = h2h_side_hit_rate if h2h_side_hit_rate is not None else side_hit_rate
+        ranking_source = "h2h" if h2h_side_hit_rate is not None else "recent"
 
         if odds < 1.40:
             return None
@@ -6948,39 +8503,54 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
                 "is_override": True,
                 "matchup_label": matchup_label or next_game_info.get("matchup_label"),
             })
-        fair_over_prob = orig_row.get("consensus_over_fair_prob")
-        fair_under_prob = orig_row.get("consensus_under_fair_prob")
-        if fair_over_prob is None:
-            fair_over_prob = orig_row.get("over_fair_prob")
-        if fair_under_prob is None:
-            fair_under_prob = orig_row.get("under_fair_prob")
-        if fair_over_prob is None or fair_under_prob is None:
-            market_probs = fair_implied_probabilities(orig_row.get("over_odds"), orig_row.get("under_odds"))
-            if fair_over_prob is None:
-                fair_over_prob = market_probs.get("over")
-            if fair_under_prob is None:
-                fair_under_prob = market_probs.get("under")
-        fair_prob = fair_over_prob if side == "OVER" else fair_under_prob
-        try:
-            fair_prob = float(fair_prob) if fair_prob is not None else decimal_implied_probability(odds)
-        except (TypeError, ValueError):
-            fair_prob = decimal_implied_probability(odds)
+        pricing_snapshot = build_shared_market_pricing_snapshot(
+            market_row=orig_row,
+            over_odds=float(orig_row.get("over_odds") or 0.0),
+            under_odds=float(orig_row.get("under_odds") or 0.0),
+            hit_rate_pct=float(hit_rate),
+            average=float(avg),
+            line=float(line),
+            stat=stat,
+            matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
+            opportunity=analysis.get("opportunity") or {},
+            team_context=analysis.get("team_context") or {},
+            environment=analysis.get("environment") or {},
+            variance=analysis.get("variance") or {},
+            games_count=int(analysis.get("games_count") or 0),
+            h2h_games_count=int((analysis.get("h2h") or {}).get("games_count") or 0),
+        )
+        fair_over_prob = pricing_snapshot["market"].get("fair_over")
+        fair_under_prob = pricing_snapshot["market"].get("fair_under")
+        model_over = float(pricing_snapshot["raw"]["over_probability"])
+        model_under = float(pricing_snapshot["raw"]["under_probability"])
+        calibrated_over = float(pricing_snapshot["calibrated"]["over_probability"])
+        calibrated_under = float(pricing_snapshot["calibrated"]["under_probability"])
+        if side == "OVER":
+            model_prob = calibrated_over
+            fair_prob = float(fair_over_prob or 0.5)
+            _computed_edge = float(pricing_snapshot["calibrated"]["over_edge_pct"])
+            _computed_edge_raw = float(pricing_snapshot["raw"]["over_edge_pct"])
+            _computed_ev = float(pricing_snapshot["adjusted"]["over_ev"])
+            _computed_ev_raw = float(pricing_snapshot["raw"]["over_ev"])
+            calibrated_model_prob = calibrated_over
+            calibrated_edge_pct = float(pricing_snapshot["calibrated"]["over_edge_pct"])
+            calibrated_ev = float(pricing_snapshot["calibrated"]["over_ev"])
+        else:
+            model_prob = calibrated_under
+            fair_prob = float(fair_under_prob or 0.5)
+            _computed_edge = float(pricing_snapshot["calibrated"]["under_edge_pct"])
+            _computed_edge_raw = float(pricing_snapshot["raw"]["under_edge_pct"])
+            _computed_ev = float(pricing_snapshot["adjusted"]["under_ev"])
+            _computed_ev_raw = float(pricing_snapshot["raw"]["under_ev"])
+            calibrated_model_prob = calibrated_under
+            calibrated_edge_pct = float(pricing_snapshot["calibrated"]["under_edge_pct"])
+            calibrated_ev = float(pricing_snapshot["calibrated"]["under_ev"])
         enriched_environment = enrich_environment_with_market_context(
             analysis.get("environment") or {},
             orig_row,
             player_team_name=team_name,
             player_team_abbreviation=player_info.get("team_abbreviation") or "",
         )
-        _computed_edge = round((side_hit_rate / 100.0 - fair_prob) * 100.0, 1) if fair_prob is not None else round(abs(avg - line), 1)
-        # True EV: (hit_rate × decimal_odds) - 1, expressed as a percentage
-        # This differs from Edge because it accounts for the payout multiplier,
-        # not just the implied probability gap.
-        _p = side_hit_rate / 100.0
-        if odds and odds > 1.0:
-            _computed_ev = round((_p * odds - 1.0) * 100.0, 1)
-        else:
-            # Fallback: no payout info — use edge as proxy
-            _computed_ev = _computed_edge
         confidence_engine = build_confidence_engine(
             side=side, hit_rate=float(side_hit_rate), games_count=base_games_count,
             edge=_computed_edge,
@@ -7027,12 +8597,29 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             "opponent_abbreviation": str(opponent_info.get("opponent_abbreviation") or ""),
             "stat": stat, "line": line, "side": side, "odds": odds,
             "hit_rate": round(side_hit_rate, 1),
+            "ranking_hit_rate": round(ranking_hit_rate, 1),
+            "ranking_source": ranking_source,
+            "h2h_games_count": h2h_games_count,
+            "h2h_hit_count": h2h_side_hit_count,
+            "h2h_hit_rate": round(h2h_side_hit_rate, 1) if h2h_side_hit_rate is not None else None,
             "base_hit_rate": round(base_hit_rate, 1),
             "average": round(avg, 2),
-            "games_count": base_games_count,
-            "hit_count": int(round(base_games_count * side_hit_rate / 100.0)) if base_games_count > 0 else int(analysis.get("hit_count") or 0),
+            "games_count": clamped_games_count,
+            "hit_count": side_hit_count,
             "ev": _computed_ev,
+            "ev_raw": _computed_ev_raw,
             "edge": _computed_edge,
+            "edge_raw": _computed_edge_raw,
+            "edge_pct": _computed_edge,
+            "edge_definition": EDGE_DEFINITION_MODEL_FAIR,
+            "model_probability": round(model_prob * 100.0, 1),
+            "model_probability_raw": round((model_under if side == "UNDER" else model_over) * 100.0, 1),
+            "model_probability_calibrated": round(calibrated_model_prob * 100.0, 1),
+            "implied_probability": round(fair_prob * 100.0, 1),
+            "calibrated_edge_pct": calibrated_edge_pct,
+            "calibrated_ev": calibrated_ev,
+            "calibration_reliability": round(float(pricing_snapshot["reliability"]["reliability"]) * 100.0, 1),
+            "calibration_shrink": round(float(pricing_snapshot["reliability"]["shrink_strength"]) * 100.0, 1),
             "last_n": last_n,
             "bookmaker": orig_row.get("bookmaker_title") or "N/A",
             "market_key": orig_row.get("market_key") or "",
@@ -7058,6 +8645,10 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             "injury_boost": injury_boost,
             "injury_filter_player_ids": injury_filter_player_ids,
             "injury_filter_player_names": injury_filter_player_names,
+            "injury_filter_count": len(injury_filter_player_ids),
+            "injury_filter_mode": (
+                "combo" if len(injury_filter_player_ids) > 1 else ("single" if len(injury_filter_player_ids) == 1 else "none")
+            ),
             "team_injury_player_names": team_injury_player_names,
             "books_count": orig_row.get("books_count") or 1,
             "hold_percent": orig_row.get("hold_percent"),
@@ -7077,7 +8668,15 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         if idx % scoring_step == 0 or idx == len(analysis_rows):
             _emit_progress(progress_cb, "scoring_progress", done=idx, total=len(analysis_rows))
 
-    scored.sort(key=lambda x: (x.get("ranking_score", x["confidence_score"]), x["hit_rate"], x["odds"]), reverse=True)
+    scored.sort(
+        key=lambda x: (
+            x.get("ranking_hit_rate", x.get("hit_rate", 0)),
+            x.get("h2h_games_count", 0),
+            x.get("ranking_score", x["confidence_score"]),
+            x["odds"],
+        ),
+        reverse=True,
+    )
 
     # Pick top N and annotate why each row was selected or skipped.
     parlay_legs = annotate_parlay_selection(scored, legs)
@@ -7093,12 +8692,19 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
     all_team_names: set[str] = {p.get("team_name", "") for p in scored if p.get("team_name")}
     injury_summary: list[dict[str, Any]] = []
     for tn in sorted(all_team_names):
-        inj_ids = get_injured_ids_for_team(tn)
+        injury_context = get_injured_context_for_team(tn)
+        inj_ids = list(injury_context.get("ids") or [])
         if inj_ids:
             injury_summary.append({
                 "team_name": tn,
                 "injured_player_names": cached_without_player_names(inj_ids),
                 "count": len(inj_ids),
+            })
+        elif injury_context.get("names"):
+            injury_summary.append({
+                "team_name": tn,
+                "injured_player_names": list(injury_context.get("names") or []),
+                "count": len(injury_context.get("names") or []),
             })
 
     all_errors = scrape_errors + analysis_errors
@@ -7124,22 +8730,25 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
         "injury_summary": injury_summary,
     }
-    _submit_pg_write(_pg_write_parlay_builder_run, payload)
+    _submit_pg_write(_pg_write_parlay_builder_run, payload, request_hash_value)
     return payload
 
 
 @app.post("/api/parlay-builder-injury-aware")
-def parlay_builder_injury_aware(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def parlay_builder_injury_aware(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    enforce_heavy_rate_limit(request, "parlay_builder_injury_aware")
     return _parlay_builder_injury_aware_core(payload)
 
 
 @app.post("/api/parlay-builder-injury-aware/async")
-def parlay_builder_injury_aware_async(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def parlay_builder_injury_aware_async(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    enforce_heavy_rate_limit(request, "parlay_builder_injury_aware_async")
     return submit_async_job("parlay_builder_injury_aware", _parlay_builder_injury_aware_core, payload)
 
 
 @app.post("/api/parlay-builder-injury-aware/stream")
-def parlay_builder_injury_aware_stream(payload: dict[str, Any] = Body(...)) -> StreamingResponse:
+def parlay_builder_injury_aware_stream(request: Request, payload: dict[str, Any] = Body(...)) -> StreamingResponse:
+    enforce_heavy_rate_limit(request, "parlay_builder_injury_aware_stream")
     return _stream_with_progress(_parlay_builder_injury_aware_core, payload)
 
 
@@ -7153,7 +8762,10 @@ def todays_games(game_date: str | None = None) -> dict[str, Any]:
 
     if not rows:
         base_date = datetime.strptime(requested_date, "%Y-%m-%d").date()
-        for offset in range(1, 4):
+        # If no explicit date is requested, search around "today" to absorb timezone
+        # offsets (e.g., Asia/Manila vs ET) and still show the active slate.
+        probe_offsets = [1, 2, 3] if game_date else [-1, 1, 2]
+        for offset in probe_offsets:
             probe_date = (base_date + timedelta(days=offset)).strftime("%Y-%m-%d")
             probe_rows = fetch_scoreboard_games(probe_date)
             if probe_rows:
@@ -7162,7 +8774,7 @@ def todays_games(game_date: str | None = None) -> dict[str, Any]:
                 fallback_used = True
                 break
 
-    report_payload = get_cached_injury_report_payload()
+    report_payload = get_cached_injury_report_payload_fast()
     injury_rows_by_team: dict[str, list[dict[str, Any]]] = {}
     if report_payload.get("ok"):
         involved_teams = {
@@ -7186,6 +8798,7 @@ def todays_games(game_date: str | None = None) -> dict[str, Any]:
         home_team = TEAM_LOOKUP.get(home_team_id, {})
         away_team = TEAM_LOOKUP.get(away_team_id, {})
         game_status = str(row.get("GAME_STATUS_TEXT") or "").strip()
+        status_text_display = convert_game_status_text_to_pht(game_status, resolved_date)
         home_score = safe_int_score(row.get("PTS_HOME"), 0)
         away_score = safe_int_score(row.get("PTS_AWAY"), 0)
         home_summary = build_team_availability_summary(str(home_team.get("full_name") or ""), report_payload, game_date=resolved_date)
@@ -7227,7 +8840,7 @@ def todays_games(game_date: str | None = None) -> dict[str, Any]:
         games.append({
             "game_id": str(row.get("GAME_ID") or "").strip(),
             "game_date": resolved_date,
-            "status_text": game_status or "TBD",
+            "status_text": status_text_display,
             "status_category": "final" if "Final" in game_status else ("live" if "Q" in game_status or "Halftime" in game_status else "scheduled"),
             "game_label": f"{away_team.get('abbreviation', '')} @ {home_team.get('abbreviation', '')}",
             "home": {
@@ -7404,7 +9017,7 @@ def tracker_live_stat(player_id: int, stat: str = Query(..., pattern="^(PTS|REB|
     fallback_date: str | None = None
     try:
         season = current_nba_season()
-        rows = fetch_player_game_log(player_id=player_id, season=season, season_type="Regular Season")
+        rows = fetch_player_game_log(player_id=player_id, season=season, season_type=DEFAULT_SEASON_TYPE)
         if rows:
             r = rows[0]
             fallback_val = compute_stat_value(r, stat)
@@ -7447,7 +9060,7 @@ def player_prop(
     over_odds: float | None = Query(None, ge=1.01),
     under_odds: float | None = Query(None, ge=1.01),
     season: str | None = None,
-    season_type: str = Query("Regular Season"),
+    season_type: str = Query(DEFAULT_SEASON_TYPE),
     team_id: int | None = Query(None),
     player_position: str | None = Query(None),
     location: str = Query('all', pattern='^(all|home|away)$'),
@@ -7464,6 +9077,7 @@ def player_prop(
     without_player_ids: list[int] | None = Query(None),
     without_player_name: str | None = Query(None),
     override_opponent_id: int | None = Query(None),
+    forced_side: str | None = Query(None, pattern="^(OVER|UNDER)$"),
     debug: bool = Query(False),
 ) -> dict[str, Any]:
     selected_season = season or current_nba_season()
@@ -7493,6 +9107,7 @@ def player_prop(
         without_player_ids=without_player_ids,
         without_player_name=without_player_name,
         override_opponent_id=override_opponent_id,
+        forced_side=forced_side,
         debug=debug,
         populate_player_info_cache=True,
     )
@@ -7501,13 +9116,6 @@ BULK_ANALYSIS_ENABLED = os.getenv("NBA_BULK_ANALYSIS_ENABLED", "1").strip().lowe
 BULK_ANALYSIS_MAX_WORKERS = max(1, int(os.getenv("NBA_BULK_ANALYSIS_MAX_WORKERS", "4")))
 BULK_ANALYSIS_MAX_ROWS = max(1, int(os.getenv("NBA_BULK_ANALYSIS_MAX_ROWS", "100")))
 BULK_PREFETCH_MAX_WORKERS = max(1, int(os.getenv("NBA_BULK_PREFETCH_MAX_WORKERS", "6")))
-
-WARM_CACHE_ON_STARTUP_ENABLED = os.getenv("NBA_WARM_CACHE_ON_STARTUP_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
-WARM_CACHE_STARTUP_MAX_WORKERS = max(1, int(os.getenv("NBA_WARM_CACHE_STARTUP_MAX_WORKERS", "4")))
-WARM_CACHE_PRELOAD_TODAYS_GAMES = os.getenv("NBA_WARM_CACHE_PRELOAD_TODAYS_GAMES", "1").strip().lower() not in {"0", "false", "no", "off"}
-WARM_CACHE_PRELOAD_INJURIES = os.getenv("NBA_WARM_CACHE_PRELOAD_INJURIES", "1").strip().lower() not in {"0", "false", "no", "off"}
-WARM_CACHE_PRELOAD_PLAYERS = os.getenv("NBA_WARM_CACHE_PRELOAD_PLAYERS", "1").strip().lower() not in {"0", "false", "no", "off"}
-WARM_CACHE_PRELOAD_TEAMS = os.getenv("NBA_WARM_CACHE_PRELOAD_TEAMS", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _cache_is_fresh(entry: dict[str, Any] | None, ttl_seconds: float) -> bool:
@@ -7645,7 +9253,7 @@ def _build_bulk_prop_item(row_index: int, row: dict[str, Any], defaults: dict[st
         raise HTTPException(status_code=400, detail=f"Row {row_index}: line must be numeric.")
 
     season = str(row.get("season") or defaults.get("season") or current_nba_season())
-    season_type = str(row.get("season_type") or defaults.get("season_type") or "Regular Season")
+    season_type = normalize_requested_season_type(row.get("season_type") or defaults.get("season_type"))
     last_n = int(row.get("last_n") or defaults.get("last_n") or 10)
     team_id = row.get("team_id", defaults.get("team_id"))
     team_id = int(team_id) if team_id not in (None, "") else None
@@ -7696,6 +9304,7 @@ def _build_bulk_prop_item(row_index: int, row: dict[str, Any], defaults: dict[st
         max_fga,
         bool(h2h_only),
         bool(debug),
+        override_opponent_id,
     )
 
     if cache_key in local_cache:
@@ -7734,8 +9343,9 @@ def _build_bulk_prop_item(row_index: int, row: dict[str, Any], defaults: dict[st
     }
 
 
-@app.post("/api/player-props/bulk")
-def bulk_player_props(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def _bulk_player_props_core(payload: dict[str, Any], request: Request | None = None) -> dict[str, Any]:
+    if request is not None:
+        enforce_heavy_rate_limit(request, "player_props_bulk")
     if not BULK_ANALYSIS_ENABLED:
         raise HTTPException(status_code=503, detail="Bulk analysis endpoint is disabled.")
 
@@ -7802,7 +9412,7 @@ def bulk_player_props(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     prefetch_bulk_analysis_context(
         player_ids=bulk_player_ids,
         season=str(defaults.get("season") or current_nba_season()),
-        season_type=str(defaults.get("season_type") or "Regular Season"),
+        season_type=normalize_requested_season_type(defaults.get("season_type")),
         team_ids=bulk_team_ids,
         primary_player_by_team=primary_by_team,
         max_workers=max_workers,
@@ -7849,9 +9459,15 @@ def bulk_player_props(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     }
 
 
+@app.post("/api/player-props/bulk")
+def bulk_player_props(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    return _bulk_player_props_core(payload, request=request)
+
+
 @app.post("/api/player-props/bulk/async")
-def bulk_player_props_async(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    return submit_async_job("bulk_player_props", bulk_player_props, payload)
+def bulk_player_props_async(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    enforce_heavy_rate_limit(request, "player_props_bulk_async")
+    return submit_async_job("bulk_player_props", _bulk_player_props_core, payload)
 
 
 @app.get("/api/debug/injury-report-raw")
@@ -8096,7 +9712,7 @@ def _merge_backtest_entries(raw_entries: list[Any]) -> tuple[int, int, list[dict
             except Exception:
                 skipped += 1
                 continue
-            logged_at = str(raw.get("logged_at") or datetime.utcnow().isoformat() + "Z").strip()
+            logged_at = str(raw.get("logged_at") or _utc_iso_z()).strip()
             dedupe_key = (player.lower(), stat, line, side, logged_at)
             if dedupe_key in existing_keys:
                 skipped += 1
@@ -8325,6 +9941,7 @@ def _compute_backtest_stats(entries: list[dict[str, Any]]) -> dict[str, Any]:
             "by_stat": {},
             "by_tier": {},
             "by_market_alignment": {},
+            "roi_assumed_odds_count": 0,
             "top_players": [
                 {"player": player, "total": count}
                 for player, count in sorted(
@@ -8341,8 +9958,12 @@ def _compute_backtest_stats(entries: list[dict[str, Any]]) -> dict[str, Any]:
 
     # ROI: assumes -110 odds (decimal 1.909) unless odds supplied
     roi_list = []
+    roi_assumed_odds_count = 0
     for e in resolved:
-        decimal_odds = float(e.get("odds") or 1.909)
+        stored_odds = e.get("odds")
+        if stored_odds in (None, ""):
+            roi_assumed_odds_count += 1
+        decimal_odds = float(stored_odds or 1.909)
         if e["result"] == "hit":
             roi_list.append(decimal_odds - 1)   # profit on 1 unit
         else:
@@ -8498,6 +10119,7 @@ def _compute_backtest_stats(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "misses": total - hits,
         "win_rate": win_rate,
         "roi_pct": roi,
+        "roi_assumed_odds_count": roi_assumed_odds_count,
         "by_tier": tier_summary,
         "by_stat": stat_summary,
         "by_side": side_summary,
@@ -8532,7 +10154,7 @@ def backtest_log_prediction(payload: dict = Body(...)) -> dict[str, Any]:
         "odds": payload.get("odds"),  # decimal odds, optional
         "result": "pending",
         "actual_value": None,
-        "logged_at": datetime.utcnow().isoformat() + "Z",
+        "logged_at": _utc_iso_z(),
         "resolved_at": None,
         "event_date": str(payload.get("event_date") or ""),
         "source": str(payload.get("source") or ""),
@@ -8563,12 +10185,12 @@ def backtest_resolve_prediction(payload: dict = Body(...)) -> dict[str, Any]:
         for entry in _BACKTEST_LOG:
             if entry["id"] == pred_id:
                 hit = (
-                    actual_value > entry["line"] if entry["side"] == "OVER"
+                    actual_value >= entry["line"] if entry["side"] == "OVER"
                     else actual_value < entry["line"]
                 )
                 entry["result"] = "hit" if hit else "miss"
                 entry["actual_value"] = actual_value
-                entry["resolved_at"] = datetime.utcnow().isoformat() + "Z"
+                entry["resolved_at"] = _utc_iso_z()
                 _save_backtest_log()
                 _require_pg_backtest_write(_pg_write_backtest_entries, [entry])
                 return {"ok": True, "entry": entry}
@@ -8978,7 +10600,7 @@ def backtest_export_csv(
 def backtest_archive_entries(payload: dict = Body(default={})) -> dict[str, Any]:
     older_than_days = max(1, min(int(payload.get("older_than_days") or 90), 3650))
     archive_pending = bool(payload.get("archive_pending")) if payload.get("archive_pending") is not None else False
-    cutoff = datetime.utcnow() - timedelta(days=older_than_days)
+    cutoff = _utc_now_naive() - timedelta(days=older_than_days)
     archived: list[dict[str, Any]] = []
     archived_ids: list[str] = []
     with _BACKTEST_LOCK:
@@ -9040,7 +10662,12 @@ def odds_check_quota(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Missing API key.")
     # Hit the /sports endpoint — it's the cheapest call (costs 0 credits on free tier)
     try:
-        result = odds_api_fetch("/sports", api_key, {"all": "false"})
+        result = odds_api_fetch(
+            "/sports",
+            api_key,
+            {"all": "false"},
+            allow_query_auth_fallback=True,
+        )
     except Exception as exc:
         detail = f"Odds API check failed: {exc}"
         return {
@@ -9151,7 +10778,12 @@ def odds_game_context(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     team_abbreviation = str(payload.get("team_abbreviation") or "").strip()
     opponent_abbreviation = str(payload.get("opponent_abbreviation") or "").strip()
 
-    events_result = odds_api_fetch(f"/sports/{sport}/events", api_key, {"dateFormat": "iso"})
+    events_result = odds_api_fetch(
+        f"/sports/{sport}/events",
+        api_key,
+        {"dateFormat": "iso"},
+        allow_query_auth_fallback=True,
+    )
     events = events_result.get("data") or []
     matched_event = next(
         (
@@ -9183,6 +10815,7 @@ def odds_game_context(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             "dateFormat": "iso",
             "bookmakers": ",".join(requested_bookmakers),
         },
+        allow_query_auth_fallback=True,
     )
     odds_event = odds_result.get("data") or {}
     event_context = build_event_market_context(odds_event)

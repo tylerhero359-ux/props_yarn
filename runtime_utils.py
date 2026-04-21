@@ -121,8 +121,10 @@ def create_retry_http_session(
     retry_status_codes: tuple[int, ...],
     pool_connections: int = 20,
     pool_maxsize: int = 20,
+    trust_env: bool = False,
 ) -> requests.Session:
     session = requests.Session()
+    session.trust_env = bool(trust_env)
     retry = Retry(
         total=retry_total,
         connect=retry_total,

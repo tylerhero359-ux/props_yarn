@@ -278,7 +278,11 @@ class PlayerDataService:
                 if reliable_stale_exists:
                     return cached["row"]
                 if attempt_idx < max(1, attempts) - 1:
-                    time.sleep(min(self.player_info_retry_base_delay * (attempt_idx + 1), max(0.0, max(remaining - 1, 0.0))))
+                    elapsed_after = time.monotonic() - started_at
+                    remaining_after = max(0.0, budget_seconds - elapsed_after)
+                    sleep_seconds = min(self.player_info_retry_base_delay * (attempt_idx + 1), remaining_after)
+                    if sleep_seconds > 0.0:
+                        time.sleep(sleep_seconds)
 
         if reliable_stale_exists and cached and cached.get("row"):
             return cached["row"]
@@ -339,7 +343,11 @@ class PlayerDataService:
                 if reliable_stale_exists:
                     return cached.get("row")
                 if attempt_idx < max(1, attempts) - 1:
-                    time.sleep(min(self.next_game_retry_base_delay * (attempt_idx + 1), max(0.0, max(remaining - 1, 0.0))))
+                    elapsed_after = time.monotonic() - started_at
+                    remaining_after = max(0.0, budget_seconds - elapsed_after)
+                    sleep_seconds = min(self.next_game_retry_base_delay * (attempt_idx + 1), remaining_after)
+                    if sleep_seconds > 0.0:
+                        time.sleep(sleep_seconds)
 
         if cached:
             return cached.get("row")

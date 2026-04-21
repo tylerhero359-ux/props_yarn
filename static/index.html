@@ -1,40 +1,88 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
 <title>NBA Props Tracker</title>
+<meta name="description" content="NBA Props Tracker for player analysis, market scanning, parlay building, and backtest performance in one dashboard."/>
+<meta property="og:type" content="website"/>
+<meta property="og:title" content="NBA Props Tracker"/>
+<meta property="og:description" content="Analyze props, scan market edges, and track backtest performance from a single NBA workflow."/>
+<meta property="og:image" content="/static/favicon.svg"/>
+<meta property="og:url" content="/"/>
+<meta name="twitter:card" content="summary"/>
+<meta name="twitter:title" content="NBA Props Tracker"/>
+<meta name="twitter:description" content="Analyze props, scan market edges, and track backtest performance from a single NBA workflow."/>
+<meta name="twitter:image" content="/static/favicon.svg"/>
 <link href="/static/favicon.svg" rel="icon" type="image/svg+xml"/>
 <link href="https://fonts.googleapis.com" rel="preconnect"/>
 <script>
-  (function () {
-    const warn = console.warn;
-    console.warn = function (...args) {
-      const msg = args && args[0] ? String(args[0]) : "";
-      if (msg.includes("cdn.tailwindcss.com should not be used in production")) return;
-      return warn.apply(console, args);
-    };
-  })();
+ (function () {
+ const warn = console.warn;
+ console.warn = function (...args) {
+ const msg = args && args[0] ? String(args[0]) : "";
+ if (msg.includes("cdn.tailwindcss.com should not be used in production")) return;
+ return warn.apply(console, args);
+ };
+ })();
 </script>
 <script src="https://cdn.tailwindcss.com"></script><script>
 tailwind.config = {
-  theme: {
-    extend: {
-      fontFamily: {
-        sans: ['Inter', 'Manrope', 'Arial', 'sans-serif'],
-        display: ['Outfit', 'Sora', 'Space Grotesk', 'Inter', 'Arial', 'sans-serif']
-      },
-      boxShadow: {
-        softxl: '0 22px 50px rgba(0,0,0,0.30)'
-      }
-    }
-  }
+ theme: {
+ extend: {
+ fontFamily: {
+ sans: ['Inter', 'Arial', 'sans-serif'],
+ display: ['Barlow Condensed', 'Inter', 'Arial', 'sans-serif'],
+ ui: ['Inter', 'Arial', 'sans-serif'],
+ numeric: ['Barlow Condensed', 'Inter', 'Arial', 'sans-serif']
+ },
+ colors: {
+ ds: {
+ canvas: 'var(--ds-color-bg-canvas)',
+ surface1: 'var(--ds-color-bg-surface-1)',
+ surface2: 'var(--ds-color-bg-surface-2)',
+ border: 'var(--ds-color-border-subtle)',
+ text: 'var(--ds-color-text-primary)',
+ muted: 'var(--ds-color-text-secondary)',
+ primary: 'var(--ds-color-brand-primary)',
+ secondary: 'var(--ds-color-brand-secondary)',
+ good: 'var(--ds-color-good)',
+ bad: 'var(--ds-color-bad)',
+ warn: 'var(--ds-color-warn)'
+ }
+ },
+ spacing: {
+ ds1: '4px',
+ ds2: '8px',
+ ds3: '12px',
+ ds4: '16px',
+ ds5: '20px',
+ ds6: '24px',
+ ds8: '32px',
+ ds10: '40px',
+ ds12: '48px'
+ },
+ borderRadius: {
+ dsSm: '8px',
+ dsMd: '12px',
+ dsLg: '16px',
+ dsXl: '20px'
+ },
+ boxShadow: {
+ softxl: '0 22px 50px rgba(0,0,0,0.30)',
+ ds1: '0 1px 2px rgba(0,0,0,0.24)',
+ ds2: '0 6px 16px rgba(0,0,0,0.28)',
+ ds3: '0 12px 28px rgba(0,0,0,0.32)'
+ }
+ }
+ }
 };
 </script>
 <link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&amp;family=Manrope:wght@500;600;700;800&amp;family=Outfit:wght@500;600;700;800&amp;family=Sora:wght@500;600;700;800&amp;family=Space+Grotesk:wght@500;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&amp;family=Inter:wght@400;500;600;700;800&amp;display=swap" rel="stylesheet"/>
 <link href="/static/style.css" rel="stylesheet">
+<link href="/static/design-system.css" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </link></head>
 <body class="font-sans antialiased selection:bg-sky-400/20 selection:text-white">
@@ -53,61 +101,61 @@ tailwind.config = {
 </div>
 </div>
 <button aria-label="Collapse sidebar" class="sidebar-toggle" id="sidebarToggle" type="button">
-<span class="sidebar-toggle-icon">⟨</span>
+<span class="sidebar-toggle-icon">&lt;</span>
 </button>
 </div>
 <nav aria-label="Dashboard sections" class="sidebar-nav grid gap-2 md:grid-cols-2 xl:grid-cols-1">
 <button class="nav-item active w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition duration-200" data-view="overview" type="button">
-<span class="nav-icon">⌂</span>
+<span class="nav-icon nav-icon-svg"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/></svg></span>
 <span>
 <strong>Overview</strong>
 <small>Snapshot and shortcuts</small>
 </span>
 </button>
 <button class="nav-item w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition duration-200" data-view="today" type="button">
-<span class="nav-icon">🗓️</span>
+<span class="nav-icon nav-icon-svg"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 10h18"/></svg></span>
 <span>
 <strong>Today's Games</strong>
 <small>Slate, status, team notes</small>
 </span>
 </button>
 <button class="nav-item w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition duration-200" data-view="analyzer" type="button">
-<span class="nav-icon">📊</span>
+<span class="nav-icon nav-icon-svg"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V4"/><path d="M4 20h16"/><path d="M8 16l4-4 3 2 5-6"/></svg></span>
 <span>
 <strong>Player Analyzer</strong>
 <small>Charts, roster, trends</small>
 </span>
 </button>
 <button class="nav-item w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition duration-200" data-view="betfinder" type="button">
-<span class="nav-icon">🎯</span>
+<span class="nav-icon nav-icon-svg"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.5"/></svg></span>
 <span>
 <strong>Bet Finder</strong>
 <small>Rank team props fast</small>
 </span>
 </button>
 <button class="nav-item w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition duration-200" data-view="market" type="button">
-<span class="nav-icon">🧾</span>
+<span class="nav-icon nav-icon-svg"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="8" cy="6" r="1.2"/><circle cx="15" cy="12" r="1.2"/><circle cx="11" cy="18" r="1.2"/></svg></span>
 <span>
 <strong>Market Scanner</strong>
 <small>Paste and rank a full board</small>
 </span>
 </button>
 <button class="nav-item w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition duration-200" data-view="parlay" type="button">
-<span class="nav-icon">🎰</span>
+<span class="nav-icon nav-icon-svg"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h6l2 12h8"/><path d="M7 6l2 12"/><path d="M11 10h9"/></svg></span>
 <span>
 <strong>Parlay Builder</strong>
 <small>Auto-build best-hit-rate parlays</small>
 </span>
 </button>
 <button class="nav-item w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition duration-200" data-view="tracker" type="button">
-<span class="nav-icon">📡</span>
+<span class="nav-icon nav-icon-svg"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 18v-3a8 8 0 0 1 16 0v3"/><circle cx="12" cy="18" r="1.5"/><path d="M12 4v3"/></svg></span>
 <span>
 <strong>Prop Tracker</strong>
 <small>Live bar tracking for active bets</small>
 </span>
 </button>
 <button class="nav-item w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition duration-200" data-view="keyvault" type="button">
-<span class="nav-icon">🔑</span>
+<span class="nav-icon nav-icon-svg"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 11a4 4 0 1 1 4 4H4v-2h3v-2h4"/><circle cx="11" cy="11" r="1"/></svg></span>
 <span>
 <strong>Key Vault</strong>
 <small>Store and manage your API keys</small>
@@ -129,11 +177,11 @@ tailwind.config = {
 </div>
 <div class="sidebar-footer grid gap-3">
 <button aria-label="Toggle theme" class="theme-toggle inline-flex items-center justify-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 font-semibold" id="themeToggle" type="button">
-<span class="theme-icon">☀</span>
+<span class="theme-icon">SUN</span>
 <span class="theme-text">Light</span>
 </button>
 <button class="inline-flex items-center justify-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 font-semibold w-full" id="openUserGuideBtn" type="button" title="Open the full user guide">
-<span>📖</span><span>User Guide</span>
+<span class="nav-icon nav-icon-svg"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h9a3 3 0 0 1 3 3v13H8a3 3 0 0 0-3 3z"/><path d="M8 4v16"/></svg></span><span>User Guide</span>
 </button>
 <p class="sidebar-footnote">Professional workflow for player props, matchup analysis, availability, and market scanning.</p>
 </div>
@@ -145,174 +193,141 @@ tailwind.config = {
 <h2 id="workspaceTitle">Overview</h2>
 <p class="workspace-subtitle" id="workspaceSubtitle">A structured view of the selected player, current matchup, and key prop indicators.</p>
 </div>
-<button aria-label="Toggle navigation" class="ghost-btn inline-flex items-center gap-2 self-start xl:hidden" id="mobileSidebarToggle" type="button">☰ Menu</button></header>
-<section class="dashboard-view active gap-4" data-view="overview">
-<header class="hero-card card glass overview-hero-refined rounded-[28px] border border-white/10 bg-slate-950/40 p-5 shadow-softxl backdrop-blur-xl sm:p-7">
-<div class="hero-copy">
-<div class="eyebrow-row">
-<span class="eyebrow">NBA Props Dashboard</span>
-<span class="live-dot-pill"><span class="live-dot"></span>Structured research workspace</span>
+<button aria-label="Toggle navigation" class="ghost-btn inline-flex items-center gap-2 self-start xl:hidden" id="mobileSidebarToggle" type="button">Menu</button></header>
+<section class="dashboard-view active gap-4 premium-overview-view ds-overview" data-view="overview">
+<header class="ds-card ds-overview-header">
+<div class="ds-overview-header-copy">
+<h1>Board</h1>
+<p class="ds-text-sm">Scan EV first. Validate quickly.</p>
 </div>
-<h1>Centralize player prop research in one structured dashboard.</h1>
-<p class="hero-subtext">
-              Review the active player, scan the current slate, surface the strongest board edges, and move into deeper matchup analysis without losing context.
-            </p>
-<div class="hero-meta-row hero-meta-row-compact">
-<div class="hero-stat-pill">
-<strong>Today’s Slate</strong>
-<span>Quick view of scheduled games and report notes</span>
-</div>
-<div class="hero-stat-pill">
-<strong>Best Bets</strong>
-<span>Latest scanner leaders with confidence scoring</span>
-</div>
-<div class="hero-stat-pill">
-<strong>Confidence Engine</strong>
-<span>Balances edge, EV, matchup, sample, and risk</span>
-</div>
+<div class="ds-overview-header-rail">
+<article class="ds-stat ds-stat--good ds-overview-ev-stat">
+<span class="ds-stat__label">Top Board EV</span>
+<strong class="ds-stat__value ds-num-xl" id="overviewEvValue">--%</strong>
+<span class="ds-stat__meta" id="overviewBestBetsMeta">Waiting for the next scanner pass.</span>
+</article>
+<div class="ds-overview-header-actions">
+<button class="ds-btn ds-btn--md ds-btn--primary" data-go-view="market" type="button">Open Market Scanner</button>
+<button class="ds-btn ds-btn--md ds-btn--ghost" data-go-view="analyzer" type="button">Open Analyzer</button>
 </div>
 </div>
 </header>
-<section class="overview-main-stack">
-<section class="overview-grid grid gap-4">
-<article class="card glass overview-current-card rounded-[28px] border border-white/10 backdrop-blur-xl">
-<div class="section-head">
+<section class="ds-overview-primary-grid">
+<article class="ds-card ds-overview-board-shell">
+<div class="ds-overview-section-head">
 <div>
-<p class="section-kicker">Current Selection</p>
-<h2>Player snapshot</h2>
+<h2>Top Opportunities</h2>
 </div>
-<span class="spotlight-pill">Live summary</span>
+</div>
+<div class="overview-board-tabs ds-overview-tabs" id="overviewBoardTabs" role="tablist" aria-label="Today's board lanes">
+<button aria-selected="true" class="overview-board-tab active" data-board-tab="top" role="tab" type="button">Top <span id="overviewTopCount">0</span></button>
+<button aria-selected="false" class="overview-board-tab" data-board-tab="caution" role="tab" type="button">Caution <span id="overviewCautionCount">0</span></button>
+<button aria-selected="false" class="overview-board-tab" data-board-tab="boost" role="tab" type="button">Boost <span id="overviewBoostCount">0</span></button>
+</div>
+<div class="overview-board-stack ds-overview-board-stack">
+<div class="overview-board-column active" data-board-panel="top" role="tabpanel">
+<div class="overview-best-bets-list empty-state-panel compact board-empty-state" id="overviewBestBets">
+<div class="empty-icon ds-overview-empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V6"/><path d="M4 20h16"/><path d="M8 16v-4M12 16v-7M16 16v-2"/></svg></div>
+<strong>No best bets saved yet.</strong>
+<span>Run Market Scanner to rank high-EV plays.</span>
+</div>
+</div>
+<div class="overview-board-column" data-board-panel="caution" hidden role="tabpanel">
+<div class="overview-best-bets-list empty-state-panel compact board-empty-state" id="overviewCautionBoard">
+<div class="empty-icon ds-overview-empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9 17H3L12 3z"/><path d="M12 9v5M12 17h.01"/></svg></div>
+<strong>No caution spots yet.</strong>
+<span>Risk-forward plays will surface here.</span>
+</div>
+</div>
+<div class="overview-board-column" data-board-panel="boost" hidden role="tabpanel">
+<div class="overview-best-bets-list empty-state-panel compact board-empty-state" id="overviewBoostBoard">
+<div class="empty-icon ds-overview-empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V4"/><path d="M4 20h16"/><path d="M8 15l3-3 3 2 6-7"/></svg></div>
+<strong>No lineup boosts yet.</strong>
+<span>Teammate-absence spots will appear here.</span>
+</div>
+</div>
+</div>
+</article>
+<aside class="ds-overview-side-stack">
+<article class="ds-card ds-overview-current-shell">
+<div class="ds-overview-section-head">
+<div>
+<h2>Player Focus</h2>
+</div>
 </div>
 <div class="overview-current-body" id="overviewCurrentCard">
 <div class="overview-current-avatar placeholder-avatar">NBA</div>
 <div class="overview-current-copy">
 <span class="selected-player-label">Waiting for a selection</span>
 <strong>No player selected</strong>
-<small>Choose a team and player in the analyzer to fill this card.</small>
+<small>Choose a team and player in the analyzer to load context.</small>
 </div>
 </div>
+</article>
+<section class="ds-overview-metric-grid">
+<article class="ds-stat">
+<span class="ds-stat__label">Hit Rate</span>
+<strong class="ds-stat__value" id="hitRateValue">--</strong>
+<span class="ds-stat__meta">Recent sample</span>
+</article>
+<article class="ds-stat">
+<span class="ds-stat__label">Average</span>
+<strong class="ds-stat__value" id="avgValue">--</strong>
+<span class="ds-stat__meta">Against current line</span>
+</article>
+<article class="ds-stat">
+<span class="ds-stat__label">Hits</span>
+<strong class="ds-stat__value" id="hitCountValue">--</strong>
+<span class="ds-stat__meta">Over count</span>
+</article>
+<article class="ds-stat">
+<span class="ds-stat__label">Streak</span>
+<strong class="ds-stat__value" id="streakValue">--</strong>
+<span class="ds-stat__meta">Current run</span>
+</article>
+<article class="ds-stat">
+<span class="ds-stat__label">Last Game</span>
+<strong class="ds-stat__value" id="lastGameValue">--</strong>
+<span class="ds-stat__meta">Most recent output</span>
+</article>
+<article class="ds-stat">
+<span class="ds-stat__label">Season</span>
+<strong class="ds-stat__value" id="seasonValue">--</strong>
+<span class="ds-stat__meta">Data source</span>
 </article>
 </section>
-<article class="card glass overview-actions-card overview-best-bets-card rounded-[28px] border border-white/10 backdrop-blur-xl">
-<div class="section-head">
-<div>
-<p class="section-kicker">Best Bets</p>
-<h2>Today's board</h2>
-</div>
-<span class="small-meta" id="overviewBestBetsMeta">Populated by your latest Market Scanner run.</span>
-</div>
-<div class="overview-board-tabs" id="overviewBoardTabs" role="tablist" aria-label="Today's board lanes">
-<button aria-selected="true" class="overview-board-tab active" data-board-tab="top" role="tab" type="button">Top plays</button>
-<button aria-selected="false" class="overview-board-tab" data-board-tab="caution" role="tab" type="button">Use caution</button>
-<button aria-selected="false" class="overview-board-tab" data-board-tab="boost" role="tab" type="button">Lineup context</button>
-</div>
-<div class="overview-board-stack">
-<div class="overview-board-column active" data-board-panel="top" role="tabpanel">
-<div class="mini-section-head"><h3>Top 5 plays</h3><span class="small-badge" id="overviewTopCount">0</span></div>
-<div class="overview-best-bets-list empty-state-panel compact grid gap-3" id="overviewBestBets">
-<div class="empty-icon">⭐</div>
-<strong>No best bets saved yet.</strong>
-<span>Run Market Scanner to pin the strongest current board edges here.</span>
-</div>
-</div>
-<div class="overview-board-column" data-board-panel="caution" hidden role="tabpanel">
-<div class="mini-section-head"><h3>Use caution</h3><span class="small-badge" id="overviewCautionCount">0</span></div>
-<div class="overview-best-bets-list empty-state-panel compact grid gap-3" id="overviewCautionBoard">
-<div class="empty-icon">⚠️</div>
-<strong>No caution spots yet.</strong>
-<span>Risky plays will appear here after a board scan.</span>
-</div>
-</div>
-<div class="overview-board-column" data-board-panel="boost" hidden role="tabpanel">
-<div class="mini-section-head"><h3>Lineup context</h3><span class="small-badge" id="overviewBoostCount">0</span></div>
-<div class="overview-best-bets-list empty-state-panel compact grid gap-3" id="overviewBoostBoard">
-<div class="empty-icon">📈</div>
-<strong>No lineup-context edges yet.</strong>
-<span>Plays with strong teammate-absence context will appear here.</span>
-</div>
-</div>
-</div>
-</article>
-<section class="insight-strip grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-<article class="metric-card card glass rounded-3xl border border-white/10 bg-slate-950/40 p-4 sm:p-5 rounded-[28px] backdrop-blur-xl">
-<span class="metric-label">Average</span>
-<strong id="avgValue">—</strong>
-<small>Across selected sample</small>
-</article>
-<article class="metric-card card glass rounded-3xl border border-white/10 bg-slate-950/40 p-4 sm:p-5 rounded-[28px] backdrop-blur-xl">
-<span class="metric-label">Hit Rate</span>
-<strong id="hitRateValue">—</strong>
-<small>Overs at current line</small>
-</article>
-<article class="metric-card card glass rounded-3xl border border-white/10 bg-slate-950/40 p-4 sm:p-5 rounded-[28px] backdrop-blur-xl">
-<span class="metric-label">Hits</span>
-<strong id="hitCountValue">—</strong>
-<small>Games above the line</small>
-</article>
-<article class="metric-card card glass rounded-3xl border border-white/10 bg-slate-950/40 p-4 sm:p-5 rounded-[28px] backdrop-blur-xl">
-<span class="metric-label">Season</span>
-<strong id="seasonValue">—</strong>
-<small>Current data source</small>
-</article>
-<article class="metric-card card glass rounded-3xl border border-white/10 bg-slate-950/40 p-4 sm:p-5 rounded-[28px] backdrop-blur-xl">
-<span class="metric-label">Over Streak</span>
-<strong id="streakValue">—</strong>
-<small>Current consecutive overs</small>
-</article>
-<article class="metric-card card glass rounded-3xl border border-white/10 bg-slate-950/40 p-4 sm:p-5 rounded-[28px] backdrop-blur-xl">
-<span class="metric-label">Last Game</span>
-<strong id="lastGameValue">—</strong>
-<small>Most recent performance</small>
-</article>
+</aside>
 </section>
-<section class="overview-lower-grid grid gap-4 xl:grid-cols-2">
-<article class="card glass today-overview-card rounded-[28px] border border-white/10 backdrop-blur-xl">
-<div class="section-head">
+<section class="ds-overview-lower-grid">
+<article class="ds-card">
+<div class="ds-overview-section-head">
 <div>
-<p class="section-kicker">Today's Games</p>
-<h2>Slate snapshot</h2>
+<h2>Today's Slate</h2>
 </div>
-<span class="small-meta" id="overviewTodayMeta">Fetching today’s slate...</span>
+<span class="small-meta" id="overviewTodayMeta">Fetching today's slate...</span>
 </div>
 <div class="today-overview-list empty-state-panel compact" id="overviewTodayGames">
-<div class="empty-icon">🗓️</div>
+<div class="empty-icon ds-overview-empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 10h18"/></svg></div>
 <strong>No slate loaded yet.</strong>
-<span>The dashboard will show today’s games and injury-report context here.</span>
+<span>The dashboard will show the active slate and injury context here.</span>
 </div>
 </article>
-<article class="card glass favorites-card rounded-[28px] border border-white/10 backdrop-blur-xl">
-<div class="section-head">
+<article class="ds-card ds-overview-matchup-shell" id="matchupPanel">
+<div class="ds-overview-section-head">
 <div>
-<p class="section-kicker">Favorites</p>
-<h2>Saved players and props</h2>
-</div>
-<span class="small-meta">Reusable shortcuts</span>
-</div>
-<div class="favorites-list empty-state-panel compact" id="favoritesList">
-<div class="empty-icon">💾</div>
-<strong>No favorites yet.</strong>
-<span>Star a player or save a prop from the analyzer to keep it here.</span>
-</div>
-</article>
-</section>
-<section class="card glass matchup-panel rounded-[28px] border border-white/10 backdrop-blur-xl" id="matchupPanel">
-<div class="section-head">
-<div>
-<p class="section-kicker">Next Matchup</p>
-<h2>Opponent context</h2>
+<h2>Matchup Context</h2>
 </div>
 <span class="spotlight-pill neutral" id="matchupLeanBadge">Waiting for analysis</span>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="matchupBody">
-<div class="empty-icon">🛡️</div>
+<div class="empty-icon ds-overview-empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v6c0 4.5-3.2 7.4-7 9-3.8-1.6-7-4.5-7-9V6l7-3z"/></svg></div>
 <strong>No matchup loaded yet.</strong>
-<span>Analyze a player prop to load the next opponent and defense-vs-position read.</span>
+<span>Analyze a player prop to load opponent and position context.</span>
 </div>
+</article>
 </section>
-</section>
-</section>
-<section class="dashboard-view gap-4 analyzer-dashboard-view" data-view="analyzer">
-<section class="controls-panel analyzer-command-panel card glass rounded-[28px] border border-white/10 bg-slate-950/40 p-4 shadow-softxl backdrop-blur-xl sm:p-6">
+</section><section class="dashboard-view gap-4 analyzer-dashboard-view ds-analyzer" data-view="analyzer">
+<section class="ds-card controls-panel analyzer-command-panel card glass rounded-[28px] border border-white/10 bg-slate-950/40 p-4 shadow-softxl backdrop-blur-xl sm:p-6">
 <div class="controls-top">
 <div>
 <p class="section-kicker">Control Center</p>
@@ -409,11 +424,11 @@ tailwind.config = {
 <strong id="stickySignalLabel">Awaiting analysis</strong>
 </div>
 <div class="sticky-action-row">
-<button class="icon-btn" id="favoritePlayerBtn" title="Favorite player" type="button">★</button>
+<button class="icon-btn" id="favoritePlayerBtn" title="Favorite player" type="button">Fav</button>
 <button class="secondary-btn" id="savePropBtn" type="button">Save prop</button>
 </div>
 </div>
-<section class="card glass analyzer-decision-strip rounded-[28px] border border-white/10 backdrop-blur-xl" id="analyzerDecisionStrip">
+<section class="ds-card card glass analyzer-decision-strip rounded-[28px] border border-white/10 backdrop-blur-xl" id="analyzerDecisionStrip">
 <div class="decision-strip-head">
 <div>
 <p class="section-kicker">Decision strip</p>
@@ -431,17 +446,17 @@ tailwind.config = {
 </div>
 <div class="decision-strip-chip">
 <span class="small-label">Hit rate</span>
-<strong>—</strong>
+<strong>--</strong>
 <small>Recent sample</small>
 </div>
 <div class="decision-strip-chip">
 <span class="small-label">Avg vs line</span>
-<strong>—</strong>
+<strong>--</strong>
 <small>Line cushion</small>
 </div>
 <div class="decision-strip-chip">
 <span class="small-label">Lineup</span>
-<strong>—</strong>
+<strong>--</strong>
 <small>Same-team absences</small>
 </div>
 <div class="decision-strip-chip">
@@ -451,7 +466,7 @@ tailwind.config = {
 </div>
 <div class="decision-strip-chip">
 <span class="small-label">Market</span>
-<strong>—</strong>
+<strong>--</strong>
 <small>Alignment status</small>
 </div>
 </div>
@@ -463,7 +478,7 @@ tailwind.config = {
 <div class="cache-debug-grid"></div>
 </div>
 </section>
-<div class="card glass analyzer-filter-card rounded-[28px] border border-white/10 backdrop-blur-xl">
+<div class="ds-card card glass analyzer-filter-card rounded-[28px] border border-white/10 backdrop-blur-xl">
 <div class="section-head">
 <div>
 <p class="section-kicker">Analyzer Filters</p>
@@ -527,12 +542,12 @@ tailwind.config = {
 <div class="control-group compact-filter-group without-teammate-group">
 <label>Without teammate(s)</label>
 <div class="without-chip-picker" id="withoutChipPicker" aria-label="Without teammates">
-  <span class="without-chip-placeholder">Select a player first</span>
+ <span class="without-chip-placeholder">Select a player first</span>
 </div>
 <select id="filterWithoutPlayer" multiple aria-hidden="true" style="display:none"></select>
 </div>
 <div class="control-group compact-filter-group injury-boost-group" id="injuryBoostGroup" style="display:none">
-<label>🏥 Injury boost <span class="small-meta" style="font-weight:400;opacity:0.7">— Today's injured teammates</span></label>
+<label>Injury boost <span class="small-meta" style="font-weight:400;opacity:0.7">- Today's injured teammates</span></label>
 <div class="injury-boost-chips" id="injuryBoostChips"></div>
 </div>
 </div>
@@ -544,8 +559,10 @@ tailwind.config = {
 </div>
 </div>
 </section>
+<div class="ds-analyzer-workspace">
+<div class="ds-analyzer-main-col">
 <section class="explorer-grid analyzer-explorer-grid grid gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(320px,0.9fr)]">
-<article class="card glass spotlight-card rounded-[28px] border border-white/10 backdrop-blur-xl">
+<article class="ds-card card glass spotlight-card rounded-[28px] border border-white/10 backdrop-blur-xl">
 <div class="section-head">
 <div>
 <p class="section-kicker">Spotlight</p>
@@ -572,7 +589,7 @@ tailwind.config = {
 <div class="mini-player-row" id="recentPlayers"></div>
 </div>
 </article>
-<article class="card glass roster-panel rounded-[28px] border border-white/10 backdrop-blur-xl">
+<article class="ds-card card glass roster-panel rounded-[28px] border border-white/10 backdrop-blur-xl">
 <div class="section-head">
 <div>
 <p class="section-kicker">Roster Explorer</p>
@@ -582,14 +599,15 @@ tailwind.config = {
 </div>
 <div class="player-grid empty-grid" id="playerGrid">
 <div class="empty-roster-state empty-state-panel">
-<div class="empty-icon">🏀</div>
+<div class="empty-icon">[ ]</div>
 <strong>Choose a team to load player cards.</strong>
-<span>You’ll get clickable headshots, jersey numbers, and positions.</span>
+<span>You'll get clickable headshots, jersey numbers, and positions.</span>
 </div>
 </div>
 </article>
 </section>
-<section class="card glass matchup-panel analyzer-matchup-panel rounded-[28px] border border-white/10 backdrop-blur-xl">
+<section class="selected-player-matchup-section hidden" id="selectedPlayerMatchupSection"></section>
+<section class="ds-card card glass matchup-panel analyzer-matchup-panel rounded-[28px] border border-white/10 backdrop-blur-xl">
 <div class="section-head collapsible-head">
 <div>
 <p class="section-kicker">Next Matchup</p>
@@ -601,13 +619,13 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="analyzerMatchupBody">
-<div class="empty-icon">🛡️</div>
+<div class="empty-icon">[ ]</div>
 <strong>No matchup loaded yet.</strong>
 <span>Analyze a player prop to load the next opponent and defense-vs-position read.</span>
 </div>
 </section>
 <section class="dashboard-grid analyzer-insight-grid grid gap-4 xl:grid-cols-2">
-<article class="card glass insight-card recommendation-card rounded-[28px] border border-white/10 backdrop-blur-xl">
+<article class="ds-card card glass insight-card recommendation-card rounded-[28px] border border-white/10 backdrop-blur-xl">
 <div class="section-head collapsible-head">
 <div>
 <p class="section-kicker">Recommendation</p>
@@ -619,12 +637,12 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="recommendationBody">
-<div class="empty-icon">🚦</div>
+<div class="empty-icon">[ ]</div>
 <strong>No recommendation yet.</strong>
 <span>Analyze a player prop to get a simple green / yellow / red read.</span>
 </div>
 </article>
-<article class="card glass insight-card rounded-[28px] border border-white/10 backdrop-blur-xl">
+<article class="ds-card card glass insight-card rounded-[28px] border border-white/10 backdrop-blur-xl">
 <div class="section-head collapsible-head">
 <div>
 <p class="section-kicker">Interpretation</p>
@@ -636,12 +654,12 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="interpretationBody">
-<div class="empty-icon">🧠</div>
+<div class="empty-icon">[ ]</div>
 <strong>No interpretation yet.</strong>
 <span>Analyze a player prop to get a simple read on whether the line looks supportive, mixed, or risky.</span>
 </div>
 </article>
-<article class="card glass insight-card analyzer-detail-only rounded-[28px] border border-white/10 backdrop-blur-xl">
+<article class="ds-card card glass insight-card analyzer-detail-only rounded-[28px] border border-white/10 backdrop-blur-xl">
 <div class="section-head collapsible-head">
 <div>
 <p class="section-kicker">Opportunity</p>
@@ -653,12 +671,12 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="opportunityBody">
-<div class="empty-icon">⏱️</div>
+<div class="empty-icon">[ ]</div>
 <strong>No opportunity profile yet.</strong>
 <span>Analyze a player prop to see minutes, shot attempts, and teammate absence context.</span>
 </div>
 </article>
-<article class="card glass insight-card analyzer-detail-only rounded-[28px] border border-white/10 backdrop-blur-xl">
+<article class="ds-card card glass insight-card analyzer-detail-only rounded-[28px] border border-white/10 backdrop-blur-xl">
 <div class="section-head collapsible-head">
 <div>
 <p class="section-kicker">Environment</p>
@@ -670,13 +688,13 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="environmentBody">
-<div class="empty-icon">📅</div>
+<div class="empty-icon">[ ]</div>
 <strong>No schedule read yet.</strong>
 <span>Analyze a player prop to see rest, back-to-back risk, and next-game setup.</span>
 </div>
 </article>
 
-<article class="card glass insight-card market-context-card rounded-[28px] border border-white/10 backdrop-blur-xl">
+<article class="ds-card card glass insight-card market-context-card rounded-[28px] border border-white/10 backdrop-blur-xl">
 <div class="section-head collapsible-head">
 <div>
 <p class="section-kicker">Market Context</p>
@@ -688,13 +706,13 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="marketBody">
-<div class="empty-icon">ðŸ’°</div>
+<div class="empty-icon">[ ]</div>
 <strong>No market context yet.</strong>
 <span>Analyze a player prop to see team total, spread, and game total for the matchup.</span>
 </div>
 </article>
 
-<article class="card glass insight-card analyzer-detail-only rounded-[28px] border border-white/10 backdrop-blur-xl">
+<article class="ds-card card glass insight-card analyzer-detail-only rounded-[28px] border border-white/10 backdrop-blur-xl">
 <div class="section-head collapsible-head">
 <div>
 <p class="section-kicker">Distribution</p>
@@ -706,15 +724,16 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="varianceBody">
-<div class="empty-icon">📊</div>
+<div class="empty-icon">[ ]</div>
 <strong>No distribution data yet.</strong>
 <span>Analyze a player prop to see consistency score, median, floor, ceiling and percentile bands.</span>
 </div>
 </article>
 </section>
-<section class="selected-player-matchup-section hidden" id="selectedPlayerMatchupSection"></section>
+</div>
+<aside class="ds-analyzer-side-col">
 <section class="dashboard-grid dashboard-analysis-stack grid gap-5">
-<article class="chart-card card glass analysis-feature-card rounded-[28px] border border-white/10 backdrop-blur-xl">
+<article class="ds-card chart-card card glass analysis-feature-card rounded-[28px] border border-white/10 backdrop-blur-xl">
 <div class="chart-topbar">
 <div>
 <p class="section-kicker">Trend View</p>
@@ -746,7 +765,7 @@ tailwind.config = {
 <canvas id="propsChart"></canvas>
 </div>
 </article>
-<article class="table-card card glass analysis-feature-card rounded-[28px] border border-white/10 backdrop-blur-xl">
+<article class="ds-card table-card card glass analysis-feature-card rounded-[28px] border border-white/10 backdrop-blur-xl">
 <div class="section-head table-head game-log-head collapsible-head">
 <div>
 <p class="section-kicker">Game Log</p>
@@ -779,7 +798,7 @@ tailwind.config = {
 <tr>
 <td colspan="4">
 <div class="empty-state-panel compact">
-<div class="empty-icon">📊</div>
+<div class="empty-icon">[ ]</div>
 <strong>No data yet.</strong>
 <span>Analyze a player prop to fill the game log.</span>
 </div>
@@ -790,53 +809,134 @@ tailwind.config = {
 </div>
 </article>
 </section>
-</section>
-<section class="dashboard-view gap-4" data-view="today">
-<section class="tool-intro-card card glass analyzer-sticky-shell flex flex-col gap-4 rounded-[28px] border border-white/10 bg-slate-950/40 p-5 shadow-softxl backdrop-blur-xl xl:flex-row xl:items-center xl:justify-between">
-<div>
-<p class="section-kicker">Today's Games</p>
-<h2>Track the active slate, injury-report notes, and fast team entry points.</h2>
-<p class="small-meta" id="todayGamesMeta">Loading today’s NBA slate...</p>
+</aside>
 </div>
 </section>
-<section class="today-games-grid grid gap-4 sm:grid-cols-2 2xl:grid-cols-3" id="todayGamesBoard">
-<article class="card glass empty-state-panel compact today-game-empty rounded-[28px] border border-white/10 backdrop-blur-xl">
-<div class="empty-icon">🗓️</div>
+<section class="dashboard-view gap-4 ds-today" data-view="today">
+<header class="ds-card ds-today-header">
+<div class="ds-today-header-copy">
+<p class="section-kicker">Live Slate</p>
+<h2>Status and Team Entry</h2>
+<p class="ds-text-sm">Track game status, injury-report context, and quick team entry points.</p>
+</div>
+<div class="ds-today-header-rail">
+<article class="ds-stat ds-today-meta-stat">
+<span class="ds-stat__label">Slate Status</span>
+<strong class="ds-stat__value ds-num-md">Live Board</strong>
+<span class="ds-stat__meta" id="todayGamesMeta">Loading today's NBA slate...</span>
+</article>
+</div>
+</header>
+<article class="ds-card ds-today-board-shell">
+<div class="ds-overview-section-head">
+<div>
+<h2>Games</h2>
+</div>
+</div>
+<section class="today-games-grid" id="todayGamesBoard">
+<article class="today-game-card empty-state-panel compact today-game-empty">
+<div class="empty-icon ds-overview-empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 10h18"/></svg></div>
 <strong>Loading games...</strong>
-<span>Schedule, team context, and injury report notes will appear here.</span>
+<span>Schedule, team context, and injury-report notes will appear here.</span>
 </article>
 </section>
+</article>
 </section>
-<section class="dashboard-view gap-4" data-view="betfinder">
-<section class="tool-intro-card card glass flex flex-col gap-4 rounded-[28px] border border-white/10 bg-slate-950/40 p-5 shadow-softxl backdrop-blur-xl xl:flex-row xl:items-center xl:justify-between">
+<section class="dashboard-view gap-4 ds-betfinder" data-view="betfinder">
+<header class="ds-card ds-betfinder-header">
 <div>
-<p class="section-kicker">Bet Finder Workspace</p>
-<h2>Scan the selected roster using your current line and sample size.</h2>
-<p class="small-meta">Use the Player Analyzer to choose the team, stat, line, and recent-game sample. Then run Bet Finder here or from the analyzer controls.</p>
+<p class="section-kicker">Team Rankings</p>
+<h2>Bet Finder</h2>
+<p class="small-meta">Set inputs here and rank the strongest recent overs on one roster.</p>
 </div>
-<div class="tool-intro-actions flex flex-wrap gap-3">
+<span class="small-badge">Team-scoped for speed</span>
+</header>
+<section class="ds-card ds-betfinder-controls-shell">
+<div class="ds-betfinder-controls-head">
+<div>
+<h3>Inputs</h3>
+<p class="small-meta">No need to switch pages. Configure and run directly from this workspace.</p>
+</div>
+<div class="ds-betfinder-controls-actions">
 <button class="primary-btn" id="betFinderViewRunBtn" type="button">Run Bet Finder</button>
-<button class="secondary-btn" data-go-view="analyzer" type="button">Adjust Inputs</button>
+<button class="secondary-btn" data-go-view="analyzer" type="button">Open Analyzer</button>
+</div>
+</div>
+<div class="ds-betfinder-controls-grid">
+<label class="control-group">
+<span>Team</span>
+<div class="input-shell">
+<select id="betFinderTeamSelect">
+<option value="">Choose a team</option>
+</select>
+</div>
+</label>
+<label class="control-group">
+<span>Prop</span>
+<div class="input-shell">
+<select id="betFinderStatSelect">
+<option value="PTS">PTS</option>
+<option value="REB">REB</option>
+<option value="AST">AST</option>
+<option value="3PM">3PM</option>
+<option value="STL">STL</option>
+<option value="BLK">BLK</option>
+<option value="PRA">PRA</option>
+<option value="PR">PR</option>
+<option value="PA">PA</option>
+<option value="RA">RA</option>
+</select>
+</div>
+</label>
+<label class="control-group">
+<span>Line</span>
+<div class="input-shell">
+<input id="betFinderLineInput" min="0" step="0.5" type="number" value="25.5"/>
+</div>
+</label>
+<label class="control-group">
+<span>Recent games</span>
+<div class="input-shell">
+<select id="betFinderGamesSelect">
+<option value="5">Last 5</option>
+<option selected="" value="10">Last 10</option>
+<option value="15">Last 15</option>
+<option value="20">Last 20</option>
+</select>
+</div>
+</label>
+<label class="control-group">
+<span>Season</span>
+<div class="input-shell">
+<input id="betFinderSeasonInput" placeholder="2025-26" type="text"/>
+</div>
+</label>
+<label class="control-group ds-betfinder-toggle-group">
+<span>Context</span>
+<label class="parlay-injury-toggle-wrap ds-betfinder-injury-toggle" title="Use lineup context when available">
+<input id="betFinderInjuryAware" type="checkbox">
+<span class="small-label">Injury-Aware</span>
+</label>
+</label>
 </div>
 </section>
-<section class="card glass bet-finder-panel standalone-panel rounded-[28px] border border-white/10 backdrop-blur-xl" id="betFinderPanel">
+<section class="ds-card card glass bet-finder-panel standalone-panel rounded-[28px] border border-white/10 backdrop-blur-xl" id="betFinderPanel">
 <div class="bet-finder-topbar">
 <div>
 <p class="section-kicker">Bet Finder</p>
-<h2>Find the best recent overs on the selected team.</h2>
-<p class="small-meta" id="betFinderMeta">Uses your current team, prop, line, and recent-game sample.</p>
+<h2>Best roster props</h2>
+<p class="small-meta" id="betFinderMeta">Uses your selected team, prop, line, and recent-game sample.</p>
 </div>
-<span class="small-badge">Team-scoped for speed</span>
 </div>
 <div class="bet-finder-state empty-state-panel compact" id="betFinderResults">
-<div class="empty-icon">🎯</div>
+<div class="empty-icon">[ ]</div>
 <strong>No bet finder results yet.</strong>
-<span>Choose a team, set your prop line, then click Bet Finder.</span>
+<span>Choose a team, set your line, and run Bet Finder.</span>
 </div>
 </section>
 </section>
-<section class="dashboard-view gap-4 market-dashboard-view" data-view="market">
-<section class="card glass market-panel standalone-panel rounded-[28px] border border-white/10 backdrop-blur-xl" id="marketScannerPanel">
+<section class="dashboard-view gap-4 market-dashboard-view ds-market" data-view="market">
+<section class="card glass market-panel standalone-panel rounded-[28px] border border-white/10 backdrop-blur-xl ds-card" id="marketScannerPanel">
 <div class="bet-finder-topbar market-topbar market-hero-head">
 <div>
 <p class="section-kicker">Market Scanner</p>
@@ -850,8 +950,49 @@ tailwind.config = {
 <option value="best_ev">Best EV</option>
 <option value="best_edge">Best Edge</option>
 <option value="highest_hit_rate">Highest Win Rate</option>
+<option value="best_combo">Best Combo (H2H + Form)</option>
 </select>
+<label class="parlay-injury-toggle-wrap market-injury-toggle-top" title="Re-score each market prop using current lineup context">
+<input id="marketInjuryAwareTop" type="checkbox">
+<span class="small-label">Injury-Aware</span>
+</label>
 </div>
+</div>
+<div class="market-filter-group market-advanced-filters ds-market-filter-shell">
+<span class="small-label market-filter-label">Narrow results</span>
+<div class="market-advanced-filter-row">
+<label class="field-inline market-adv-field">
+<span class="small-label">Bookmaker</span>
+<select class="market-api-input" id="marketBookFilter">
+<option value="">All bookmakers</option>
+<option value="draftkings">DraftKings</option>
+<option value="fanduel">FanDuel</option>
+<option value="betmgm">BetMGM</option>
+<option value="caesars">Caesars</option>
+<option value="pointsbet">PointsBet</option>
+<option value="betrivers">BetRivers</option>
+<option value="bovada">Bovada</option>
+<option value="mybookie">MyBookie</option>
+</select>
+</label>
+<label class="field-inline market-adv-field">
+<span class="small-label">Min odds (decimal)</span>
+<input class="market-api-input" id="marketMinOdds" type="number" min="1.01" max="50" step="0.05" placeholder="e.g. 1.80"/>
+</label>
+<label class="field-inline market-adv-field">
+<span class="small-label">Max odds (decimal)</span>
+<input class="market-api-input" id="marketMaxOdds" type="number" min="1.01" max="50" step="0.05" placeholder="e.g. 2.50"/>
+</label>
+<button class="secondary-btn" id="marketAdvFilterResetBtn" type="button">Reset</button>
+</div>
+</div>
+<div class="market-filter-group ds-market-filter-shell">
+<span class="small-label market-filter-label">Standard filters</span>
+<div class="market-filter-chip-row flex flex-wrap gap-2" id="marketFilterChips"></div>
+</div>
+<div class="market-filter-group expert-filter-group ds-market-filter-shell">
+<span class="small-label market-filter-label">Expert angles</span>
+<div class="market-filter-chip-row flex flex-wrap gap-2" id="marketExpertFilterChips"></div>
 </div>
 <div class="market-api-panel card rounded-[28px] border border-white/10 market-api-command">
 <div class="section-head compact-inline-head">
@@ -887,7 +1028,7 @@ tailwind.config = {
 </label>
 </div>
 <div class="market-api-actions flex flex-wrap items-end gap-3">
-<button class="secondary-btn" id="oddsCheckBalanceBtn" type="button" title="Check remaining API credits without loading events">💳 Check Balance</button>
+<button class="secondary-btn" id="oddsCheckBalanceBtn" type="button" title="Check remaining API credits without loading events">Check Balance</button>
 <button class="secondary-btn" id="oddsLoadEventsBtn" type="button">Load Events</button>
 <label class="field-inline field-grow">
 <span class="small-label">Event</span>
@@ -908,7 +1049,7 @@ tailwind.config = {
 <textarea class="market-textarea" id="marketTextarea" placeholder="player_name,stat,line,over_odds,under_odds
 Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 <div class="market-template-note">
-                Template: <code>player_name,stat,line,over_odds,under_odds</code>
+ Template: <code>player_name,stat,line,over_odds,under_odds</code>
 </div>
 <div class="market-action-row">
 <button class="secondary-btn" id="marketTemplateBtn" type="button">Load Template</button>
@@ -921,47 +1062,11 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 <h3>One prop per line.</h3>
 <ul class="market-guide-list">
 <li>Imported Odds API rows are converted to decimal before scanning.</li>
-              <li>Use stat codes like <strong>PTS</strong>, <strong>REB</strong>, <strong>AST</strong>, <strong>3PM</strong>, <strong>PRA</strong>, <strong>RA</strong>.</li>
+ <li>Use stat codes like <strong>PTS</strong>, <strong>REB</strong>, <strong>AST</strong>, <strong>3PM</strong>, <strong>PRA</strong>, <strong>RA</strong>.</li>
 <li>Teams and opponents are auto-detected from the player.</li>
 <li>The scanner ranks by EV first, then edge, then recent hit rate.</li>
 </ul>
 </div>
-</div>
-<div class="market-filter-group market-advanced-filters">
-<span class="small-label market-filter-label">Narrow results</span>
-<div class="market-advanced-filter-row">
-<label class="field-inline market-adv-field">
-<span class="small-label">Bookmaker</span>
-<select class="market-api-input" id="marketBookFilter">
-<option value="">All bookmakers</option>
-<option value="draftkings">DraftKings</option>
-<option value="fanduel">FanDuel</option>
-<option value="betmgm">BetMGM</option>
-<option value="caesars">Caesars</option>
-<option value="pointsbet">PointsBet</option>
-<option value="betrivers">BetRivers</option>
-<option value="bovada">Bovada</option>
-<option value="mybookie">MyBookie</option>
-</select>
-</label>
-<label class="field-inline market-adv-field">
-<span class="small-label">Min odds (decimal)</span>
-<input class="market-api-input" id="marketMinOdds" type="number" min="1.01" max="50" step="0.05" placeholder="e.g. 1.80"/>
-</label>
-<label class="field-inline market-adv-field">
-<span class="small-label">Max odds (decimal)</span>
-<input class="market-api-input" id="marketMaxOdds" type="number" min="1.01" max="50" step="0.05" placeholder="e.g. 2.50"/>
-</label>
-<button class="secondary-btn" id="marketAdvFilterResetBtn" type="button">Reset</button>
-</div>
-</div>
-<div class="market-filter-group">
-<span class="small-label market-filter-label">Standard filters</span>
-<div class="market-filter-chip-row flex flex-wrap gap-2" id="marketFilterChips"></div>
-</div>
-<div class="market-filter-group expert-filter-group">
-<span class="small-label market-filter-label">Expert angles</span>
-<div class="market-filter-chip-row flex flex-wrap gap-2" id="marketExpertFilterChips"></div>
 </div>
 <div class="bet-finder-state empty-state-panel compact" id="marketResults">
 <div class="empty-icon">🧾</div>
@@ -971,19 +1076,28 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 </section>
 <div class="market-inspect-tray hidden" id="marketInspectTray" aria-live="polite"></div>
 </section>
-<section class="dashboard-view gap-4" data-view="parlay">
-<section class="tool-intro-card card glass parlay-intro-card flex flex-col gap-4 rounded-[28px] border border-white/10 bg-slate-950/40 p-5 shadow-softxl backdrop-blur-xl xl:flex-row xl:items-center xl:justify-between">
+<section class="dashboard-view gap-4 ds-parlay" data-view="parlay">
+<section class="tool-intro-card ds-card ds-parlay-header card glass parlay-intro-card flex flex-col gap-4 rounded-[28px] border border-white/10 bg-slate-950/40 p-5 shadow-softxl backdrop-blur-xl xl:flex-row xl:items-center xl:justify-between">
 <div>
 <p class="section-kicker">Parlay Builder</p>
-<h2>Scrape every today's game, find the highest hit-rate props, build your parlay.</h2>
-<p class="small-meta">Uses key rotation across your API keys so no single key runs dry. One bookmaker per call saves ~80% of credits. Props are analyzed in parallel then ranked by win rate.</p>
+<h2>Scan today's games, rank the strongest props, and build a clean ticket fast.</h2>
+<p class="small-meta">Uses key rotation so no single API key burns out. Single-bookmaker runs keep credit usage efficient while props are scored and ranked by hit rate.</p>
 </div>
 </section>
-<section class="card glass parlay-panel rounded-[28px] border border-white/10 backdrop-blur-xl" id="parlayPanel">
-<!-- Step 1: API config -->
+<section class="ds-card ds-parlay-shell card glass parlay-panel rounded-[28px] border border-white/10 backdrop-blur-xl" id="parlayPanel">
+<div class="parlay-jump-row" aria-label="Parlay sections">
+<button class="parlay-jump-chip is-active" type="button" data-target="parlaySetupBlock">Setup</button>
+<button class="parlay-jump-chip" type="button" data-target="parlayEventPickerWrap">Events</button>
+<button class="parlay-jump-chip" type="button" data-target="parlayBuildWrap">Build</button>
+<button class="parlay-jump-chip" type="button" data-target="parlayTicket">Ticket</button>
+<button class="parlay-jump-chip" type="button" data-target="parlayAllPropsWrap">Board</button>
+</div>
+<div class="parlay-workbench">
+<div class="parlay-command-rail">
+<section class="parlay-block" id="parlaySetupBlock">
 <div class="parlay-step-label"><span class="parlay-step-num">1</span> API Setup</div>
 <div class="parlay-config-grid">
-<div class="parlay-config-row">
+<div class="parlay-config-row parlay-quick-config-row">
 <label class="field-inline">
 <span class="small-label">Sport</span>
 <select class="market-api-input" id="parlaySportSelect">
@@ -991,6 +1105,13 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 <option value="basketball_wnba">WNBA</option>
 </select>
 </label>
+<div class="field-inline parlay-load-btn-wrap">
+<button class="secondary-btn" id="parlayLoadEventsBtn" type="button">Load Today's Events</button>
+</div>
+</div>
+<details class="parlay-advanced-settings">
+<summary>Advanced config</summary>
+<div class="parlay-config-row parlay-advanced-config-row">
 <label class="field-inline">
 <span class="small-label">Odds format</span>
 <select class="market-api-input" id="parlayOddsFormatSelect">
@@ -1020,23 +1141,22 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 <option value="20">Last 20</option>
 </select>
 </label>
-<div class="field-inline" style="align-self:flex-end">
-<button class="secondary-btn" id="parlayLoadEventsBtn" type="button">Load Today's Events</button>
 </div>
+</details>
 </div>
-</div>
-<!-- Step 2: Event picker (hidden until events load) -->
-<div id="parlayEventPickerWrap" style="display:none">
-<div class="parlay-step-label"><span class="parlay-step-num">2</span> Pick Events <span class="parlay-key-hint">(select the games you want props from)</span></div>
+</section>
+
+<section class="parlay-block" id="parlayEventPickerWrap" style="display:none">
+<div class="parlay-step-label"><span class="parlay-step-num">2</span> Pick Events <span class="parlay-key-hint">(select the games you want to pull props from)</span></div>
 <div class="parlay-event-list" id="parlayEventList"></div>
 <div class="parlay-event-actions">
 <button class="text-btn" id="parlaySelectAllBtn" type="button">Select all</button>
 <button class="text-btn" id="parlaySelectNoneBtn" type="button">Clear</button>
 <span class="small-meta" id="parlayEventSelectionMeta"></span>
 </div>
-</div>
-<!-- Step 3: Leg count + build (hidden until events picked) -->
-<div id="parlayBuildWrap" style="display:none">
+</section>
+
+<section class="parlay-block" id="parlayBuildWrap" style="display:none">
 <div class="parlay-step-label"><span class="parlay-step-num">3</span> Build Parlay</div>
 <div class="parlay-action-row">
 <label class="field-inline">
@@ -1049,50 +1169,42 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 <option value="6">6-Leg</option>
 </select>
 </label>
-<label class="field-inline parlay-injury-toggle-wrap" title="Re-analyze props using today's injury report — considers who is OUT or Questionable">
+<label class="field-inline parlay-injury-toggle-wrap" title="Re-analyze props using today's injury report and lineup context">
 <input id="parlayInjuryAware" type="checkbox">
-<span class="small-label">🏥 Injury-Aware</span>
+<span class="small-label">Injury-Aware</span>
 </label>
 <button class="primary-btn parlay-build-btn" id="parlayBuildBtn" type="button">
-<span class="parlay-btn-icon">🎰</span> Scrape &amp; Build
-              </button>
-<button class="secondary-btn parlay-build-btn" id="parlayRebuildBtn" style="display:none" title="Re-pick legs from cache — no API calls" type="button">
-<span class="parlay-btn-icon">🔀</span> Reshuffle
-              </button>
-<button class="text-btn" id="parlayRescrapeBtn" style="display:none" title="Re-scrape selected events — uses API credits" type="button">
-                ↺ Re-scrape
-              </button>
+Build Parlay
+</button>
+<button class="secondary-btn parlay-build-btn" id="parlayRebuildBtn" style="display:none" title="Re-pick legs from cache - no API calls" type="button">
+<span class="parlay-btn-icon">Reshuffle</span> Reshuffle
+</button>
+<button class="secondary-btn parlay-build-btn" id="parlayRescrapeBtn" style="display:none" title="Re-scrape selected events - uses API credits" type="button">
+Re-scrape
+</button>
+</div>
 <div class="small-meta parlay-status-meta" id="parlayStatusMeta"></div>
-</div>
-</div>
-<!-- Injury summary panel (shown after injury-aware build) -->
+</section>
+
+<section id="parlayInjurySummaryWrap">
 <div id="parlayInjurySummary" style="display:none" class="parlay-injury-summary-panel"></div>
-<!-- Quota tracker -->
+</section>
+
+<details class="parlay-advanced-settings parlay-credit-log">
+<summary>Credit log</summary>
 <div class="parlay-quota-bar" id="parlayQuotaBar" style="display:none">
 <div class="parlay-quota-inner">
 <span class="small-label">Credit log</span>
 <div class="parlay-quota-list" id="parlayQuotaList"></div>
 </div>
 </div>
-<!-- Scrape progress bar -->
-<div aria-live="polite" class="parlay-progress-wrap" id="parlayProgressWrap" style="display:none">
-<div class="parlay-progress-track">
-<span class="streaming-badge parlay-streaming-badge" id="parlayStreamingBadge"><span class="streaming-dot"></span>Live progress</span>
-<div class="parlay-progress-court" aria-hidden="true">
-<div class="parlay-progress-lane"></div>
-<div class="parlay-progress-arc"></div>
-<div class="parlay-progress-ball" id="parlayProgressBall"></div>
-</div>
-<div aria-valuemax="100" aria-valuemin="0" aria-valuenow="0" class="parlay-progress-bar" id="parlayProgressBar" role="progressbar" style="width:0%"></div>
-</div>
-<div class="parlay-progress-copy">
-<div class="parlay-progress-left">
-<span class="parlay-progress-label" id="parlayProgressLabel"></span>
-</div>
-<span class="parlay-progress-percent" id="parlayProgressPercent">0%</span>
+</details>
+
+<div aria-live="polite" class="parlay-progress-wrap" id="parlayProgressWrap" style="display:none"></div>
 </div>
 </div>
-<!-- Results: selected parlay ticket -->
+
+<section class="parlay-ticket-shell" id="parlayTicketShell" style="display:none">
 <div class="parlay-ticket" id="parlayTicket" style="display:none">
 <div class="parlay-ticket-header">
 <div>
@@ -1101,14 +1213,15 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 </div>
 <div class="parlay-ticket-odds-block">
 <span class="small-label">Combined odds</span>
-<strong class="parlay-combined-odds" id="parlayTicketOdds">—</strong>
+<strong class="parlay-combined-odds" id="parlayTicketOdds">--</strong>
 </div>
 </div>
-<div class="parlay-legs-grid" id="parlayTicketLegs"></div>
+<div class="parlay-legs-grid" id="parlayTicketLegsGrid"></div>
 </div>
-<!-- All props board -->
-<div id="parlayAllPropsWrap" style="display:none">
-<div class="section-head" style="padding: 0 0 12px">
+</section>
+
+<section class="parlay-board-shell" id="parlayAllPropsWrap" style="display:none">
+<div class="section-head parlay-board-head">
 <div>
 <p class="section-kicker">All Props Scored</p>
 <h3 id="parlayAllPropsTitle">Ranked by hit rate</h3>
@@ -1143,35 +1256,43 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 <th>Confidence</th>
 <th>Quick read</th>
 <th>Odds</th>
-<th class="parlay-inj-col" title="Lineup Context — shows injured teammates and lineup-context support (requires Injury-Aware mode)">🏥 Injuries</th>
+<th class="parlay-inj-col" title="Lineup context support (requires Injury-Aware mode)">Injuries</th>
 <th></th>
 </tr>
 </thead>
 <tbody id="parlayAllPropsBody"></tbody>
 </table>
 </div>
-</div>
-<!-- Empty state -->
-<div class="bet-finder-state empty-state-panel compact" id="parlayEmptyState">
-<div class="empty-icon">🎰</div>
+</section>
+
+<div class="bet-finder-state empty-state-panel compact parlay-empty-shell" id="parlayEmptyState">
+<div class="empty-icon">[ ]</div>
 <strong>No parlay built yet.</strong>
 <span>Add at least 5 usable Odds API keys in Key Vault, choose your legs, and click Build Parlay.</span>
 </div>
 </section>
 </section>
-<section class="dashboard-view gap-4" data-view="tracker">
-<section class="tracker-hero card glass rounded-[28px] border border-white/10 backdrop-blur-xl">
+<section class="dashboard-view gap-4 ds-tracker" data-view="tracker">
+<section class="tracker-hero card glass rounded-[28px] border border-white/10 backdrop-blur-xl ds-card">
 <div class="tracker-hero-copy">
 <p class="section-kicker">Live Prop Tracker</p>
-<h2>Watch your bets fill in real time.</h2>
-<p class="small-meta">Add player props below and hit Refresh to pull the latest game log stats. Each bar fills toward the line — green when it hits.</p>
+<h2>Prop Tracker Terminal</h2>
+<p class="small-meta">Fast board for active positions. Add entries, tune the board view, and refresh live progress toward each line.</p>
 </div>
+<div class="tracker-hero-actions">
 <button class="primary-btn tracker-refresh-btn" id="trackerRefreshBtn" type="button">
-<span class="tracker-refresh-icon">↻</span> Refresh All
-          </button>
+<span class="tracker-refresh-icon">↻</span> Refresh Live Board
+</button>
+<div class="tracker-toolbar-summary" id="trackerBoardSummary">Standing by</div>
+</div>
 </section>
-<section class="card glass tracker-add-panel rounded-[28px] border border-white/10 backdrop-blur-xl">
-<div class="parlay-step-label"><span class="parlay-step-num">+</span> Add a Prop to Track</div>
+<section class="card glass tracker-control-deck rounded-[28px] border border-white/10 backdrop-blur-xl ds-card">
+<div class="tracker-control-head">
+<div>
+<p class="section-kicker">Execution Panel</p>
+<h3>Add a Prop to Track</h3>
+</div>
+</div>
 <div class="tracker-add-grid">
 <label class="field-inline tracker-field-player">
 <span class="small-label">Player name</span>
@@ -1219,329 +1340,340 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 </div>
 </div>
 <div class="small-meta" id="trackerAddError" style="color:var(--bad);display:none"></div>
+<div class="tracker-toolbar card glass rounded-[20px] border border-white/10 backdrop-blur-xl">
+ <label class="field-inline">
+ <span class="small-label">Sort</span>
+ <select class="market-api-input" id="trackerSortSelect">
+ <option value="closest">Closest to cash</option>
+ <option value="danger">Biggest risk</option>
+ <option value="live">Live first</option>
+ <option value="recent">Recently updated</option>
+ <option value="player">Player A-Z</option>
+ </select>
+ </label>
+ <label class="field-inline">
+ <span class="small-label">Group</span>
+ <select class="market-api-input" id="trackerGroupSelect">
+ <option value="game">By game</option>
+ <option value="status">By status</option>
+ <option value="none">No grouping</option>
+ </select>
+ </label>
+ <label class="field-inline">
+ <span class="small-label">Filter</span>
+ <select class="market-api-input" id="trackerFilterSelect">
+ <option value="all">All props</option>
+ <option value="live">Live only</option>
+ <option value="active">In progress</option>
+ <option value="pending">Pending only</option>
+ <option value="hit">Hit only</option>
+ <option value="busted">Busted only</option>
+ </select>
+ </label>
+</div>
 </section>
-<section class="tracker-toolbar card glass rounded-[24px] border border-white/10 backdrop-blur-xl">
-  <label class="field-inline">
-    <span class="small-label">Sort</span>
-    <select class="market-api-input" id="trackerSortSelect">
-      <option value="closest">Closest to cash</option>
-      <option value="danger">Biggest risk</option>
-      <option value="live">Live first</option>
-      <option value="recent">Recently updated</option>
-      <option value="player">Player A-Z</option>
-    </select>
-  </label>
-  <label class="field-inline">
-    <span class="small-label">Group</span>
-    <select class="market-api-input" id="trackerGroupSelect">
-      <option value="game">By game</option>
-      <option value="status">By status</option>
-      <option value="none">No grouping</option>
-    </select>
-  </label>
-  <label class="field-inline">
-    <span class="small-label">Filter</span>
-    <select class="market-api-input" id="trackerFilterSelect">
-      <option value="all">All props</option>
-      <option value="live">Live only</option>
-      <option value="active">In progress</option>
-      <option value="pending">Pending only</option>
-      <option value="hit">Hit only</option>
-      <option value="busted">Busted only</option>
-    </select>
-  </label>
-  <div class="tracker-toolbar-summary" id="trackerBoardSummary">Standing by</div>
-</section>
+<section class="tracker-board-shell card glass rounded-[28px] border border-white/10 backdrop-blur-xl ds-card">
+<div class="tracker-board-head">
+<p class="section-kicker">Live Positions</p>
+</div>
 <div class="tracker-cards" id="trackerCards"></div>
 <div class="bet-finder-state empty-state-panel compact" id="trackerEmpty">
-<div class="empty-icon">📡</div>
+<div class="empty-icon">[ ]</div>
 <strong>No props tracked yet.</strong>
 <span>Add a prop above to start watching it fill toward the line.</span>
 </div>
+</section>
 
 <!-- ── Backtest Performance Dashboard ─────────────────────────────────── -->
-<section class="card glass rounded-[28px] border border-white/10 backdrop-blur-xl" id="backtestSection" style="margin-top:8px">
-  <div class="section-head collapsible-head">
-    <div>
-      <p class="section-kicker">Win Rate Engine</p>
-      <h2>Backtest performance</h2>
-    </div>
-    <div class="section-head-actions">
-      <span class="spotlight-pill neutral" id="backtestSummaryPill">No results yet</span>
-      <button aria-label="Toggle backtest panel" class="collapse-btn" data-collapse-target="backtestBody" type="button">-</button>
-    </div>
-  </div>
-  <div id="backtestBody">
-    <!-- Log prediction form -->
-    <div class="tracker-add-panel" style="padding:16px 20px 0">
-      <div class="parlay-step-label"><span class="parlay-step-num">+</span> Log a Prediction</div>
-      <div class="tracker-add-grid" style="grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px 14px;padding-top:10px">
-        <label class="field-inline">
-          <span class="small-label">Player</span>
-          <div class="tracker-player-autocomplete">
-            <input aria-autocomplete="list" aria-expanded="false" aria-owns="btPlayerDropdown" autocomplete="off" class="market-api-input" id="btPlayerInput" placeholder="e.g. LeBron James" role="combobox" type="text"/>
-            <ul aria-label="Backtest player suggestions" class="tracker-player-dropdown" id="btPlayerDropdown" role="listbox"></ul>
-          </div>
-        </label>
-        <label class="field-inline">
-          <span class="small-label">Stat</span>
-          <select class="market-api-input" id="btStatSelect">
-            <option value="PTS">PTS</option><option value="REB">REB</option><option value="AST">AST</option>
-            <option value="3PM">3PM</option><option value="STL">STL</option><option value="BLK">BLK</option>
-            <option value="PRA">PRA</option><option value="PR">PR</option><option value="PA">PA</option>
-            <option value="RA">RA</option>
-          </select>
-        </label>
-        <label class="field-inline">
-          <span class="small-label">Line</span>
-          <input class="market-api-input" id="btLineInput" min="0" placeholder="25.5" step="0.5" type="number"/>
-        </label>
-        <label class="field-inline">
-          <span class="small-label">Side</span>
-          <select class="market-api-input" id="btSideSelect">
-            <option value="OVER">OVER</option><option value="UNDER">UNDER</option>
-          </select>
-        </label>
-        <label class="field-inline">
-          <span class="small-label">Confidence tier</span>
-          <select class="market-api-input" id="btTierSelect">
-            <option value="Elite">Elite (A)</option>
-            <option value="High">High (B)</option>
-            <option value="Medium" selected>Medium (C)</option>
-            <option value="Low">Low (D)</option>
-          </select>
-        </label>
-        <label class="field-inline">
-          <span class="small-label">Odds (decimal)</span>
-          <input class="market-api-input" id="btOddsInput" min="1" placeholder="1.91" step="0.01" type="number"/>
-        </label>
-        <div class="field-inline tracker-add-btn-wrap" style="align-self:flex-end">
-          <button class="secondary-btn" id="btLogBtn" type="button">Log Prediction</button>
-        </div>
-      </div>
-      <div class="small-meta" id="btLogError" style="color:var(--bad);display:none;padding:6px 0"></div>
-    </div>
+<section class="card glass rounded-[28px] border border-white/10 backdrop-blur-xl ds-card ds-backtest" id="backtestSection">
+ <div class="section-head collapsible-head">
+ <div>
+ <p class="section-kicker">Win Rate Engine</p>
+ <h2>Backtest performance</h2>
+ </div>
+ <div class="section-head-actions">
+ <span class="spotlight-pill neutral" id="backtestSummaryPill">No results yet</span>
+ <button aria-label="Toggle backtest panel" class="collapse-btn" data-collapse-target="backtestBody" type="button">-</button>
+ </div>
+ </div>
+ <div class="ds-backtest-body" id="backtestBody">
+ <!-- Log prediction form -->
+ <div class="tracker-add-panel backtest-entry-panel">
+ <div class="parlay-step-label"><span class="parlay-step-num">+</span> Log a Prediction</div>
+ <div class="tracker-add-grid backtest-entry-grid">
+ <label class="field-inline">
+ <span class="small-label">Player</span>
+ <div class="tracker-player-autocomplete">
+ <input aria-autocomplete="list" aria-expanded="false" aria-owns="btPlayerDropdown" autocomplete="off" class="market-api-input" id="btPlayerInput" placeholder="e.g. LeBron James" role="combobox" type="text"/>
+ <ul aria-label="Backtest player suggestions" class="tracker-player-dropdown" id="btPlayerDropdown" role="listbox"></ul>
+ </div>
+ </label>
+ <label class="field-inline">
+ <span class="small-label">Stat</span>
+ <select class="market-api-input" id="btStatSelect">
+ <option value="PTS">PTS</option><option value="REB">REB</option><option value="AST">AST</option>
+ <option value="3PM">3PM</option><option value="STL">STL</option><option value="BLK">BLK</option>
+ <option value="PRA">PRA</option><option value="PR">PR</option><option value="PA">PA</option>
+ <option value="RA">RA</option>
+ </select>
+ </label>
+ <label class="field-inline">
+ <span class="small-label">Line</span>
+ <input class="market-api-input" id="btLineInput" min="0" placeholder="25.5" step="0.5" type="number"/>
+ </label>
+ <label class="field-inline">
+ <span class="small-label">Side</span>
+ <select class="market-api-input" id="btSideSelect">
+ <option value="OVER">OVER</option><option value="UNDER">UNDER</option>
+ </select>
+ </label>
+ <label class="field-inline">
+ <span class="small-label">Confidence tier</span>
+ <select class="market-api-input" id="btTierSelect">
+ <option value="Elite">Elite (A)</option>
+ <option value="High">High (B)</option>
+ <option value="Medium" selected>Medium (C)</option>
+ <option value="Low">Low (D)</option>
+ </select>
+ </label>
+ <label class="field-inline">
+ <span class="small-label">Odds (decimal)</span>
+ <input class="market-api-input" id="btOddsInput" min="1" placeholder="1.91" step="0.01" type="number"/>
+ </label>
+ <div class="field-inline tracker-add-btn-wrap">
+ <button class="secondary-btn" id="btLogBtn" type="button">Log Prediction</button>
+ </div>
+ </div>
+ <div class="small-meta backtest-log-error" id="btLogError" style="display:none"></div>
+ </div>
 
-    <!-- Stats summary row -->
-    <div id="backtestStats" style="display:none;padding:16px 20px 8px">
-      <div class="opportunity-chip-grid" style="grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px">
-        <div class="opportunity-chip" id="btStatTotal"><span class="small-label">Logged</span><strong>—</strong><small>predictions</small></div>
-        <div class="opportunity-chip" id="btStatWin"><span class="small-label">Win rate</span><strong>—</strong><small>resolved bets</small></div>
-        <div class="opportunity-chip" id="btStatROI"><span class="small-label">ROI</span><strong>—</strong><small>at -110 avg</small></div>
-        <div class="opportunity-chip" id="btStatPending"><span class="small-label">Pending</span><strong>—</strong><small>unresolved</small></div>
-      </div>
-      <!-- Tier breakdown -->
-      <div id="btTierBreakdown" style="margin-top:12px"></div>
-      <!-- Stat breakdown -->
-      <div id="btStatBreakdown" style="margin-top:8px"></div>
-      <div class="backtest-breakdown-grid" style="margin-top:12px">
-        <div id="btSideBreakdown"></div>
-        <div id="btAlignmentBreakdown"></div>
-        <div id="btTopPlayers"></div>
-        <div id="btRecentForm"></div>
-      </div>
-    </div>
+ <!-- Stats summary row -->
+ <div class="ds-backtest-stats" id="backtestStats" style="display:none">
+ <div class="opportunity-chip-grid ds-backtest-stat-grid">
+ <div class="opportunity-chip" id="btStatTotal"><span class="small-label">Logged</span><strong>—</strong><small>predictions</small></div>
+ <div class="opportunity-chip" id="btStatWin"><span class="small-label">Win rate</span><strong>—</strong><small>resolved bets</small></div>
+ <div class="opportunity-chip" id="btStatROI"><span class="small-label">ROI</span><strong>—</strong><small>at -110 avg</small></div>
+ <div class="opportunity-chip" id="btStatPending"><span class="small-label">Pending</span><strong>—</strong><small>unresolved</small></div>
+ </div>
+ <!-- Tier breakdown -->
+ <div class="ds-backtest-tier" id="btTierBreakdown"></div>
+ <!-- Stat breakdown -->
+ <div class="ds-backtest-statbreak" id="btStatBreakdown"></div>
+ <div class="backtest-breakdown-grid ds-backtest-breakdown-grid">
+ <div id="btSideBreakdown"></div>
+ <div id="btAlignmentBreakdown"></div>
+ <div id="btTopPlayers"></div>
+ <div id="btRecentForm"></div>
+ </div>
+ </div>
 
-    <!-- Log table -->
-    <div id="backtestLogWrap" style="padding:0 20px 16px">
-      <div class="backtest-view-tabs" id="btViewTabs">
-        <button class="secondary-btn active" data-bt-view="active" type="button">Recent + Pending</button>
-        <button class="secondary-btn" data-bt-view="pending" type="button">Pending</button>
-        <button class="secondary-btn" data-bt-view="resolved" type="button">Resolved</button>
-      </div>
-      <div class="backtest-toolbar">
-        <label class="field-inline">
-          <span class="small-label">Search</span>
-          <input class="market-api-input" id="btFilterSearch" placeholder="Find player or note" type="text"/>
-        </label>
-        <label class="field-inline">
-          <span class="small-label">Result</span>
-          <select class="market-api-input" id="btFilterResult">
-            <option value="all">All</option>
-            <option value="pending">Pending</option>
-            <option value="hit">Hit</option>
-            <option value="miss">Miss</option>
-          </select>
-        </label>
-        <label class="field-inline">
-          <span class="small-label">Stat</span>
-          <select class="market-api-input" id="btFilterStat">
-            <option value="all">All stats</option>
-          </select>
-        </label>
-        <label class="field-inline">
-          <span class="small-label">Tier</span>
-          <select class="market-api-input" id="btFilterTier">
-            <option value="all">All tiers</option>
-          </select>
-        </label>
-        <label class="field-inline">
-          <span class="small-label">Side</span>
-          <select class="market-api-input" id="btFilterSide">
-            <option value="all">All sides</option>
-            <option value="OVER">Over</option>
-            <option value="UNDER">Under</option>
-          </select>
-        </label>
-        <label class="field-inline">
-          <span class="small-label">Range</span>
-          <select class="market-api-input" id="btFilterRange">
-            <option value="all">All time</option>
-            <option value="7d">Last 7 days</option>
-            <option value="30d">Last 30 days</option>
-            <option value="season">This season</option>
-          </select>
-        </label>
-        <label class="field-inline">
-          <span class="small-label">Group</span>
-          <select class="market-api-input" id="btGroupBy">
-            <option value="none">No grouping</option>
-            <option value="date">Group by date</option>
-            <option value="player">Group by player</option>
-          </select>
-        </label>
-        <label class="field-inline">
-          <span class="small-label">Page size</span>
-          <select class="market-api-input" id="btPageSize">
-            <option value="25">25</option>
-            <option value="50">50</option>
-          </select>
-        </label>
-      </div>
-      <div id="backtestLog" style="margin-top:12px"></div>
-      <div class="backtest-pagination" id="btPagination"></div>
-      <div class="backtest-archive-bar">
-        <label class="field-inline">
-          <span class="small-label">Archive resolved older than</span>
-          <select class="market-api-input" id="btArchiveDays">
-            <option value="30">30 days</option>
-            <option value="60">60 days</option>
-            <option value="90" selected>90 days</option>
-            <option value="180">180 days</option>
-          </select>
-        </label>
-        <button class="secondary-btn" id="btArchiveBtn" style="font-size:12px;padding:6px 14px" type="button">Archive older resolved</button>
-      </div>
-      <div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap">
-        <button class="secondary-btn" id="btRefreshBtn" style="font-size:12px;padding:6px 14px" type="button">↻ Refresh log</button>
-        <button class="secondary-btn" id="btSyncPgBtn" style="font-size:12px;padding:6px 14px" type="button">Sync from Postgres</button>
-        <button class="secondary-btn" id="btPushPgBtn" style="font-size:12px;padding:6px 14px" type="button">Push to Postgres</button>
-        <button class="secondary-btn" id="btExportBtn" style="font-size:12px;padding:6px 14px" type="button">Export current view</button>
-        <button class="secondary-btn" id="btExportSeasonBtn" style="font-size:12px;padding:6px 14px" type="button">Export season</button>
-        <label class="secondary-btn" style="font-size:12px;padding:6px 14px;cursor:pointer">
-          Import CSV
-          <input accept=".csv,text/csv" id="btImportInput" style="display:none" type="file"/>
-        </label>
-        <button class="secondary-btn" id="btClearBtn" style="font-size:12px;padding:6px 14px;color:var(--bad)" type="button">Clear all</button>
-      </div>
-    </div>
-  </div>
+ <!-- Log table -->
+ <div class="ds-backtest-log-wrap" id="backtestLogWrap">
+ <div class="backtest-view-tabs" id="btViewTabs">
+ <button class="secondary-btn active" data-bt-view="active" type="button">Recent + Pending</button>
+ <button class="secondary-btn" data-bt-view="pending" type="button">Pending</button>
+ <button class="secondary-btn" data-bt-view="resolved" type="button">Resolved</button>
+ </div>
+ <div class="backtest-toolbar">
+ <label class="field-inline">
+ <span class="small-label">Search</span>
+ <input class="market-api-input" id="btFilterSearch" placeholder="Find player or note" type="text"/>
+ </label>
+ <label class="field-inline">
+ <span class="small-label">Result</span>
+ <select class="market-api-input" id="btFilterResult">
+ <option value="all">All</option>
+ <option value="pending">Pending</option>
+ <option value="hit">Hit</option>
+ <option value="miss">Miss</option>
+ </select>
+ </label>
+ <label class="field-inline">
+ <span class="small-label">Stat</span>
+ <select class="market-api-input" id="btFilterStat">
+ <option value="all">All stats</option>
+ </select>
+ </label>
+ <label class="field-inline">
+ <span class="small-label">Tier</span>
+ <select class="market-api-input" id="btFilterTier">
+ <option value="all">All tiers</option>
+ </select>
+ </label>
+ <label class="field-inline">
+ <span class="small-label">Side</span>
+ <select class="market-api-input" id="btFilterSide">
+ <option value="all">All sides</option>
+ <option value="OVER">Over</option>
+ <option value="UNDER">Under</option>
+ </select>
+ </label>
+ <label class="field-inline">
+ <span class="small-label">Range</span>
+ <select class="market-api-input" id="btFilterRange">
+ <option value="all">All time</option>
+ <option value="7d">Last 7 days</option>
+ <option value="30d">Last 30 days</option>
+ <option value="season">This season</option>
+ </select>
+ </label>
+ <label class="field-inline">
+ <span class="small-label">Group</span>
+ <select class="market-api-input" id="btGroupBy">
+ <option value="none">No grouping</option>
+ <option value="date">Group by date</option>
+ <option value="player">Group by player</option>
+ </select>
+ </label>
+ <label class="field-inline">
+ <span class="small-label">Page size</span>
+ <select class="market-api-input" id="btPageSize">
+ <option value="25">25</option>
+ <option value="50">50</option>
+ </select>
+ </label>
+ </div>
+ <div class="ds-backtest-log" id="backtestLog"></div>
+ <div class="backtest-pagination" id="btPagination"></div>
+ <div class="backtest-archive-bar">
+ <label class="field-inline">
+ <span class="small-label">Archive resolved older than</span>
+ <select class="market-api-input" id="btArchiveDays">
+ <option value="30">30 days</option>
+ <option value="60">60 days</option>
+ <option value="90" selected>90 days</option>
+ <option value="180">180 days</option>
+ </select>
+ </label>
+ <button class="secondary-btn" id="btArchiveBtn" type="button">Archive older resolved</button>
+ </div>
+ <div class="backtest-actions-row">
+ <button class="secondary-btn" id="btRefreshBtn" type="button">↻ Refresh log</button>
+ <button class="secondary-btn" id="btSyncPgBtn" type="button">Sync from Postgres</button>
+ <button class="secondary-btn" id="btPushPgBtn" type="button">Push to Postgres</button>
+ <button class="secondary-btn" id="btExportBtn" type="button">Export current view</button>
+ <button class="secondary-btn" id="btExportSeasonBtn" type="button">Export season</button>
+ <label class="secondary-btn backtest-import-label">
+ Import CSV
+ <input accept=".csv,text/csv" id="btImportInput" style="display:none" type="file"/>
+ </label>
+ <button class="secondary-btn bt-danger-btn" id="btClearBtn" type="button">Clear all</button>
+ </div>
+ </div>
+ </div>
 </section>
 </section>
 
 <!-- ── Key Vault ─────────────────────────────────────────────────── -->
-<section class="dashboard-view gap-4" data-view="keyvault">
-  <section class="card glass rounded-[28px] border border-white/10 backdrop-blur-xl p-6" id="keyVaultPanel">
-    <div class="bet-finder-topbar market-topbar market-hero-head" style="margin-bottom:24px">
-      <div>
-        <p class="section-kicker">Key Vault</p>
-        <h2>Store and manage your API keys across all pages.</h2>
-        <p class="small-meta">Keys are saved locally in your browser and used as a shared rotating pool across Odds-powered tools. Keep at least 5 usable Odds API keys here so the app can randomize safely.</p>
-      </div>
-      <span class="small-badge" id="keyVaultStatus">Ready</span>
-    </div>
-
-    <!-- Add new key -->
-    <div class="card rounded-[28px] border border-white/10 p-5 mb-4" style="margin-bottom:16px">
-      <p class="section-kicker">Add Keys</p>
-      <div class="market-api-grid grid gap-3" style="grid-template-columns:1fr auto auto;align-items:flex-end">
-        <label class="field-inline">
-          <span class="small-label">API Keys</span>
-          <input class="market-api-input" id="kvKeyInput" placeholder="Paste key1,key2,key3" type="text"/>
-        </label>
-        <label class="field-inline">
-          <span class="small-label">Provider</span>
-          <select class="market-api-input" id="kvProviderSelect">
-            <option value="odds_api">The Odds API</option>
-          </select>
-        </label>
-        <button class="primary-btn" id="kvAddBtn" type="button">💾 Save Keys</button>
-      </div>
-    </div>
-
-    <!-- Saved keys list -->
-    <div class="card rounded-[28px] border border-white/10 p-5">
-      <div class="kv-health-grid" id="kvHealthGrid">
-        <div class="kv-health-card">
-          <span class="small-label">Pool health</span>
-          <strong id="kvHealthHeadline">Waiting for keys</strong>
-          <small id="kvHealthDetail">Add and check keys to see vault health.</small>
-        </div>
-        <div class="kv-health-card">
-          <span class="small-label">Healthy</span>
-          <strong id="kvHealthyCount">0</strong>
-          <small>Ready for rotation</small>
-        </div>
-        <div class="kv-health-card">
-          <span class="small-label">Soft-disabled</span>
-          <strong id="kvSoftDisabledCount">0</strong>
-          <small>Low-credit reserve</small>
-        </div>
-        <div class="kv-health-card">
-          <span class="small-label">Unchecked</span>
-          <strong id="kvUncheckedCount">0</strong>
-          <small>Run Check credits</small>
-        </div>
-      </div>
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px">
-        <div>
-          <p class="section-kicker" style="margin:0">Saved Keys</p>
-          <span class="small-meta" id="kvActiveLabel">Rotation pool not ready</span>
-        </div>
-        <div style="display:flex;gap:10px;flex-wrap:wrap">
-          <button class="secondary-btn" id="kvRefreshAllBtn" type="button">Check credits</button>
-        </div>
-      </div>
-      <div class="small-meta" id="kvVaultSummary" style="margin-bottom:14px">Store at least 5 usable keys to unlock automatic rotation.</div>
-      <div id="kvKeyList">
-        <div class="bet-finder-state empty-state-panel compact" style="padding:32px 0">
-          <div class="empty-icon">🔑</div>
-          <strong>No keys saved yet.</strong>
-          <span>Add a key above to get started.</span>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <section class="card glass rounded-[28px] border border-white/10 backdrop-blur-xl p-6" id="historyPanel">
-    <div class="bet-finder-topbar market-topbar market-hero-head" style="margin-bottom:18px">
-      <div>
-        <p class="section-kicker">Data Vault</p>
-        <h2>Browse historical records stored in Postgres.</h2>
-        <p class="small-meta">Review recent injury reports, odds snapshots, scanner runs, and parlay builds.</p>
-      </div>
-      <span class="small-badge" id="historyStatus">Ready</span>
-    </div>
-    <div class="history-controls">
-      <label class="field-inline">
-        <span class="small-label">Record type</span>
-        <select class="market-api-input" id="historyType">
-          <option value="injury">Injury reports</option>
-          <option value="odds">Odds snapshots</option>
-          <option value="market_scan">Market scans</option>
-          <option value="parlay">Parlay runs</option>
-          <option value="backtest">Backtest log</option>
-          <option value="player_info">Player info cache</option>
-        </select>
-      </label>
-      <label class="field-inline">
-        <span class="small-label">Limit</span>
-        <input class="market-api-input" id="historyLimit" type="number" min="5" max="200" value="25"/>
-      </label>
-      <button class="secondary-btn" id="historyRefreshBtn" type="button">Refresh</button>
-    </div>
-    <div id="historyList" class="history-list"></div>
-  </section>
+<section class="dashboard-view gap-4 ds-keyvault" data-view="keyvault">
+ <header class="ds-card ds-keyvault-header">
+ <div>
+ <p class="section-kicker">API Key Management</p>
+ <h2>Key Vault</h2>
+ <p class="small-meta">Store, rotate, and monitor API keys with a terminal-style workspace built for fast ops.</p>
+ </div>
+ </header>
+ <section class="ds-card ds-keyvault-shell" id="keyVaultPanel">
+ <div class="ds-keyvault-shell-head">
+ <div>
+ <p class="section-kicker">Key Vault</p>
+ <h3>Rotation pool and credit health</h3>
+ <p class="small-meta">Keys are saved locally in your browser and shared across Odds-powered views.</p>
+ </div>
+ <span class="small-badge" id="keyVaultStatus">Ready</span>
+ </div>
+ <div class="ds-keyvault-add">
+ <label class="field-inline">
+ <span class="small-label">API keys</span>
+ <input class="market-api-input" id="kvKeyInput" placeholder="Paste key1,key2,key3" type="text"/>
+ </label>
+ <label class="field-inline">
+ <span class="small-label">Provider</span>
+ <select class="market-api-input" id="kvProviderSelect">
+ <option value="odds_api">The Odds API</option>
+ </select>
+ </label>
+ <button class="primary-btn" id="kvAddBtn" type="button">Save keys</button>
+ </div>
+ <div class="kv-health-grid ds-keyvault-health-grid" id="kvHealthGrid">
+ <div class="kv-health-card">
+ <span class="small-label">Pool health</span>
+ <strong id="kvHealthHeadline">Waiting for keys</strong>
+ <small id="kvHealthDetail">Add and check keys to see vault health.</small>
+ </div>
+ <div class="kv-health-card">
+ <span class="small-label">Healthy</span>
+ <strong id="kvHealthyCount">0</strong>
+ <small>Ready for rotation</small>
+ </div>
+ <div class="kv-health-card">
+ <span class="small-label">Soft-disabled</span>
+ <strong id="kvSoftDisabledCount">0</strong>
+ <small>Low-credit reserve</small>
+ </div>
+ <div class="kv-health-card">
+ <span class="small-label">Unchecked</span>
+ <strong id="kvUncheckedCount">0</strong>
+ <small>Run check credits</small>
+ </div>
+ </div>
+ <section class="ds-keyvault-list-shell">
+ <div class="ds-keyvault-list-head">
+ <div>
+ <p class="section-kicker">Saved keys</p>
+ <span class="small-meta" id="kvActiveLabel">Rotation pool not ready</span>
+ </div>
+ <button class="secondary-btn" id="kvRefreshAllBtn" type="button">Check credits</button>
+ </div>
+ <div class="small-meta" id="kvVaultSummary">Store at least 5 usable keys to unlock automatic rotation.</div>
+ <div id="kvKeyList">
+ <div class="bet-finder-state empty-state-panel compact" style="padding:32px 0">
+ <div class="empty-icon">[ ]</div>
+ <strong>No keys saved yet.</strong>
+ <span>Add a key above to get started.</span>
+ </div>
+ </div>
+ <div class="ds-pagination" id="kvPagination">
+ <button class="secondary-btn" id="kvPrevBtn" type="button">Previous</button>
+ <span class="small-meta" id="kvPageInfo">Page 1 of 1</span>
+ <button class="secondary-btn" id="kvNextBtn" type="button">Next</button>
+ </div>
+ </section>
+ </section>
+ <section class="ds-card ds-keyvault-history" id="historyPanel">
+ <div class="ds-keyvault-shell-head">
+ <div>
+ <p class="section-kicker">Data Vault</p>
+ <h3>Historical records</h3>
+ <p class="small-meta">Review injury reports, odds snapshots, scanner runs, and parlay builds.</p>
+ </div>
+ <span class="small-badge" id="historyStatus">Ready</span>
+ </div>
+ <div class="history-controls ds-keyvault-history-controls">
+ <label class="field-inline">
+ <span class="small-label">Record type</span>
+ <select class="market-api-input" id="historyType">
+ <option value="injury">Injury reports</option>
+ <option value="odds">Odds snapshots</option>
+ <option value="market_scan">Market scans</option>
+ <option value="parlay">Parlay runs</option>
+ <option value="backtest">Backtest log</option>
+ <option value="player_info">Player info cache</option>
+ </select>
+ </label>
+ <label class="field-inline">
+ <span class="small-label">Limit</span>
+ <input class="market-api-input" id="historyLimit" type="number" min="5" max="200" value="25"/>
+ </label>
+ <button class="secondary-btn" id="historyRefreshBtn" type="button">Refresh</button>
+ </div>
+ <div id="historyList" class="history-list"></div>
+ <div class="ds-pagination" id="historyPagination">
+ <button class="secondary-btn" id="historyPrevBtn" type="button">Previous</button>
+ <span class="small-meta" id="historyPageInfo">Page 1 of 1</span>
+ <button class="secondary-btn" id="historyNextBtn" type="button">Next</button>
+ </div>
+ </section>
 </section>
 
 </main>
@@ -1553,96 +1685,102 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 <div class="action-banner-copy">
 <strong id="actionBannerTitle">Working on it…</strong>
 <span id="actionBannerDetail">Please wait while the dashboard updates.</span>
+<div class="action-banner-progress" id="actionBannerProgress" aria-hidden="true">
+<div class="action-banner-progress-rail">
+<div class="action-banner-progress-fill" id="actionBannerProgressFill"></div>
+</div>
+<span class="action-banner-progress-text" id="actionBannerProgressText">0%</span>
+</div>
 </div>
 <span class="action-banner-state" id="actionBannerState">Working</span>
 </div>
 </div>
 
-<!-- ══════════════════════════════════════════════════════════════
-     USER GUIDE MODAL
-     ══════════════════════════════════════════════════════════════ -->
+<!-- ==================================================================
+ USER GUIDE MODAL
+ ================================================================== -->
 <div id="userGuideModal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.75);backdrop-filter:blur(6px);overflow-y:auto;padding:24px 16px">
-  <div style="max-width:780px;margin:0 auto;background:var(--card-bg,#0f1117);border:1px solid rgba(255,255,255,0.1);border-radius:24px;padding:32px;color:var(--text,#e8eaf0);font-family:inherit;position:relative">
-    <button id="closeUserGuideBtn" type="button" style="position:absolute;top:16px;right:16px;background:none;border:none;color:inherit;font-size:22px;cursor:pointer;opacity:0.5;line-height:1" title="Close">✕</button>
-    <div style="display:flex;align-items:center;gap:12px;margin-bottom:28px">
-      <span style="font-size:32px">📖</span>
-      <div>
-        <p style="font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;opacity:.45;margin:0">NBA Props Tracker</p>
-        <h2 style="font-size:22px;font-weight:800;margin:2px 0 0">User Guide</h2>
-      </div>
-    </div>
+ <div style="max-width:780px;margin:0 auto;background:var(--card-bg,#0f1117);border:1px solid rgba(255,255,255,0.1);border-radius:24px;padding:32px;color:var(--text,#e8eaf0);font-family:inherit;position:relative">
+ <button id="closeUserGuideBtn" type="button" style="position:absolute;top:16px;right:16px;background:none;border:none;color:inherit;font-size:22px;cursor:pointer;opacity:0.5;line-height:1" title="Close">✕</button>
+ <div style="display:flex;align-items:center;gap:12px;margin-bottom:28px">
+ <span style="font-size:32px">📖</span>
+ <div>
+ <p style="font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;opacity:.45;margin:0">NBA Props Tracker</p>
+ <h2 style="font-size:22px;font-weight:800;margin:2px 0 0">User Guide</h2>
+ </div>
+ </div>
 
-    <!-- SECTION: What each section does -->
-    <div class="ug-section">
-      <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">🗺️ Section Overview</h3>
-      <div style="display:grid;gap:10px">
-        <div class="ug-card"><span class="ug-icon">⌂</span><div><strong>Overview</strong> — Dashboard snapshot. Shows today's schedule, quick-access favorites, and recent tracker bets at a glance.</div></div>
-        <div class="ug-card"><span class="ug-icon">🗓️</span><div><strong>Today's Games</strong> — Full slate with team injury notes and game status. Use this to spot missing key players before analyzing props.</div></div>
-        <div class="ug-card"><span class="ug-icon">📊</span><div><strong>Player Analyzer</strong> — Deep-dive on one player prop. Pick a player, stat, and line to get hit rate, averages, trends, matchup data, and a confidence score.</div></div>
-        <div class="ug-card"><span class="ug-icon">🔍</span><div><strong>Bet Finder</strong> — Bulk analysis mode. Enter multiple props (or import from Odds API) and the scanner ranks them by EV, edge, and hit rate.</div></div>
-        <div class="ug-card"><span class="ug-icon">📡</span><div><strong>Live Tracker</strong> — Real-time monitoring for props you are tracking today. Add props here to watch their live stat as games progress.</div></div>
-        <div class="ug-card"><span class="ug-icon">🔗</span><div><strong>Parlay Builder</strong> — Provide Odds API keys and event IDs; the tool scrapes props, analyzes all of them, and builds the statistically strongest N-leg parlay.</div></div>
-        <div class="ug-card"><span class="ug-icon">📈</span><div><strong>Backtest Performance</strong> — Log your predictions <em>before</em> games, then resolve them after. Tracks win rate, ROI, and accuracy by confidence tier.</div></div>
-      </div>
-    </div>
+ <!-- SECTION: What each section does -->
+ <div class="ug-section">
+ <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">🗺️ Section Overview</h3>
+ <div style="display:grid;gap:10px">
+ <div class="ug-card"><span class="ug-icon">⌂</span><div><strong>Overview</strong> — Dashboard snapshot. Shows today's schedule, quick-access favorites, and recent tracker bets at a glance.</div></div>
+ <div class="ug-card"><span class="ug-icon">🗓️</span><div><strong>Today's Games</strong> — Full slate with team injury notes and game status. Use this to spot missing key players before analyzing props.</div></div>
+ <div class="ug-card"><span class="ug-icon">📊</span><div><strong>Player Analyzer</strong> — Deep-dive on one player prop. Pick a player, stat, and line to get hit rate, averages, trends, matchup data, and a confidence score.</div></div>
+ <div class="ug-card"><span class="ug-icon">🔍</span><div><strong>Bet Finder</strong> — Bulk analysis mode. Enter multiple props (or import from Odds API) and the scanner ranks them by EV, edge, and hit rate.</div></div>
+ <div class="ug-card"><span class="ug-icon">📡</span><div><strong>Live Tracker</strong> — Real-time monitoring for props you are tracking today. Add props here to watch their live stat as games progress.</div></div>
+ <div class="ug-card"><span class="ug-icon">🔗</span><div><strong>Parlay Builder</strong> — Provide Odds API keys and event IDs; the tool scrapes props, analyzes all of them, and builds the statistically strongest N-leg parlay.</div></div>
+ <div class="ug-card"><span class="ug-icon">📈</span><div><strong>Backtest Performance</strong> — Log your predictions <em>before</em> games, then resolve them after. Tracks win rate, ROI, and accuracy by confidence tier.</div></div>
+ </div>
+ </div>
 
-    <!-- SECTION: Key Metrics Explained -->
-    <div class="ug-section" style="margin-top:28px">
-      <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">🧮 Key Metrics Explained</h3>
-      <div style="display:grid;gap:8px">
-        <div class="ug-metric"><span class="ug-label">Hit Rate</span><span>% of last N games where the player went OVER the line. Above 60% is strong; above 70% is elite.</span></div>
-        <div class="ug-metric"><span class="ug-label">Average</span><span>Mean stat value across the sample window. Compare to the line — a big gap is your edge.</span></div>
-        <div class="ug-metric"><span class="ug-label">Edge</span><span>How far the average sits from the line, as a percentage. Higher edge = more statistical buffer.</span></div>
-        <div class="ug-metric"><span class="ug-label">EV (Expected Value)</span><span>Estimated profit per $100 based on hit rate × odds. Positive EV (green) = theoretically profitable long-term.</span></div>
-        <div class="ug-metric"><span class="ug-label">Confidence Score</span><span>0–100 composite score built from hit rate, sample size, H2H data, and minutes trend. 70+ = High, 50–69 = Medium, below 50 = Low.</span></div>
-        <div class="ug-metric"><span class="ug-label">Confidence Tier</span><span><strong style="color:#4ade80">High</strong> = strong lean, large sample. <strong style="color:#facc15">Medium</strong> = moderate lean. <strong style="color:#f87171">Low</strong> = small sample or mixed signals.</span></div>
-        <div class="ug-metric"><span class="ug-label">H2H Hit Rate</span><span>Hit rate in games specifically against today's opponent. Useful to confirm or override the overall trend.</span></div>
-        <div class="ug-metric"><span class="ug-label">vs. Position Delta</span><span>How much opponents at the same position allow compared to league average. Positive = the defense is weak at defending this stat.</span></div>
-        <div class="ug-metric"><span class="ug-label">Back-to-Back</span><span>Whether the player is playing on zero rest today. B2B typically reduces minutes and output — factor this in for OVER bets.</span></div>
-        <div class="ug-metric"><span class="ug-label">Minutes Trend</span><span>Whether the player's minutes are trending UP, DOWN, or FLAT over recent games. Rising minutes usually means rising prop output.</span></div>
-        <div class="ug-metric"><span class="ug-label">Impact Count</span><span>Number of key teammates missing (injured/out). Higher impact count = player may absorb extra usage and volume.</span></div>
-        <div class="ug-metric"><span class="ug-label">Odds API Credits</span><span>Each "Load Events" or "Import Props" call costs credits. Use <strong>Check Balance</strong> (free) to see remaining credits without spending any.</span></div>
-      </div>
-    </div>
+ <!-- SECTION: Key Metrics Explained -->
+ <div class="ug-section" style="margin-top:28px">
+ <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">🧮 Key Metrics Explained</h3>
+ <div style="display:grid;gap:8px">
+ <div class="ug-metric"><span class="ug-label">Hit Rate</span><span>% of last N games where the player went OVER the line. Above 60% is strong; above 70% is elite.</span></div>
+ <div class="ug-metric"><span class="ug-label">Average</span><span>Mean stat value across the sample window. Compare to the line — a big gap is your edge.</span></div>
+ <div class="ug-metric"><span class="ug-label">Edge</span><span>How far the average sits from the line, as a percentage. Higher edge = more statistical buffer.</span></div>
+ <div class="ug-metric"><span class="ug-label">EV (Expected Value)</span><span>Estimated profit per $100 based on hit rate × odds. Positive EV (green) = theoretically profitable long-term.</span></div>
+ <div class="ug-metric"><span class="ug-label">Confidence Score</span><span>0–100 composite score built from hit rate, sample size, H2H data, and minutes trend. 70+ = High, 50–69 = Medium, below 50 = Low.</span></div>
+ <div class="ug-metric"><span class="ug-label">Confidence Tier</span><span><strong style="color:#4ade80">High</strong> = strong lean, large sample. <strong style="color:#facc15">Medium</strong> = moderate lean. <strong style="color:#f87171">Low</strong> = small sample or mixed signals.</span></div>
+ <div class="ug-metric"><span class="ug-label">H2H Hit Rate</span><span>Hit rate in games specifically against today's opponent. Useful to confirm or override the overall trend.</span></div>
+ <div class="ug-metric"><span class="ug-label">vs. Position Delta</span><span>How much opponents at the same position allow compared to league average. Positive = the defense is weak at defending this stat.</span></div>
+ <div class="ug-metric"><span class="ug-label">Back-to-Back</span><span>Whether the player is playing on zero rest today. B2B typically reduces minutes and output — factor this in for OVER bets.</span></div>
+ <div class="ug-metric"><span class="ug-label">Minutes Trend</span><span>Whether the player's minutes are trending UP, DOWN, or FLAT over recent games. Rising minutes usually means rising prop output.</span></div>
+ <div class="ug-metric"><span class="ug-label">Impact Count</span><span>Number of key teammates missing (injured/out). Higher impact count = player may absorb extra usage and volume.</span></div>
+ <div class="ug-metric"><span class="ug-label">Odds API Credits</span><span>Each "Load Events" or "Import Props" call costs credits. Use <strong>Check Balance</strong> (free) to see remaining credits without spending any.</span></div>
+ </div>
+ </div>
 
-    <!-- SECTION: Step-by-step workflow -->
-    <div class="ug-section" style="margin-top:28px">
-      <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">🚀 Recommended Workflow</h3>
-      <ol style="margin:0;padding-left:20px;display:grid;gap:10px;font-size:13.5px;line-height:1.6">
-        <li><strong>Check Today's Games</strong> — Go to Today's Games to see the full slate. Note any injury news that could boost a player's usage or minutes.</li>
-        <li><strong>Fill the Key Vault</strong> — Go to Key Vault, paste your Odds API keys, then use <em>Check credits</em> so the app can rotate only usable keys.</li>
-        <li><strong>Load Events &amp; Import Props</strong> — Click <em>Load Events</em>, pick a game from the dropdown, then click <em>Import Props &amp; Scan</em>. The scanner will rank all available props by EV and edge.</li>
-        <li><strong>Deep-dive with Player Analyzer</strong> — Click any player row in the scanner to open Player Analyzer. Review hit rate, average, H2H, matchup, and environment signals. Use Analyzer Filters to narrow by Home/Away, win/loss context, or opponent quality.</li>
-        <li><strong>Send results to other tools</strong> — Use the three action buttons at the top of the Analyzer results:
-          <ul style="margin-top:6px;padding-left:18px;display:grid;gap:4px">
-            <li><strong>Add to Slip</strong> — Adds the prop to your Prop Slip for a quick multi-pick summary.</li>
-            <li><strong>📡 Send to Tracker</strong> — Adds to Live Tracker so you can monitor the stat in real time during the game.</li>
-            <li><strong>📊 Send to Backtest</strong> — Pre-fills the Backtest log form so you can record this prediction before the game starts.</li>
-          </ul>
-        </li>
-        <li><strong>Log predictions in Backtest</strong> — Before games tip off, use Backtest Performance to log your picks. After the game, enter the actual stat value to resolve each prediction as a hit or miss.</li>
-        <li><strong>Review your performance</strong> — The Backtest dashboard shows overall win rate, ROI, and accuracy broken down by confidence tier. Use this to learn which tier and stat types you call best.</li>
-      </ol>
-    </div>
+ <!-- SECTION: Step-by-step workflow -->
+ <div class="ug-section" style="margin-top:28px">
+ <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">🚀 Recommended Workflow</h3>
+ <ol style="margin:0;padding-left:20px;display:grid;gap:10px;font-size:13.5px;line-height:1.6">
+ <li><strong>Check Today's Games</strong> — Go to Today's Games to see the full slate. Note any injury news that could boost a player's usage or minutes.</li>
+ <li><strong>Fill the Key Vault</strong> — Go to Key Vault, paste your Odds API keys, then use <em>Check credits</em> so the app can rotate only usable keys.</li>
+ <li><strong>Load Events &amp; Import Props</strong> — Click <em>Load Events</em>, pick a game from the dropdown, then click <em>Import Props &amp; Scan</em>. The scanner will rank all available props by EV and edge.</li>
+ <li><strong>Deep-dive with Player Analyzer</strong> — Click any player row in the scanner to open Player Analyzer. Review hit rate, average, H2H, matchup, and environment signals. Use Analyzer Filters to narrow by Home/Away, win/loss context, or opponent quality.</li>
+ <li><strong>Send results to other tools</strong> — Use the three action buttons at the top of the Analyzer results:
+ <ul style="margin-top:6px;padding-left:18px;display:grid;gap:4px">
+ <li><strong>Add to Slip</strong> — Adds the prop to your Prop Slip for a quick multi-pick summary.</li>
+ <li><strong>📡 Send to Tracker</strong> — Adds to Live Tracker so you can monitor the stat in real time during the game.</li>
+ <li><strong>📊 Send to Backtest</strong> — Pre-fills the Backtest log form so you can record this prediction before the game starts.</li>
+ </ul>
+ </li>
+ <li><strong>Log predictions in Backtest</strong> — Before games tip off, use Backtest Performance to log your picks. After the game, enter the actual stat value to resolve each prediction as a hit or miss.</li>
+ <li><strong>Review your performance</strong> — The Backtest dashboard shows overall win rate, ROI, and accuracy broken down by confidence tier. Use this to learn which tier and stat types you call best.</li>
+ </ol>
+ </div>
 
-    <!-- SECTION: Tips -->
-    <div class="ug-section" style="margin-top:28px">
-      <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">💡 Pro Tips</h3>
-      <ul style="margin:0;padding-left:20px;display:grid;gap:8px;font-size:13.5px;line-height:1.6">
-        <li>Always log predictions in Backtest <em>before</em> the game starts — resolving after the fact defeats the purpose of tracking your forecast accuracy.</li>
-        <li>A High confidence tier alone is not enough. Check H2H hit rate against today's opponent and confirm no back-to-back or key teammate is missing.</li>
-        <li>Use the "Last N" filter (5/10/15/20 games) in the Analyzer. A player with a 70% hit rate over 20 games but 90% in the last 5 is on a hot streak — lean on the recent form.</li>
-        <li>In Bet Finder, sort by EV first to find the most mispriced props. Sort by hit rate to find the most consistent ones. The best bets usually score well on both.</li>
-        <li>Use Parlay Builder only when you have 2–3 High-tier props already identified. The builder will round out the remaining legs with the best available stats.</li>
-        <li>Save your Odds API key once and it will be remembered between sessions. You won't need to re-enter it.</li>
-        <li>The <em>✕</em> button on Backtest logs removes just that one entry. The <em>Clear All</em> button wipes the entire log — use it carefully.</li>
-      </ul>
-    </div>
+ <!-- SECTION: Tips -->
+ <div class="ug-section" style="margin-top:28px">
+ <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">💡 Pro Tips</h3>
+ <ul style="margin:0;padding-left:20px;display:grid;gap:8px;font-size:13.5px;line-height:1.6">
+ <li>Always log predictions in Backtest <em>before</em> the game starts — resolving after the fact defeats the purpose of tracking your forecast accuracy.</li>
+ <li>A High confidence tier alone is not enough. Check H2H hit rate against today's opponent and confirm no back-to-back or key teammate is missing.</li>
+ <li>Use the "Last N" filter (5/10/15/20 games) in the Analyzer. A player with a 70% hit rate over 20 games but 90% in the last 5 is on a hot streak — lean on the recent form.</li>
+ <li>In Bet Finder, sort by EV first to find the most mispriced props. Sort by hit rate to find the most consistent ones. The best bets usually score well on both.</li>
+ <li>Use Parlay Builder only when you have 2–3 High-tier props already identified. The builder will round out the remaining legs with the best available stats.</li>
+ <li>Save your Odds API key once and it will be remembered between sessions. You won't need to re-enter it.</li>
+ <li>The <em>✕</em> button on Backtest logs removes just that one entry. The <em>Clear All</em> button wipes the entire log — use it carefully.</li>
+ </ul>
+ </div>
 
-    <div style="margin-top:32px;text-align:center">
-      <button id="closeUserGuideBtnBottom" type="button" style="background:var(--accent,#7c6ef5);color:#fff;border:none;border-radius:40px;padding:12px 40px;font-size:14px;font-weight:700;cursor:pointer;letter-spacing:.02em">Got it — close guide</button>
-    </div>
-  </div>
+ <div style="margin-top:32px;text-align:center">
+ <button id="closeUserGuideBtnBottom" type="button" style="background:var(--accent,#7c6ef5);color:#fff;border:none;border-radius:40px;padding:12px 40px;font-size:14px;font-weight:700;cursor:pointer;letter-spacing:.02em">Got it — close guide</button>
+ </div>
+ </div>
 </div>
 
 <style>
@@ -1658,3 +1796,4 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 
 </body>
 </html>
+
