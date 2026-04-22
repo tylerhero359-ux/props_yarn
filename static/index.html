@@ -177,7 +177,7 @@ tailwind.config = {
 </div>
 <div class="sidebar-footer grid gap-3">
 <button aria-label="Toggle theme" class="theme-toggle inline-flex items-center justify-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 font-semibold" id="themeToggle" type="button">
-<span class="theme-icon">SUN</span>
+<span class="theme-icon">☀</span>
 <span class="theme-text">Light</span>
 </button>
 <button class="inline-flex items-center justify-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 font-semibold w-full" id="openUserGuideBtn" type="button" title="Open the full user guide">
@@ -374,6 +374,16 @@ tailwind.config = {
 </div>
 </div>
 <div class="control-group">
+<label for="seasonTypeSelect">Season type</label>
+<div class="input-shell">
+<select id="seasonTypeSelect">
+<option selected="" value="Combined">Combined</option>
+<option value="Regular Season">Regular Season</option>
+<option value="Playoffs">Playoffs</option>
+</select>
+</div>
+</div>
+<div class="control-group">
 <label for="oppSelect">Opponent</label>
 <div class="input-shell">
 <select id="oppSelect">
@@ -391,6 +401,10 @@ tailwind.config = {
 <button class="primary-btn" id="analyzeBtn" type="button">Analyze Prop</button>
 <button class="secondary-btn" id="betFinderBtn" type="button">Bet Finder</button>
 </div>
+</div>
+<div class="playoff-mode-banner hidden" id="playoffModeBanner" role="status" aria-live="polite">
+<strong>Playoff Mode</strong>
+<span id="playoffModeBannerText">Season type is set to Playoffs for postseason analysis.</span>
 </div>
 <div class="prop-picker-wrap analyzer-prop-strip">
 <div class="prop-picker-copy">
@@ -599,7 +613,7 @@ tailwind.config = {
 </div>
 <div class="player-grid empty-grid" id="playerGrid">
 <div class="empty-roster-state empty-state-panel">
-<div class="empty-icon">[ ]</div>
+<div class="empty-icon"></div>
 <strong>Choose a team to load player cards.</strong>
 <span>You'll get clickable headshots, jersey numbers, and positions.</span>
 </div>
@@ -619,7 +633,7 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="analyzerMatchupBody">
-<div class="empty-icon">[ ]</div>
+<div class="empty-icon"></div>
 <strong>No matchup loaded yet.</strong>
 <span>Analyze a player prop to load the next opponent and defense-vs-position read.</span>
 </div>
@@ -637,7 +651,7 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="recommendationBody">
-<div class="empty-icon">[ ]</div>
+<div class="empty-icon"></div>
 <strong>No recommendation yet.</strong>
 <span>Analyze a player prop to get a simple green / yellow / red read.</span>
 </div>
@@ -654,7 +668,7 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="interpretationBody">
-<div class="empty-icon">[ ]</div>
+<div class="empty-icon"></div>
 <strong>No interpretation yet.</strong>
 <span>Analyze a player prop to get a simple read on whether the line looks supportive, mixed, or risky.</span>
 </div>
@@ -671,7 +685,7 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="opportunityBody">
-<div class="empty-icon">[ ]</div>
+<div class="empty-icon"></div>
 <strong>No opportunity profile yet.</strong>
 <span>Analyze a player prop to see minutes, shot attempts, and teammate absence context.</span>
 </div>
@@ -688,7 +702,7 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="environmentBody">
-<div class="empty-icon">[ ]</div>
+<div class="empty-icon"></div>
 <strong>No schedule read yet.</strong>
 <span>Analyze a player prop to see rest, back-to-back risk, and next-game setup.</span>
 </div>
@@ -706,7 +720,7 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="marketBody">
-<div class="empty-icon">[ ]</div>
+<div class="empty-icon"></div>
 <strong>No market context yet.</strong>
 <span>Analyze a player prop to see team total, spread, and game total for the matchup.</span>
 </div>
@@ -724,7 +738,7 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="varianceBody">
-<div class="empty-icon">[ ]</div>
+<div class="empty-icon"></div>
 <strong>No distribution data yet.</strong>
 <span>Analyze a player prop to see consistency score, median, floor, ceiling and percentile bands.</span>
 </div>
@@ -798,7 +812,7 @@ tailwind.config = {
 <tr>
 <td colspan="4">
 <div class="empty-state-panel compact">
-<div class="empty-icon">[ ]</div>
+<div class="empty-icon"></div>
 <strong>No data yet.</strong>
 <span>Analyze a player prop to fill the game log.</span>
 </div>
@@ -911,6 +925,16 @@ tailwind.config = {
 <input id="betFinderSeasonInput" placeholder="2025-26" type="text"/>
 </div>
 </label>
+<label class="control-group">
+<span>Season type</span>
+<div class="input-shell">
+<select id="betFinderSeasonTypeSelect">
+<option selected="" value="Combined">Combined</option>
+<option value="Regular Season">Regular Season</option>
+<option value="Playoffs">Playoffs</option>
+</select>
+</div>
+</label>
 <label class="control-group ds-betfinder-toggle-group">
 <span>Context</span>
 <label class="parlay-injury-toggle-wrap ds-betfinder-injury-toggle" title="Use lineup context when available">
@@ -929,7 +953,7 @@ tailwind.config = {
 </div>
 </div>
 <div class="bet-finder-state empty-state-panel compact" id="betFinderResults">
-<div class="empty-icon">[ ]</div>
+<div class="empty-icon"></div>
 <strong>No bet finder results yet.</strong>
 <span>Choose a team, set your line, and run Bet Finder.</span>
 </div>
@@ -945,6 +969,12 @@ tailwind.config = {
 </div>
 <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
 <span class="small-badge">Manual paste template</span>
+<label class="small-meta" for="marketSeasonTypeSelect" style="margin:0;">Season type</label>
+<select id="marketSeasonTypeSelect" style="min-width:170px;">
+<option selected="" value="Combined">Combined</option>
+<option value="Regular Season">Regular Season</option>
+<option value="Playoffs">Playoffs</option>
+</select>
 <label class="small-meta" for="marketSortSelect" style="margin:0;">Sort</label>
 <select id="marketSortSelect" style="min-width:170px;">
 <option value="best_ev">Best EV</option>
@@ -1141,6 +1171,14 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 <option value="20">Last 20</option>
 </select>
 </label>
+<label class="field-inline">
+<span class="small-label">Season type</span>
+<select class="market-api-input" id="parlaySeasonTypeSelect">
+<option selected="" value="Combined">Combined</option>
+<option value="Regular Season">Regular Season</option>
+<option value="Playoffs">Playoffs</option>
+</select>
+</label>
 </div>
 </details>
 </div>
@@ -1266,7 +1304,7 @@ Re-scrape
 </section>
 
 <div class="bet-finder-state empty-state-panel compact parlay-empty-shell" id="parlayEmptyState">
-<div class="empty-icon">[ ]</div>
+<div class="empty-icon"></div>
 <strong>No parlay built yet.</strong>
 <span>Add at least 5 usable Odds API keys in Key Vault, choose your legs, and click Build Parlay.</span>
 </div>
@@ -1378,7 +1416,7 @@ Re-scrape
 </div>
 <div class="tracker-cards" id="trackerCards"></div>
 <div class="bet-finder-state empty-state-panel compact" id="trackerEmpty">
-<div class="empty-icon">[ ]</div>
+<div class="empty-icon"></div>
 <strong>No props tracked yet.</strong>
 <span>Add a prop above to start watching it fill toward the line.</span>
 </div>
@@ -1628,7 +1666,7 @@ Re-scrape
  <div class="small-meta" id="kvVaultSummary">Store at least 5 usable keys to unlock automatic rotation.</div>
  <div id="kvKeyList">
  <div class="bet-finder-state empty-state-panel compact" style="padding:32px 0">
- <div class="empty-icon">[ ]</div>
+ <div class="empty-icon"></div>
  <strong>No keys saved yet.</strong>
  <span>Add a key above to get started.</span>
  </div>
@@ -1796,4 +1834,5 @@ Re-scrape
 
 </body>
 </html>
+
 

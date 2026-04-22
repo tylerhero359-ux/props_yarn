@@ -90,7 +90,7 @@ function refreshNetworkActivityBanner() {
     phase: 'working',
     title,
     detail,
-    state: `Working · ${formatElapsedMs(snap.elapsedMs)}${snap.count > 1 ? ` · ${snap.count} active` : ''}`
+    state: `Working  ${formatElapsedMs(snap.elapsedMs)}${snap.count > 1 ? `  ${snap.count} active` : ''}`
   });
 }
 
@@ -156,7 +156,7 @@ function showGlobalProgress({ key, title, detail, percent }) {
     mode: 'progress',
     title: title || 'Working...',
     detail: detail || 'Processing...',
-    state: `${Math.round(safePercent)}% · ${elapsed}`,
+    state: `${Math.round(safePercent)}%  ${elapsed}`,
     progressPercent: safePercent,
   });
 }
@@ -194,7 +194,7 @@ function finishNetworkActivity(id, { ok = true, status = null, error = '' } = {}
     phase: ok ? 'success' : 'error',
     title: ok ? `${task.label} complete` : `${task.label} failed`,
     detail,
-    state: `${ok ? 'Done' : 'Issue'} · ${elapsed}`
+    state: `${ok ? 'Done' : 'Issue'}  ${elapsed}`
   });
   networkCompletionTimer = window.setTimeout(() => {
     if (networkActivityMap.size === 0 && activeWorkCount === 0) {
@@ -264,6 +264,12 @@ const betFinderBtn = document.getElementById('betFinderBtn');
 const lineInput = document.getElementById('lineInput');
 const gamesSelect = document.getElementById('gamesSelect');
 const seasonInput = document.getElementById('seasonInput');
+const seasonTypeSelect = document.getElementById('seasonTypeSelect');
+const betFinderSeasonTypeSelect = document.getElementById('betFinderSeasonTypeSelect');
+const marketSeasonTypeSelect = document.getElementById('marketSeasonTypeSelect');
+const parlaySeasonTypeSelect = document.getElementById('parlaySeasonTypeSelect');
+const playoffModeBanner = document.getElementById('playoffModeBanner');
+const playoffModeBannerText = document.getElementById('playoffModeBannerText');
 const chartTitle = document.getElementById('chartTitle');
 const chartSubtitle = document.getElementById('chartSubtitle');
 const chartChips = document.getElementById('chartChips');
@@ -367,6 +373,70 @@ const INJURY_DEBUG_STORAGE = 'nba-props-injury-debug';
 const CACHE_DEBUG_STORAGE = 'nba-props-cache-debug';
 const LAST_PLAYER_KEY = 'nba-props-last-player';
 const LAST_STAT_KEY = 'nba-props-last-stat';
+let seasonTypeUserOverridden = false;
+
+function normalizeSeasonTypeValue(raw) {
+  const value = String(raw || '').trim().toLowerCase();
+  if (!value) return 'Combined';
+  if (value === 'playoffs' || value === 'playoff' || value === 'postseason') return 'Playoffs';
+  if (value === 'regular season' || value === 'regular' || value === 'regular-season') return 'Regular Season';
+  return 'Combined';
+}
+
+function isPlayoffCalendarWindow(now = new Date()) {
+  const year = now.getFullYear();
+  const start = new Date(year, 3, 18, 0, 0, 0, 0);   // April 18
+  const end = new Date(year, 6, 31, 23, 59, 59, 999); // July 31
+  return now >= start && now <= end;
+}
+
+function getSelectedSeasonType() {
+  return normalizeSeasonTypeValue(
+    seasonTypeSelect?.value ||
+    betFinderSeasonTypeSelect?.value ||
+    marketSeasonTypeSelect?.value ||
+    parlaySeasonTypeSelect?.value ||
+    'Combined'
+  );
+}
+
+function syncSeasonTypeMirrors(source = 'main') {
+  const normalized = getSelectedSeasonType();
+  if (seasonTypeSelect && source !== 'main') seasonTypeSelect.value = normalized;
+  if (betFinderSeasonTypeSelect && source !== 'betfinder') betFinderSeasonTypeSelect.value = normalized;
+  if (marketSeasonTypeSelect && source !== 'market') marketSeasonTypeSelect.value = normalized;
+  if (parlaySeasonTypeSelect && source !== 'parlay') parlaySeasonTypeSelect.value = normalized;
+}
+
+function setGlobalSeasonType(rawValue, { markOverridden = true, source = 'main' } = {}) {
+  const normalized = normalizeSeasonTypeValue(rawValue);
+  if (seasonTypeSelect) seasonTypeSelect.value = normalized;
+  syncSeasonTypeMirrors(source);
+  if (markOverridden) seasonTypeUserOverridden = true;
+  updatePlayoffModeBanner();
+}
+
+function updatePlayoffModeBanner() {
+  if (!playoffModeBanner) return;
+  const selected = getSelectedSeasonType();
+  const show = selected === 'Playoffs';
+  playoffModeBanner.classList.toggle('hidden', !show);
+  if (!show || !playoffModeBannerText) return;
+  playoffModeBannerText.textContent = isPlayoffCalendarWindow(new Date())
+    ? 'Season type is set to Playoffs for postseason analysis.'
+    : 'Playoff filter is active. Switch back to Combined or Regular Season if needed.';
+}
+
+function applySeasonTypeDefaultFromCalendar() {
+  if (!seasonTypeSelect) return;
+  if (isPlayoffCalendarWindow(new Date()) && getSelectedSeasonType() === 'Combined') {
+    setGlobalSeasonType('Playoffs', { markOverridden: false, source: 'auto' });
+  } else {
+    syncSeasonTypeMirrors('auto');
+  }
+  updatePlayoffModeBanner();
+}
+
 const FALLBACK_HEADSHOT = encodeURIComponent(`
   <svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240">
     <defs>
@@ -456,12 +526,12 @@ const marketTeamInjuryCache = new Map();
 const analyzerGameContextCache = new Map();
 const todayGameContextCache = new Map();
 
-// ── Market advanced filters (bookmaker + odds range) ──────────────────
+//  Market advanced filters (bookmaker + odds range) 
 let currentMarketBookFilter = '';
 let currentMarketMinOdds = null;
 let currentMarketMaxOdds = null;
 
-// ── Key Vault ─────────────────────────────────────────────────────────
+//  Key Vault 
 const KEY_VAULT_STORAGE = 'nba-props-key-vault';
 const KEY_VAULT_ACTIVE_STORAGE = 'nba-props-key-vault-active';
 const KEY_VAULT_MIN_ROTATING_KEYS = 5;
@@ -504,7 +574,7 @@ const VIEW_META = {
   parlay: {
     eyebrow: 'Parlay builder',
     title: 'Parlay Builder',
-    subtitle: 'Scrape every game, rank props by opponent H2H hit rate (fallback to recent form), and auto-build the strongest 2–6 leg parlay.'
+    subtitle: 'Scrape every game, rank props by opponent H2H hit rate (fallback to recent form), and auto-build the strongest 2-6 leg parlay.'
   },
   tracker: {
     eyebrow: 'Live tracking',
@@ -603,14 +673,14 @@ function updateOddsKeyVaultEntry(entryId, patch) {
 function deleteOddsKeyVaultEntry(entryId) {
   const vault = loadOddsKeyVault(null).filter(entry => entry.id !== entryId);
   const nextActiveId = oddsKeyVaultActiveId === entryId ? '' : oddsKeyVaultActiveId;
-  return saveOddsKeyVault(vault, { activeId: nextActiveId });
   invalidateEligibleVaultKeyCache();
+  return saveOddsKeyVault(vault, { activeId: nextActiveId });
 }
 
 function maskVaultKey(key) {
   const raw = String(key || '');
-  if (raw.length < 8) return '••••••••';
-  return raw.slice(0, 4) + '••••••••' + raw.slice(-4);
+  if (raw.length < 8) return '';
+  return raw.slice(0, 4) + '' + raw.slice(-4);
 }
 
 function shuffleArray(items) {
@@ -712,7 +782,6 @@ async function promptDeleteLowCreditVaultKey(entry, sourceLabel = 'this feature'
   if (!entry?.id) return;
   const remaining = parseVaultRemaining(entry.remaining);
   if (remaining === null) return;
-  if (remaining >= KEY_VAULT_MIN_USABLE_CREDITS) return;
   const prettyRemaining = remaining !== null ? remaining : 0;
   const shouldDelete = confirm(`"${entry.label}" only has ${prettyRemaining} remaining credit${prettyRemaining === 1 ? '' : 's'} and is not usable for ${sourceLabel}.\n\nDo you want to delete it from the Key Vault?`);
   if (shouldDelete) {
@@ -759,6 +828,7 @@ async function pickRandomVaultKeyForFeature({
   const shuffled = shuffleArray(vault);
   const healthyEligible = [];
   const fallbackEligible = [];
+  const unknownFallback = [];
   for (const candidate of shuffled) {
     let refreshed = candidate;
     try {
@@ -768,6 +838,13 @@ async function pickRandomVaultKeyForFeature({
       });
     } catch (error) {
       console.warn('Key credit check failed for', candidate.label, error);
+      const cachedHealth = getVaultHealth(candidate, { requiredCredits });
+      if (cachedHealth.usable) {
+        if (cachedHealth.softDisabled) fallbackEligible.push(candidate);
+        else healthyEligible.push(candidate);
+      } else if (!enforceMinimum && requiredCredits <= 1 && candidate?.key) {
+        unknownFallback.push(candidate);
+      }
       continue;
     }
     const health = getVaultHealth(refreshed, { requiredCredits });
@@ -780,6 +857,11 @@ async function pickRandomVaultKeyForFeature({
   if (eligible.length) {
     primeEligibleVaultKeyCache(eligible);
     const winner = markVaultKeyUsed(shuffleArray(eligible)[0], sourceLabel);
+    if (winner?.key) syncVaultKeyIntoOddsInputs(winner.key);
+    return winner;
+  }
+  if (unknownFallback.length) {
+    const winner = markVaultKeyUsed(shuffleArray(unknownFallback)[0], sourceLabel);
     if (winner?.key) syncVaultKeyIntoOddsInputs(winner.key);
     return winner;
   }
@@ -835,18 +917,18 @@ async function getRotatingVaultKeysForFeature({
   return eligible;
 }
 
-// ── Global app toast ─────────────────────────────────────────────────
+//  Global app toast 
 function showAppToast(msg, type = 'default', options = {}) {
   if (type && typeof type === 'object') {
     options = type;
     type = options.type || 'default';
   }
   const icons = {
-    default: '•',
-    success: '✓',
-    info: 'i',
-    warning: '!',
-    error: '×'
+    default: '\u2022',
+    success: '\u2713',
+    info: '\u2139',
+    warning: '\u26A0',
+    error: '\u2715'
   };
   let host = document.getElementById('_appToastHost');
   if (!host) {
@@ -958,7 +1040,7 @@ function setSidebarCollapsed(collapsed) {
   document.body.classList.toggle('sidebar-collapsed', collapsed);
   localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? '1' : '0');
   if (sidebarToggle) {
-    sidebarToggle.querySelector('.sidebar-toggle-icon').textContent = collapsed ? '⟩' : '⟨';
+    sidebarToggle.querySelector('.sidebar-toggle-icon').textContent = collapsed ? '\u203A' : '\u2039';
     sidebarToggle.setAttribute('aria-label', collapsed ? 'Expand sidebar' : 'Collapse sidebar');
   }
 }
@@ -1138,7 +1220,7 @@ function getExpertFilterSummary() {
   const active = getExpertFilterDefinitions()
     .filter(([key]) => currentExpertFilters?.[key])
     .map(([, label]) => label);
-  return active.length ? `Expert: ${active.join(' • ')}` : 'Expert: All';
+  return active.length ? `Expert: ${active.join(' \u2022 ')}` : 'Expert: All';
 }
 
 
@@ -1228,32 +1310,32 @@ function getMarketExpertAngles(item) {
 
   if (snapshot.minutesLast5 > 0) {
     const minuteTone = snapshot.minutesTrend === 'down' ? 'neutral' : 'info';
-    angles.push({ key: 'stable_minutes', label: `Minutes lately • ${snapshot.minutesLast5.toFixed(1)}`, tone: minuteTone });
+    angles.push({ key: 'stable_minutes', label: `Minutes lately \u2022 ${snapshot.minutesLast5.toFixed(1)}`, tone: minuteTone });
   }
   if (snapshot.fgaLast5 > 0) {
     const fgaTone = snapshot.fgaTrend === 'down' ? 'neutral' : 'info';
-    angles.push({ key: 'stable_fga', label: `FGA lately • ${snapshot.fgaLast5.toFixed(1)}`, tone: fgaTone });
+    angles.push({ key: 'stable_fga', label: `FGA lately \u2022 ${snapshot.fgaLast5.toFixed(1)}`, tone: fgaTone });
   }
   if (snapshot.h2hGames > 0) {
-    angles.push({ key: 'h2h_over', label: `H2H • ${snapshot.h2hHits}/${snapshot.h2hGames} (${snapshot.h2hHitRate.toFixed(0)}%)`, tone: snapshot.h2hHitRate >= currentExpertSettings.min_h2h_hit_rate ? 'positive' : 'neutral' });
+    angles.push({ key: 'h2h_over', label: `H2H \u2022 ${snapshot.h2hHits}/${snapshot.h2hGames} (${snapshot.h2hHitRate.toFixed(0)}%)`, tone: snapshot.h2hHitRate >= currentExpertSettings.min_h2h_hit_rate ? 'positive' : 'neutral' });
   }
   if (!snapshot.isBackToBack && snapshot.restDays >= 2) {
-    angles.push({ key: 'rest_edge', label: `Rest edge • ${snapshot.restDays} days`, tone: 'positive' });
+    angles.push({ key: 'rest_edge', label: `Rest edge \u2022 ${snapshot.restDays} days`, tone: 'positive' });
   }
   if (!snapshot.isBackToBack) angles.push({ key: 'avoid_b2b', label: 'No back-to-back', tone: 'info' });
   if (snapshot.paceBucket) {
     const paceTone = snapshot.paceBucket === 'fast' ? 'positive' : (snapshot.paceBucket === 'slow' ? 'tough' : 'neutral');
-    angles.push({ key: snapshot.paceBucket === 'fast' ? 'fast_pace' : 'avoid_slow_pace', label: snapshot.paceLabel || `Pace • ${snapshot.paceBucket}`, tone: paceTone });
+    angles.push({ key: snapshot.paceBucket === 'fast' ? 'fast_pace' : 'avoid_slow_pace', label: snapshot.paceLabel || `Pace \u2022 ${snapshot.paceBucket}`, tone: paceTone });
   }
   if (snapshot.projectedSpread !== null && Number.isFinite(snapshot.projectedSpread)) {
     const spreadTone = Math.abs(snapshot.projectedSpread) >= 8 ? 'tough' : 'info';
-    const spreadLabel = snapshot.spreadLabel || `Est. spread • ${snapshot.projectedSpread > 0 ? '+' : ''}${snapshot.projectedSpread.toFixed(1)}`;
+    const spreadLabel = snapshot.spreadLabel || `Est. spread \u2022 ${snapshot.projectedSpread > 0 ? '+' : ''}${snapshot.projectedSpread.toFixed(1)}`;
     angles.push({ key: 'spread_threshold', label: spreadLabel, tone: spreadTone });
   }
   if (bestBet.market_side) {
     angles.push({
       key: bestBet.market_disagrees ? 'market_disagrees' : 'market_aligned',
-      label: bestBet.market_disagrees ? `Against market lean • ${bestBet.market_side}` : `Market aligned • ${bestBet.market_side}`,
+      label: bestBet.market_disagrees ? `Against market lean \u2022 ${bestBet.market_side}` : `Market aligned \u2022 ${bestBet.market_side}`,
       tone: bestBet.market_disagrees ? 'tough' : 'positive',
       kind: 'market'
     });
@@ -1261,7 +1343,7 @@ function getMarketExpertAngles(item) {
   if (Number.isFinite(Number(bestBet.market_penalty)) && Number(bestBet.market_penalty) > 0) {
     angles.push({
       key: 'market_penalty',
-      label: `Market penalty • -${Number(bestBet.market_penalty).toFixed(0)}`,
+      label: `Market penalty \u2022 -${Number(bestBet.market_penalty).toFixed(0)}`,
       tone: 'tough',
       kind: 'market'
     });
@@ -1326,7 +1408,7 @@ function renderOverviewSelection() {
     selectedPlayer.team_name || selectedPlayer.team_abbreviation || '',
     selectedPlayer.position || '',
     selectedPlayer.jersey ? `#${selectedPlayer.jersey}` : ''
-  ].filter(Boolean).join(' • ');
+  ].filter(Boolean).join('  ');
 
   const contextData = getSelectedPlayerContextData();
   const availability = contextData.availability || selectedPlayer.availability || null;
@@ -1572,7 +1654,7 @@ function updateAccentForCurrentTheme(teamAbbreviation) {
 function setTheme(theme) {
   document.body.classList.toggle('light-theme', theme === 'light');
   localStorage.setItem(THEME_KEY, theme);
-  themeToggle.querySelector('.theme-icon').textContent = theme === 'light' ? '🌙' : '☀';
+  themeToggle.querySelector('.theme-icon').textContent = theme === 'light' ? '\u263E' : '\u2600';
   themeToggle.querySelector('.theme-text').textContent = theme === 'light' ? 'Dark' : 'Light';
   updateAccentForCurrentTheme(currentAccentTeam);
 
@@ -1799,7 +1881,7 @@ function updateRosterScrollState(players, season) {
     playerGrid.classList.toggle('has-scroll', hasScroll);
 
     if (selectedTeam) {
-      rosterMeta.textContent = `${players.length} players • ${season}${hasScroll ? ' • Scroll for more' : ''}`;
+      rosterMeta.textContent = `${players.length} players  ${season}${hasScroll ? '  Scroll for more' : ''}`;
     }
   });
 }
@@ -1880,10 +1962,10 @@ function renderRoster(team, season, players) {
   const outCnt = players.filter(p => p.is_unavailable).length;
   const riskCnt = players.filter(p => p.is_risky && !p.is_unavailable).length;
   let injNote = '';
-  if (outCnt) injNote += ' • ' + outCnt + ' out';
-  if (riskCnt) injNote += (outCnt ? ', ' : ' • ') + riskCnt + ' questionable';
+  if (outCnt) injNote += '  ' + outCnt + ' out';
+  if (riskCnt) injNote += (outCnt ? ', ' : '  ') + riskCnt + ' questionable';
   rosterMeta.innerHTML =
-    players.length + ' players • ' + season + injNote +
+    players.length + ' players  ' + season + injNote +
     '&nbsp;<button class="inj-report-btn" onclick="toggleInjuryPanel(' + team.id + ')">Injury Report</button>';
 
   if (!players.length) {
@@ -1891,7 +1973,7 @@ function renderRoster(team, season, players) {
     playerGrid.classList.add('empty-grid');
     playerGrid.innerHTML = `
       <div class="empty-roster-state empty-state-panel compact">
-        <div class="empty-icon">🧍</div>
+        <div class="empty-icon"></div>
         <strong>No players found for this team and season.</strong>
         <span>Try another season or another team.</span>
       </div>
@@ -1940,7 +2022,7 @@ function renderRoster(team, season, players) {
   updateRosterScrollState(players, season);
 }
 
-// ── Injury report slide-down panel ───────────────────────────────────────
+//  Injury report slide-down panel 
 let _injPanelTeamId = null;
 
 async function toggleInjuryPanel(teamId) {
@@ -2108,7 +2190,7 @@ function buildTodayGameCard(game, compact = false) {
     return players.slice(0, 4).map(function (p) {
       const cls = p.is_unavailable ? 'out' : 'risky';
       const fullName = formatPlayerName(p.full_name || p.short_name || '');
-      const chipTitle = [fullName, p.status, p.injury_reason].filter(Boolean).join(' • ');
+      const chipTitle = [fullName, p.status, p.injury_reason].filter(Boolean).join('  ');
       return '<span class="today-inj-chip ' + cls + '" title="' + escapeHtml(chipTitle) + '">'
         + escapeHtml(fullName) + '</span>';
     }).join('') + (players.length > 4 ? '<span class="today-inj-more">+' + (players.length - 4) + '</span>' : '');
@@ -2204,7 +2286,7 @@ function bindSlateTeamButtons(root) {
 function renderBetFinderEmpty(message = 'Choose a team, set your prop line, then click Bet Finder.') {
   betFinderResults.className = 'bet-finder-state empty-state-panel compact';
   betFinderResults.innerHTML = `
-    <div class="empty-icon">🎯</div>
+    <div class="empty-icon"></div>
     <strong>No bet finder results yet.</strong>
     <span>${escapeHtml(message)}</span>
   `;
@@ -2230,7 +2312,7 @@ function getFinderLabel(hitRate) {
   return 'Thin';
 }
 
-/* ── Mini sparkline SVG ─────────────────────────────────────────────── */
+/*  Mini sparkline SVG  */
 function renderBetFinderResults(payload) {
   const results = payload.results || [];
 
@@ -2239,7 +2321,7 @@ function renderBetFinderResults(payload) {
     return;
   }
 
-  betFinderMeta.textContent = `${payload.team.full_name} • ${getStatLabel(payload.stat)} ${payload.line} • Last ${payload.last_n} • Min ${payload.min_games} games`;
+  betFinderMeta.textContent = `${payload.team.full_name} - ${getStatLabel(payload.stat)} ${payload.line} - Last ${payload.last_n} - Min ${payload.min_games} games`;
   betFinderResults.className = 'bet-finder-grid sportsbook-grid';
   betFinderResults.innerHTML = results.map((item, index) => {
     const tone = getFinderTone(item.hit_rate);
@@ -2264,8 +2346,8 @@ function renderBetFinderResults(payload) {
                   <strong>${escapeHtml(item.player.full_name)}</strong>
                   <span class="finder-side-pill ${sideClass}">${sideGuess}</span>
                 </div>
-                <span>${escapeHtml(item.player.position || 'Position N/A')} • ${escapeHtml(item.player.team_abbreviation || '')}</span>
-                <small class="market-slip-subtext">${getStatLabel(payload.stat)} line ${payload.line} • Last ${payload.last_n}</small>
+                <span>${escapeHtml(item.player.position || 'Position N/A')} - ${escapeHtml(item.player.team_abbreviation || '')}</span>
+                <small class="market-slip-subtext">${getStatLabel(payload.stat)} line ${payload.line} - Last ${payload.last_n}</small>
               </div>
             </div>
           </div>
@@ -2307,19 +2389,37 @@ function renderBetFinderResults(payload) {
     `;
   }).join('');
 
-  betFinderResults.querySelectorAll('.finder-card').forEach(card => {
+  betFinderResults.querySelectorAll('.finder-card').forEach((card, idx) => {
     card.addEventListener('click', async () => {
-      setSelectedPlayer({
-        id: Number(card.dataset.id),
-        full_name: card.dataset.name,
-        is_active: true,
-        team_abbreviation: card.dataset.teamAbbr,
-        team_name: card.dataset.teamName,
-        team_id: card.dataset.teamId ? Number(card.dataset.teamId) : null,
-        position: card.dataset.position,
-        jersey: card.dataset.jersey
+      const item = results[idx] || {};
+      const player = item.player || {};
+      const resolvedPlayerId = Number(player.id || card.dataset.id);
+      const hydrated = await hydrateAnalyzerFromPropSelection({
+        player_id: resolvedPlayerId,
+        player_name: player.full_name || card.dataset.name,
+        team_id: player.team_id || (card.dataset.teamId ? Number(card.dataset.teamId) : null),
+        team_name: player.team_name || card.dataset.teamName || '',
+        team_abbreviation: player.team_abbreviation || card.dataset.teamAbbr || '',
+        player_position: player.position || card.dataset.position || '',
+        player_jersey: player.jersey || card.dataset.jersey || '',
+        stat: payload.stat,
+        line: payload.line,
+        last_n: payload.last_n,
+        season_type: item.season_type || payload.season_type || getSelectedSeasonType(),
       });
-      await analyzePlayerProp();
+      if (!hydrated) {
+        setSelectedPlayer({
+          id: resolvedPlayerId,
+          full_name: player.full_name || card.dataset.name,
+          is_active: true,
+          team_abbreviation: player.team_abbreviation || card.dataset.teamAbbr,
+          team_name: player.team_name || card.dataset.teamName,
+          team_id: player.team_id || (card.dataset.teamId ? Number(card.dataset.teamId) : null),
+          position: player.position || card.dataset.position,
+          jersey: player.jersey || card.dataset.jersey
+        });
+        await analyzePlayerProp();
+      }
     });
   });
 }
@@ -2354,6 +2454,7 @@ async function runBetFinder() {
 
     const season = seasonInput.value.trim();
     if (season) params.set('season', season);
+    params.set('season_type', getSelectedSeasonType());
 
     const payload = await apiFetch(`/api/bet-finder?${params.toString()}`, {}, 30000);
 
@@ -2409,7 +2510,7 @@ function renderAvailabilityBadge(availability, compact = false) {
   const tagClass = compact ? 'availability-tag compact' : 'availability-tag';
   const reason = escapeHtml(availability.reason || availability.note || 'No official note');
   const reportLabel = escapeHtml(availability.report_label || 'Latest report time unavailable');
-  return `<span class="${tagClass} ${toneClass}" title="${reason} • ${reportLabel}">${escapeHtml(availability.status || 'Unknown')}</span>`;
+  return `<span class="${tagClass} ${toneClass}" title="${reason}  ${reportLabel}">${escapeHtml(availability.status || 'Unknown')}</span>`;
 }
 
 function getMatchupTargets() {
@@ -2428,6 +2529,13 @@ async function hydrateAnalyzerFromPropSelection(prop) {
   if (!prop || !prop.player_id) return false;
 
   try {
+    const hydratedSeasonType = normalizeSeasonTypeValue(
+      prop.season_type || prop.seasonType || (prop.analysis && prop.analysis.season_type) || ''
+    );
+    if (hydratedSeasonType) {
+      setGlobalSeasonType(hydratedSeasonType, { markOverridden: true, source: 'hydration' });
+    }
+
     if (typeof ensureTeamsLoaded === 'function') {
       await ensureTeamsLoaded();
     }
@@ -2580,6 +2688,7 @@ function renderMatchup(payload) {
   const vsPosition = payload?.matchup?.vs_position;
   const availability = payload?.availability;
   const targets = getMatchupTargets();
+  const seriesSummary = String(nextGame?.series_summary || nextGame?.series_text || '').trim();
 
   if (!nextGame && !vsPosition && !availability) {
     targets.forEach(({ badge, body }) => {
@@ -2587,7 +2696,7 @@ function renderMatchup(payload) {
       badge.textContent = 'No matchup data';
       body.className = 'empty-state-panel compact matchup-empty';
       body.innerHTML = `
-        <div class="empty-icon">🛡️</div>
+        <div class="empty-icon"></div>
         <strong>Matchup context unavailable.</strong>
         <span>We could not resolve the next opponent or position split for this player.</span>
       `;
@@ -2599,7 +2708,7 @@ function renderMatchup(payload) {
   const leanText = vsPosition?.lean || (nextGame ? 'Upcoming game found' : 'Partial matchup');
 
   const nextGameLabel = nextGame
-    ? `${nextGame.matchup_label} • ${nextGame.game_date ? formatNextGameDate(nextGame.game_date) : 'Date TBA'}${nextGame.game_time ? ` • ${nextGame.game_time}` : ''}`
+    ? `${nextGame.matchup_label}${seriesSummary ? `  ${seriesSummary}` : ''}  ${nextGame.game_date ? formatNextGameDate(nextGame.game_date) : 'Date TBA'}${nextGame.game_time ? `  ${nextGame.game_time}` : ''}`
     : 'Upcoming game unavailable';
 
   const isOverride = Boolean(nextGame?.is_override);
@@ -2608,7 +2717,7 @@ function renderMatchup(payload) {
     : 'Venue unavailable';
 
   const overrideBannerHtml = isOverride
-    ? `<div class="override-notice">📌 <strong>Manual opponent override:</strong> ${escapeHtml(nextGame?.opponent_name || nextGame?.opponent_abbreviation || 'Custom opponent')} -- defense-vs-position and H2H stats reflect this selection, not the actual scheduled game.</div>`
+    ? `<div class="override-notice"> <strong>Manual opponent override:</strong> ${escapeHtml(nextGame?.opponent_name || nextGame?.opponent_abbreviation || 'Custom opponent')} -- defense-vs-position and H2H stats reflect this selection, not the actual scheduled game.</div>`
     : '';
 
   const formatMaybe = (value, digits = 2) => {
@@ -2639,6 +2748,11 @@ function renderMatchup(payload) {
         <small>${escapeHtml(availability?.reason || availability?.note || 'Official status unavailable')}</small>
       </article>
       <article class="matchup-tile">
+        <span class="small-label">Series</span>
+        <strong>${escapeHtml(seriesSummary || 'Not in series')}</strong>
+        <small>${escapeHtml(nextGame?.playoff_game_number ? `Game ${nextGame.playoff_game_number}` : 'Series context unavailable')}</small>
+      </article>
+      <article class="matchup-tile">
         <span class="small-label">Vs position</span>
         <strong>${escapeHtml(vsPosition?.position_label || 'Unavailable')}</strong>
         <small>${escapeHtml(vsPosition ? getStatLabel(vsPosition.stat) : 'Need position data')}</small>
@@ -2660,12 +2774,12 @@ function renderMatchup(payload) {
       </article>
     </div>
     <p class="matchup-summary">${escapeHtml(summaryText)}</p>
-    ${availability ? `<p class="availability-footnote">${renderAvailabilityBadge(availability, true)} ${escapeHtml(availability.report_label || 'Latest report time unavailable')} • ${escapeHtml(availability.source || 'Official NBA injury report')}</p>` : ''}
+    ${availability ? `<p class="availability-footnote">${renderAvailabilityBadge(availability, true)} ${escapeHtml(availability.report_label || 'Latest report time unavailable')}  ${escapeHtml(availability.source || 'Official NBA injury report')}</p>` : ''}
   `;
 
   targets.forEach(({ badge, body }) => {
     badge.className = `spotlight-pill ${isOverride ? 'warning' : leanTone}`;
-    badge.textContent = isOverride ? `📌 vs ${nextGame?.opponent_abbreviation || 'Override'}` : leanText;
+    badge.textContent = isOverride ? ` vs ${nextGame?.opponent_abbreviation || 'Override'}` : leanText;
     body.className = 'matchup-body';
     body.innerHTML = bodyHtml;
   });
@@ -2751,7 +2865,7 @@ function buildGameLogRowsMarkup(games, emptyTitle, emptySubtitle, stat = selecte
       <tr>
         <td colspan="${columns.length}">
           <div class="empty-state-panel compact">
-            <div class="empty-icon">📊</div>
+            <div class="empty-icon"></div>
             <strong>${escapeHtml(emptyTitle)}</strong>
             <span>${escapeHtml(emptySubtitle)}</span>
           </div>
@@ -2812,7 +2926,7 @@ function renderGameLogTab(view = activeGameLogView) {
     const h2hSideHits = getSideHitFromOverHits(h2h.hit_count, h2h.games_count, leanSide);
     const h2hLabel = leanSide === 'UNDER' ? 'unders' : 'overs';
     if (games.length) {
-      gameLogMeta.textContent = `${h2hSideHits}/${h2h.games_count} ${h2hLabel} • Avg ${Number(h2h.average || 0).toFixed(1)} vs ${oppLabel} • Minutes and attempts included`;
+      gameLogMeta.textContent = `${h2hSideHits}/${h2h.games_count} ${h2hLabel}  Avg ${Number(h2h.average || 0).toFixed(1)} vs ${oppLabel}  Minutes and attempts included`;
       renderGameLogHeader(currentGameLogPayload?.stat || selectedStat);
       gamesTableBody.innerHTML = buildGameLogRowsMarkup(games, `No H2H games vs ${oppLabel} yet.`, 'No current-season meetings found for this next opponent.', currentGameLogPayload?.stat || selectedStat, leanSide);
     } else {
@@ -2823,7 +2937,7 @@ function renderGameLogTab(view = activeGameLogView) {
     return;
   }
 
-  gameLogMeta.textContent = `Last ${currentGameLogPayload.last_n} games • Value, minutes, and attempts`;
+  gameLogMeta.textContent = `Last ${currentGameLogPayload.last_n} games  Value, minutes, and attempts`;
   renderGameLogHeader(currentGameLogPayload?.stat || selectedStat);
   gamesTableBody.innerHTML = buildGameLogRowsMarkup(currentGameLogPayload.games || [], 'No data yet.', 'Analyze a player prop to fill the game log.', currentGameLogPayload?.stat || selectedStat, leanSide);
 }
@@ -2909,7 +3023,7 @@ function setOddsQuotaMeta(quota) {
     oddsQuotaMeta.textContent = 'Credits used will appear here after an Odds API call.';
     return;
   }
-  oddsQuotaMeta.textContent = `Credits used: ${quota.used ?? '--'} • Remaining: ${quota.remaining ?? '--'} • Last call cost: ${quota.last ?? '--'}`;
+  oddsQuotaMeta.textContent = `Credits used: ${quota.used ?? '--'}  Remaining: ${quota.remaining ?? '--'}  Last call cost: ${quota.last ?? '--'}`;
 }
 
 function setOddsApiKeyMeta(apiKey) {
@@ -3116,7 +3230,7 @@ function renderOddsEvents(events) {
   }
   oddsEventSelect.innerHTML = '<option value="">Select an event</option>' + events.map(event => {
     const timeText = event?.commence_time ? formatPHT(event.commence_time) : 'Time TBA';
-    return `<option value="${escapeHtml(event.id)}">${escapeHtml(event.away_team || '')} @ ${escapeHtml(event.home_team || '')} • ${escapeHtml(timeText)}</option>`;
+    return `<option value="${escapeHtml(event.id)}">${escapeHtml(event.away_team || '')} @ ${escapeHtml(event.home_team || '')}  ${escapeHtml(timeText)}</option>`;
   }).join('');
 }
 
@@ -3127,6 +3241,7 @@ async function loadOddsEvents() {
     keyEntry = await pickRandomVaultKeyForFeature({
       requiredCredits: 1,
       sourceLabel: 'Odds event loading',
+      enforceMinimum: false,
     });
   } catch (error) {
     alert(error.message || 'No usable Odds API key found in Key Vault.');
@@ -3167,6 +3282,7 @@ async function importOddsPropsAndScan() {
     keyEntry = await pickRandomVaultKeyForFeature({
       requiredCredits: 1,
       sourceLabel: 'Odds props import',
+      enforceMinimum: false,
     });
   } catch (error) {
     alert(error.message || 'No usable Odds API key found in Key Vault.');
@@ -3201,7 +3317,7 @@ async function importOddsPropsAndScan() {
       return;
     }
     marketTextarea.value = csvRows.join('\n');
-    marketMeta.textContent = `${csvRows.length} imported row(s) • ${payload.event?.away_team || ''} @ ${payload.event?.home_team || ''} • Credits used ${payload.quota?.used ?? '--'} • Remaining ${payload.quota?.remaining ?? '--'}`;
+    marketMeta.textContent = `${csvRows.length} imported row(s)  ${payload.event?.away_team || ''} @ ${payload.event?.home_team || ''}  Credits used ${payload.quota?.used ?? '--'}  Remaining ${payload.quota?.remaining ?? '--'}`;
     setOddsApiStatus(`Imported ${csvRows.length} prop row(s)`, 'good');
     const importedRows = Array.isArray(payload.import_rows) ? payload.import_rows : [];
     const scanRows = importedRows.map(row => ({
@@ -3248,7 +3364,7 @@ function renderMarketEmpty(message = 'Paste your board using the template, then 
   marketMeta.textContent = 'Paste rows using the template below. Team and opponent are detected automatically from the player.';
   marketResults.className = 'bet-finder-state empty-state-panel compact';
   marketResults.innerHTML = `
-    <div class="empty-icon">🧾</div>
+    <div class="empty-icon"></div>
     <strong>No market scan yet.</strong>
     <span>${escapeHtml(message)}</span>
   `;
@@ -3345,6 +3461,12 @@ async function focusMarketPlayer(item, options = {}) {
 async function focusMarketPlayerEnhanced(item) {
   if (!item?.player?.id) return;
   const analysis = item.analysis || {};
+  const normalizedSeasonType = normalizeSeasonTypeValue(
+    analysis.season_type || currentMarketResultsPayload?.season_type || getSelectedSeasonType()
+  );
+  if (seasonTypeSelect && normalizedSeasonType) {
+    setGlobalSeasonType(normalizedSeasonType, { markOverridden: true, source: 'market' });
+  }
   if (analysis && Array.isArray(analysis.games) && analysis.games.length) {
     await focusMarketPlayer(item, { skipRefresh: true });
     return;
@@ -3368,6 +3490,7 @@ async function focusMarketPlayerEnhanced(item) {
     last_n: marketLastN,
     over_odds: item.market?.over_odds,
     under_odds: item.market?.under_odds,
+    season_type: analysis.season_type || currentMarketResultsPayload?.season_type || getSelectedSeasonType(),
   });
   if (!hydrated) {
     await focusMarketPlayer(item);
@@ -3456,7 +3579,7 @@ function buildDecisionLensData({
   if (Number.isFinite(gameTotal)) marketEnvironmentBits.push(`game total ${gameTotal.toFixed(1)}`);
   if (Number.isFinite(spread)) marketEnvironmentBits.push(`spread ${spread > 0 ? '+' : ''}${spread.toFixed(1)}`);
   if (marketEnvironmentBits.length) {
-    marketText += ` Market setup: ${marketEnvironmentBits.join(' • ')}.`;
+    marketText += ` Market setup: ${marketEnvironmentBits.join('  ')}.`;
   }
 
   let lineupText = 'No major same-team absences are materially changing this read.';
@@ -3525,7 +3648,7 @@ function getMarketInspectDetails(item) {
   });
   const matchupSubtitle = item?.game_label || `${item?.player?.team || ''} vs ${item?.player?.opponent || ''}`.trim();
   return {
-    title: `${item?.player?.full_name || 'Unknown player'} • ${item?.market?.stat || 'Prop'} ${item?.market?.line ?? ''}`,
+    title: `${item?.player?.full_name || 'Unknown player'}  ${item?.market?.stat || 'Prop'} ${item?.market?.line ?? ''}`,
     subtitle: matchupSubtitle.trim(),
     side: marketSide,
     summary: bestBet.user_read || bestBet.confidence_summary || 'Confidence summary unavailable.',
@@ -3632,7 +3755,7 @@ function renderMarketInspectTray() {
           </div>
           <div class="market-inspect-block">
             <span class="small-label">Market context</span>
-            <strong>TT ${escapeHtml(details.teamTotal)} • Spr ${escapeHtml(details.spread)} • GT ${escapeHtml(details.gameTotal)}</strong>
+            <strong>TT ${escapeHtml(details.teamTotal)}  Spr ${escapeHtml(details.spread)}  GT ${escapeHtml(details.gameTotal)}</strong>
             <small>Spread and totals loaded into scanner context</small>
           </div>
           ${renderDecisionLensHtml(details.decisionLens, 'compact')}
@@ -3641,7 +3764,7 @@ function renderMarketInspectTray() {
             <div class="market-inspect-lineup-card">
               <strong>${escapeHtml(details.lineupHeadline)}</strong>
               <small>${escapeHtml(details.lineupSummary)}</small>
-              ${details.lineupNames.length ? `<p>${escapeHtml(details.lineupNames.join(' • '))}</p>` : ''}
+              ${details.lineupNames.length ? `<p>${escapeHtml(details.lineupNames.join('  '))}</p>` : ''}
             </div>
           </div>
           <div class="market-slip-angle-row">
@@ -3699,19 +3822,19 @@ function applyMarketInjuryDataToCell(cell, data) {
     const name = escapeHtml(p.lookup_name || p.display_name || 'Player');
     const status = escapeHtml(String(p.status || 'Out').trim());
     const reason = escapeHtml(String(p.reason || '').trim());
-    bullets.push(`<small><strong>${name}</strong> — ${status}${reason ? ` (${reason})` : ''}</small>`);
+    bullets.push(`<small><strong>${name}</strong>  ${status}${reason ? ` (${reason})` : ''}</small>`);
   });
   riskyPlayers.slice(0, 2).forEach(p => {
     const name = escapeHtml(p.lookup_name || p.display_name || 'Player');
     const status = escapeHtml(String(p.status || 'Questionable').trim());
     const reason = escapeHtml(String(p.reason || '').trim());
-    bullets.push(`<small><strong>${name}</strong> — ${status}${reason ? ` (${reason})` : ''}</small>`);
+    bullets.push(`<small><strong>${name}</strong>  ${status}${reason ? ` (${reason})` : ''}</small>`);
   });
   const extra = Math.max(0, injured.length - 4);
   if (extra > 0) bullets.push(`<small>+${extra} more listed</small>`);
   cell.innerHTML = `
     <div class="market-inj-summary">
-      <strong>${outPlayers.length} out • ${riskyPlayers.length} questionable</strong>
+      <strong>${outPlayers.length} out  ${riskyPlayers.length} questionable</strong>
       ${bullets.join('')}
       ${reportLabel ? `<small class="market-inj-report">Report: ${escapeHtml(reportLabel)}</small>` : ''}
     </div>
@@ -3814,7 +3937,7 @@ function renderMarketResults(payload) {
   const pageEnd = Math.min(totalResults, pageStart + MARKET_PAGE_SIZE);
   const results = fullResults.slice(pageStart, pageEnd);
 
-  marketMeta.textContent = `${totalResults} props scanned • ${getMarketSortLabel(sortKey)} • ${getMarketFilterLabel(filterKey)} • ${getExpertFilterSummary()} • Page ${currentMarketPage}/${totalPages}`;
+  marketMeta.textContent = `${totalResults} props scanned  ${getMarketSortLabel(sortKey)}  ${getMarketFilterLabel(filterKey)}  ${getExpertFilterSummary()}  Page ${currentMarketPage}/${totalPages}`;
 
   const resultKeySet = new Set(fullResults.map(getMarketItemKey));
   currentMarketInspectKeys = currentMarketInspectKeys.filter(key => resultKeySet.has(key));
@@ -3976,8 +4099,8 @@ function renderMarketResults(payload) {
                 <td>${escapeHtml(item.market.stat)} ${item.market.line}</td>
                 <td>
                   <div class="market-confidence-cell">
-                    <span class="finder-badge ${tone}">${item.best_bet.display_side || item.best_bet.side} • ${item.best_bet.confidence}${item.best_bet.confidence_score ? ` ${item.best_bet.confidence_score}` : ''}</span>
-                    <small>Rank score ${item.best_bet.ranking_score ?? item.best_bet.confidence_score ?? '--'}${Number(item.best_bet.market_penalty || 0) > 0 ? ` • market penalty ${Number(item.best_bet.market_penalty).toFixed(1)}` : ''}</small>
+                    <span class="finder-badge ${tone}">${item.best_bet.display_side || item.best_bet.side}  ${item.best_bet.confidence}${item.best_bet.confidence_score ? ` ${item.best_bet.confidence_score}` : ''}</span>
+                    <small>Rank score ${item.best_bet.ranking_score ?? item.best_bet.confidence_score ?? '--'}${Number(item.best_bet.market_penalty || 0) > 0 ? `  market penalty ${Number(item.best_bet.market_penalty).toFixed(1)}` : ''}</small>
                     <small class="market-row-summary">${escapeHtml(compactSummary)}</small>
                   </div>
                   <div class="market-row-micro">
@@ -4200,6 +4323,7 @@ async function runMarketScan(rowsOverride = null) {
       rows,
       last_n: Number(gamesSelect.value),
       season: seasonInput.value.trim() || undefined,
+      season_type: getSelectedSeasonType(),
       injury_aware: injuryAwareEnabled
     };
     const progressLabel = (msg) => {
@@ -4309,7 +4433,7 @@ function resetDashboardForNoSelection() {
     badge.textContent = 'Waiting for analysis';
     body.className = 'empty-state-panel compact matchup-empty';
     body.innerHTML = `
-      <div class="empty-icon">🛡️</div>
+      <div class="empty-icon"></div>
       <strong>No matchup loaded yet.</strong>
       <span>Analyze a player prop to load the next opponent and defense-vs-position read.</span>
     `;
@@ -4382,9 +4506,9 @@ teamSelect.addEventListener('change', async () => {
     playerGrid.classList.add('empty-grid');
     playerGrid.innerHTML = `
       <div class="empty-roster-state empty-state-panel compact">
-        <div class="empty-icon">🏀</div>
+        <div class="empty-icon"></div>
         <strong>Choose a team to load player cards.</strong>
-        <span>You’ll get clickable headshots, jersey numbers, and positions.</span>
+        <span>You'll get clickable headshots, jersey numbers, and positions.</span>
       </div>
     `;
     betFinderMeta.textContent = 'Uses your current team, prop, line, and recent-game sample.';
@@ -4409,7 +4533,7 @@ teamSelect.addEventListener('change', async () => {
 
   try {
     await loadRoster(teamId);
-    betFinderMeta.textContent = `${selectedOption.dataset.name} • ${getStatLabel(selectedStat)} ${lineInput.value} • Last ${gamesSelect.value}`;
+    betFinderMeta.textContent = `${selectedOption.dataset.name}  ${getStatLabel(selectedStat)} ${lineInput.value}  Last ${gamesSelect.value}`;
     renderBetFinderEmpty('Click Bet Finder to rank this roster by recent hit rate.');
     setStatus('Roster ready');
   } catch (error) {
@@ -4476,6 +4600,26 @@ if (oppSelect) {
     }
   });
 }
+if (seasonTypeSelect) {
+  seasonTypeSelect.addEventListener('change', () => {
+    setGlobalSeasonType(seasonTypeSelect.value, { markOverridden: true, source: 'main' });
+  });
+}
+if (betFinderSeasonTypeSelect) {
+  betFinderSeasonTypeSelect.addEventListener('change', () => {
+    setGlobalSeasonType(betFinderSeasonTypeSelect.value, { markOverridden: true, source: 'betfinder' });
+  });
+}
+if (marketSeasonTypeSelect) {
+  marketSeasonTypeSelect.addEventListener('change', () => {
+    setGlobalSeasonType(marketSeasonTypeSelect.value, { markOverridden: true, source: 'market' });
+  });
+}
+if (parlaySeasonTypeSelect) {
+  parlaySeasonTypeSelect.addEventListener('change', () => {
+    setGlobalSeasonType(parlaySeasonTypeSelect.value, { markOverridden: true, source: 'parlay' });
+  });
+}
 clearRecentBtn.addEventListener('click', () => clearRecentPlayersState({ resetCurrent: true }));
 marketTemplateBtn.addEventListener('click', () => { marketTextarea.value = getMarketTemplate(); });
 marketClearBtn.addEventListener('click', () => { marketTextarea.value = ''; renderMarketEmpty(); });
@@ -4500,6 +4644,7 @@ oddsCheckBalBtn?.addEventListener('click', async () => {
     keyEntry = await pickRandomVaultKeyForFeature({
       requiredCredits: 0,
       sourceLabel: 'balance check',
+      enforceMinimum: false,
     });
   } catch (error) {
     alert(error.message || 'No usable Odds API key found in Key Vault.');
@@ -4582,7 +4727,7 @@ themeToggle.addEventListener('click', () => {
   setTheme(nextTheme);
 });
 
-// ── User Guide modal ──────────────────────────────────────────────────
+//  User Guide modal 
 (function () {
   const modal    = document.getElementById('userGuideModal');
   const openBtn  = document.getElementById('openUserGuideBtn');
@@ -4597,9 +4742,9 @@ themeToggle.addEventListener('click', () => {
   document.addEventListener('keydown', e => { if (e.key === 'Escape' && modal?.style.display === 'block') closeGuide(); });
 })();
 
-// ══════════════════════════════════════════════════════════════════════
-// ── DATA VAULT / HISTORY PANEL ────────────────────────────────────────
-// ══════════════════════════════════════════════════════════════════════
+// 
+//  DATA VAULT / HISTORY PANEL 
+// 
 
 (function initHistoryPanel() {
   const historyType = document.getElementById('historyType');
@@ -4635,7 +4780,7 @@ themeToggle.addEventListener('click', () => {
   function renderEmpty(message) {
     historyList.innerHTML = `
       <div class="bet-finder-state empty-state-panel compact history-empty">
-        <div class="empty-icon">[ ]</div>
+        <div class="empty-icon">\uD83D\uDD11</div>
         <strong>${escapeHtml(message)}</strong>
         <span>Run a scan or analysis to populate history.</span>
       </div>`;
@@ -4701,7 +4846,7 @@ themeToggle.addEventListener('click', () => {
           <div class="history-row">
             <div>
               <strong>Market scan</strong>
-              <small>${escapeHtml(entry.count)} results • ${escapeHtml(entry.errors)} errors</small>
+              <small>${escapeHtml(entry.count)} results  ${escapeHtml(entry.errors)} errors</small>
             </div>
             <div class="history-meta">
               ${escapeHtml(formatDate(entry.requested_at))}
@@ -4715,7 +4860,7 @@ themeToggle.addEventListener('click', () => {
           <div class="history-row">
             <div>
               <strong>Parlay run</strong>
-              <small>${escapeHtml(entry.legs ?? '--')} legs • ${escapeHtml(entry.props_found ?? '--')} props</small>
+              <small>${escapeHtml(entry.legs ?? '--')} legs  ${escapeHtml(entry.props_found ?? '--')} props</small>
             </div>
             <div class="history-meta">
               ${escapeHtml(formatDate(entry.requested_at))}
@@ -4923,6 +5068,7 @@ let upgradedChartPrefs = (() => {
 
 (async function init() {
   applySavedTheme();
+  applySeasonTypeDefaultFromCalendar();
   renderRecentPlayers();
   renderSelectedPlayer();
   renderOverviewSelection();
@@ -5012,7 +5158,7 @@ function getAnalyzerHeroState() {
     : '';
   const lineupCount = Number(teamContext.impact_count || 0);
   const signalText = payload
-    ? `${recommendation.label || chosenSide || 'Lean'}${confidence.grade ? ` • ${confidence.grade} ${confidence.score || ''}` : ''}${nextGame.matchup_label ? ` • ${nextGame.matchup_label}` : ''}`
+    ? `${recommendation.label || chosenSide || 'Lean'}${confidence.grade ? `  ${confidence.grade} ${confidence.score || ''}` : ''}${nextGame.matchup_label ? `  ${nextGame.matchup_label}` : ''}`
     : 'Awaiting analysis';
   const chips = payload ? [
     chosenSide ? `${chosenSide} lean` : '',
@@ -5065,7 +5211,7 @@ function renderFavoritesUpgrade() {
   if (!favorites.length) {
     favoritesListEl.className = 'favorites-list empty-state-panel compact';
     favoritesListEl.innerHTML = `
-      <div class="empty-icon">💾</div>
+      <div class="empty-icon"></div>
       <strong>No favorites yet.</strong>
       <span>Star a player or save a prop from the analyzer to keep it here.</span>
     `;
@@ -5083,7 +5229,7 @@ function renderFavoritesUpgrade() {
     const subtitle = item.subtitle || (isProp ? 'Reusable prop setup' : (player?.position || 'Saved player'));
     const kicker = isProp
       ? `${item.stat || ''} ${item.line ?? ''}`.trim()
-      : [teamAbbr, player?.position].filter(Boolean).join(' • ');
+      : [teamAbbr, player?.position].filter(Boolean).join('  ');
     const logo = teamId ? getTeamLogo(teamId) : '';
     const headshot = player?.id ? getPlayerImage(player.id) : getFallbackHeadshot();
     return `
@@ -5176,7 +5322,7 @@ function toggleSectionByIdUpgrade(id) {
   body.classList.toggle('collapsed', collapsed);
   body.closest('.card')?.classList.toggle('section-collapsed', collapsed);
   const btn = document.querySelector(`.collapse-btn[data-collapse-target="${id}"]`);
-  if (btn) btn.textContent = collapsed ? '+' : '−';
+  if (btn) btn.textContent = collapsed ? '+' : '\u2212';
 }
 
 function renderOverviewBestBets() {
@@ -5200,14 +5346,14 @@ function renderOverviewBestBets() {
             <span class="overview-rank-hash">#</span>
             <span class="overview-rank-num">${index + 1}</span>
           </span>
-          <span class="finder-badge ${(item.best_bet.traffic_light?.tone || item.best_bet.confidence_tone || '')}">${escapeHtml(item.best_bet.display_side || item.best_bet.side)} • ${escapeHtml(item.best_bet.traffic_light?.label || item.best_bet.confidence || '')}</span>
+          <span class="finder-badge ${(item.best_bet.traffic_light?.tone || item.best_bet.confidence_tone || '')}">${escapeHtml(item.best_bet.display_side || item.best_bet.side)}  ${escapeHtml(item.best_bet.traffic_light?.label || item.best_bet.confidence || '')}</span>
         </div>
         <div class="overview-best-bet-main">
           <div class="overview-best-bet-player">
             <img class="overview-best-bet-avatar" src="${getPlayerImage(item.player.id)}" alt="${escapeHtml(item.player.full_name)}" onerror="this.onerror=null;this.src='${getFallbackHeadshot()}'">
             <div class="overview-best-bet-copy">
               <strong>${escapeHtml(item.player.full_name)}</strong>
-              <small>${escapeHtml(item.market.stat)} ${item.market.line} • ${escapeHtml(item.player.team || '')}${item.player.opponent ? ` vs ${escapeHtml(item.player.opponent)}` : ''}</small>
+              <small>${escapeHtml(item.market.stat)} ${item.market.line}  ${escapeHtml(item.player.team || '')}${item.player.opponent ? ` vs ${escapeHtml(item.player.opponent)}` : ''}</small>
               <div class="overview-best-bet-detail-row">
                 <span class="overview-best-bet-chip stat">${escapeHtml(item.market.stat)} ${item.market.line}</span>
                 <span class="overview-best-bet-chip">Edge ${item.best_bet.edge ?? '--'}%</span>
@@ -5248,9 +5394,9 @@ function renderOverviewBestBets() {
   if (overviewTopCountEl) overviewTopCountEl.textContent = String(strongest.length);
   if (overviewCautionCountEl) overviewCautionCountEl.textContent = String(caution.length);
   if (overviewBoostCountEl) overviewBoostCountEl.textContent = String(boosts.length);
-  renderBoard(overviewBestBets, strongest, '⭐', 'No best bets saved yet.', 'Run Market Scanner to pin the strongest current board edges here.');
-  renderBoard(overviewCautionBoardEl, caution, '⚠️', 'No caution spots yet.', 'Risky plays will appear here after a board scan.');
-  renderBoard(overviewBoostBoardEl, boosts, '📈', 'No lineup-context edges yet.', 'Plays with strong teammate-absence context will appear here.');
+  renderBoard(overviewBestBets, strongest, '\u2605', 'No best bets saved yet.', 'Run Market Scanner to pin the strongest current board edges here.');
+  renderBoard(overviewCautionBoardEl, caution, '\u26A0', 'No caution spots yet.', 'Risky plays will appear here after a board scan.');
+  renderBoard(overviewBoostBoardEl, boosts, '\u2728', 'No lineup-context edges yet.', 'Plays with strong teammate-absence context will appear here.');
   setOverviewBoardTab(overviewBoardTab);
 }
 
@@ -5264,6 +5410,15 @@ overviewBoardTabsEl?.querySelectorAll('.overview-board-tab').forEach(btn => {
 
 function renderTodayGames(payload) {
   latestTodayGamesPayload = payload;
+  if (
+    seasonTypeSelect &&
+    !seasonTypeUserOverridden &&
+    payload?.playoff_mode_active === true &&
+    getSelectedSeasonType() === 'Combined'
+  ) {
+    setGlobalSeasonType('Playoffs', { markOverridden: false, source: 'today-auto' });
+  }
+  updatePlayoffModeBanner();
   try {
     localStorage.setItem(TODAY_GAMES_CACHE_KEY, JSON.stringify({
       savedAt: Date.now(),
@@ -5282,14 +5437,14 @@ function renderTodayGames(payload) {
   });
   if (todayGamesMeta) {
     todayGamesMeta.textContent = payload.fallback_used
-      ? `No games on ${payload.requested_date}. Showing next slate on ${payload.resolved_date}. ${payload.report_label ? `• Report ${payload.report_label}` : ''}`
-      : `${games.length} game${games.length === 1 ? '' : 's'} on ${payload.resolved_date}${payload.report_label ? ` • Report ${payload.report_label}` : ''}`;
+      ? `No games on ${payload.requested_date}. Showing next slate on ${payload.resolved_date}. ${payload.report_label ? ` Report ${payload.report_label}` : ''}`
+      : `${games.length} game${games.length === 1 ? '' : 's'} on ${payload.resolved_date}${payload.report_label ? `  Report ${payload.report_label}` : ''}`;
   }
   if (overviewTodayMeta) {
     overviewTodayMeta.textContent = payload.fallback_used ? `Next slate: ${payload.resolved_date}` : `${games.length} game${games.length === 1 ? '' : 's'} on ${payload.resolved_date}`;
   }
   if (!games.length) {
-    const emptyHtml = `<div class="empty-state-panel compact today-game-empty"><div class="empty-icon">🗓️</div><strong>No games on the active slate.</strong><span>When the NBA schedule posts games, they will appear here with report context.</span></div>`;
+    const emptyHtml = `<div class="empty-state-panel compact today-game-empty"><div class="empty-icon"></div><strong>No games on the active slate.</strong><span>When the NBA schedule posts games, they will appear here with report context.</span></div>`;
     if (todayGamesBoard) todayGamesBoard.innerHTML = emptyHtml;
     if (overviewTodayGames) overviewTodayGames.innerHTML = emptyHtml;
     return;
@@ -5333,7 +5488,7 @@ function renderDecisionStrip(payload) {
   const resolvedTeam = debugPayload.resolved_team_name || teamContext.team_name || '';
   const matchedRows = Array.isArray(debugPayload.matched_injury_rows) ? debugPayload.matched_injury_rows : [];
   const debugLabel = isDebug
-    ? `Team ${resolvedTeam || '--'} · rows ${matchedRows.length}`
+    ? `Team ${resolvedTeam || '--'}  rows ${matchedRows.length}`
     : 'Off';
   const debugMeta = isDebug
     ? (matchedRows.length ? matchedRows.map(row => `${row.name} (${row.status})`).slice(0, 3).join(', ') : 'No matched rows')
@@ -5466,7 +5621,7 @@ function renderCacheDebugPanel(payload) {
         <div class="cache-debug-card">
           <strong>${escapeHtml(item.label)}</strong>
           <small>Source: ${escapeHtml(String(item.source || 'unknown'))}</small><br/>
-          <small>Age: ${escapeHtml(ageText)} • ${escapeHtml(queuedText)}</small>
+          <small>Age: ${escapeHtml(ageText)}  ${escapeHtml(queuedText)}</small>
         </div>
       `;
     }).join('');
@@ -5501,10 +5656,11 @@ function renderInterpretationPanels(payload) {
       ? `<span style="font-size:11px;opacity:0.65;margin-left:8px">Consistency ${consistencyScore.toFixed(0)}/100</span>`
       : '';
     const warningHtml = sampleWarning
-      ? `<div style="margin-top:10px;padding:8px 12px;border-radius:10px;background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.25);font-size:12px;color:var(--warning,#f59e0b)">⚠ ${escapeHtml(sampleWarning)}</div>`
+      ? `<div class="playoff-mode-banner" style="margin-top:0;margin-bottom:12px;font-size:13px;line-height:1.45"><strong> Sample warning</strong><span>${escapeHtml(sampleWarning)}</span></div>`
       : '';
     recommendationBodyEl.className = 'interpretation-body';
     recommendationBodyEl.innerHTML = `
+      ${warningHtml}
       <div class="insight-summary ${trafficToneClass}">
         <span class="insight-summary-label">Traffic light</span>
         <strong>${escapeHtml(recommendation.label || 'Caution')}</strong>
@@ -5512,14 +5668,13 @@ function renderInterpretationPanels(payload) {
       </div>
       <div class="traffic-light-row">
         <span class="traffic-pill ${trafficToneClass}">${escapeHtml(chosenSide)}</span>
-        <span class="traffic-meta">${escapeHtml(confidence.grade || '--')} ${escapeHtml(String(confidence.score || ''))} • ${escapeHtml(confidence.summary || '')}</span>
+        <span class="traffic-meta">${escapeHtml(confidence.grade || '--')} ${escapeHtml(String(confidence.score || ''))}  ${escapeHtml(confidence.summary || '')}</span>
       </div>
       <div style="display:flex;align-items:center;gap:6px;margin-top:8px;flex-wrap:wrap">
         ${consistencyScore >= 0 ? `<span style="font-size:11px;padding:3px 10px;border-radius:12px;background:rgba(255,255,255,0.07);opacity:0.8">Consistency <strong>${consistencyScore.toFixed(0)}/100</strong></span>` : ''}
-        ${variance.std_dev !== undefined ? `<span style="font-size:11px;padding:3px 10px;border-radius:12px;background:rgba(255,255,255,0.07);opacity:0.7">σ <strong>${Number(variance.std_dev).toFixed(1)}</strong></span>` : ''}
+        ${variance.std_dev !== undefined ? `<span style="font-size:11px;padding:3px 10px;border-radius:12px;background:rgba(255,255,255,0.07);opacity:0.7"> <strong>${Number(variance.std_dev).toFixed(1)}</strong></span>` : ''}
         ${variance.median !== undefined ? `<span style="font-size:11px;padding:3px 10px;border-radius:12px;background:rgba(255,255,255,0.07);opacity:0.7">Median <strong>${Number(variance.median).toFixed(1)}</strong></span>` : ''}
-      </div>
-      ${warningHtml}`;
+      </div>`;
   }
   if (interpretationTone) {
     interpretationTone.className = `spotlight-pill ${interpretationToneClass}`;
@@ -5593,7 +5748,7 @@ function renderInterpretationPanels(payload) {
       </div>
       <div class="opportunity-summary-wrap refined-opportunity-wrap">
         <div class="insight-summary neutral compact-summary"><span class="insight-summary-label">Model read</span><p class="opportunity-summary">${escapeHtml(opportunity.summary || 'Opportunity trends will appear after analysis.')}</p></div>
-        <div class="team-context-box ${teamContext.impact_count ? 'warning' : 'neutral'}"><strong>${escapeHtml(teamContext.headline || 'Lineup context')}</strong><p>${escapeHtml(teamContext.impact_summary || teamContext.summary || 'No team-availability context yet.')}</p>${listedPlayers.length ? `<small>${escapeHtml(listedPlayers.join(' • '))}</small>` : '<small>No major same-team absences flagged on the latest report.</small>'}</div>
+        <div class="team-context-box ${teamContext.impact_count ? 'warning' : 'neutral'}"><strong>${escapeHtml(teamContext.headline || 'Lineup context')}</strong><p>${escapeHtml(teamContext.impact_summary || teamContext.summary || 'No team-availability context yet.')}</p>${listedPlayers.length ? `<small>${escapeHtml(listedPlayers.join('  '))}</small>` : '<small>No major same-team absences flagged on the latest report.</small>'}</div>
       </div>`;
   }
   if (environmentBody) {
@@ -5647,7 +5802,7 @@ function renderInterpretationPanels(payload) {
       <div class="insight-summary ${hasMarketContext ? 'good' : 'neutral'} compact-summary"><span class="insight-summary-label">Market read</span><strong>${escapeHtml(hasMarketContext ? 'Betting market context loaded' : 'Market context unavailable')}</strong><p class="opportunity-summary">${escapeHtml(marketSummary)}</p><small>${escapeHtml(hasMarketContext ? 'Aligned market direction is a strong confirmation of the play; a conflicting market lean triggers a penalty and lowers confidence.' : 'Add usable Odds API keys to Key Vault and re-run analysis to add market context.')}</small></div>`;
   }
 
-  // ── Variance / distribution panel ────────────────────────────────────
+  //  Variance / distribution panel 
   const variance = payload?.variance || {};
   const sampleWarning = payload?.sample_warning || null;
   if (varianceTone) {
@@ -5660,11 +5815,11 @@ function renderInterpretationPanels(payload) {
       else { vtLabel = 'Volatile'; vtClass = 'bad'; }
     }
     varianceTone.className = `spotlight-pill ${vtClass}`;
-    varianceTone.textContent = cs >= 0 ? `${vtLabel} • ${cs.toFixed(0)}` : 'Waiting for analysis';
+    varianceTone.textContent = cs >= 0 ? `${vtLabel}  ${cs.toFixed(0)}` : 'Waiting for analysis';
   }
   if (varianceBody) {
     if (!variance || Object.keys(variance).length === 0) {
-      varianceBody.innerHTML = `<div class="empty-state-panel compact matchup-empty"><div class="empty-icon">📊</div><strong>No distribution data yet.</strong><span>Analyze a player prop to see consistency, median, floor and ceiling.</span></div>`;
+      varianceBody.innerHTML = `<div class="empty-state-panel compact matchup-empty"><div class="empty-icon"></div><strong>No distribution data yet.</strong><span>Analyze a player prop to see consistency, median, floor and ceiling.</span></div>`;
     } else {
       const cs = Number(variance.consistency_score ?? 0);
       const csColor = cs >= 72 ? 'var(--good)' : cs >= 48 ? 'var(--warning,#f59e0b)' : 'var(--bad)';
@@ -5683,7 +5838,7 @@ function renderInterpretationPanels(payload) {
       const linePctClamped = Math.max(0, Math.min(100, linePct));
 
       const warningHtml = sampleWarning
-        ? `<div class="insight-summary warning compact-summary" style="margin-bottom:10px"><span class="insight-summary-label">⚠ Small sample</span><p>${escapeHtml(sampleWarning)}</p></div>`
+        ? `<div class="insight-summary warning compact-summary" style="margin-bottom:10px"><span class="insight-summary-label"> Small sample</span><p>${escapeHtml(sampleWarning)}</p></div>`
         : '';
 
       varianceBody.className = 'environment-body';
@@ -5717,14 +5872,14 @@ function renderInterpretationPanels(payload) {
           </div>
           <div class="opportunity-chip">
             <span class="small-label">P25 / P75</span>
-            <strong>${Number(variance.p25 ?? 0).toFixed(1)} – ${Number(variance.p75 ?? 0).toFixed(1)}</strong>
+            <strong>${Number(variance.p25 ?? 0).toFixed(1)}  ${Number(variance.p75 ?? 0).toFixed(1)}</strong>
             <small>middle band</small>
           </div>
         </div>
         <div style="padding:0 20px 16px">
           <div class="insight-summary-label" style="margin-bottom:6px">Distribution range</div>
           <div style="position:relative;height:28px;background:var(--surface2,rgba(255,255,255,0.06));border-radius:14px;overflow:hidden">
-            <!-- P25–P75 band -->
+            <!-- P25P75 band -->
             <div style="position:absolute;top:0;bottom:0;left:${p25Pct}%;width:${p75Pct - p25Pct}%;background:rgba(99,179,237,0.22);border-radius:4px"></div>
             <!-- Median marker -->
             <div style="position:absolute;top:3px;bottom:3px;left:${medPct}%;width:3px;background:#63b3ed;border-radius:2px" title="Median ${Number(variance.median ?? 0).toFixed(1)}"></div>
@@ -5733,8 +5888,8 @@ function renderInterpretationPanels(payload) {
           </div>
           <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:10px;opacity:0.55">
             <span>Floor ${Number(variance.floor ?? 0).toFixed(1)}</span>
-            <span style="color:#63b3ed">◆ Median</span>
-            <span style="color:var(--bad)">┃ Line ${line}</span>
+            <span style="color:#63b3ed"> Median</span>
+            <span style="color:var(--bad)"> Line ${line}</span>
             <span>Ceiling ${Number(variance.ceiling ?? 0).toFixed(1)}</span>
           </div>
           <div class="insight-summary neutral compact-summary" style="margin-top:10px">
@@ -5850,7 +6005,7 @@ function formatTrendAxisDate(value) {
 
 /**
  * Format any date/datetime string in Philippines Time (Asia/Manila, UTC+8).
- * Returns e.g. "Apr 5 • 8:00 AM PHT" or "Apr 5 PHT" if no time component.
+ * Returns e.g. "Apr 5  8:00 AM PHT" or "Apr 5 PHT" if no time component.
  */
 function formatPHT(value) {
   if (!value) return '';
@@ -5862,7 +6017,7 @@ function formatPHT(value) {
   const hasTime = String(value).includes('T') || String(value).includes(' ') && String(value).match(/\d{1,2}:\d{2}/);
   if (hasTime) {
     const timePart = d.toLocaleTimeString('en-PH', { timeZone: PHT, hour: 'numeric', minute: '2-digit' });
-    return `${datePart} • ${timePart} PHT`;
+    return `${datePart}  ${timePart} PHT`;
   }
   return `${datePart} PHT`;
 }
@@ -6016,9 +6171,9 @@ function renderChart(payload) {
               const overHit = value >= payload.line;
               const sideHit = leanSide === 'UNDER' ? !overHit : overHit;
               const verdict = sideHit
-                ? `${leanSide} ✓`
-                : `${leanSide === 'UNDER' ? 'OVER' : 'UNDER'} ✗`;
-              const extra = isComboMarket ? ` • Total ${Number(game.value || 0).toFixed(1)}` : '';
+                ? `${leanSide} `
+                : `${leanSide === 'UNDER' ? 'OVER' : 'UNDER'} `;
+              const extra = isComboMarket ? `  Total ${Number(game.value || 0).toFixed(1)}` : '';
               return `${context.dataset?.label || getStatLabel(payload.stat)}: ${value}${extra} (${verdict})`;
             },
             afterBody(items) {
@@ -6109,7 +6264,7 @@ savePropBtnEl?.addEventListener('click', async () => {
   if (!selectedPlayer) return;
   const propKey = `${selectedPlayer.id}:${selectedStat}:${lineInput.value}`;
   const existing = loadFavoritesUpgrade().some(e => `${e.type}:${e.key}` === `prop:${propKey}`);
-  const favoritePayload = { type: 'prop', key: propKey, title: `${selectedPlayer.full_name} • ${selectedStat} ${lineInput.value}`, subtitle: lastPayload?.traffic_light?.summary || lastPayload?.interpretation?.summary || 'Saved from analyzer', stat: selectedStat, line: Number(lineInput.value || 0), player: selectedPlayer };
+  const favoritePayload = { type: 'prop', key: propKey, title: `${selectedPlayer.full_name}  ${selectedStat} ${lineInput.value}`, subtitle: lastPayload?.traffic_light?.summary || lastPayload?.interpretation?.summary || 'Saved from analyzer', stat: selectedStat, line: Number(lineInput.value || 0), player: selectedPlayer };
   toggleFavoriteUpgrade(favoritePayload);
   if (existing) {
     showAppToast('Prop removed from Saved Props', 'warning', {
@@ -6121,11 +6276,11 @@ savePropBtnEl?.addEventListener('click', async () => {
   }
 });
 analyzeBtn?.addEventListener('click', () => {
-  getMatchupTargets().forEach(target => renderPanelSkeletonUpgrade(target.body, '🛡️', 'Loading matchup...', 'Fetching the next opponent context.'));
-  renderPanelSkeletonUpgrade(recommendationBodyEl, '🚦', 'Loading recommendation...', 'Building the traffic-light read.');
-  renderPanelSkeletonUpgrade(interpretationBody, '🧠', 'Loading quick read...', 'Summarizing the latest signals.');
-  renderPanelSkeletonUpgrade(opportunityBody, '⏱️', 'Loading opportunity...', 'Pulling minutes, attempts, and team context.');
-  renderPanelSkeletonUpgrade(environmentBody, '📅', 'Loading schedule...', 'Checking the current rest and schedule spot.');
+  getMatchupTargets().forEach(target => renderPanelSkeletonUpgrade(target.body, '', 'Loading matchup...', 'Fetching the next opponent context.'));
+  renderPanelSkeletonUpgrade(recommendationBodyEl, '', 'Loading recommendation...', 'Building the traffic-light read.');
+  renderPanelSkeletonUpgrade(interpretationBody, '', 'Loading quick read...', 'Summarizing the latest signals.');
+  renderPanelSkeletonUpgrade(opportunityBody, '', 'Loading opportunity...', 'Pulling minutes, attempts, and team context.');
+  renderPanelSkeletonUpgrade(environmentBody, '', 'Loading schedule...', 'Checking the current rest and schedule spot.');
 }, true);
 marketScanBtn?.addEventListener('click', () => {
   if (marketResults) marketResults.innerHTML = `<div class="empty-state-panel compact skeleton-panel"><div class="empty-icon">[...]</div><strong>Scanning your board...</strong><span>Comparing hit rate, implied odds, EV, and matchup context.</span><div class="skeleton-line"></div><div class="skeleton-line short"></div></div>`;
@@ -6195,9 +6350,10 @@ function renderSelectedPlayerContext() {
   const toneMap = { good: 'good', bad: 'bad', warning: 'neutral', neutral: 'neutral' };
   const isOverrideTile = Boolean(nextGame?.is_override);
   const leanTone = isOverrideTile ? 'warning' : (toneMap[getLeanClass(vsPosition?.lean_tone)] || 'neutral');
-  const leanText = isOverrideTile ? `📌 vs ${nextGame?.opponent_abbreviation || 'Override'}` : (vsPosition?.lean || (nextGame ? 'Upcoming game found' : 'Partial matchup'));
+  const leanText = isOverrideTile ? ` vs ${nextGame?.opponent_abbreviation || 'Override'}` : (vsPosition?.lean || (nextGame ? 'Upcoming game found' : 'Partial matchup'));
+  const seriesSummary = String(nextGame?.series_summary || nextGame?.series_text || '').trim();
   const nextGameLabel = nextGame
-    ? `${nextGame.matchup_label || nextGame.opponent_name || 'Upcoming game'} • ${nextGame.game_date ? formatNextGameDate(nextGame.game_date) : 'Date TBA'}${nextGame.game_time ? ` • ${nextGame.game_time}` : ''}`
+    ? `${nextGame.matchup_label || nextGame.opponent_name || 'Upcoming game'}${seriesSummary ? `  ${seriesSummary}` : ''}  ${nextGame.game_date ? formatNextGameDate(nextGame.game_date) : 'Date TBA'}${nextGame.game_time ? `  ${nextGame.game_time}` : ''}`
     : 'Upcoming game unavailable';
   const venueLabel = nextGame ? (isOverrideTile ? 'Opponent override' : (nextGame.is_home ? 'Home game' : 'Away game')) : 'Venue unavailable';
   const oppVal = typeof vsPosition?.opponent_value === 'number' ? vsPosition.opponent_value.toFixed(2) : (vsPosition?.opponent_value ?? '--');
@@ -6238,6 +6394,11 @@ function renderSelectedPlayerContext() {
         <span class="small-label">Availability</span>
         <strong>${renderAvailabilityBadge(availability, true) || '--'}</strong>
         <small>${escapeHtml(availability?.reason || availability?.note || 'Official status unavailable')}</small>
+      </article>
+      <article class="matchup-tile matchup-stat-tile">
+        <span class="small-label">Series</span>
+        <strong>${escapeHtml(seriesSummary || 'Not in series')}</strong>
+        <small>${escapeHtml(nextGame?.playoff_game_number ? `Game ${nextGame.playoff_game_number}` : 'Series context unavailable')}</small>
       </article>
       <article class="matchup-tile matchup-stat-tile">
         <span class="small-label">Vs position</span>
@@ -6295,7 +6456,7 @@ function renderSelectedPlayer() {
     selectedPlayer.team_name || selectedPlayer.team_abbreviation || '',
     selectedPlayer.position || '',
     selectedPlayer.jersey ? `#${selectedPlayer.jersey}` : ''
-  ].filter(Boolean).join(' • ');
+  ].filter(Boolean).join('  ');
   const contextData = getSelectedPlayerContextData();
   const availabilitySource = contextData.availability || selectedPlayer.availability;
   const availabilityHtml = availabilitySource
@@ -6369,7 +6530,7 @@ function clearAnalysisForNewSelection() {
   if (recommendationBodyEl) {
     recommendationBodyEl.className = 'empty-state-panel compact matchup-empty';
     recommendationBodyEl.innerHTML = `
-      <div class="empty-icon">🚦</div>
+      <div class="empty-icon"></div>
       <strong>No recommendation yet.</strong>
       <span>Analyze a player prop to generate a green / yellow / red read.</span>
     `;
@@ -6452,8 +6613,8 @@ function saveLatestMarketResults(payload) {
 
 function getMarketFilterLabel(filterKey) {
   if (filterKey === 'positive_ev') return 'Filter: +EV';
-  if (filterKey === 'edge_5') return 'Filter: Edge ≥ 5%';
-  if (filterKey === 'win_rate_60') return 'Filter: Win Rate ≥ 60%';
+  if (filterKey === 'edge_5') return 'Filter: Edge  5%';
+  if (filterKey === 'win_rate_60') return 'Filter: Win Rate  60%';
   if (filterKey === 'available_only') return 'Filter: Available';
   if (filterKey === 'good_matchup') return 'Filter: Good Matchup';
   return 'Filter: All';
@@ -6492,8 +6653,8 @@ function renderMarketFilterChips() {
   const filters = [
     ['all', 'All'],
     ['positive_ev', '+EV'],
-    ['edge_5', 'Edge ≥ 5%'],
-    ['win_rate_60', 'Win Rate ≥ 60%'],
+    ['edge_5', 'Edge  5%'],
+    ['win_rate_60', 'Win Rate  60%'],
     ['available_only', 'Available'],
     ['good_matchup', 'Good Matchup'],
   ];
@@ -6581,8 +6742,8 @@ function compareMarketRows(a, b, sortKey, direction = currentMarketSortDirection
 }
 
 function getMarketSortArrow(sortKey) {
-  if (currentMarketSort !== sortKey) return '↕';
-  return currentMarketSortDirection === 'asc' ? '↑' : '↓';
+  if (currentMarketSort !== sortKey) return '';
+  return currentMarketSortDirection === 'asc' ? '\u2191' : '\u2193';
 }
 
 function getMarketAriaSort(sortKey) {
@@ -6617,7 +6778,7 @@ async function loadTodayGames(force = false) {
       if (cached?.payload && cached?.savedAt && Date.now() - cached.savedAt < TODAY_GAMES_CACHE_TTL_MS) {
         renderTodayGames(cached.payload);
         if (todayGamesMeta) {
-          todayGamesMeta.textContent = `Showing cached slate • ${todayGamesMeta.textContent || ''}`.trim();
+          todayGamesMeta.textContent = `Showing cached slate  ${todayGamesMeta.textContent || ''}`.trim();
         }
       }
     } catch (error) {
@@ -6640,8 +6801,8 @@ async function loadTodayGames(force = false) {
   todayGamesLoadInFlight = true;
   if (todayGamesMeta) todayGamesMeta.textContent = "Loading today's NBA slate...";
   if (overviewTodayMeta) overviewTodayMeta.textContent = "Fetching today's slate...";
-  if (todayGamesBoard) todayGamesBoard.innerHTML = `<div class="empty-state-panel compact skeleton-panel today-game-empty"><div class="empty-icon">🗓️</div><strong>Loading games...</strong><span>Pulling the current slate and report context.</span><div class="skeleton-line"></div><div class="skeleton-line short"></div></div>`;
-  if (overviewTodayGames) overviewTodayGames.innerHTML = `<div class="empty-state-panel compact skeleton-panel today-game-empty"><div class="empty-icon">🗓️</div><strong>Loading games...</strong><span>Pulling the current slate and report context.</span></div>`;
+  if (todayGamesBoard) todayGamesBoard.innerHTML = `<div class="empty-state-panel compact skeleton-panel today-game-empty"><div class="empty-icon"></div><strong>Loading games...</strong><span>Pulling the current slate and report context.</span><div class="skeleton-line"></div><div class="skeleton-line short"></div></div>`;
+  if (overviewTodayGames) overviewTodayGames.innerHTML = `<div class="empty-state-panel compact skeleton-panel today-game-empty"><div class="empty-icon"></div><strong>Loading games...</strong><span>Pulling the current slate and report context.</span></div>`;
   try {
     const payload = await apiFetch('/api/todays-games', {}, 20000);
     try {
@@ -6649,7 +6810,7 @@ async function loadTodayGames(force = false) {
     } catch (renderError) {
       console.error('Today games render failed:', renderError);
       if (todayGamesBoard) {
-        todayGamesBoard.innerHTML = `<div class="empty-state-panel compact today-game-empty"><div class="empty-icon">⚠️</div><strong>Could not render today&#39;s games.</strong><span>${escapeHtml(renderError.message || 'Render failed.')}</span></div>`;
+        todayGamesBoard.innerHTML = `<div class="empty-state-panel compact today-game-empty"><div class="empty-icon"></div><strong>Could not render today&#39;s games.</strong><span>${escapeHtml(renderError.message || 'Render failed.')}</span></div>`;
       }
     }
     todayGamesLastSuccessAt = Date.now();
@@ -6673,10 +6834,10 @@ async function loadTodayGames(force = false) {
     console.error(error);
     const fallbackMessage = error.message || "Failed to load today's slate.";
     if (todayGamesBoard) {
-      todayGamesBoard.innerHTML = `<div class="empty-state-panel compact today-game-empty"><div class="empty-icon">⚠️</div><strong>Could not load today&#39;s games.</strong><span>${escapeHtml(fallbackMessage)}</span></div>`;
+      todayGamesBoard.innerHTML = `<div class="empty-state-panel compact today-game-empty"><div class="empty-icon"></div><strong>Could not load today&#39;s games.</strong><span>${escapeHtml(fallbackMessage)}</span></div>`;
     }
     if (overviewTodayGames) {
-      overviewTodayGames.innerHTML = `<div class="empty-state-panel compact today-game-empty"><div class="empty-icon">⚠️</div><strong>Could not load the slate.</strong><span>${escapeHtml(fallbackMessage)}</span></div>`;
+      overviewTodayGames.innerHTML = `<div class="empty-state-panel compact today-game-empty"><div class="empty-icon"></div><strong>Could not load the slate.</strong><span>${escapeHtml(fallbackMessage)}</span></div>`;
     }
     todayGamesLastErrorAt = Date.now();
     todayGamesLoadAttempts += 1;
@@ -6776,7 +6937,7 @@ async function loadInjuryBoostChips(player) {
         '</button>';
     }).join('');
 
-    // Wire up chip clicks → add to without-teammate filter
+    // Wire up chip clicks  add to without-teammate filter
     injuryBoostChips.querySelectorAll('.inj-boost-chip').forEach(chip => {
       chip.addEventListener('click', () => {
         const pid = chip.dataset.playerId;
@@ -6933,18 +7094,18 @@ function buildFilterSummaryCopy(filters) {
   else if (filters.result === 'loss') chips.push('Losses');
   if (filters.margin_min !== null || filters.margin_max !== null) {
     if (filters.margin_min !== null && filters.margin_max !== null) chips.push(`Margin ${filters.margin_min}-${filters.margin_max}`);
-    else if (filters.margin_min !== null) chips.push(`Margin ≥ ${filters.margin_min}`);
-    else chips.push(`Margin ≤ ${filters.margin_max}`);
+    else if (filters.margin_min !== null) chips.push(`Margin  ${filters.margin_min}`);
+    else chips.push(`Margin  ${filters.margin_max}`);
   }
   if (filters.min_minutes !== null || filters.max_minutes !== null) {
     if (filters.min_minutes !== null && filters.max_minutes !== null) chips.push(`MIN ${filters.min_minutes}-${filters.max_minutes}`);
-    else if (filters.min_minutes !== null) chips.push(`MIN ≥ ${filters.min_minutes}`);
-    else chips.push(`MIN ≤ ${filters.max_minutes}`);
+    else if (filters.min_minutes !== null) chips.push(`MIN  ${filters.min_minutes}`);
+    else chips.push(`MIN  ${filters.max_minutes}`);
   }
   if (filters.min_fga !== null || filters.max_fga !== null) {
     if (filters.min_fga !== null && filters.max_fga !== null) chips.push(`FGA ${filters.min_fga}-${filters.max_fga}`);
-    else if (filters.min_fga !== null) chips.push(`FGA ≥ ${filters.min_fga}`);
-    else chips.push(`FGA ≤ ${filters.max_fga}`);
+    else if (filters.min_fga !== null) chips.push(`FGA  ${filters.min_fga}`);
+    else chips.push(`FGA  ${filters.max_fga}`);
   }
   if (filters.opponent_rank_range && filters.opponent_rank_range !== 'all') {
     const map = { top10: 'Opp rank 1-10', top5: 'Opp rank 1-5', mid10: 'Opp rank 11-20', bottom10: 'Opp rank 21-30', bottom5: 'Opp rank 26-30' };
@@ -6956,7 +7117,7 @@ function buildFilterSummaryCopy(filters) {
     chips.push(teammate ? `Without ${teammate}` : 'Without teammate');
   }
   if (filters.h2h_only) chips.push('H2H only');
-  return { label: chips.length ? chips.join(' • ') : 'All games', hasFilters: chips.length > 0, chips };
+  return { label: chips.length ? chips.join('  ') : 'All games', hasFilters: chips.length > 0, chips };
 }
 
 function updateFilterSummaryUpgrade(payload = null) {
@@ -6967,10 +7128,10 @@ function updateFilterSummaryUpgrade(payload = null) {
   }
   if (activeFiltersSummaryEl) {
     if (payload?.filtered_pool_count !== undefined && payload?.season_pool_count !== undefined) {
-      activeFiltersSummaryEl.textContent = `${filterSummary.label || 'All games'} • Using ${payload.filtered_pool_count} of ${payload.season_pool_count} season games.`;
+      activeFiltersSummaryEl.textContent = `${filterSummary.label || 'All games'}  Using ${payload.filtered_pool_count} of ${payload.season_pool_count} season games.`;
     } else {
       activeFiltersSummaryEl.textContent = filterSummary.hasFilters
-        ? `${filterSummary.label} • Applied to the analyzer, chart, and game log.`
+        ? `${filterSummary.label}  Applied to the analyzer, chart, and game log.`
         : 'No active filters. Using all games in the selected season.';
     }
   }
@@ -7027,7 +7188,7 @@ function renderEmptyFilterStatesUpgrade() {
     <tr>
       <td colspan="8">
         <div class="empty-state-panel compact">
-          <div class="empty-icon">🧪</div>
+          <div class="empty-icon"></div>
           <strong>No games matched the filters.</strong>
           <span>Relax the current split or reset the filters to repopulate the trend view and game log.</span>
         </div>
@@ -7102,13 +7263,13 @@ function renderSummary(payload) {
     payload.games_count || 0
   );
 
-  chartTitle.textContent = `${payload.player.full_name} • ${getStatLabel(payload.stat)}`;
+  chartTitle.textContent = `${payload.player.full_name}  ${getStatLabel(payload.stat)}`;
 
   // Running hit-rate subtitle with grade + streak
   const hitRatePct = Number(sideHitRate || 0).toFixed(1);
-  let subtitleText = `${hitRatePct}% ${leanSide.toLowerCase()} hit rate (${sideHitCount || 0}/${payload.games_count || 0}) • Grade ${grade}: ${gradeLabel(grade)}`;
-  if (streak > 1) subtitleText += ` • 🔥 ${streak} straight`;
-  if (nextGame) subtitleText += ` • vs ${nextGame.matchup_label}`;
+  let subtitleText = `${hitRatePct}% ${leanSide.toLowerCase()} hit rate (${sideHitCount || 0}/${payload.games_count || 0})  Grade ${grade}: ${gradeLabel(grade)}`;
+  if (streak > 1) subtitleText += `   ${streak} straight`;
+  if (nextGame) subtitleText += `  vs ${nextGame.matchup_label}`;
   chartSubtitle.textContent = subtitleText;
 
   const splitHtml = buildSplitChips(payload.games || [], payload.line, leanSide);
@@ -7179,6 +7340,7 @@ async function analyzePlayerProp(options = {}) {
     if (selectedPlayer.position) params.set('player_position', selectedPlayer.position);
     const season = seasonInput.value.trim();
     if (season) params.set('season', season);
+    params.set('season_type', getSelectedSeasonType());
 
     const filters = getAnalyzerFiltersState();
     if (filters.location && filters.location !== 'all') params.set('location', filters.location);
@@ -7319,11 +7481,11 @@ resetFiltersBtnEl?.addEventListener('click', async () => {
 setAnalyzerFiltersState({ location: 'all', result: 'all', h2h_only: false });
 
 
-/* ═══════════════════════════════════════════════════════════════════════
+/* 
    IMPROVEMENT PATCH -- Features 7-13
-   ═══════════════════════════════════════════════════════════════════════ */
+    */
 
-/* ── Session cache helpers ─────────────────────────────────────── */
+/*  Session cache helpers  */
 function getPropCacheKey(playerId, stat, line, lastN, filters, forcedSide) {
   // lastN excluded -- backend slices from shared filtered_pool, all windows share one cache entry.
   // without_player_ids included -- filtered/unfiltered results must not collide.
@@ -7332,6 +7494,7 @@ function getPropCacheKey(playerId, stat, line, lastN, filters, forcedSide) {
     ? state.without_player_ids.slice().sort().join(',')
     : (state.without_player_id ? String(state.without_player_id) : '');
   const filterKey = [
+    getSelectedSeasonType(),
     state.location || 'all',
     state.result || 'all',
     state.margin_min ?? '',
@@ -7361,7 +7524,7 @@ function writePropCache(key, payload) {
   } catch { /* quota */ }
 }
 
-/* ── Chart error overlay ───────────────────────────────────────── */
+/*  Chart error overlay  */
 function renderChartError(message) {
   const canvas = document.getElementById('propsChart');
   if (!canvas) return;
@@ -7372,7 +7535,7 @@ function renderChartError(message) {
   overlay.className = 'chart-error-overlay';
   overlay.innerHTML = `
     <div class="chart-error-inner">
-      <span class="chart-error-icon">⚠️</span>
+      <span class="chart-error-icon"></span>
       <strong>Chart unavailable</strong>
       <small>${escapeHtml(message || 'An error occurred loading the trend data.')}</small>
       <button class="secondary-btn compact-btn" type="button" onclick="this.closest('.chart-error-overlay').remove();if(selectedPlayer)analyzePlayerProp({preserveScroll:true,forceRefresh:true})">Retry</button>
@@ -7380,7 +7543,7 @@ function renderChartError(message) {
   wrap.appendChild(overlay);
 }
 
-/* ── Mini sparkline SVG for Bet Finder cards ──────────────────── */
+/*  Mini sparkline SVG for Bet Finder cards  */
 function buildSparklineSvg(values, line, width, height) {
   width = width || 72; height = height || 26;
   if (!values || values.length < 2) return '';
@@ -7403,7 +7566,7 @@ function buildSparklineSvg(values, line, width, height) {
     + '</svg>';
 }
 
-/* ── Inject sparklines + grade into Bet Finder results ─────────── */
+/*  Inject sparklines + grade into Bet Finder results  */
 (function patchBetFinderSparklines() {
   const _orig = renderBetFinderResults;
   renderBetFinderResults = function (payload) {
@@ -7428,14 +7591,14 @@ function buildSparklineSvg(values, line, width, height) {
       if (chipRow && !chipRow.querySelector('.grade-chip')) {
         const gradeEl = document.createElement('span');
         gradeEl.className = 'finder-chip grade-chip grade-' + grade.toLowerCase();
-        gradeEl.textContent = grade + ' • ' + gradeLabel(grade);
+        gradeEl.textContent = grade + '  ' + gradeLabel(grade);
         chipRow.appendChild(gradeEl);
       }
     });
   };
 })();
 
-/* ── Session cache: intercept analyzePlayerProp ─────────────────── */
+/*  Session cache: intercept analyzePlayerProp  */
 (function patchAnalyzeCache() {
   const _orig = analyzePlayerProp;
   analyzePlayerProp = async function (options) {
@@ -7479,7 +7642,7 @@ function buildSparklineSvg(values, line, width, height) {
   };
 })();
 
-/* ── Write cache after successful analysis ──────────────────────── */
+/*  Write cache after successful analysis  */
 (function patchPostAnalysis() {
   // Hook into renderChart to write cache after real fetch
   const _origRenderChart = renderChart;
@@ -7506,7 +7669,7 @@ function buildSparklineSvg(values, line, width, height) {
   };
 })();
 
-/* ── Debounced line input re-analyze ────────────────────────────── */
+/*  Debounced line input re-analyze  */
 (function patchLineInputDebounce() {
   if (!lineInput) return;
   lineInput.addEventListener('input', function () {
@@ -7518,7 +7681,7 @@ function buildSparklineSvg(values, line, width, height) {
   });
 })();
 
-/* ── Keyboard shortcuts: J/K cycle players, ←/→ cycle stats ──── */
+/*  Keyboard shortcuts: J/K cycle players, / cycle stats  */
 (function bindKeyboardShortcuts() {
   document.addEventListener('keydown', function (e) {
     const tag = (document.activeElement || {}).tagName;
@@ -7549,7 +7712,7 @@ function buildSparklineSvg(values, line, width, height) {
   });
 })();
 
-/* ── Restore last player + stat on page load ─────────────────── */
+/*  Restore last player + stat on page load  */
 (function restoreLastSession() {
   const lastStat = localStorage.getItem(LAST_STAT_KEY);
   if (lastStat && propButtonsWrap) {
@@ -7566,7 +7729,7 @@ function buildSparklineSvg(values, line, width, height) {
   }
 })();
 
-/* ── Patch setActiveProp to persist stat ────────────────────────── */
+/*  Patch setActiveProp to persist stat  */
 (function patchSetActivePropPersist() {
   const _orig = setActiveProp;
   setActiveProp = function (stat) {
@@ -7575,7 +7738,7 @@ function buildSparklineSvg(values, line, width, height) {
   };
 })();
 
-/* ── Runtime CSS for all new UI elements ─────────────────────── */
+/*  Runtime CSS for all new UI elements  */
 (function injectPatchStyles() {
   const style = document.createElement('style');
   style.textContent = `
@@ -7630,7 +7793,7 @@ function buildSparklineSvg(values, line, width, height) {
   document.head.appendChild(style);
 })();
 
-/* ── Keyboard hint badges on roster meta ────────────────────────── */
+/*  Keyboard hint badges on roster meta  */
 (function addKbdHints() {
   const rosterMetaEl = document.getElementById('rosterMeta');
   if (rosterMetaEl && !rosterMetaEl.querySelector('.kbd-hint')) {
@@ -7641,13 +7804,13 @@ function buildSparklineSvg(values, line, width, height) {
   }
 })();
 
-/* ═══════════════════════════════════════════════════════════════════════
+/* 
    PARLAY BUILDER
-═══════════════════════════════════════════════════════════════════════ */
+ */
 (function initParlayBuilder() {
   const PARLAY_SETTINGS_STORAGE = 'nba-props-parlay-settings';
 
-  // ── DOM refs ──────────────────────────────────────────────────────────
+  //  DOM refs 
   const parlayApiKeys = document.getElementById('parlayApiKeys');
   const parlaySportSelect = document.getElementById('parlaySportSelect');
   const parlayOddsFormatSel = document.getElementById('parlayOddsFormatSelect');
@@ -7656,7 +7819,7 @@ function buildSparklineSvg(values, line, width, height) {
   const parlayBookmakerSelect = document.getElementById('parlayBookmakerSelect');
   const parlayLoadEventsBtn = document.getElementById('parlayLoadEventsBtn');
 
-  // ── Progress bar helper ───────────────────────────────────────────────
+  //  Progress bar helper 
   function setParlayProgress(pct, label) {
     var value = Number(pct) || 0;
     if (value <= 0) {
@@ -7697,14 +7860,14 @@ function buildSparklineSvg(values, line, width, height) {
 
   if (!parlayLoadEventsBtn) return;
 
-  // ── State ─────────────────────────────────────────────────────────────
+  //  State 
   let allEvents = [];       // events returned by /api/odds/events
   let selectedEventIds = new Set();
   let cachedScoredProps = null;
   let cachedQuotaLog = null;
   let cachedScrapeMeta = null;
 
-  // ── Persist / restore ─────────────────────────────────────────────────
+  //  Persist / restore 
   try {
     const s = JSON.parse(localStorage.getItem(PARLAY_SETTINGS_STORAGE) || '{}');
     if (s.sport && parlaySportSelect) parlaySportSelect.value = s.sport;
@@ -7724,7 +7887,7 @@ function buildSparklineSvg(values, line, width, height) {
     } catch (e) { }
   }
 
-  // ── Helpers ───────────────────────────────────────────────────────────
+  //  Helpers 
   function escHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
   function fmtOdds(v) { return v != null ? Number(v).toFixed(2) : '--'; }
   function show(el, v) { if (el) el.style.display = v ? '' : 'none'; }
@@ -7801,7 +7964,7 @@ function buildSparklineSvg(values, line, width, height) {
     });
   }
 
-  // ── Update legs dropdown to match selected event count ─────────────────
+  //  Update legs dropdown to match selected event count 
   function syncLegsToEventCount() {
     const count = selectedEventIds.size;
     if (!parlayLegsSelect) return;
@@ -7823,16 +7986,16 @@ function buildSparklineSvg(values, line, width, height) {
         ? 'Select at least 2 games'
         : count === 1
           ? '1 game selected -- select at least 1 more'
-          : count + ' games selected · up to ' + max + '-leg parlay available';
+          : count + ' games selected  up to ' + max + '-leg parlay available';
     }
   }
 
-  // ── Render event picker chips ──────────────────────────────────────────
+  //  Render event picker chips 
   function renderEventPicker(events) {
     parlayEventList.innerHTML = events.map(function (ev) {
       const time = formatEventTime(ev.commence_time);
       return '<div class="parlay-event-chip" data-event-id="' + escHtml(ev.id) + '">' +
-        '<span class="parlay-chip-check">✓</span>' +
+        '<span class="parlay-chip-check"></span>' +
         '<div>' +
         '<div class="parlay-chip-teams">' + escHtml(ev.away_team) + ' @ ' + escHtml(ev.home_team) + '</div>' +
         (time ? '<div class="parlay-chip-time">' + time + '</div>' : '') +
@@ -7870,19 +8033,19 @@ function buildSparklineSvg(values, line, width, height) {
     if (parlayBuildBtn) parlayBuildBtn.style.display = hasCache ? 'none' : '';
   }
 
-  // ── Render quota pills ─────────────────────────────────────────────────
+  //  Render quota pills 
   function renderQuota(log) {
     if (!log || !log.length) return;
     show(parlayQuotaBar, true);
     parlayQuotaList.innerHTML = log.map(function (e) {
       const q = e.quota || {};
       return '<span class="parlay-quota-pill"><strong>' + escHtml(e.call || '?') + '</strong>' +
-        (q.remaining != null ? ' · rem: ' + q.remaining : '') +
-        (q.last != null ? ' · cost: ' + q.last : '') + '</span>';
+        (q.remaining != null ? '  rem: ' + q.remaining : '') +
+        (q.last != null ? '  cost: ' + q.last : '') + '</span>';
     }).join('');
   }
 
-  // ── Pick top N legs from cached props ──────────────────────────────────
+  //  Pick top N legs from cached props 
   function pickLegs(props, n) {
     const legs = [], seenPlayers = new Set(), seenEvents = new Set();
     for (const p of props) {
@@ -7916,12 +8079,12 @@ function buildSparklineSvg(values, line, width, height) {
     const h2hRate = Number(prop?.h2h_hit_rate);
     const toneClass = label === 'H2H' ? 'h2h' : 'recent';
     const detail = label === 'H2H' && h2hGames > 0 && Number.isFinite(h2hRate)
-      ? ' (' + h2hRate.toFixed(1) + '% · ' + h2hGames + 'g)'
+      ? ' (' + h2hRate.toFixed(1) + '%  ' + h2hGames + 'g)'
       : '';
     return '<span class="finder-chip parlay-rank-chip ' + toneClass + '">Ranked by: ' + label + detail + '</span>';
   }
 
-  // ── Render ticket ──────────────────────────────────────────────────────
+  //  Render ticket 
   function renderTicket(parlay, legs, parlayOdds) {
     if (!parlay || !parlay.length) return;
     show(parlayTicketShell, true);
@@ -7971,7 +8134,7 @@ function buildSparklineSvg(values, line, width, height) {
         '<div class="parlay-leg-details-body">' +
         reasonHtml +
         renderDecisionLensHtml(decisionLens, 'compact') +
-        '<div class="parlay-leg-analyze-hint" style="font-size:0.72rem;color:var(--muted);margin-top:6px;text-align:center">' + escHtml(leg.confidence_summary || 'Click to analyze →') + '</div>' +
+        '<div class="parlay-leg-analyze-hint" style="font-size:0.72rem;color:var(--muted);margin-top:6px;text-align:center">' + escHtml(leg.confidence_summary || 'Click to analyze ') + '</div>' +
         '</div>' +
         '</details>';
       return '<div class="parlay-leg-card" data-leg-idx="' + i + '" title="Analyze ' + escHtml(leg.player_name) + '" style="cursor:pointer">' +
@@ -7986,7 +8149,7 @@ function buildSparklineSvg(values, line, width, height) {
         '<span class="finder-badge ' + tone + '">' + escHtml(leg.confidence || 'C') + ' ' + escHtml(String(leg.confidence_score || '')) + '</span>' +
         (leg.confidence_tier ? '<span class="finder-badge">' + escHtml(leg.confidence_tier) + '</span>' : '') +
         getParlayRankingChip(leg) +
-        (leg.injury_boost ? '<span class="parlay-leg-inj-boost">🏥 +' + Math.round((leg.hit_rate || 0) - (leg.base_hit_rate || leg.hit_rate || 0)) + '% context edge</span>' : '') +
+        (leg.injury_boost ? '<span class="parlay-leg-inj-boost"> +' + Math.round((leg.hit_rate || 0) - (leg.base_hit_rate || leg.hit_rate || 0)) + '% context edge</span>' : '') +
         tags.map(function (tag) { return '<span class="finder-chip">' + escHtml(tag) + '</span>'; }).join('') +
         '</div>' +
         renderCalibrationChips(leg, escHtml) +
@@ -8011,7 +8174,7 @@ function buildSparklineSvg(values, line, width, height) {
         '</div>';
     }).join('');
 
-    // Wire up click → analyzer with full auto-populate
+    // Wire up click  analyzer with full auto-populate
     grid.querySelectorAll('.parlay-leg-card[data-leg-idx]').forEach(function (card) {
       card.addEventListener('click', async function (event) {
         const clickTarget = event && event.target ? event.target : null;
@@ -8027,7 +8190,7 @@ function buildSparklineSvg(values, line, width, height) {
     });
   }
 
-  // ── Render all props table (clickable → analyzer) ─────────────────────
+  //  Render all props table (clickable  analyzer) 
   function renderAllProps(all, selectedIds) {
     if (!all || !all.length) return;
     show(parlayAllPropsWrap, true);
@@ -8045,7 +8208,7 @@ function buildSparklineSvg(values, line, width, height) {
       return '<tr class="' + (isSel ? 'parlay-selected-row' : '') + '" data-prop-idx="' + idx + '" data-player-id="' + (p.player_id || '') + '" data-player-name="' + escHtml(p.player_name || '') + '" data-stat="' + escHtml(p.stat || '') + '" data-line="' + (p.line || 0) + '" data-side="' + escHtml(p.side || 'OVER') + '" title="Analyze ' + escHtml(p.player_name) + '">' +
         '<td><span style="display:flex;align-items:center;gap:8px"><img src="' + imgSrc + '" style="width:26px;height:26px;border-radius:50%;object-fit:cover;object-position:top" onerror="this.hidden=true">' +
         '<span style="display:flex;flex-direction:column;gap:2px">' +
-        '<span>' + escHtml(p.player_name) + (isSel ? ' ⭐' : '') + '</span>' + gameTag +
+        '<span>' + escHtml(p.player_name) + (isSel ? ' ' : '') + '</span>' + gameTag +
         '</span></span></td>' +
         '<td>' + escHtml(p.stat) + '</td><td>' + p.line + '</td>' +
         '<td class="' + (p.side === 'OVER' ? 'side-over' : 'side-under') + '">' + p.side + '</td>' +
@@ -8085,7 +8248,7 @@ function buildSparklineSvg(values, line, width, height) {
     });
   }
 
-  // ── Rebuild from cache (zero API calls) ───────────────────────────────
+  //  Rebuild from cache (zero API calls) 
   function rebuildFromCache() {
     if (!cachedScoredProps || !cachedScoredProps.length) return;
     const n = parseInt(parlayLegsSelect.value) || 3;
@@ -8094,11 +8257,11 @@ function buildSparklineSvg(values, line, width, height) {
     renderTicket(legs, n, odds);
     renderAllProps(cachedScoredProps, legs.map(function (l) { return l.player_id; }));
     const m = cachedScrapeMeta || {};
-    const ago = m.scrapedAt ? ' · cached ' + Math.round((Date.now() - m.scrapedAt) / 60000) + 'm ago' : '';
-    setStatus((m.evCount || 0) + ' events · ' + (m.analyzed || 0) + ' props analyzed' + ago + ' -- no credits used', false);
+    const ago = m.scrapedAt ? '  cached ' + Math.round((Date.now() - m.scrapedAt) / 60000) + 'm ago' : '';
+    setStatus((m.evCount || 0) + ' events  ' + (m.analyzed || 0) + ' props analyzed' + ago + ' -- no credits used', false);
   }
 
-  // ── Render injury summary panel ──────────────────────────────────────
+  //  Render injury summary panel 
   function renderInjurySummary(injurySummary) {
     if (!parlayInjurySummaryEl) return;
     if (!injurySummary || !injurySummary.length) {
@@ -8107,7 +8270,7 @@ function buildSparklineSvg(values, line, width, height) {
     }
     parlayInjurySummaryEl.style.display = '';
     parlayInjurySummaryEl.innerHTML =
-      '<div class="parlay-inj-summary-label">🏥 Today\'s lineup context used in analysis</div>' +
+      '<div class="parlay-inj-summary-label"> Today\'s lineup context used in analysis</div>' +
       injurySummary.map(function(t) {
         return '<div class="parlay-inj-team-chip">' +
           '<span class="inj-team-name">' + escHtml(t.team_name) + '</span>' +
@@ -8116,7 +8279,7 @@ function buildSparklineSvg(values, line, width, height) {
       }).join('');
   }
 
-  // ── Render single injury cell for all-props table ─────────────────────
+  //  Render single injury cell for all-props table 
   function renderInjuryCell(p) {
     if (!p) return '<span style="opacity:0.3">--</span>';
     const teamInjured = p.team_injury_player_names || [];
@@ -8128,7 +8291,7 @@ function buildSparklineSvg(values, line, width, height) {
     var parts = [];
     if (boost) {
       const diff = Math.round((p.hit_rate || 0) - (p.base_hit_rate || p.hit_rate || 0));
-      parts.push('<span class="inj-boost-tag">🏥' + (diff > 0 ? ' +' + diff + '%' : '') + ' context</span>');
+      parts.push('<span class="inj-boost-tag">' + (diff > 0 ? ' +' + diff + '%' : '') + ' context</span>');
     }
     if (filterUsed.length) {
       const modeLabel = filterMode === 'combo'
@@ -8144,12 +8307,12 @@ function buildSparklineSvg(values, line, width, height) {
     return parts.length ? parts.join('') : '<span style="opacity:0.3">--</span>';
   }
 
-  // ── Full scrape selected events → analyze → render ───────────────────
+  //  Full scrape selected events  analyze  render 
   async function runScrape() {
     let keyEntries = [];
     try {
       keyEntries = await getRotatingVaultKeysForFeature({
-        minimumKeys: KEY_VAULT_MIN_ROTATING_KEYS,
+        minimumKeys: 1,
         requiredCredits: 1,
         sourceLabel: 'Parlay Builder',
       });
@@ -8184,6 +8347,8 @@ function buildSparklineSvg(values, line, width, height) {
       const inputPayload = {
         api_keys: keys, legs: legs, sport: sport,
         odds_format: oddsFormat, last_n: lastN,
+        season: seasonInput.value.trim() || undefined,
+        season_type: getSelectedSeasonType(),
         event_ids: Array.from(selectedEventIds),
         bookmaker: parlayBookmakerSelect ? parlayBookmakerSelect.value : 'draftkings',
       };
@@ -8193,15 +8358,15 @@ function buildSparklineSvg(values, line, width, height) {
         let label = 'Processing parlay...';
         if (msg.stage === 'events_resolved') {
           pct = 12;
-          label = 'Events loaded · ' + (msg.events || totalEvents) + ' games';
+          label = 'Events loaded  ' + (msg.events || totalEvents) + ' games';
         } else if (msg.stage === 'scrape_progress') {
           const batch = msg.batch || 1;
           const batches = msg.batches || 1;
           pct = 15 + Math.round((batch / batches) * 30);
-          label = 'Scraping odds · batch ' + batch + ' of ' + batches;
+          label = 'Scraping odds  batch ' + batch + ' of ' + batches;
         } else if (msg.stage === 'analysis_start') {
           pct = 55;
-          label = 'Analyzing props · ' + (msg.total || 0) + ' rows';
+          label = 'Analyzing props  ' + (msg.total || 0) + ' rows';
         } else if (msg.stage === 'analysis_progress') {
           const done = msg.done || 0;
           const total = msg.total || 1;
@@ -8209,7 +8374,7 @@ function buildSparklineSvg(values, line, width, height) {
           label = 'Analyzing ' + done + '/' + total + ' props';
         } else if (msg.stage === 'analysis_done') {
           pct = 82;
-          label = 'Analysis complete · scoring edges';
+          label = 'Analysis complete  scoring edges';
         } else if (msg.stage === 'scoring_progress') {
           const done = msg.done || 0;
           const total = msg.total || 1;
@@ -8229,8 +8394,12 @@ function buildSparklineSvg(values, line, width, height) {
         data = streamResult?.payload || null;
       } catch (streamError) {
         data = await runAsyncJob(parlayAsyncEndpoint, inputPayload, (status) => {
-          const label = status.status === 'running' ? 'Analyzing parlay...' : 'Queued parlay...';
-          setParlayProgress(60, label);
+          const state = String(status?.status || 'queued');
+          const label = state === 'running'
+            ? 'Analyzing parlay...'
+            : (state === 'done' ? 'Fourth quarter: building your ticket...' : 'Queued parlay...');
+          const pct = state === 'running' ? 65 : (state === 'done' ? 95 : 20);
+          setParlayProgress(pct, label);
           setStatus(label, false);
         });
       }
@@ -8242,8 +8411,8 @@ function buildSparklineSvg(values, line, width, height) {
       renderQuota(cachedQuotaLog);
       const m = cachedScrapeMeta;
       const injBoostCount = (cachedScoredProps || []).filter(function(p){ return p.injury_boost; }).length;
-      const injStatusMsg = useInjuryAware ? (' · 🏥 ' + injBoostCount + ' lineup-context edge' + (injBoostCount !== 1 ? 's' : '')) : '';
-      setStatus('✓ Done -- ' + m.evCount + ' event(s) scraped · ' + m.propCount + ' props found · ' + m.analyzed + ' analyzed' + injStatusMsg, false);
+      const injStatusMsg = useInjuryAware ? ('   ' + injBoostCount + ' lineup-context edge' + (injBoostCount !== 1 ? 's' : '')) : '';
+      setStatus(' Done -- ' + m.evCount + ' event(s) scraped  ' + m.propCount + ' props found  ' + m.analyzed + ' analyzed' + injStatusMsg, false);
       // Render injury summary panel
       if (useInjuryAware && parlayInjurySummaryEl) renderInjurySummary(data.injury_summary || []);
       setParlayProgress(100, 'Buzzer beater: parlay ready.');
@@ -8262,7 +8431,7 @@ function buildSparklineSvg(values, line, width, height) {
       if (typeof hideBanner === 'function') hideBanner();
     } catch (err) {
       setParlayProgress(0, '');
-      setStatus('❌ Error: ' + (err.message || 'Unknown'), true);
+      setStatus(' Error: ' + (err.message || 'Unknown'), true);
       show(parlayEmptyState, true);
     } finally {
       if (parlayBuildBtn) parlayBuildBtn.disabled = false;
@@ -8271,12 +8440,12 @@ function buildSparklineSvg(values, line, width, height) {
     }
   }
 
-  // ── Step 1: Load today's events ───────────────────────────────────────
+  //  Step 1: Load today's events 
   parlayLoadEventsBtn.addEventListener('click', async function () {
     let keyEntries = [];
     try {
       keyEntries = await getRotatingVaultKeysForFeature({
-        minimumKeys: KEY_VAULT_MIN_ROTATING_KEYS,
+        minimumKeys: 1,
         requiredCredits: 1,
         sourceLabel: 'Parlay event loading',
       });
@@ -8362,7 +8531,7 @@ function buildSparklineSvg(values, line, width, height) {
     });
   }
 
-  // Leg change → instant local rebuild
+  // Leg change  instant local rebuild
   if (parlayLegsSelect) {
     parlayLegsSelect.addEventListener('change', function () {
       if (cachedScoredProps && cachedScoredProps.length) rebuildFromCache();
@@ -8371,9 +8540,9 @@ function buildSparklineSvg(values, line, width, height) {
 
 })();
 
-/* ═══════════════════════════════════════════════════════════════════════
+/* 
    PROP TRACKER
-═══════════════════════════════════════════════════════════════════════ */
+ */
 (function initPropTracker() {
 
   const trackerPlayerInput = document.getElementById('trackerPlayerInput');
@@ -8394,7 +8563,7 @@ function buildSparklineSvg(values, line, width, height) {
 
   if (!trackerAddBtn) return;
 
-  // ── Autocomplete dropdown for player input ────────────────────────────
+  //  Autocomplete dropdown for player input 
   const trackerPlayerDropdown = document.getElementById('trackerPlayerDropdown');
   let _autocompleteDebounce = null;
   let _selectedPlayerName = '';
@@ -8474,7 +8643,7 @@ function buildSparklineSvg(values, line, width, height) {
     window.addEventListener('scroll', positionTrackerDropdown, true);
   }
 
-  // ── State ─────────────────────────────────────────────────────────────
+  //  State 
   // bet = { id, player_name, player_id, stat, line, side, odds, book,
   //         current_val, games_count, last_updated, status }
   let bets = [];
@@ -8483,7 +8652,7 @@ function buildSparklineSvg(values, line, width, height) {
   let trackerGroupMode = 'game';
   let trackerFilterMode = 'all';
 
-  // ── Persist ───────────────────────────────────────────────────────────
+  //  Persist 
   function saveBets() {
     const snapshot = Array.isArray(bets) ? bets.map(function (bet) { return { ...bet }; }) : [];
     trackerPersistPromise = trackerPersistPromise
@@ -8505,7 +8674,7 @@ function buildSparklineSvg(values, line, width, height) {
     return Array.isArray(data.entries) ? data.entries : [];
   }
 
-  // ── Helpers ───────────────────────────────────────────────────────────
+  //  Helpers 
   function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
   function escapeHtmlT(s) { return esc(s); }
   function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
@@ -8529,7 +8698,7 @@ function buildSparklineSvg(values, line, width, height) {
       existing.side === candidate.side;
   }
 
-  // ── Compute status from current val vs line ────────────────────────────
+  //  Compute status from current val vs line 
   function computeStatus(bet) {
     const val = bet.current_val;
     const line = parseFloat(bet.line);
@@ -8642,7 +8811,7 @@ function buildSparklineSvg(values, line, width, height) {
     return (distA ?? 9999) - (distB ?? 9999);
   }
 
-  // ── Render a single card ───────────────────────────────────────────────
+  //  Render a single card 
   function renderCard(bet) {
     const status = computeStatus(bet);
     const barPct = computeBarPct(bet);
@@ -8669,8 +8838,8 @@ function buildSparklineSvg(values, line, width, height) {
             : 'tracker-bar-track progress';
 
     // Status badge
-    const badgeLabel = status === 'hit' ? '✓ HIT'
-      : status === 'busted' ? '✗ BUST'
+    const badgeLabel = status === 'hit' ? ' HIT'
+      : status === 'busted' ? ' BUST'
         : status === 'close' ? 'CLOSE'
           : status === 'pending' ? 'PENDING'
             : 'IN PROGRESS';
@@ -8694,7 +8863,7 @@ function buildSparklineSvg(values, line, width, height) {
 
     // Period/clock
     const gameCtx = bet.game_label
-      ? esc(bet.game_label) + (bet.game_status === 'live' && bet.period ? ' · ' + esc(bet.period) + (bet.clock ? ' ' + esc(bet.clock) : '') : '')
+      ? esc(bet.game_label) + (bet.game_status === 'live' && bet.period ? '  ' + esc(bet.period) + (bet.clock ? ' ' + esc(bet.clock) : '') : '')
       : '';
 
     const sideClass = bet.side === 'OVER' ? 'over' : 'under';
@@ -8723,7 +8892,7 @@ function buildSparklineSvg(values, line, width, height) {
   <div class="tracker-card-inner">
     ${stampHtml}
     <div class="tracker-avatar-strip">
-      ${imgSrc ? `<img src="${imgSrc}" alt="${esc(bet.player_name)}" onerror="this.style.display='none'">` : '<div style="width:80px;height:80px;display:flex;align-items:center;justify-content:center;font-size:1.8rem;opacity:0.4">🏀</div>'}
+      ${imgSrc ? `<img src="${imgSrc}" alt="${esc(bet.player_name)}" onerror="this.style.display='none'">` : '<div style="width:80px;height:80px;display:flex;align-items:center;justify-content:center;font-size:1.8rem;opacity:0.4"></div>'}
     </div>
     <div class="tracker-card-body">
       <div class="tracker-card-top">
@@ -8731,7 +8900,7 @@ function buildSparklineSvg(values, line, width, height) {
         <span class="tracker-stat-pill">${esc(bet.stat)}</span>
         <span class="tracker-side-pill ${sideClass}">${esc(bet.side)}</span>
         ${bet.book ? `<span class="tracker-book-pill">${esc(bet.book)}</span>` : ''}
-        <button class="tracker-remove-btn" data-remove-id="${esc(bet.id)}" title="Remove this prop" type="button">✕</button>
+        <button class="tracker-remove-btn" data-remove-id="${esc(bet.id)}" title="Remove this prop" type="button"></button>
       </div>
 
       <div class="tracker-value-row">
@@ -8763,7 +8932,7 @@ function buildSparklineSvg(values, line, width, height) {
 </div>`;
   }
 
-  // ── Re-render all cards ────────────────────────────────────────────────
+  //  Re-render all cards 
   function renderAll() {
     if (!bets.length) { showEmpty(true); return; }
     const visibleBets = bets.filter(passesTrackerFilter).sort(compareTrackerBets);
@@ -8778,7 +8947,7 @@ function buildSparklineSvg(values, line, width, height) {
     if (trackerBoardSummary) {
       const liveCount = visibleBets.filter(b => b.source === 'LIVE' || b.game_status === 'live').length;
       const closeCount = visibleBets.filter(b => computeStatus(b) === 'close').length;
-      trackerBoardSummary.textContent = `${visibleBets.length} tracked • ${liveCount} live • ${closeCount} close to cash`;
+      trackerBoardSummary.textContent = `${visibleBets.length} tracked  ${liveCount} live  ${closeCount} close to cash`;
     }
     trackerCards.innerHTML = Array.from(grouped.entries()).map(function ([key, items]) {
       const heading = formatTrackerGroupLabel(key);
@@ -8809,7 +8978,7 @@ function buildSparklineSvg(values, line, width, height) {
     });
   }
 
-  // ── Fetch live stat -- today/future only, no historical fallback ────────
+  //  Fetch live stat -- today/future only, no historical fallback 
   async function refreshBet(bet) {
     if (!bet.player_id) return;
     try {
@@ -8854,7 +9023,7 @@ function buildSparklineSvg(values, line, width, height) {
     }
   }
 
-  // ── Resolve player_id from name via search ────────────────────────────
+  //  Resolve player_id from name via search 
   async function resolvePlayerId(name) {
     // If user picked from autocomplete dropdown, use the cached id directly
     if (_selectedPlayerId && _selectedPlayerName.toLowerCase() === name.toLowerCase()) {
@@ -8873,7 +9042,7 @@ function buildSparklineSvg(values, line, width, height) {
     return null;
   }
 
-  // ── Add prop from parlay to tracker ────────────────────────────────────
+  //  Add prop from parlay to tracker 
   // Returns true if actually added, false if duplicate or invalid.
   function addPropToTracker(prop) {
     if (!prop || !prop.player_name) return false;
@@ -8938,7 +9107,7 @@ function buildSparklineSvg(values, line, width, height) {
     }, 2600);
   }
 
-  // ── Add bet handler ────────────────────────────────────────────────────
+  //  Add bet handler 
   trackerAddBtn.addEventListener('click', async function () {
     showErr('');
     const playerName = (trackerPlayerInput.value || '').trim();
@@ -9009,7 +9178,7 @@ function buildSparklineSvg(values, line, width, height) {
     }
   });
 
-  // ── Refresh all handler ────────────────────────────────────────────────
+  //  Refresh all handler 
   trackerRefreshBtn.addEventListener('click', async function () {
     if (!bets.length) return;
     trackerRefreshBtn.classList.add('spinning');
@@ -9049,7 +9218,7 @@ function buildSparklineSvg(values, line, width, height) {
     });
   }
 
-  // ── Init: restore from localStorage ───────────────────────────────────
+  //  Init: restore from localStorage 
   (async function initTrackerState() {
     try {
       bets = await loadBets();
@@ -9068,7 +9237,7 @@ function buildSparklineSvg(values, line, width, height) {
     saveBets(); renderAll();
   }, 30000);
 
-  // ── Expose globally so parlay builder (different IIFE) can call in ────
+  //  Expose globally so parlay builder (different IIFE) can call in 
   window._trackerAddProp = function (prop) {
     const added = addPropToTracker(prop);
     try { renderAll(); } catch (e) { console.error('Tracker renderAll failed:', e); }
@@ -9356,7 +9525,7 @@ function buildSparklineSvg(values, line, width, height) {
         </div>
       ` : `
         <div class="empty-state-panel compact" style="grid-column:1/-1">
-          <div class="empty-icon">🎟️</div>
+          <div class="empty-icon"></div>
           <strong>No props in the slip yet.</strong>
           <span>Use Add to Slip from the analyzer, market, bet finder, or parlay board.</span>
         </div>
@@ -9368,7 +9537,7 @@ function buildSparklineSvg(values, line, width, height) {
         <article class="prop-slip-item">
           <div class="prop-slip-item-top">
             <strong>${escapeHtml(item.player_name)}</strong>
-            <button class="prop-slip-remove" data-slip-remove="${escapeHtml(item.key)}" type="button">✕</button>
+            <button class="prop-slip-remove" data-slip-remove="${escapeHtml(item.key)}" type="button"></button>
           </div>
           <div class="prop-slip-item-line">
             <span>${escapeHtml(item.stat)} ${item.line}</span>
@@ -9394,7 +9563,7 @@ function buildSparklineSvg(values, line, width, height) {
     const saveBtn = document.getElementById('savePropBtn');
     if (!saveBtn || document.getElementById('addToSlipBtn')) return;
 
-    // ── Add to Slip ──────────────────────────────────────────────────────
+    //  Add to Slip 
     const slipBtn = document.createElement('button');
     slipBtn.id = 'addToSlipBtn';
     slipBtn.className = 'secondary-btn secondary-btn-glow';
@@ -9441,7 +9610,7 @@ function buildSparklineSvg(values, line, width, height) {
       refreshSlipButtons();
     });
 
-    // ── Send to Tracker ──────────────────────────────────────────────────
+    //  Send to Tracker 
     if (!document.getElementById('analyzerToTrackerBtn')) {
       const toTrackerBtn = document.createElement('button');
       toTrackerBtn.id = 'analyzerToTrackerBtn';
@@ -9471,13 +9640,13 @@ function buildSparklineSvg(values, line, width, height) {
         }
         const added = trackerFn(prop);
         if (added !== false) {
-          showAppToast('✅ Sent to Live Tracker!', 'success');
+          showAppToast(' Sent to Live Tracker!', 'success');
           switchView && switchView('tracker', { scroll: true });
         }
       });
     }
 
-    // ── Send to Backtest ─────────────────────────────────────────────────
+    //  Send to Backtest 
     if (!document.getElementById('analyzerToBacktestBtn')) {
       const toBacktestBtn = document.createElement('button');
       toBacktestBtn.id = 'analyzerToBacktestBtn';
@@ -9491,7 +9660,7 @@ function buildSparklineSvg(values, line, width, height) {
         if (!selectedPlayer) { alert('Please select and analyze a player first.'); return; }
         if (typeof window._backtestPrefillFromPayload === 'function') {
           window._backtestPrefillFromPayload(lastPayload);
-          showAppToast('✅ Sent to Backtest -- form pre-filled below!', 'info');
+          showAppToast(' Sent to Backtest -- form pre-filled below!', 'info');
           const btSection = document.getElementById('backtestSection');
           if (btSection) btSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
           else switchView && switchView('backtest', { scroll: true });
@@ -9670,7 +9839,7 @@ function buildSparklineSvg(values, line, width, height) {
       const prop = { player_name: player, player_id: playerId, stat, line, side, odds: 1.91, source: 'Parlay Board', confidenceScore };
       const cell = document.createElement('div');
       cell.className = 'parlay-slip-inline';
-      cell.innerHTML = `<button class="parlay-slip-btn" type="button">${loadSlipProps().some(x => x.key === getSlipKey(prop)) ? '✓ Slip' : '+ Slip'}</button>`;
+      cell.innerHTML = `<button class="parlay-slip-btn" type="button">${loadSlipProps().some(x => x.key === getSlipKey(prop)) ? ' Slip' : '+ Slip'}</button>`;
       const actionCell = row.lastElementChild?.querySelector('.parlay-action-cell') || row.lastElementChild;
       actionCell?.appendChild(cell);
       cell.querySelector('button')?.addEventListener('click', (event) => {
@@ -9819,14 +9988,14 @@ function buildSparklineSvg(values, line, width, height) {
   }, 400);
 })();
 
-/* ═══════════════════════════════════════════════════════════════════════════
+/* 
    BACKTEST PERFORMANCE DASHBOARD
    Logs predictions to the server, resolves results, shows ROI / win-rate.
-   ═══════════════════════════════════════════════════════════════════════════ */
+    */
 (function () {
   'use strict';
 
-  // ── Element refs ──────────────────────────────────────────────────────
+  //  Element refs 
   const btPlayerInput  = document.getElementById('btPlayerInput');
   const btStatSelect   = document.getElementById('btStatSelect');
   const btLineInput    = document.getElementById('btLineInput');
@@ -9901,7 +10070,7 @@ function buildSparklineSvg(values, line, width, height) {
     });
   }
 
-  // ── Helpers ───────────────────────────────────────────────────────────
+  //  Helpers 
   function esc(s) {
     return String(s || '')
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -9911,6 +10080,29 @@ function buildSparklineSvg(values, line, width, height) {
     if (!btLogError) return;
     btLogError.textContent = msg;
     btLogError.style.display = msg ? '' : 'none';
+  }
+
+  function normalizeBacktestTier(rawTier, rawScore) {
+    const tier = String(rawTier || '').trim().toLowerCase();
+    if (tier === 'elite' || tier === 'a') return 'Elite';
+    if (tier === 'high' || tier === 'b') return 'High';
+    if (tier === 'medium' || tier === 'c') return 'Medium';
+    if (tier === 'low' || tier === 'd' || tier === 'very low' || tier === 'verylow' || tier === 'f' || tier === 'x') return 'Low';
+    const score = Number(rawScore);
+    if (Number.isFinite(score)) {
+      if (score >= 85) return 'Elite';
+      if (score >= 72) return 'High';
+      if (score >= 60) return 'Medium';
+      return 'Low';
+    }
+    return 'Medium';
+  }
+
+  function scoreFromBacktestTier(tier) {
+    if (tier === 'Elite') return 87;
+    if (tier === 'High') return 76;
+    if (tier === 'Medium') return 64;
+    return 52;
   }
 
   function parseBacktestDate(value) {
@@ -9971,13 +10163,13 @@ function buildSparklineSvg(values, line, width, height) {
 
   function renderBacktestBreakdowns(stats) {
     const sideItems = Object.entries(stats.by_side || {}).map(([label, data]) => ({ label, data }));
-    renderMiniBreakdown('btSideBreakdown', 'By side', sideItems, item => `${item.data.win_rate}% • ${item.data.total}`);
+    renderMiniBreakdown('btSideBreakdown', 'By side', sideItems, item => `${item.data.win_rate}%  ${item.data.total}`);
 
     const alignItems = Object.entries(stats.by_market_alignment || {}).map(([label, data]) => ({ label, data }));
-    renderMiniBreakdown('btAlignmentBreakdown', 'Market alignment', alignItems, item => `${item.data.win_rate}% • ${item.data.total}`);
+    renderMiniBreakdown('btAlignmentBreakdown', 'Market alignment', alignItems, item => `${item.data.win_rate}%  ${item.data.total}`);
 
     const playerItems = (stats.top_players || []).map(item => ({ label: item.player, data: item }));
-    renderMiniBreakdown('btTopPlayers', 'Most tracked players', playerItems, item => `${item.data.total} • ${item.data.win_rate != null ? `${item.data.win_rate}%` : 'pending'}`);
+    renderMiniBreakdown('btTopPlayers', 'Most tracked players', playerItems, item => `${item.data.total}  ${item.data.win_rate != null ? `${item.data.win_rate}%` : 'pending'}`);
 
     const recentForm = document.getElementById('btRecentForm');
     if (recentForm) {
@@ -10098,7 +10290,7 @@ function buildSparklineSvg(values, line, width, height) {
     window.addEventListener('scroll', positionBtDropdown, true);
   }
 
-  // ── Render aggregate stats row ────────────────────────────────────────
+  //  Render aggregate stats row 
   function renderStats(stats) {
     if (!stats || stats.total === 0) {
       if (backtestStats) backtestStats.style.display = 'none';
@@ -10115,7 +10307,7 @@ function buildSparklineSvg(values, line, width, height) {
       const wr = stats.win_rate;
       const pillClass = wr >= 57 ? 'good' : wr >= 52 ? 'warning' : 'bad';
       backtestSummaryPill.className = `spotlight-pill ${pillClass}`;
-      backtestSummaryPill.textContent = `${wr}% hit • ROI ${stats.roi_pct > 0 ? '+' : ''}${stats.roi_pct}%`;
+      backtestSummaryPill.textContent = `${wr}% hit  ROI ${stats.roi_pct > 0 ? '+' : ''}${stats.roi_pct}%`;
     }
 
     // Stat chips
@@ -10159,7 +10351,7 @@ function buildSparklineSvg(values, line, width, height) {
           const col = d.win_rate >= 57 ? 'var(--good)' : d.win_rate >= 52 ? '#60a5fa' : d.win_rate >= 48 ? 'var(--warning)' : 'var(--bad)';
           return `<span style="display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:20px;background:rgba(255,255,255,0.06);font-size:11px;margin:2px">
             <strong style="color:${col}">${esc(st)}</strong>
-            <span style="opacity:0.65">${d.win_rate}% · ${d.total}g</span>
+            <span style="opacity:0.65">${d.win_rate}%  ${d.total}g</span>
           </span>`;
         }).join('');
       statBreakdown.innerHTML = `<div class="insight-summary-label" style="margin-bottom:5px">By stat type</div><div>${pills}</div>`;
@@ -10168,7 +10360,7 @@ function buildSparklineSvg(values, line, width, height) {
     renderBacktestBreakdowns(stats);
   }
 
-  // ── Render log table ──────────────────────────────────────────────────
+  //  Render log table 
   function renderLog(entries) {
     if (!backtestLog) return;
     if (!entries || entries.length === 0) {
@@ -10185,7 +10377,7 @@ function buildSparklineSvg(values, line, width, height) {
       const isPending = e.result === 'pending';
       const isHit     = e.result === 'hit';
       const resultColor = isPending ? 'var(--neutral,#9ca3af)' : isHit ? 'var(--good,#4ade80)' : 'var(--bad,#f87171)';
-      const resultIcon  = isPending ? '[...]' : isHit ? '✓' : '✗';
+      const resultIcon  = isPending ? '\u2026' : isHit ? '\u2713' : '\u2715';
       const resultLabel = isPending ? 'Pending' : isHit ? 'Hit' : 'Miss';
       const dateStr = e.logged_at ? new Date(e.logged_at).toLocaleDateString(undefined, { month:'short', day:'numeric' }) : '--';
 
@@ -10203,9 +10395,9 @@ function buildSparklineSvg(values, line, width, height) {
           ${isPending
             ? `<div style="display:flex;gap:4px;align-items:center">
                 <input type="number" step="0.1" min="0" placeholder="Actual" class="market-api-input bt-actual-input" style="width:70px;padding:3px 6px;font-size:11px" data-bt-resolve-id="${esc(e.id)}"/>
-                <button class="secondary-btn bt-resolve-btn" data-bt-resolve-id="${esc(e.id)}" style="font-size:10px;padding:3px 8px">✓</button>
+                <button class="secondary-btn bt-resolve-btn" data-bt-resolve-id="${esc(e.id)}" style="font-size:10px;padding:3px 8px"></button>
               </div>`
-            : `<button class="bt-delete-btn" data-bt-id="${esc(e.id)}" style="background:none;border:none;cursor:pointer;opacity:0.4;font-size:13px;padding:2px 6px" title="Remove">✕</button>`
+            : `<button class="bt-delete-btn" data-bt-id="${esc(e.id)}" style="background:none;border:none;cursor:pointer;opacity:0.4;font-size:13px;padding:2px 6px" title="Remove"></button>`
           }
         </td>
       </tr>`;
@@ -10290,7 +10482,7 @@ function buildSparklineSvg(values, line, width, height) {
     if (nextBtn) nextBtn.addEventListener('click', async () => { backtestFilters.offset = offset + limit; await loadAndRender(); });
   }
 
-  // ── Load from server and render ───────────────────────────────────────
+  //  Load from server and render 
   async function loadAndRender() {
     try {
       const params = new URLSearchParams({
@@ -10372,13 +10564,15 @@ function buildSparklineSvg(values, line, width, height) {
     return [headers.join(',')].concat((entries || []).map(entry => headers.map(key => escCsv(entry[key])).join(','))).join('\n');
   }
 
-  // ── Log prediction ────────────────────────────────────────────────────
+  //  Log prediction 
   btLogBtn.addEventListener('click', async () => {
     const player = btPlayerInput ? btPlayerInput.value.trim() : '';
     const stat   = btStatSelect  ? btStatSelect.value   : 'PTS';
     const line   = btLineInput   ? parseFloat(btLineInput.value) : NaN;
     const side   = btSideSelect  ? btSideSelect.value   : 'OVER';
-    const tier   = btTierSelect  ? btTierSelect.value   : 'Medium';
+    const tierRaw = btTierSelect ? btTierSelect.value : 'Medium';
+    const prefilledScore = Number(btLogBtn?.dataset?.prefilledConfidenceScore || NaN);
+    const tier   = normalizeBacktestTier(tierRaw, prefilledScore);
     const odds   = btOddsInput   ? parseFloat(btOddsInput.value) : 1.91;
 
     if (!player) { showBtError('Enter a player name.'); return; }
@@ -10398,7 +10592,7 @@ function buildSparklineSvg(values, line, width, height) {
         body: JSON.stringify({
           player, stat, line, side,
           confidence_tier: tier,
-          confidence_score: tier === 'Elite' ? 87 : tier === 'High' ? 76 : tier === 'Medium' ? 64 : 52,
+          confidence_score: Number.isFinite(prefilledScore) ? prefilledScore : scoreFromBacktestTier(tier),
           model_prob: 0.55,
           odds: isNaN(odds) ? 1.91 : odds,
           source: 'manual',
@@ -10409,6 +10603,7 @@ function buildSparklineSvg(values, line, width, height) {
       if (btPlayerInput) btPlayerInput.value = '';
       if (btLineInput)   btLineInput.value   = '';
       if (btOddsInput)   btOddsInput.value   = '';
+      if (btLogBtn) btLogBtn.dataset.prefilledConfidenceScore = '';
       btSelectedPlayerName = '';
       closeBtDropdown();
       await loadAndRender();
@@ -10420,7 +10615,7 @@ function buildSparklineSvg(values, line, width, height) {
     }
   });
 
-  // ── Auto-fill from analyzer payload ──────────────────────────────────
+  //  Auto-fill from analyzer payload 
   // When the analyzer runs, expose a hook so we can pre-fill the log form
   window._backtestPrefillFromPayload = function (payload) {
     if (!payload) return;
@@ -10428,14 +10623,15 @@ function buildSparklineSvg(values, line, width, height) {
       const playerName = payload.player?.full_name || '';
       const stat       = payload.stat || 'PTS';
       const side       = payload.recommended_side || 'OVER';
-      const tier       = payload.confidence?.tier || 'Medium';
-      const score      = payload.confidence?.score || 0;
+      const score      = Number(payload.confidence?.score ?? payload.confidence_score ?? payload.best_bet?.confidence_score ?? NaN);
+      const tier       = normalizeBacktestTier(payload.confidence?.tier || payload.confidence_tier || payload.best_bet?.confidence_tier, score);
 
       if (btPlayerInput) btPlayerInput.value = playerName;
       if (btStatSelect)  btStatSelect.value  = stat;
       if (btSideSelect)  btSideSelect.value  = side;
       if (btLineInput)   btLineInput.value   = payload.line || '';
       if (btTierSelect)  btTierSelect.value  = tier;
+      if (btLogBtn) btLogBtn.dataset.prefilledConfidenceScore = Number.isFinite(score) ? String(score) : '';
       btSelectedPlayerName = playerName;
 
       // Scroll to backtest section smoothly
@@ -10444,7 +10640,7 @@ function buildSparklineSvg(values, line, width, height) {
     } catch (e) { /* silent */ }
   };
 
-  // ── Refresh button ────────────────────────────────────────────────────
+  //  Refresh button 
   if (btRefreshBtn) {
     btRefreshBtn.addEventListener('click', loadAndRender);
   }
@@ -10633,7 +10829,7 @@ function buildSparklineSvg(values, line, width, height) {
           body: JSON.stringify({ entries }),
         }, 15000);
         showBtError('');
-        showAppToast(`Imported ${payload.added || 0} rows${payload.skipped ? ` • ${payload.skipped} skipped` : ''}.`, 'info');
+        showAppToast(`Imported ${payload.added || 0} rows${payload.skipped ? `  ${payload.skipped} skipped` : ''}.`, 'info');
         await loadAndRender();
       } catch (err) {
         showBtError('Import failed: ' + err.message);
@@ -10643,7 +10839,7 @@ function buildSparklineSvg(values, line, width, height) {
     });
   }
 
-  // ── Clear all ─────────────────────────────────────────────────────────
+  //  Clear all 
   if (btClearBtn) {
     btClearBtn.addEventListener('click', async () => {
       if (!confirm('Clear all backtest predictions? This cannot be undone.')) return;
@@ -10656,14 +10852,14 @@ function buildSparklineSvg(values, line, width, height) {
     });
   }
 
-  // ── Initial load ──────────────────────────────────────────────────────
+  //  Initial load 
   loadAndRender();
 
 })();
 
-// ══════════════════════════════════════════════════════════════════════
-// ── MARKET ADVANCED FILTERS (Bookmaker + Min/Max Odds) ────────────────
-// ══════════════════════════════════════════════════════════════════════
+// 
+//  MARKET ADVANCED FILTERS (Bookmaker + Min/Max Odds) 
+// 
 
 (function initMarketAdvancedFilters() {
   const bookFilter   = document.getElementById('marketBookFilter');
@@ -10699,7 +10895,7 @@ function buildSparklineSvg(values, line, width, height) {
 
 // Called in the filter chain inside renderMarketResults
 function passesAdvancedMarketFilters(item) {
-  // ── Bookmaker filter ──
+  //  Bookmaker filter 
   if (currentMarketBookFilter) {
     const itemBook = String(
       item?.market?.bookmaker || item?.bookmaker || item?.source || ''
@@ -10707,7 +10903,7 @@ function passesAdvancedMarketFilters(item) {
     if (itemBook && itemBook !== currentMarketBookFilter) return false;
   }
 
-  // ── Odds range filter -- use best odds available on the winning side ──
+  //  Odds range filter -- use best odds available on the winning side 
   const side = String(item?.best_bet?.side || item?.best_bet?.display_side || '').toUpperCase();
   const bestOdds = item?.best_bet?.best_odds != null
     ? Number(item.best_bet.best_odds)
@@ -10722,9 +10918,9 @@ function passesAdvancedMarketFilters(item) {
 }
 
 
-// ══════════════════════════════════════════════════════════════════════
-// ── KEY VAULT ─────────────────────────────────────────────────────────
-// ══════════════════════════════════════════════════════════════════════
+// 
+//  KEY VAULT 
+// 
 
 (function initKeyVault() {
   const kvKeyInput      = document.getElementById('kvKeyInput');
@@ -10748,7 +10944,7 @@ function passesAdvancedMarketFilters(item) {
   const KV_PAGE_SIZE = 8;
   let kvCurrentPage = 1;
 
-  // ── Helpers ───────────────────────────────────────────────────────────
+  //  Helpers 
   function loadVault() {
     return loadOddsKeyVault(null);
   }
@@ -10763,8 +10959,8 @@ function passesAdvancedMarketFilters(item) {
     return saveOddsKeyVault(loadVault(), { activeId: oddsKeyVaultActiveId });
   }
   function maskKey(key) {
-    if (!key || key.length < 8) return '••••••••';
-    return key.slice(0, 4) + '••••••••' + key.slice(-4);
+    if (!key || key.length < 8) return '';
+    return key.slice(0, 4) + '' + key.slice(-4);
   }
   function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
   function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
@@ -10803,7 +10999,7 @@ function passesAdvancedMarketFilters(item) {
     if (kvNextBtn) kvNextBtn.disabled = kvCurrentPage >= totalPages;
   }
 
-  // ── Render key list ───────────────────────────────────────────────────
+  //  Render key list 
   function renderVault() {
     const vault = loadVault();
     const activeId = getActiveId();
@@ -10821,7 +11017,7 @@ function passesAdvancedMarketFilters(item) {
         : `Rotation needs ${Math.max(KEY_VAULT_MIN_ROTATING_KEYS - usableCount, 0)} more usable key${Math.max(KEY_VAULT_MIN_ROTATING_KEYS - usableCount, 0) === 1 ? '' : 's'}`;
     }
     if (kvVaultSummary) {
-      kvVaultSummary.textContent = `${oddsVault.length} saved Odds API key${oddsVault.length === 1 ? '' : 's'} • ${usableCount} usable • ${lowCount} low-credit • minimum rotating pool: ${KEY_VAULT_MIN_ROTATING_KEYS}`;
+      kvVaultSummary.textContent = `${oddsVault.length} saved Odds API key${oddsVault.length === 1 ? '' : 's'}  ${usableCount} usable  ${lowCount} low-credit  minimum rotating pool: ${KEY_VAULT_MIN_ROTATING_KEYS}`;
     }
 
     if (kvHealthyCount) kvHealthyCount.textContent = String(healthyCount);
@@ -10848,7 +11044,7 @@ function passesAdvancedMarketFilters(item) {
       updateKvPager(0);
       kvKeyList.innerHTML = `
         <div class="bet-finder-state empty-state-panel compact" style="padding:32px 0">
-          <div class="empty-icon">[ ]</div>
+          <div class="empty-icon">\uD83D\uDD11</div>
           <strong>No keys saved yet.</strong>
           <span>Add a key above to get started.</span>
         </div>`;
@@ -10873,15 +11069,15 @@ function passesAdvancedMarketFilters(item) {
           <div style="flex:1;min-width:0">
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">
               <strong style="font-size:.9rem">${esc(entry.label)}</strong>
-              ${isActive ? '<span class="small-badge" style="background:rgba(var(--accent-rgb),0.18);color:var(--accent)">● Active</span>' : ''}
+              ${isActive ? '<span class="small-badge" style="background:rgba(var(--accent-rgb),0.18);color:var(--accent)"> Active</span>' : ''}
               <span class="small-badge">${esc(entry.provider === 'odds_api' ? 'Odds API' : entry.provider)}</span>
               <span class="small-badge kv-health-badge ${esc(health.tone)}">${esc(health.label)}</span>
             </div>
             <code style="font-size:.78rem;opacity:0.55;letter-spacing:.05em">${esc(maskKey(entry.key))}</code>
           </div>
           <div style="display:flex;gap:8px;flex-shrink:0">
-            <button class="secondary-btn kv-credits-btn" data-id="${esc(entry.id)}" style="padding:6px 14px;font-size:.8rem" type="button" title="Check remaining credits">💳 Credits</button>
-            <button class="text-btn kv-delete-btn" data-id="${esc(entry.id)}" style="padding:6px 10px;font-size:.8rem;color:var(--bad);opacity:0.7" type="button" title="Remove key">✕</button>
+            <button class="secondary-btn kv-credits-btn" data-id="${esc(entry.id)}" style="padding:6px 14px;font-size:.8rem" type="button" title="Check remaining credits"> Credits</button>
+            <button class="text-btn kv-delete-btn" data-id="${esc(entry.id)}" style="padding:6px 10px;font-size:.8rem;color:var(--bad);opacity:0.7" type="button" title="Remove key"></button>
           </div>
         </div>`;
     }).join('');
@@ -10914,7 +11110,7 @@ function passesAdvancedMarketFilters(item) {
         meta.dataset.kvCreditMeta = '1';
         meta.style.marginTop = '6px';
         meta.textContent = parseVaultRemaining(entry.remaining) !== null
-          ? `Remaining ${entry.remaining} • Used ${entry.used ?? '--'} • Checked ${entry.last_checked_at ? new Date(entry.last_checked_at).toLocaleString() : 'just now'}`
+          ? `Remaining ${entry.remaining}  Used ${entry.used ?? '--'}  Checked ${entry.last_checked_at ? new Date(entry.last_checked_at).toLocaleString() : 'just now'}`
           : 'Balance not checked yet';
         codeEl.insertAdjacentElement('afterend', meta);
       }
@@ -10944,7 +11140,7 @@ function passesAdvancedMarketFilters(item) {
           });
           const used = refreshed?.used ?? '?';
           const remaining = refreshed?.remaining ?? '?';
-          setKvStatus(`"${entry.label}" -- Used: ${used} • Remaining: ${remaining}`, 'good');
+          setKvStatus(`"${entry.label}" -- Used: ${used}  Remaining: ${remaining}`, 'good');
           renderVault();
           setTimeout(() => setKvStatus('Ready'), 5000);
         } catch (err) {
@@ -10958,7 +11154,7 @@ function passesAdvancedMarketFilters(item) {
     });
   }
 
-  // ── Add key ───────────────────────────────────────────────────────────
+  //  Add key 
   kvAddBtn?.addEventListener('click', async () => {
     await ensureOddsKeyVaultLoaded().catch(function () { });
     const rawKeys = (kvKeyInput?.value || '').trim();
@@ -11061,7 +11257,7 @@ function passesAdvancedMarketFilters(item) {
     renderVault();
   });
 
-  // ── Init: render vault and sync active key on load ────────────────────
+  //  Init: render vault and sync active key on load 
   (async function bootstrapVaultUi() {
     try {
       await ensureOddsKeyVaultLoaded();

@@ -970,6 +970,11 @@ body.light-theme .search-results {
   font-size: 28px;
 }
 
+.empty-icon:empty::before {
+  content: "\2726";
+  opacity: 0.9;
+}
+
 .skeleton-card {
   min-height: 240px;
   border-radius: 22px;
@@ -7171,7 +7176,7 @@ body.light-theme .prop-chip {
 }
 
 .analyzer-controls-grid {
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 16px !important;
   align-items: end;
   margin-top: 20px;
@@ -7236,6 +7241,23 @@ body.light-theme .prop-chip {
   font-size: 1rem;
   font-weight: 700;
   border-radius: 20px;
+}
+
+.playoff-mode-banner {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--warning, #f59e0b);
+  font-size: 0.86rem;
+}
+
+.playoff-mode-banner strong {
+  font-weight: 700;
 }
 
 #analyzeBtn.primary-btn {

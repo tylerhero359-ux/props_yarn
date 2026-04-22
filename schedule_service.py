@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable
@@ -159,6 +160,44 @@ class ScheduleDataService:
 
         return []
 
+    @staticmethod
+    def _extract_playoff_series_context(game_row: dict[str, Any]) -> tuple[str | None, int | None]:
+        row = game_row or {}
+        series_text_candidates = [
+            row.get("SERIES_LEADER"),
+            row.get("SERIES_STANDINGS"),
+            row.get("SERIES_SUMMARY"),
+            row.get("SERIES_TEXT"),
+        ]
+        series_text = ""
+        for candidate in series_text_candidates:
+            text = str(candidate or "").strip()
+            if text:
+                series_text = text
+                break
+        playoff_game_number: int | None = None
+        for key in ("PLAYOFF_GAME_NUMBER", "SERIES_GAME_NUMBER", "GAME_NUMBER"):
+            raw_value = row.get(key)
+            if raw_value in (None, ""):
+                continue
+            try:
+                parsed = int(raw_value)
+            except Exception:
+                parsed = 0
+            if 1 <= parsed <= 7:
+                playoff_game_number = parsed
+                break
+        if playoff_game_number is None and series_text:
+            match = re.search(r"\bGame\s*(\d+)\b", series_text, flags=re.IGNORECASE)
+            if match:
+                try:
+                    parsed = int(match.group(1))
+                    if 1 <= parsed <= 7:
+                        playoff_game_number = parsed
+                except Exception:
+                    playoff_game_number = None
+        return (series_text or None, playoff_game_number)
+
     def build_scoreboard_next_game_payload(self, game_row: dict[str, Any], player_team_id: int | None) -> dict[str, Any] | None:
         if not player_team_id:
             return None
@@ -183,6 +222,7 @@ class ScheduleDataService:
         else:
             return None
 
+        series_text, playoff_game_number = self._extract_playoff_series_context(game_row)
         return {
             "game_date": str(game_row.get("GAME_DATE_EST") or "").strip(),
             "game_time": "",
@@ -192,6 +232,9 @@ class ScheduleDataService:
             "opponent_name": str(opponent.get("full_name") or "").strip(),
             "opponent_abbreviation": opponent_abbreviation,
             "player_team_abbreviation": str(player_team.get("abbreviation") or "").strip(),
+            "series_text": series_text,
+            "series_summary": series_text,
+            "playoff_game_number": playoff_game_number,
         }
 
     def find_team_next_game_via_scoreboard(self, team_id: int | None, lookahead_days: int = 10) -> dict[str, Any] | None:
@@ -236,6 +279,7 @@ class ScheduleDataService:
         else:
             return None
 
+        series_text, playoff_game_number = self._extract_playoff_series_context(next_game_row or {})
         return {
             "game_date": str(next_game_row.get("GAME_DATE", "")).strip(),
             "game_time": str(next_game_row.get("GAME_TIME", "")).strip(),
@@ -245,6 +289,9 @@ class ScheduleDataService:
             "opponent_name": str(opponent_name or "").strip(),
             "opponent_abbreviation": str(opponent_abbreviation or "").strip(),
             "player_team_abbreviation": str(player_team_abbreviation or "").strip(),
+            "series_text": series_text,
+            "series_summary": series_text,
+            "playoff_game_number": playoff_game_number,
         }
 
     def _resolve_team_next_game_impl(self, team_id: int | None, primary_player_id: int, season: str, season_type: str) -> dict[str, Any] | None:
