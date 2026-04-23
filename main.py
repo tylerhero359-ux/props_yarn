@@ -9899,21 +9899,29 @@ def _normalize_backtest_confidence_score(raw_score: Any, fallback_tier: str) -> 
     return 52
 
 
-def _merge_backtest_entries(raw_entries: list[Any]) -> tuple[int, int, list[dict[str, Any]]]:
+def _merge_backtest_entries(raw_entries: list[Any]) -> tuple[int, int, int, list[dict[str, Any]]]:
     added = 0
+    updated = 0
     skipped = 0
     imported: list[dict[str, Any]] = []
     with _BACKTEST_LOCK:
-        existing_keys = {
-            (
-                str(e.get("player") or "").strip().lower(),
-                str(e.get("stat") or "").strip().upper(),
-                float(e.get("line") or 0),
-                str(e.get("side") or "").strip().upper(),
-                str(e.get("logged_at") or "").strip(),
+        existing_entries_by_id: dict[str, dict[str, Any]] = {}
+        existing_entries_by_key: dict[tuple[str, str, float, str, str], dict[str, Any]] = {}
+        for existing in _BACKTEST_LOG:
+            if not isinstance(existing, dict):
+                continue
+            existing_id = str(existing.get("id") or "").strip()
+            if existing_id:
+                existing_entries_by_id[existing_id] = existing
+            dedupe_key = (
+                str(existing.get("player") or "").strip().lower(),
+                str(existing.get("stat") or "").strip().upper(),
+                float(existing.get("line") or 0),
+                str(existing.get("side") or "").strip().upper(),
+                str(existing.get("logged_at") or "").strip(),
             )
-            for e in _BACKTEST_LOG
-        }
+            existing_entries_by_key[dedupe_key] = existing
+
         for raw in raw_entries:
             if not isinstance(raw, dict):
                 skipped += 1
@@ -9932,17 +9940,15 @@ def _merge_backtest_entries(raw_entries: list[Any]) -> tuple[int, int, list[dict
             normalized_tier = _normalize_backtest_confidence_tier(raw.get("confidence_tier"), raw.get("confidence_score"))
             normalized_score = _normalize_backtest_confidence_score(raw.get("confidence_score"), normalized_tier)
             logged_at = str(raw.get("logged_at") or _utc_iso_z()).strip()
+            incoming_id = str(raw.get("id") or _backtest_new_id()).strip()
             dedupe_key = (player.lower(), stat, line, side, logged_at)
-            if dedupe_key in existing_keys:
-                skipped += 1
-                continue
             actual_raw = raw.get("actual_value")
             try:
                 actual_value = float(actual_raw) if actual_raw not in (None, "", "null") else None
             except Exception:
                 actual_value = None
             entry = {
-                "id": str(raw.get("id") or _backtest_new_id()),
+                "id": incoming_id,
                 "player": player,
                 "stat": stat,
                 "line": line,
@@ -9961,13 +9967,49 @@ def _merge_backtest_entries(raw_entries: list[Any]) -> tuple[int, int, list[dict
                 "market_disagrees": bool(raw.get("market_disagrees")) if raw.get("market_disagrees") is not None else False,
                 "notes": str(raw.get("notes") or ""),
             }
+
+            existing_by_id = existing_entries_by_id.get(incoming_id)
+            if isinstance(existing_by_id, dict):
+                if existing_by_id != entry:
+                    existing_by_id.clear()
+                    existing_by_id.update(entry)
+                    updated += 1
+                    imported.append(entry)
+                    existing_entries_by_key[dedupe_key] = existing_by_id
+                else:
+                    skipped += 1
+                continue
+
+            existing_by_key = existing_entries_by_key.get(dedupe_key)
+            if isinstance(existing_by_key, dict):
+                # Prefer the incoming row when it has a resolved outcome while local is still pending.
+                existing_result = str(existing_by_key.get("result") or "pending").lower()
+                incoming_result = str(entry.get("result") or "pending").lower()
+                should_update = existing_result == "pending" and incoming_result in {"hit", "miss"}
+                if should_update:
+                    preserved_id = str(existing_by_key.get("id") or "").strip()
+                    if preserved_id and not str(entry.get("id") or "").strip():
+                        entry["id"] = preserved_id
+                    existing_by_key.clear()
+                    existing_by_key.update(entry)
+                    updated += 1
+                    imported.append(entry)
+                    entry_id = str(existing_by_key.get("id") or "").strip()
+                    if entry_id:
+                        existing_entries_by_id[entry_id] = existing_by_key
+                else:
+                    skipped += 1
+                continue
+
             _BACKTEST_LOG.append(entry)
-            existing_keys.add(dedupe_key)
+            existing_entries_by_key[dedupe_key] = entry
+            if incoming_id:
+                existing_entries_by_id[incoming_id] = entry
             imported.append(entry)
             added += 1
-        if added:
+        if added or updated:
             _save_backtest_log()
-    return added, skipped, imported
+    return added, updated, skipped, imported
 
 
 def _backtest_entry_datetime(entry: dict[str, Any]) -> datetime | None:
@@ -10758,10 +10800,10 @@ def backtest_import_entries(payload: dict = Body(...)) -> dict[str, Any]:
     raw_entries = payload.get("entries") or []
     if not isinstance(raw_entries, list) or not raw_entries:
         raise HTTPException(status_code=400, detail="entries list is required")
-    added, skipped, imported = _merge_backtest_entries(raw_entries)
+    added, updated, skipped, imported = _merge_backtest_entries(raw_entries)
     if imported:
         _require_pg_backtest_write(_pg_write_backtest_entries, imported)
-    return {"ok": True, "added": added, "skipped": skipped, "entries": imported}
+    return {"ok": True, "added": added, "updated": updated, "skipped": skipped, "entries": imported}
 
 
 @app.post("/api/backtest/sync-postgres")
@@ -10771,9 +10813,16 @@ def backtest_sync_from_postgres(payload: dict = Body(default={})) -> dict[str, A
     limit = max(1, min(int(payload.get("limit") or 5000), 20000))
     pg_entries = _pg_fetch_backtest_entries(limit=limit)
     if not pg_entries:
-        return {"ok": True, "added": 0, "skipped": 0, "entries": [], "fetched": 0}
-    added, skipped, imported = _merge_backtest_entries(pg_entries)
-    return {"ok": True, "added": added, "skipped": skipped, "entries": imported, "fetched": len(pg_entries)}
+        return {"ok": True, "added": 0, "updated": 0, "skipped": 0, "entries": [], "fetched": 0}
+    added, updated, skipped, imported = _merge_backtest_entries(pg_entries)
+    return {
+        "ok": True,
+        "added": added,
+        "updated": updated,
+        "skipped": skipped,
+        "entries": imported,
+        "fetched": len(pg_entries),
+    }
 
 
 @app.post("/api/backtest/push-postgres")

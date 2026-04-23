@@ -8554,6 +8554,7 @@ function buildSparklineSvg(values, line, width, height) {
   const trackerAddBtn = document.getElementById('trackerAddBtn');
   const trackerAddError = document.getElementById('trackerAddError');
   const trackerRefreshBtn = document.getElementById('trackerRefreshBtn');
+  const trackerClearBtn = document.getElementById('trackerClearBtn');
   const trackerCards = document.getElementById('trackerCards');
   const trackerEmpty = document.getElementById('trackerEmpty');
   const trackerSortSelect = document.getElementById('trackerSortSelect');
@@ -8686,6 +8687,12 @@ function buildSparklineSvg(values, line, width, height) {
   function showEmpty(v) {
     if (trackerEmpty) trackerEmpty.style.display = v ? '' : 'none';
     if (trackerCards) trackerCards.style.display = v ? 'none' : '';
+  }
+
+  function syncTrackerActionButtons() {
+    const hasBets = Array.isArray(bets) && bets.length > 0;
+    if (trackerRefreshBtn) trackerRefreshBtn.disabled = !hasBets;
+    if (trackerClearBtn) trackerClearBtn.disabled = !hasBets;
   }
 
   function isDuplicateBet(candidate, existing) {
@@ -8900,7 +8907,7 @@ function buildSparklineSvg(values, line, width, height) {
         <span class="tracker-stat-pill">${esc(bet.stat)}</span>
         <span class="tracker-side-pill ${sideClass}">${esc(bet.side)}</span>
         ${bet.book ? `<span class="tracker-book-pill">${esc(bet.book)}</span>` : ''}
-        <button class="tracker-remove-btn" data-remove-id="${esc(bet.id)}" title="Remove this prop" type="button"></button>
+        <button class="tracker-remove-btn" data-remove-id="${esc(bet.id)}" title="Remove this prop" aria-label="Remove this prop" type="button">×</button>
       </div>
 
       <div class="tracker-value-row">
@@ -8934,6 +8941,7 @@ function buildSparklineSvg(values, line, width, height) {
 
   //  Re-render all cards 
   function renderAll() {
+    syncTrackerActionButtons();
     if (!bets.length) { showEmpty(true); return; }
     const visibleBets = bets.filter(passesTrackerFilter).sort(compareTrackerBets);
     if (!visibleBets.length) { showEmpty(true); return; }
@@ -9197,7 +9205,19 @@ function buildSparklineSvg(values, line, width, height) {
 
     trackerRefreshBtn.classList.remove('spinning');
     trackerRefreshBtn.disabled = false;
+    syncTrackerActionButtons();
   });
+
+  if (trackerClearBtn) {
+    trackerClearBtn.addEventListener('click', async function () {
+      if (!bets.length) return;
+      if (!confirm('Remove all tracked props? This will clear your tracker board.')) return;
+      bets = [];
+      await saveBets();
+      renderAll();
+      _showTrackerToast('All tracked props removed');
+    });
+  }
 
   if (trackerSortSelect) {
     trackerSortSelect.addEventListener('change', function () {
@@ -9227,6 +9247,7 @@ function buildSparklineSvg(values, line, width, height) {
       bets = [];
     }
     renderAll();
+    syncTrackerActionButtons();
   })();
 
   // Auto-refresh every 30s when live/upcoming game
@@ -10395,9 +10416,9 @@ function buildSparklineSvg(values, line, width, height) {
           ${isPending
             ? `<div style="display:flex;gap:4px;align-items:center">
                 <input type="number" step="0.1" min="0" placeholder="Actual" class="market-api-input bt-actual-input" style="width:70px;padding:3px 6px;font-size:11px" data-bt-resolve-id="${esc(e.id)}"/>
-                <button class="secondary-btn bt-resolve-btn" data-bt-resolve-id="${esc(e.id)}" style="font-size:10px;padding:3px 8px"></button>
+                <button class="secondary-btn bt-resolve-btn" data-bt-resolve-id="${esc(e.id)}" style="font-size:10px;padding:3px 8px" aria-label="Resolve prop">✓</button>
               </div>`
-            : `<button class="bt-delete-btn" data-bt-id="${esc(e.id)}" style="background:none;border:none;cursor:pointer;opacity:0.4;font-size:13px;padding:2px 6px" title="Remove"></button>`
+            : `<button class="bt-delete-btn" data-bt-id="${esc(e.id)}" style="background:none;border:none;cursor:pointer;opacity:0.4;font-size:13px;padding:2px 6px" title="Remove" aria-label="Remove prop">×</button>`
           }
         </td>
       </tr>`;
@@ -10656,11 +10677,15 @@ function buildSparklineSvg(values, line, width, height) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ limit: 5000 }),
         }, 20000);
+        if (!payload || payload.ok === false) {
+          throw new Error(payload?.error || 'Postgres sync failed.');
+        }
         showBtError('');
         const fetched = Number(payload.fetched || 0);
         const added = Number(payload.added || 0);
+        const updated = Number(payload.updated || 0);
         const skipped = Number(payload.skipped || 0);
-        showAppToast(`Postgres sync complete: ${added} added, ${skipped} skipped, ${fetched} fetched.`, 'info');
+        showAppToast(`Postgres sync complete: ${added} added, ${updated} updated, ${skipped} skipped, ${fetched} fetched.`, 'info');
         await loadAndRender();
       } catch (err) {
         showBtError('Postgres sync failed: ' + err.message);
@@ -10682,6 +10707,9 @@ function buildSparklineSvg(values, line, width, height) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({}),
         }, 20000);
+        if (!payload || payload.ok === false) {
+          throw new Error(payload?.error || 'Postgres push failed.');
+        }
         showBtError('');
         showAppToast(`Pushed ${Number(payload.pushed || 0)} local backtest rows to Postgres.`, 'info');
       } catch (err) {

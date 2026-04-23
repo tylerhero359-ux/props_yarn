@@ -5085,6 +5085,14 @@ body.light-theme .action-banner-inner {
   gap: 16px;
 }
 
+.tracker-board-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
 .tracker-toolbar {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -5431,6 +5439,7 @@ body.light-theme .action-banner-inner {
   .tracker-avatar-strip img { width: 60px; height: 60px; }
   .tracker-add-grid { flex-direction: column; }
   .tracker-toolbar-summary { justify-content: flex-start; }
+  .tracker-board-head { flex-wrap: wrap; }
 }
 
 /* ── Tracker player autocomplete dropdown ────────────────────────────── */
