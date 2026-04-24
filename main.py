@@ -66,7 +66,11 @@ from identity_utils import (
     normalize_report_person_name,
 )
 from injury_service import InjuryReportService
+from market_scan_core_service import MarketScanCoreService
+from market_scan_service import MarketScanService
+from parlay_service import ParlayService
 from player_data_service import PlayerDataService
+from progress_stream_service import ProgressStreamService
 from persistence_utils import load_json_snapshot, save_json_snapshot
 from schedule_service import ScheduleDataService
 from runtime_utils import (
@@ -1270,6 +1274,10 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        try:
+            _shutdown_shared_executors()
+        except Exception:
+            pass
         close_postgres_pool()
 
 
@@ -1684,10 +1692,28 @@ def get_player_game_log_hybrid(player_id: int, season: str, season_type: str) ->
     cache_key = (player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)
     cached = GAME_LOG_CACHE.get(cache_key)
     age_seconds = _cache_age_seconds(cached)
+    normalized_season_type = normalize_requested_season_type(season_type)
+    stale_window_seconds = HYBRID_GAME_LOG_MAX_STALE_SECONDS
+    if normalized_season_type == SEASON_TYPE_PLAYOFFS:
+        # Playoff series update rapidly; prefer live refresh after soft TTL.
+        stale_window_seconds = HYBRID_GAME_LOG_SOFT_TTL_SECONDS
     if cached and isinstance(cached.get("rows"), list):
+        cached_rows = cached.get("rows") or []
+        if normalized_season_type == SEASON_TYPE_PLAYOFFS and len(cached_rows) < 2:
+            # Playoff series samples can lag in cache right after new games complete.
+            # Force one live refresh so H2H/series counts catch up promptly.
+            try:
+                GAME_LOG_CACHE.pop(cache_key, None)
+                GAME_LOG_FAILURE_META.pop(cache_key, None)
+                RECENT_GAME_LOG_CACHE.pop((player_id, season, season_type, 20, GAME_LOG_CACHE_SCHEMA_VERSION), None)
+                rows = PLAYER_DATA_SERVICE.fetch_player_game_log(player_id=player_id, season=season, season_type=season_type)
+                fresh_age = _cache_age_seconds(GAME_LOG_CACHE.get(cache_key))
+                return rows, {"source": "live-forced", "seconds_ago": round(fresh_age, 2) if fresh_age is not None else None, "refresh_queued": False}
+            except Exception:
+                pass
         if age_seconds is not None and age_seconds < HYBRID_GAME_LOG_SOFT_TTL_SECONDS:
             return cached["rows"], {"source": "cache-fresh", "seconds_ago": round(age_seconds, 2), "refresh_queued": False}
-        if age_seconds is not None and age_seconds < HYBRID_GAME_LOG_MAX_STALE_SECONDS:
+        if age_seconds is not None and age_seconds < stale_window_seconds:
             queued = enqueue_hybrid_refresh("game_log", (player_id, season, season_type))
             return cached["rows"], {"source": "cache-stale", "seconds_ago": round(age_seconds, 2), "refresh_queued": bool(queued)}
     rows = fetch_player_game_log(player_id=player_id, season=season, season_type=season_type)
@@ -5955,34 +5981,7 @@ def fetch_scoreboard_games(game_date: str) -> list[dict[str, Any]]:
 
 
 def _extract_series_context_from_scoreboard_row(row: dict[str, Any]) -> tuple[str | None, int | None]:
-    series_text = ""
-    for key in ("SERIES_LEADER", "SERIES_STANDINGS", "SERIES_SUMMARY", "SERIES_TEXT"):
-        text = str((row or {}).get(key) or "").strip()
-        if text:
-            series_text = text
-            break
-    playoff_game_number: int | None = None
-    for key in ("PLAYOFF_GAME_NUMBER", "SERIES_GAME_NUMBER", "GAME_NUMBER"):
-        raw_value = (row or {}).get(key)
-        if raw_value in (None, ""):
-            continue
-        try:
-            parsed = int(raw_value)
-        except Exception:
-            parsed = 0
-        if 1 <= parsed <= 7:
-            playoff_game_number = parsed
-            break
-    if playoff_game_number is None and series_text:
-        match = re.search(r"\bGame\s*(\d+)\b", series_text, flags=re.IGNORECASE)
-        if match:
-            try:
-                parsed = int(match.group(1))
-                if 1 <= parsed <= 7:
-                    playoff_game_number = parsed
-            except Exception:
-                playoff_game_number = None
-    return (series_text or None, playoff_game_number)
+    return SCHEDULE_SERVICE._extract_playoff_series_context(row)
 
 
 def enrich_next_game_with_series_context(next_game: dict[str, Any] | None, player_team_id: int | None) -> dict[str, Any] | None:
@@ -6401,193 +6400,70 @@ def bet_finder(
     return payload_out
 
 
+MARKET_SCAN_SERVICE = MarketScanService(
+    submit_async_job=submit_async_job,
+)
+PARLAY_SERVICE = ParlayService(
+    submit_async_job=submit_async_job,
+)
+PROGRESS_STREAM_SERVICE = ProgressStreamService()
+MARKET_SCAN_CORE_SERVICE = MarketScanCoreService(
+    current_nba_season=current_nba_season,
+    normalize_requested_season_type=normalize_requested_season_type,
+    request_hash=_request_hash,
+    read_market_scan_cache=lambda request_payload: _pg_read_market_scan_cache(request_payload, cache_scope="market_scan"),
+    warm_injury_cache=get_cached_injury_report_payload,
+    resolve_team_from_text=resolve_team_from_text,
+    find_player_by_name=find_player_by_name,
+    team_lookup=TEAM_LOOKUP,
+    stat_map=STAT_MAP,
+    bulk_analysis_max_workers=lambda: BULK_ANALYSIS_MAX_WORKERS,
+    prefetch_bulk_analysis_context=lambda **kwargs: prefetch_bulk_analysis_context(**kwargs),
+    submit_analysis_task=lambda func, *args, **kwargs: _submit_shared_analysis_task(func, *args, **kwargs),
+    http_exception_cls=HTTPException,
+)
+
+
 def _emit_progress(progress_cb, stage: str, **extra: Any) -> None:
-    if not progress_cb:
-        return
-    payload = {"stage": stage}
-    payload.update(extra)
-    progress_cb(payload)
+    PROGRESS_STREAM_SERVICE.emit_progress(progress_cb, stage, **extra)
 
 
 def _stream_with_progress(run_func, payload: dict[str, Any]) -> StreamingResponse:
-    def generator():
-        q: queue.Queue = queue.Queue()
-        done = threading.Event()
-
-        def progress_cb(update: dict[str, Any]) -> None:
-            q.put({"type": "progress", **update})
-
-        def runner():
-            try:
-                result = run_func(payload, progress_cb)
-                q.put({"type": "result", "payload": result})
-            except HTTPException as exc:
-                q.put({"type": "error", "status": exc.status_code, "message": exc.detail})
-            except Exception as exc:
-                q.put({"type": "error", "status": 500, "message": str(exc)})
-            finally:
-                done.set()
-
-        thread = threading.Thread(target=runner, name="progress-stream", daemon=True)
-        thread.start()
-
-        while not done.is_set() or not q.empty():
-            try:
-                item = q.get(timeout=0.25)
-            except queue.Empty:
-                continue
-            yield json.dumps(item) + "\n"
-
-    return StreamingResponse(generator(), media_type="application/x-ndjson")
+    return PROGRESS_STREAM_SERVICE.stream_with_progress(run_func, payload)
 
 
 def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, Any]:
-    rows = payload.get("rows") or []
-    default_last_n = int(payload.get("last_n") or 10)
-    selected_season = str(payload.get("season") or current_nba_season())
-    season_type = normalize_requested_season_type(payload.get("season_type"))
-    injury_aware = bool(payload.get("injury_aware"))
-
-    if not isinstance(rows, list) or not rows:
-        raise HTTPException(status_code=400, detail="Please provide at least one market row.")
-
-    request_hash_value = _request_hash("market_scan", payload)
-    cached_run = _pg_read_market_scan_cache(payload, cache_scope="market_scan")
+    prepared_payload = MARKET_SCAN_CORE_SERVICE.prepare_request(payload)
+    cached_run = prepared_payload["cached_run"]
     if cached_run:
         return cached_run
 
+    rows = prepared_payload["rows"]
+    default_last_n = int(prepared_payload["default_last_n"])
+    selected_season = str(prepared_payload["selected_season"])
+    season_type = str(prepared_payload["season_type"])
+    injury_aware = bool(prepared_payload["injury_aware"])
+    request_hash_value = str(prepared_payload["request_hash_value"])
+    errors: list[dict[str, Any]] = list(prepared_payload["errors"] or [])
+    prepared_rows: list[tuple[int, dict[str, Any], float, float, str, str, dict[str, Any] | None, dict[str, Any] | None, int | None, str]] = list(prepared_payload["prepared_rows"] or [])
+
     _emit_progress(progress_cb, "start", total_rows=len(rows))
-
-    errors: list[dict[str, Any]] = []
-    prepared_rows: list[tuple[int, dict[str, Any], float, float, str, str, dict[str, Any] | None, dict[str, Any] | None, int | None, str]] = []
-
-    try:
-        get_cached_injury_report_payload()
-    except Exception:
-        pass
-
-    for index, row in enumerate(rows, start=1):
-        if not isinstance(row, dict):
-            errors.append({"row": index, "reason": "Invalid row format."})
-            continue
-
-        player_name = str(row.get("player_name") or "").strip()
-        stat = str(row.get("stat") or "").upper().strip()
-        team_text = str(row.get("team") or "").strip()
-        opponent_text = str(row.get("opponent") or "").strip()
-        home_team_text = str(row.get("home_team") or "").strip()
-        away_team_text = str(row.get("away_team") or "").strip()
-        input_game_label = str(row.get("game_label") or "").strip()
-        if stat not in STAT_MAP:
-            errors.append({"row": index, "player_name": player_name, "reason": f"Unsupported stat: {stat}"})
-            continue
-        try:
-            line = float(row.get("line"))
-            over_odds = float(row.get("over_odds"))
-            under_odds = float(row.get("under_odds"))
-        except (TypeError, ValueError):
-            errors.append({"row": index, "player_name": player_name, "reason": "Line and odds must be numeric."})
-            continue
-
-        team = resolve_team_from_text(team_text) if team_text else None
-        opponent = resolve_team_from_text(opponent_text) if opponent_text else None
-        home_team = resolve_team_from_text(home_team_text) if home_team_text else None
-        away_team = resolve_team_from_text(away_team_text) if away_team_text else None
-        team_id = int(team["id"]) if team else None
-        player = find_player_by_name(player_name, team_id=team_id)
-        if not player:
-            errors.append({"row": index, "player_name": player_name, "reason": "Player not found."})
-            continue
-        player_team_id = int(player.get("team_id") or 0) if player.get("team_id") else 0
-        if player_team_id:
-            player_team = TEAM_LOOKUP.get(player_team_id, {})
-            if not team or int(team.get("id") or 0) != player_team_id:
-                team = player_team
-                team_text = str(player_team.get("abbreviation") or player_team.get("full_name") or team_text)
-        if (not team_text or not opponent_text) and (home_team or away_team):
-            if home_team and player_team_id and int(home_team.get("id") or 0) == player_team_id:
-                team_text = home_team_text or (home_team.get("abbreviation") or "")
-                opponent_text = away_team_text or (away_team.get("abbreviation") if away_team else opponent_text)
-                team = home_team
-                opponent = away_team
-            elif away_team and player_team_id and int(away_team.get("id") or 0) == player_team_id:
-                team_text = away_team_text or (away_team.get("abbreviation") or "")
-                opponent_text = home_team_text or (home_team.get("abbreviation") if home_team else opponent_text)
-                team = away_team
-                opponent = home_team
-            elif home_team and away_team and not team:
-                team_text = away_team_text or (away_team.get("abbreviation") or "")
-                opponent_text = home_team_text or (home_team.get("abbreviation") or "")
-                team = away_team
-                opponent = home_team
-        team_id = int(team["id"]) if team else None
-
-        bulk_row = {
-            "player_id": int(player["id"]),
-            "player_name": player_name or str(player.get("full_name") or ""),
-            "stat": stat,
-            "line": line,
-            "team_id": team_id or (player_team_id if player_team_id else None),
-            "player_position": None,
-            "override_opponent_id": int(opponent["id"]) if opponent and int(opponent.get("id") or 0) != (team_id or player_team_id) else None,
-            "over_fair_prob": row.get("over_fair_prob"),
-            "under_fair_prob": row.get("under_fair_prob"),
-            "consensus_over_fair_prob": row.get("consensus_over_fair_prob"),
-            "consensus_under_fair_prob": row.get("consensus_under_fair_prob"),
-            "hold_percent": row.get("hold_percent"),
-            "books_count": row.get("books_count"),
-            "best_over_odds": row.get("best_over_odds"),
-            "best_under_odds": row.get("best_under_odds"),
-            "best_over_bookmaker": row.get("best_over_bookmaker"),
-            "best_under_bookmaker": row.get("best_under_bookmaker"),
-            "market_implied_line": row.get("market_implied_line"),
-            "bookmaker_title": row.get("bookmaker_title"),
-        }
-        prepared_rows.append((index, bulk_row, over_odds, under_odds, team_text, opponent_text, team, opponent, team_id, input_game_label))
 
     _emit_progress(progress_cb, "prepared", prepared=len(prepared_rows), errors=len(errors))
 
-    defaults = {
-        "last_n": default_last_n,
-        "season": selected_season,
-        "season_type": season_type,
-    }
-    requested_max_workers = payload.get("max_workers")
-    max_workers = BULK_ANALYSIS_MAX_WORKERS
-    try:
-        if requested_max_workers not in (None, ""):
-            max_workers = max(1, min(BULK_ANALYSIS_MAX_WORKERS, int(requested_max_workers)))
-    except (TypeError, ValueError):
-        max_workers = BULK_ANALYSIS_MAX_WORKERS
-    max_workers = min(max_workers, max(1, len(prepared_rows)))
-
-    local_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
-    analysis_by_row: dict[int, dict[str, Any]] = {}
-
-    player_ids: set[int] = {int(bulk_row["player_id"]) for _, bulk_row, *_ in prepared_rows}
-    team_ids: set[int] = set()
-    primary_by_team: dict[int, int] = {}
-    for row in prepared_rows:
-        team_id = row[-2]
-        if team_id in (None, ""):
-            continue
-        try:
-            team_id_int = int(team_id)
-        except (TypeError, ValueError):
-            continue
-        team_ids.add(team_id_int)
-        if team_id_int not in primary_by_team:
-            bulk_row = row[1]
-            primary_by_team[team_id_int] = int(bulk_row["player_id"])
-    prefetch_bulk_analysis_context(
-        player_ids=player_ids,
-        season=selected_season,
+    analysis_context = MARKET_SCAN_CORE_SERVICE.prepare_analysis_context(
+        payload=payload,
+        prepared_rows=prepared_rows,
+        default_last_n=default_last_n,
+        selected_season=selected_season,
         season_type=season_type,
-        team_ids=team_ids,
-        primary_player_by_team=primary_by_team,
-        max_workers=max_workers,
-        label="market_scan",
     )
+    defaults = analysis_context["defaults"]
+    max_workers = int(analysis_context["max_workers"])
+    local_cache: dict[tuple[Any, ...], dict[str, Any]] = analysis_context["local_cache"]
+    analysis_by_row: dict[int, dict[str, Any]] = analysis_context["analysis_by_row"]
+    analysis_key_by_row: dict[int, tuple[Any, ...]] = analysis_context["analysis_key_by_row"]
+    unique_analysis_jobs: list[tuple[int, dict[str, Any], tuple[Any, ...]]] = analysis_context["unique_analysis_jobs"]
 
     injury_report_identity = ""
     boosted_analysis_cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
@@ -6695,28 +6571,6 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
             or ""
         )
 
-    def _scanner_analysis_key(bulk_row: dict[str, Any]) -> tuple[Any, ...]:
-        return (
-            int(bulk_row.get("player_id") or 0),
-            str(bulk_row.get("stat") or ""),
-            float(bulk_row.get("line") or 0.0),
-            int(default_last_n),
-            str(selected_season),
-            str(season_type),
-            int(bulk_row.get("team_id") or 0),
-            int(bulk_row.get("override_opponent_id") or 0),
-        )
-
-    analysis_key_by_row: dict[int, tuple[Any, ...]] = {}
-    seen_analysis_keys: set[tuple[Any, ...]] = set()
-    unique_analysis_jobs: list[tuple[int, dict[str, Any], tuple[Any, ...]]] = []
-    for row_index, bulk_row, *_ in prepared_rows:
-        analysis_key = _scanner_analysis_key(bulk_row)
-        analysis_key_by_row[row_index] = analysis_key
-        if analysis_key not in seen_analysis_keys:
-            seen_analysis_keys.add(analysis_key)
-            unique_analysis_jobs.append((row_index, bulk_row, analysis_key))
-
     _emit_progress(
         progress_cb,
         "analysis_start",
@@ -6725,39 +6579,16 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
         workers=max_workers,
     )
 
-    analysis_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
-    if max_workers <= 1:
-        step = max(1, len(unique_analysis_jobs) // 10) if unique_analysis_jobs else 1
-        done = 0
-        for row_index, bulk_row, analysis_key in unique_analysis_jobs:
-            try:
-                analysis_by_key[analysis_key] = _build_bulk_prop_item(row_index, bulk_row, defaults, local_cache)
-            except HTTPException as exc:
-                errors.append({"row": row_index, "player_name": bulk_row.get("player_name"), "reason": exc.detail})
-            except Exception as exc:
-                errors.append({"row": row_index, "player_name": bulk_row.get("player_name"), "reason": str(exc)})
-            done += 1
-            if done % step == 0 or done == len(unique_analysis_jobs):
-                _emit_progress(progress_cb, "analysis_progress", done=done, total=len(unique_analysis_jobs))
-    else:
-        futures: list[tuple[int, dict[str, Any], tuple[Any, ...], Any]] = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for row_index, bulk_row, analysis_key in unique_analysis_jobs:
-                futures.append(
-                    (row_index, bulk_row, analysis_key, executor.submit(_build_bulk_prop_item, row_index, bulk_row, defaults, local_cache))
-                )
-            step = max(1, len(futures) // 10) if futures else 1
-            done = 0
-            for row_index, bulk_row, analysis_key, future in futures:
-                try:
-                    analysis_by_key[analysis_key] = future.result()
-                except HTTPException as exc:
-                    errors.append({"row": row_index, "player_name": bulk_row.get("player_name"), "reason": exc.detail})
-                except Exception as exc:
-                    errors.append({"row": row_index, "player_name": bulk_row.get("player_name"), "reason": str(exc)})
-                done += 1
-                if done % step == 0 or done == len(futures):
-                    _emit_progress(progress_cb, "analysis_progress", done=done, total=len(futures))
+    analysis_by_key, analysis_errors = MARKET_SCAN_CORE_SERVICE.run_analysis_jobs(
+        unique_analysis_jobs=unique_analysis_jobs,
+        defaults=defaults,
+        local_cache=local_cache,
+        max_workers=max_workers,
+        build_bulk_prop_item=_build_bulk_prop_item,
+        emit_progress=lambda stage, meta: _emit_progress(progress_cb, stage, **meta),
+    )
+    if analysis_errors:
+        errors.extend(analysis_errors)
 
     for row_index, analysis_key in analysis_key_by_row.items():
         item = analysis_by_key.get(analysis_key)
@@ -7296,8 +7127,9 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
             if scored_count % scoring_step == 0 or scored_count == len(scoring_jobs):
                 _emit_progress(progress_cb, "scoring_progress", done=scored_count, total=len(scoring_jobs))
     else:
-        with ThreadPoolExecutor(max_workers=scoring_workers) as executor:
-            futures = [executor.submit(_score_prepared_row, prepared_row) for prepared_row in scoring_jobs]
+        for batch_start in range(0, len(scoring_jobs), scoring_workers):
+            batch = scoring_jobs[batch_start : batch_start + scoring_workers]
+            futures = [_submit_shared_analysis_task(_score_prepared_row, prepared_row) for prepared_row in batch]
             for future in as_completed(futures):
                 try:
                     result_item, error_item = future.result()
@@ -7342,12 +7174,12 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
 @app.post("/api/market-scan")
 def market_scan(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     enforce_heavy_rate_limit(request, "market_scan")
-    return _market_scan_core(payload)
+    return MARKET_SCAN_SERVICE.run_sync(_market_scan_core, payload)
 
 @app.post("/api/market-scan/async")
 def market_scan_async(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     enforce_heavy_rate_limit(request, "market_scan_async")
-    return submit_async_job("market_scan", _market_scan_core, payload)
+    return MARKET_SCAN_SERVICE.run_async(_market_scan_core, payload)
 
 @app.get("/api/jobs/{job_id}")
 def async_job_status(job_id: str) -> dict[str, Any]:
@@ -7529,84 +7361,30 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
         _submit_pg_write(_pg_write_parlay_builder_run, payload, request_hash_value)
         return payload
 
-    #  Phase 2: Fetch odds per event in batches, rotating keys 
-    all_import_rows: list[dict[str, Any]] = []
-    scrape_errors: list[dict[str, Any]] = []
-
-    total_batches = max(1, math.ceil(len(events) / batch_size)) if events else 1
-    batch_index = 0
-    for batch_start in range(0, len(events), batch_size):
-        batch_index += 1
-        batch = events[batch_start: batch_start + batch_size]
-        batch_jobs = [
-            {
-                "event_id": str(event.get("id") or ""),
-                "api_key": next_key(),
-                "home_team": event.get("home_team"),
-                "away_team": event.get("away_team"),
-            }
-            for event in batch
-            if str(event.get("id") or "")
-        ]
-        if not batch_jobs:
-            continue
-        batch_workers = min(len(batch_jobs), max(1, len(api_keys)), batch_size, 6)
-        if batch_workers <= 1:
-            batch_results = [
-                (
-                    job,
-                    _fetch_event_odds_payload(
-                        event_id=job["event_id"],
-                        api_key=job["api_key"],
-                        sport=sport,
-                        regions=regions,
-                        markets=markets,
-                        odds_format=odds_format,
-                        requested_bookmakers=requested_bookmakers,
-                    ),
-                )
-                for job in batch_jobs
-            ]
-        else:
-            with ThreadPoolExecutor(max_workers=batch_workers) as executor:
-                futures = [
-                    (
-                        job,
-                        executor.submit(
-                            _fetch_event_odds_payload,
-                            event_id=job["event_id"],
-                            api_key=job["api_key"],
-                            sport=sport,
-                            regions=regions,
-                            markets=markets,
-                            odds_format=odds_format,
-                            requested_bookmakers=requested_bookmakers,
-                        ),
-                    )
-                    for job in batch_jobs
-                ]
-                batch_results = [(job, future.result()) for job, future in futures]
-        for job, result in batch_results:
-            event_id = str(result.get("event_id") or job["event_id"] or "")
-            if result.get("error"):
-                scrape_errors.append({
-                    "event_id": event_id,
-                    "home_team": job.get("home_team"),
-                    "away_team": job.get("away_team"),
-                    "reason": result.get("error"),
-                    "status_code": result.get("status_code"),
-                })
-                continue
-            quota_log.append({"call": f"event_{event_id[:8]}", "quota": result.get("quota")})
-            all_import_rows.extend(result.get("rows") or [])
-        _emit_progress(
-            progress_cb,
-            "scrape_progress",
-            batch=batch_index,
-            batches=total_batches,
-            events_scraped=min(batch_index * batch_size, len(events)),
-            props_found=len(all_import_rows),
-        )
+    #  Phase 2: Fetch odds per event in batches 
+    scrape_payload = PARLAY_SERVICE.fetch_event_odds_batches(
+        events=events,
+        batch_size=batch_size,
+        api_keys=api_keys,
+        sport=sport,
+        regions=regions,
+        markets=markets,
+        odds_format=odds_format,
+        requested_bookmakers=requested_bookmakers,
+        fetch_event_odds_payload=_fetch_event_odds_payload,
+        submit_network_task=_submit_shared_network_task,
+        emit_progress=lambda stage, meta: _emit_progress(progress_cb, stage, **meta),
+    )
+    all_import_rows: list[dict[str, Any]] = list(scrape_payload.get("all_import_rows") or [])
+    scrape_errors: list[dict[str, Any]] = [
+        {
+            "event_id": str(item.get("event_id") or ""),
+            "reason": item.get("reason"),
+            "status_code": item.get("status_code"),
+        }
+        for item in (scrape_payload.get("scrape_errors") or [])
+    ]
+    quota_log.extend(scrape_payload.get("quota_log") or [])
 
     if not all_import_rows:
         payload = {
@@ -7731,13 +7509,14 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             if done % step == 0 or done == len(deduped_prepared):
                 _emit_progress(progress_cb, "analysis_progress", done=done, total=len(deduped_prepared))
     else:
-        futures_list: list[tuple[int, dict[str, Any], dict[str, Any], Any]] = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for idx, (bulk_row, orig_row) in enumerate(deduped_prepared, start=1):
-                fut = executor.submit(_build_bulk_prop_item, idx, bulk_row, defaults, local_cache)
+        step = max(1, len(deduped_prepared) // 10) if deduped_prepared else 1
+        done = 0
+        for batch_start in range(0, len(deduped_prepared), max_workers):
+            chunk = deduped_prepared[batch_start : batch_start + max_workers]
+            futures_list: list[tuple[int, dict[str, Any], dict[str, Any], Any]] = []
+            for idx, (bulk_row, orig_row) in enumerate(chunk, start=batch_start + 1):
+                fut = _submit_shared_analysis_task(_build_bulk_prop_item, idx, bulk_row, defaults, local_cache)
                 futures_list.append((idx, bulk_row, orig_row, fut))
-            step = max(1, len(futures_list) // 10) if futures_list else 1
-            done = 0
             for idx, bulk_row, orig_row, fut in futures_list:
                 try:
                     result = fut.result()
@@ -7745,8 +7524,8 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
                 except Exception as exc:
                     analysis_errors.append({"player_name": bulk_row["player_name"], "reason": str(exc)})
                 done += 1
-                if done % step == 0 or done == len(futures_list):
-                    _emit_progress(progress_cb, "analysis_progress", done=done, total=len(futures_list))
+                if done % step == 0 or done == len(deduped_prepared):
+                    _emit_progress(progress_cb, "analysis_progress", done=done, total=len(deduped_prepared))
 
     _emit_progress(progress_cb, "analysis_done", analyzed=len(analysis_rows), errors=len(analysis_errors))
 
@@ -8061,13 +7840,13 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
 @app.post("/api/parlay-builder")
 def parlay_builder(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     enforce_heavy_rate_limit(request, "parlay_builder")
-    return _parlay_builder_core(payload)
+    return PARLAY_SERVICE.run_sync(_parlay_builder_core, payload)
 
 
 @app.post("/api/parlay-builder/async")
 def parlay_builder_async(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     enforce_heavy_rate_limit(request, "parlay_builder_async")
-    return submit_async_job("parlay_builder", _parlay_builder_core, payload)
+    return PARLAY_SERVICE.run_async(_parlay_builder_core, payload)
 
 
 @app.post("/api/parlay-builder/stream")
@@ -8188,69 +7967,22 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         _submit_pg_write(_pg_write_parlay_builder_run, payload_out, request_hash_value)
         return payload_out
 
-    all_import_rows: list[dict[str, Any]] = []
-    scrape_errors: list[dict[str, Any]] = []
-
-    total_batches = max(1, math.ceil(len(events) / batch_size)) if events else 1
-    batch_index = 0
-    for batch_start in range(0, len(events), batch_size):
-        batch_index += 1
-        batch = events[batch_start: batch_start + batch_size]
-        batch_jobs = [
-            {
-                "event_id": str(event.get("id") or ""),
-                "api_key": next_key(),
-            }
-            for event in batch
-            if str(event.get("id") or "")
-        ]
-        if not batch_jobs:
-            continue
-        batch_workers = min(len(batch_jobs), max(1, len(api_keys)), batch_size, 6)
-        if batch_workers <= 1:
-            batch_results = [
-                _fetch_event_odds_payload(
-                    event_id=job["event_id"],
-                    api_key=job["api_key"],
-                    sport=sport,
-                    regions=regions,
-                    markets=markets,
-                    odds_format=odds_format,
-                    requested_bookmakers=requested_bookmakers,
-                )
-                for job in batch_jobs
-            ]
-        else:
-            with ThreadPoolExecutor(max_workers=batch_workers) as executor:
-                futures = [
-                    executor.submit(
-                        _fetch_event_odds_payload,
-                        event_id=job["event_id"],
-                        api_key=job["api_key"],
-                        sport=sport,
-                        regions=regions,
-                        markets=markets,
-                        odds_format=odds_format,
-                        requested_bookmakers=requested_bookmakers,
-                    )
-                    for job in batch_jobs
-                ]
-                batch_results = [future.result() for future in futures]
-        for result in batch_results:
-            event_id = str(result.get("event_id") or "")
-            if result.get("error"):
-                scrape_errors.append({"event_id": event_id, "reason": result.get("error"), "status_code": result.get("status_code")})
-                continue
-            quota_log.append({"call": f"event_{event_id[:8]}", "quota": result.get("quota")})
-            all_import_rows.extend(result.get("rows") or [])
-        _emit_progress(
-            progress_cb,
-            "scrape_progress",
-            batch=batch_index,
-            batches=total_batches,
-            events_scraped=min(batch_index * batch_size, len(events)),
-            props_found=len(all_import_rows),
-        )
+    scrape_payload = PARLAY_SERVICE.fetch_event_odds_batches(
+        events=events,
+        batch_size=batch_size,
+        api_keys=api_keys,
+        sport=sport,
+        regions=regions,
+        markets=markets,
+        odds_format=odds_format,
+        requested_bookmakers=requested_bookmakers,
+        fetch_event_odds_payload=_fetch_event_odds_payload,
+        submit_network_task=_submit_shared_network_task,
+        emit_progress=lambda stage, meta: _emit_progress(progress_cb, stage, **meta),
+    )
+    all_import_rows: list[dict[str, Any]] = list(scrape_payload.get("all_import_rows") or [])
+    scrape_errors: list[dict[str, Any]] = list(scrape_payload.get("scrape_errors") or [])
+    quota_log.extend(scrape_payload.get("quota_log") or [])
 
     if not all_import_rows:
         payload_out = {"legs": legs, "parlay": [], "parlay_odds": None, "all_props_scored": [],
@@ -8398,8 +8130,15 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             except Exception:
                 pass
         prewarm_workers = min(BULK_ANALYSIS_MAX_WORKERS, len(ids_to_fetch), 8)
-        with ThreadPoolExecutor(max_workers=prewarm_workers) as _pre_ex:
-            list(_pre_ex.map(_prefetch_log, ids_to_fetch))
+        ids_list = list(ids_to_fetch)
+        for batch_start in range(0, len(ids_list), prewarm_workers):
+            chunk = ids_list[batch_start : batch_start + prewarm_workers]
+            futures = [_submit_shared_analysis_task(_prefetch_log, pid) for pid in chunk]
+            for future in futures:
+                try:
+                    future.result()
+                except Exception:
+                    pass
 
     max_workers = min(BULK_ANALYSIS_MAX_WORKERS, max(1, len(deduped_prepared)))
 
@@ -8418,13 +8157,14 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             if done % step == 0 or done == len(deduped_prepared):
                 _emit_progress(progress_cb, "analysis_progress", done=done, total=len(deduped_prepared))
     else:
-        futures_list: list[tuple[int, dict[str, Any], dict[str, Any], Any]] = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for idx, (bulk_row, orig_row) in enumerate(deduped_prepared, start=1):
-                fut = executor.submit(_build_bulk_prop_item, idx, bulk_row, defaults, local_cache)
+        step = max(1, len(deduped_prepared) // 10) if deduped_prepared else 1
+        done = 0
+        for batch_start in range(0, len(deduped_prepared), max_workers):
+            chunk = deduped_prepared[batch_start : batch_start + max_workers]
+            futures_list: list[tuple[int, dict[str, Any], dict[str, Any], Any]] = []
+            for idx, (bulk_row, orig_row) in enumerate(chunk, start=batch_start + 1):
+                fut = _submit_shared_analysis_task(_build_bulk_prop_item, idx, bulk_row, defaults, local_cache)
                 futures_list.append((idx, bulk_row, orig_row, fut))
-            step = max(1, len(futures_list) // 10) if futures_list else 1
-            done = 0
             for idx, bulk_row, orig_row, fut in futures_list:
                 try:
                     result = fut.result()
@@ -8432,8 +8172,8 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
                 except Exception as exc:
                     analysis_errors.append({"player_name": bulk_row["player_name"], "reason": str(exc)})
                 done += 1
-                if done % step == 0 or done == len(futures_list):
-                    _emit_progress(progress_cb, "analysis_progress", done=done, total=len(futures_list))
+                if done % step == 0 or done == len(deduped_prepared):
+                    _emit_progress(progress_cb, "analysis_progress", done=done, total=len(deduped_prepared))
 
     _emit_progress(progress_cb, "analysis_done", analyzed=len(analysis_rows), errors=len(analysis_errors))
 
@@ -9277,6 +9017,47 @@ BULK_ANALYSIS_ENABLED = os.getenv("NBA_BULK_ANALYSIS_ENABLED", "1").strip().lowe
 BULK_ANALYSIS_MAX_WORKERS = max(1, int(os.getenv("NBA_BULK_ANALYSIS_MAX_WORKERS", "4")))
 BULK_ANALYSIS_MAX_ROWS = max(1, int(os.getenv("NBA_BULK_ANALYSIS_MAX_ROWS", "100")))
 BULK_PREFETCH_MAX_WORKERS = max(1, int(os.getenv("NBA_BULK_PREFETCH_MAX_WORKERS", "6")))
+SHARED_ANALYSIS_MAX_WORKERS = max(BULK_ANALYSIS_MAX_WORKERS, int(os.getenv("NBA_SHARED_ANALYSIS_MAX_WORKERS", str(BULK_ANALYSIS_MAX_WORKERS))))
+SHARED_NETWORK_MAX_WORKERS = max(4, int(os.getenv("NBA_SHARED_NETWORK_MAX_WORKERS", "8")))
+_SHARED_EXECUTOR_LOCK = Lock()
+_SHARED_ANALYSIS_EXECUTOR: ThreadPoolExecutor | None = None
+_SHARED_NETWORK_EXECUTOR: ThreadPoolExecutor | None = None
+
+
+def _get_shared_analysis_executor() -> ThreadPoolExecutor:
+    global _SHARED_ANALYSIS_EXECUTOR
+    with _SHARED_EXECUTOR_LOCK:
+        if _SHARED_ANALYSIS_EXECUTOR is None:
+            _SHARED_ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=SHARED_ANALYSIS_MAX_WORKERS)
+    return _SHARED_ANALYSIS_EXECUTOR
+
+
+def _get_shared_network_executor() -> ThreadPoolExecutor:
+    global _SHARED_NETWORK_EXECUTOR
+    with _SHARED_EXECUTOR_LOCK:
+        if _SHARED_NETWORK_EXECUTOR is None:
+            _SHARED_NETWORK_EXECUTOR = ThreadPoolExecutor(max_workers=SHARED_NETWORK_MAX_WORKERS)
+    return _SHARED_NETWORK_EXECUTOR
+
+
+def _submit_shared_analysis_task(func, *args, **kwargs):
+    return _get_shared_analysis_executor().submit(func, *args, **kwargs)
+
+
+def _submit_shared_network_task(func, *args, **kwargs):
+    return _get_shared_network_executor().submit(func, *args, **kwargs)
+
+
+def _shutdown_shared_executors() -> None:
+    global _SHARED_ANALYSIS_EXECUTOR, _SHARED_NETWORK_EXECUTOR
+    with _SHARED_EXECUTOR_LOCK:
+        analysis_executor = _SHARED_ANALYSIS_EXECUTOR
+        network_executor = _SHARED_NETWORK_EXECUTOR
+        _SHARED_ANALYSIS_EXECUTOR = None
+        _SHARED_NETWORK_EXECUTOR = None
+    for executor in (analysis_executor, network_executor):
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _cache_is_fresh(entry: dict[str, Any] | None, ttl_seconds: float) -> bool:
