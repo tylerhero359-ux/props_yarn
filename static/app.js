@@ -13,6 +13,13 @@ let networkActivitySeq = 0;
 let networkActivityTicker = null;
 let networkCompletionTimer = null;
 let networkDisplayDelayTimer = null;
+let isGlobalLoadingAnimationActive = false;
+let actionBannerLastPulseKey = '';
+
+const QUIET_GLOBAL_ACTIVITY_PREFIXES = [
+  '/api/odds/check-quota',
+  '/api/key-vault',
+];
 
 function formatElapsedMs(ms) {
   const total = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
@@ -27,6 +34,12 @@ function toApiPath(url) {
   } catch (err) {
     return String(url || '');
   }
+}
+
+function shouldTrackGlobalActivity(path = '') {
+  const normalized = String(path || '');
+  if (!normalized.startsWith('/api/')) return false;
+  return !QUIET_GLOBAL_ACTIVITY_PREFIXES.some(prefix => normalized.startsWith(prefix));
 }
 
 function inferApiActivityLabel(pathname = '', method = 'GET') {
@@ -96,7 +109,7 @@ function refreshNetworkActivityBanner() {
 
 function beginNetworkActivity({ url = '', method = 'GET', label = '', detail = '', force = false } = {}) {
   const path = toApiPath(url);
-  if (!force && !path.startsWith('/api/')) return null;
+  if (!force && !shouldTrackGlobalActivity(path)) return null;
   if (networkCompletionTimer) {
     clearTimeout(networkCompletionTimer);
     networkCompletionTimer = null;
@@ -234,14 +247,14 @@ async function apiFetch(url, opts = {}, timeoutMs = 20000) {
     clearTimeout(timer);
     if (!res.ok) {
       let detail = `Server error ${res.status}`;
-      try { const d = await res.json(); detail = d.detail || d.message || detail; } catch (e) {}
+      try { const d = await res.json(); detail = d.detail || d.message || detail; } catch (e) { }
       throw new Error(detail);
     }
     return await res.json();
   } catch (err) {
     clearTimeout(timer);
     if (err.name === 'AbortError') {
-      throw new Error(`Request timed out after ${timeoutMs / 1000}s -- the NBA API may be slow. Try again.`);
+      throw new Error(`Request timed out after ${timeoutMs / 1000}s -- the server may be slow. Try again.`);
     }
     throw err;
   }
@@ -281,6 +294,9 @@ const actionBannerState = document.getElementById('actionBannerState');
 const actionBannerProgress = document.getElementById('actionBannerProgress');
 const actionBannerProgressFill = document.getElementById('actionBannerProgressFill');
 const actionBannerProgressText = document.getElementById('actionBannerProgressText');
+const actionBannerTrack = actionBanner?.querySelector('.action-banner-track');
+const actionBannerInner = actionBanner?.querySelector('.action-banner-inner');
+const actionBannerSpinnerEl = actionBanner?.querySelector('.action-banner-spinner');
 const avgValue = document.getElementById('avgValue');
 const hitRateValue = document.getElementById('hitRateValue');
 const hitCountValue = document.getElementById('hitCountValue');
@@ -311,6 +327,10 @@ const marketFilterChips = document.getElementById('marketFilterChips');
 const marketExpertFilterChips = document.getElementById('marketExpertFilterChips');
 const marketInjuryAwareTop = document.getElementById('marketInjuryAwareTop');
 const marketInjuryAware = document.getElementById('marketInjuryAware');
+const marketToggleFiltersBtn = document.getElementById('marketToggleFiltersBtn');
+const marketToggleImportBtn = document.getElementById('marketToggleImportBtn');
+const marketFiltersWrap = document.getElementById('marketFiltersWrap');
+const marketImportWrap = document.getElementById('marketImportWrap');
 const marketInspectTray = document.getElementById('marketInspectTray');
 const oddsApiKeyInput = document.getElementById('oddsApiKeyInput');
 const oddsSportSelect = document.getElementById('oddsSportSelect');
@@ -318,8 +338,8 @@ const oddsRegionsInput = document.getElementById('oddsRegionsInput');
 const oddsFormatSelect = document.getElementById('oddsFormatSelect');
 const oddsMarketsInput = document.getElementById('oddsMarketsInput');
 const oddsEventSelect = document.getElementById('oddsEventSelect');
-const oddsSaveKeyBtn    = document.getElementById('oddsSaveKeyBtn');
-const oddsCheckBalBtn   = document.getElementById('oddsCheckBalanceBtn');
+const oddsSaveKeyBtn = document.getElementById('oddsSaveKeyBtn');
+const oddsCheckBalBtn = document.getElementById('oddsCheckBalanceBtn');
 const oddsLoadEventsBtn = document.getElementById('oddsLoadEventsBtn');
 const oddsImportScanBtn = document.getElementById('oddsImportScanBtn');
 const oddsQuotaMeta = document.getElementById('oddsQuotaMeta');
@@ -330,6 +350,7 @@ const workspaceSubtitle = document.getElementById('workspaceSubtitle');
 const workspaceEyebrow = document.getElementById('workspaceEyebrow');
 const navItems = document.querySelectorAll('.nav-item');
 const dashboardViews = document.querySelectorAll('.dashboard-view');
+const analyzerViewEl = document.querySelector('.dashboard-view[data-view="analyzer"]');
 const quickViewButtons = document.querySelectorAll('[data-go-view]');
 const betFinderViewRunBtn = document.getElementById('betFinderViewRunBtn');
 const overviewCurrentCard = document.getElementById('overviewCurrentCard');
@@ -347,6 +368,11 @@ const overviewBoardTabsEl = document.getElementById('overviewBoardTabs');
 const overviewTopCountEl = document.getElementById('overviewTopCount');
 const overviewCautionCountEl = document.getElementById('overviewCautionCount');
 const overviewBoostCountEl = document.getElementById('overviewBoostCount');
+const overviewViewEl = document.querySelector('.dashboard-view[data-view="overview"]');
+const overviewStartCardEl = document.getElementById('overviewStartCard');
+const analyzerStartCardEl = document.getElementById('analyzerStartCard');
+const toggleAnalyzerSetupBtnEl = document.getElementById('toggleAnalyzerSetupBtn');
+const analyzerAdvancedSetupEl = document.getElementById('analyzerAdvancedSetup');
 const interpretationTone = document.getElementById('interpretationTone');
 const interpretationBody = document.getElementById('interpretationBody');
 const opportunityTone = document.getElementById('opportunityTone');
@@ -374,6 +400,42 @@ const CACHE_DEBUG_STORAGE = 'nba-props-cache-debug';
 const LAST_PLAYER_KEY = 'nba-props-last-player';
 const LAST_STAT_KEY = 'nba-props-last-stat';
 let seasonTypeUserOverridden = false;
+let emptyIconObserver = null;
+
+const EMPTY_ICON_SVG_MAP = Object.freeze({
+  trend: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V6"/><path d="M4 20h16"/><path d="M8 16v-4M12 16v-7M16 16v-2"/></svg>',
+  warning: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9 17H3L12 3z"/><path d="M12 9v5M12 17h.01"/></svg>',
+  calendar: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 10h18"/></svg>',
+  shield: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v6c0 4.5-3.2 7.4-7 9-3.8-1.6-7-4.5-7-9V6l7-3z"/></svg>',
+  spark: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V4"/><path d="M4 20h16"/><path d="M8 15l3-3 3 2 6-7"/></svg>',
+});
+
+function getEmptyIconSvg(kind = 'trend') {
+  return EMPTY_ICON_SVG_MAP[kind] || EMPTY_ICON_SVG_MAP.trend;
+}
+
+function hydrateEmptyIcons(root = document) {
+  if (!root?.querySelectorAll) return;
+  root.querySelectorAll('.empty-icon').forEach(icon => {
+    if (icon.querySelector('svg')) return;
+    if ((icon.textContent || '').trim()) return;
+    icon.innerHTML = getEmptyIconSvg('trend');
+  });
+}
+
+function startEmptyIconObserver() {
+  if (emptyIconObserver || !document.body) return;
+  emptyIconObserver = new MutationObserver((records) => {
+    records.forEach(record => {
+      record.addedNodes.forEach(node => {
+        if (!(node instanceof HTMLElement)) return;
+        if (node.matches?.('.empty-icon')) hydrateEmptyIcons(node.parentElement || document);
+        else hydrateEmptyIcons(node);
+      });
+    });
+  });
+  emptyIconObserver.observe(document.body, { childList: true, subtree: true });
+}
 
 function normalizeSeasonTypeValue(raw) {
   const value = String(raw || '').trim().toLowerCase();
@@ -538,12 +600,22 @@ const KEY_VAULT_MIN_ROTATING_KEYS = 5;
 const KEY_VAULT_MIN_USABLE_CREDITS = 1;
 const KEY_VAULT_SOFT_DISABLE_CREDITS = 3;
 const KEY_VAULT_BALANCE_STALE_MS = 5 * 60 * 1000;
+const KEY_VAULT_RELAXED_STALE_MS = 45 * 60 * 1000;
+const KEY_VAULT_WARMUP_TTL_MS = 10 * 60 * 1000;
+const KEY_VAULT_WARMUP_MAX_KEYS = 4;
+const KEY_VAULT_WRITE_DEBOUNCE_MS = 1200;
+const TODAY_GAMES_CONTEXT_CONCURRENCY = 3;
 let cachedEligibleVaultKeys = [];
 let cachedEligibleVaultKeysAt = 0;
 let oddsKeyVaultState = [];
 let oddsKeyVaultActiveId = '';
 let keyVaultBootstrapPromise = null;
 let keyVaultSyncPromise = Promise.resolve();
+let keyVaultWarmupPromise = null;
+let keyVaultWarmupAt = 0;
+let keyVaultPendingSyncPayload = null;
+let keyVaultPendingSyncTimer = null;
+const todayGamesContextInFlightByKey = new Map();
 
 const VIEW_META = {
   overview: {
@@ -588,8 +660,21 @@ const VIEW_META = {
   }
 };
 
+function sanitizeOddsKeyVaultEntries(vault) {
+  if (!Array.isArray(vault)) return [];
+  const dedupedByKey = new Map();
+  vault.forEach(rawEntry => {
+    if (!rawEntry || typeof rawEntry !== 'object') return;
+    const normalizedKey = normalizeOddsApiKeyValue(rawEntry.key || rawEntry.api_key || '');
+    if (!normalizedKey) return;
+    const nextEntry = { ...rawEntry, key: normalizedKey };
+    dedupedByKey.set(normalizedKey, nextEntry);
+  });
+  return Array.from(dedupedByKey.values());
+}
+
 function loadOddsKeyVault(provider = 'odds_api') {
-  const vault = Array.isArray(oddsKeyVaultState) ? oddsKeyVaultState : [];
+  const vault = sanitizeOddsKeyVaultEntries(oddsKeyVaultState);
   return provider ? vault.filter(entry => entry?.provider === provider) : vault.slice();
 }
 
@@ -620,16 +705,19 @@ async function ensureOddsKeyVaultLoaded(force = false) {
         throw new Error('Failed to load Key Vault.');
       }
       const data = await response.json();
-      oddsKeyVaultState = Array.isArray(data.entries) ? data.entries : [];
+      oddsKeyVaultState = sanitizeOddsKeyVaultEntries(data.entries);
       oddsKeyVaultActiveId = String(data.active_id || '');
       if (!oddsKeyVaultState.length) {
         const legacyVault = readLegacyOddsKeyVault();
         if (legacyVault.length) {
           oddsKeyVaultState = legacyVault.slice();
           oddsKeyVaultActiveId = readLegacyOddsKeyVaultActiveId();
-          await saveOddsKeyVault(oddsKeyVaultState, { activeId: oddsKeyVaultActiveId });
+          await saveOddsKeyVault(oddsKeyVaultState, { activeId: oddsKeyVaultActiveId, immediate: true });
         }
       }
+      setTimeout(() => {
+        warmupVaultHealth({ force: false, maxKeys: KEY_VAULT_WARMUP_MAX_KEYS }).catch(() => { });
+      }, 0);
       return oddsKeyVaultState;
     })
     .catch(function (error) {
@@ -641,24 +729,49 @@ async function ensureOddsKeyVaultLoaded(force = false) {
   return keyVaultBootstrapPromise;
 }
 
-function saveOddsKeyVault(vault, { activeId = oddsKeyVaultActiveId } = {}) {
-  oddsKeyVaultState = Array.isArray(vault) ? vault.slice() : [];
-  oddsKeyVaultActiveId = String(activeId || '');
+function flushPendingKeyVaultSync() {
+  if (!keyVaultPendingSyncPayload) return keyVaultSyncPromise;
+  const payload = keyVaultPendingSyncPayload;
+  keyVaultPendingSyncPayload = null;
   keyVaultSyncPromise = keyVaultSyncPromise
     .catch(function () { })
     .then(async function () {
-      const response = await apiFetch('/api/key-vault', {
+      await apiFetch('/api/key-vault', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          entries: oddsKeyVaultState,
-          active_id: oddsKeyVaultActiveId,
-        }),
+        body: JSON.stringify(payload),
       }, 8000);
     })
     .catch(function (error) {
       console.error('Key Vault save failed:', error);
     });
+  return keyVaultSyncPromise;
+}
+
+function scheduleKeyVaultSync(delayMs = KEY_VAULT_WRITE_DEBOUNCE_MS) {
+  if (keyVaultPendingSyncTimer) clearTimeout(keyVaultPendingSyncTimer);
+  keyVaultPendingSyncTimer = setTimeout(() => {
+    keyVaultPendingSyncTimer = null;
+    flushPendingKeyVaultSync();
+  }, Math.max(0, Number(delayMs) || 0));
+}
+
+function saveOddsKeyVault(vault, { activeId = oddsKeyVaultActiveId, mode = 'merge', immediate = false } = {}) {
+  oddsKeyVaultState = sanitizeOddsKeyVaultEntries(vault);
+  oddsKeyVaultActiveId = String(activeId || '');
+  keyVaultPendingSyncPayload = {
+    entries: oddsKeyVaultState,
+    active_id: oddsKeyVaultActiveId,
+    mode: mode,
+  };
+  if (immediate) {
+    if (keyVaultPendingSyncTimer) {
+      clearTimeout(keyVaultPendingSyncTimer);
+      keyVaultPendingSyncTimer = null;
+    }
+    return flushPendingKeyVaultSync();
+  }
+  scheduleKeyVaultSync();
   return keyVaultSyncPromise;
 }
 
@@ -674,13 +787,61 @@ function deleteOddsKeyVaultEntry(entryId) {
   const vault = loadOddsKeyVault(null).filter(entry => entry.id !== entryId);
   const nextActiveId = oddsKeyVaultActiveId === entryId ? '' : oddsKeyVaultActiveId;
   invalidateEligibleVaultKeyCache();
-  return saveOddsKeyVault(vault, { activeId: nextActiveId });
+  return saveOddsKeyVault(vault, { activeId: nextActiveId, mode: 'replace' });
 }
 
 function maskVaultKey(key) {
   const raw = String(key || '');
   if (raw.length < 8) return '';
   return raw.slice(0, 4) + '' + raw.slice(-4);
+}
+
+function normalizeOddsApiKeyValue(value) {
+  let raw = String(value || '').trim();
+  if (!raw) return '';
+  raw = raw.replace(/^[,;]+|[,;]+$/g, '').trim();
+  if (/^bearer\s+/i.test(raw)) raw = raw.replace(/^bearer\s+/i, '').trim();
+
+  const assignmentMatch = raw.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_-]*)\s*[:=]\s*(.+)$/);
+  if (assignmentMatch && /key/i.test(assignmentMatch[1] || '')) {
+    raw = String(assignmentMatch[2] || '').trim();
+  }
+
+  const queryMatch = raw.match(/(?:^|[?&,\s;])(api[_-]?key|apikey)\s*=\s*([^&#,\s;]+)/i);
+  if (queryMatch && queryMatch[2]) {
+    raw = queryMatch[2].trim();
+  }
+
+  while (raw.length >= 2 && raw[0] === raw[raw.length - 1] && /['"`]/.test(raw[0])) {
+    raw = raw.slice(1, -1).trim();
+  }
+  return raw.replace(/^[,;]+|[,;]+$/g, '').trim();
+}
+
+function extractOddsApiKeysFromInput(rawInput) {
+  const raw = String(rawInput || '');
+  if (!raw.trim()) return [];
+
+  const candidates = raw
+    .split(/\r?\n|,/)
+    .map(part => part.trim())
+    .filter(Boolean);
+  if (!candidates.length) return [];
+
+  const normalized = [];
+  candidates.forEach(candidate => {
+    if (/\s/.test(candidate) && !/[=:]/.test(candidate)) {
+      candidate
+        .split(/\s+/)
+        .map(part => part.trim())
+        .filter(Boolean)
+        .forEach(part => normalized.push(normalizeOddsApiKeyValue(part)));
+      return;
+    }
+    normalized.push(normalizeOddsApiKeyValue(candidate));
+  });
+
+  return [...new Set(normalized.filter(Boolean))];
 }
 
 function shuffleArray(items) {
@@ -741,6 +902,51 @@ function getCachedEligibleVaultKeys({ provider = 'odds_api', requiredCredits = 1
   );
 }
 
+function getKnownUsableVaultKeys({ provider = 'odds_api', requiredCredits = 1, maxAgeMs = KEY_VAULT_BALANCE_STALE_MS } = {}) {
+  const now = Date.now();
+  return loadOddsKeyVault(provider).filter(entry => {
+    if (!entry?.key) return false;
+    const checkedAt = entry?.last_checked_at ? Date.parse(entry.last_checked_at) : 0;
+    if (!checkedAt || (now - checkedAt) > maxAgeMs) return false;
+    const health = getVaultHealth(entry, { requiredCredits });
+    return health.usable;
+  });
+}
+
+async function warmupVaultHealth({ force = false, maxKeys = KEY_VAULT_WARMUP_MAX_KEYS } = {}) {
+  const now = Date.now();
+  if (!force && keyVaultWarmupPromise) return keyVaultWarmupPromise;
+  if (!force && keyVaultWarmupAt && (now - keyVaultWarmupAt) < KEY_VAULT_WARMUP_TTL_MS) {
+    return Promise.resolve(loadOddsKeyVault('odds_api'));
+  }
+
+  keyVaultWarmupPromise = (async () => {
+    await ensureOddsKeyVaultLoaded();
+    const allKeys = loadOddsKeyVault('odds_api');
+    if (!allKeys.length) return [];
+    const prioritized = allKeys
+      .slice()
+      .sort((a, b) => (Date.parse(a?.last_checked_at || 0) || 0) - (Date.parse(b?.last_checked_at || 0) || 0))
+      .slice(0, Math.max(1, Number(maxKeys) || KEY_VAULT_WARMUP_MAX_KEYS));
+
+    for (const entry of prioritized) {
+      try {
+        await refreshOddsVaultEntryCredits(entry, { force: false });
+      } catch (error) {
+        console.warn('Vault warmup credit check failed for', entry?.label || entry?.id || 'key', error?.message || error);
+      }
+    }
+    keyVaultWarmupAt = Date.now();
+    return loadOddsKeyVault('odds_api');
+  })();
+
+  try {
+    return await keyVaultWarmupPromise;
+  } finally {
+    keyVaultWarmupPromise = null;
+  }
+}
+
 function primeEligibleVaultKeyCache(entries) {
   cachedEligibleVaultKeys = Array.isArray(entries) ? entries.slice() : [];
   cachedEligibleVaultKeysAt = cachedEligibleVaultKeys.length ? Date.now() : 0;
@@ -748,7 +954,8 @@ function primeEligibleVaultKeyCache(entries) {
 
 async function refreshOddsVaultEntryCredits(entry, { force = false, onLowCredits } = {}) {
   await ensureOddsKeyVaultLoaded();
-  if (!entry?.key) return null;
+  const normalizedKey = normalizeOddsApiKeyValue(entry?.key);
+  if (!normalizedKey) return null;
   const checkedAt = entry.last_checked_at ? Date.parse(entry.last_checked_at) : 0;
   const hasFreshBalance = parseVaultRemaining(entry.remaining) !== null && checkedAt && ((Date.now() - checkedAt) < KEY_VAULT_BALANCE_STALE_MS);
   if (!force && hasFreshBalance) return entry;
@@ -756,7 +963,7 @@ async function refreshOddsVaultEntryCredits(entry, { force = false, onLowCredits
   const data = await apiFetch('/api/odds/check-quota', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ api_key: entry.key })
+    body: JSON.stringify({ api_key: normalizedKey })
   }, 10000);
   if (!data?.ok || !data?.quota) {
     throw new Error(data?.error || 'Credits check failed.');
@@ -764,11 +971,12 @@ async function refreshOddsVaultEntryCredits(entry, { force = false, onLowCredits
   const remaining = parseVaultRemaining(data.quota?.remaining);
 
   const next = updateOddsKeyVaultEntry(entry.id, {
+    key: normalizedKey,
     remaining: remaining,
     used: data.quota?.used ?? null,
     last_cost: data.quota?.last ?? null,
     last_checked_at: new Date().toISOString(),
-    api_key_masked: data.api_key_masked || maskVaultKey(entry.key),
+    api_key_masked: data.api_key_masked || maskVaultKey(normalizedKey),
     soft_disabled: remaining !== null ? remaining < KEY_VAULT_SOFT_DISABLE_CREDITS : false,
   });
 
@@ -875,22 +1083,40 @@ async function getRotatingVaultKeysForFeature({
   sourceLabel = 'this feature',
 } = {}) {
   await ensureOddsKeyVaultLoaded();
-  const cachedPool = getCachedEligibleVaultKeys({ provider, requiredCredits });
-  if (cachedPool.length >= minimumKeys) {
-    const eligible = shuffleArray(cachedPool).slice(0, Math.max(minimumKeys, cachedPool.length));
+  const minRequired = Math.max(1, Number(minimumKeys) || 1);
+
+  const freshCached = shuffleArray(getCachedEligibleVaultKeys({ provider, requiredCredits }));
+  if (freshCached.length >= minRequired) {
+    const eligible = freshCached.slice(0, minRequired);
+    const first = markVaultKeyUsed(eligible[0], sourceLabel);
+    if (first?.key) syncVaultKeyIntoOddsInputs(first.key);
+    return eligible;
+  }
+
+  const relaxedKnown = shuffleArray(getKnownUsableVaultKeys({
+    provider,
+    requiredCredits,
+    maxAgeMs: KEY_VAULT_RELAXED_STALE_MS,
+  }));
+  if (relaxedKnown.length >= minRequired) {
+    primeEligibleVaultKeyCache(relaxedKnown);
+    warmupVaultHealth({ force: false, maxKeys: KEY_VAULT_WARMUP_MAX_KEYS }).catch(() => { });
+    const eligible = relaxedKnown.slice(0, minRequired);
     const first = markVaultKeyUsed(eligible[0], sourceLabel);
     if (first?.key) syncVaultKeyIntoOddsInputs(first.key);
     return eligible;
   }
 
   const vault = loadOddsKeyVault(provider);
-  if (vault.length < minimumKeys) {
-    throw new Error(`Add at least ${minimumKeys} Odds API keys to Key Vault before using ${sourceLabel}.`);
+  if (vault.length < minRequired) {
+    throw new Error(`Add at least ${minRequired} Odds API keys to Key Vault before using ${sourceLabel}.`);
   }
+
   const shuffled = shuffleArray(vault);
-  const healthyEligible = [];
-  const fallbackEligible = [];
-  for (const candidate of shuffled) {
+  const quickScanCandidates = shuffled.slice(0, Math.max(minRequired * 2, KEY_VAULT_WARMUP_MAX_KEYS));
+  const validated = [];
+  const softValidated = [];
+  for (const candidate of quickScanCandidates) {
     try {
       const refreshed = await refreshOddsVaultEntryCredits(candidate, {
         force: false,
@@ -898,23 +1124,989 @@ async function getRotatingVaultKeysForFeature({
       });
       const health = getVaultHealth(refreshed, { requiredCredits });
       if (health.usable) {
-        if (health.softDisabled) fallbackEligible.push(refreshed);
-        else healthyEligible.push(refreshed);
+        if (health.softDisabled) softValidated.push(refreshed);
+        else validated.push(refreshed);
       }
+      if ((validated.length + softValidated.length) >= minRequired) break;
     } catch (error) {
-      console.warn('Key credit check failed for', candidate.label, error);
+      console.warn('Key credit check failed for', candidate?.label || candidate?.id || 'key', error?.message || error);
     }
   }
-  const eligible = healthyEligible.length >= minimumKeys
-    ? healthyEligible
-    : healthyEligible.concat(fallbackEligible);
-  if (eligible.length < minimumKeys) {
-    throw new Error(`Only ${eligible.length} usable Odds API key${eligible.length === 1 ? '' : 's'} found. ${sourceLabel} requires at least ${minimumKeys}.`);
+
+  const eligible = validated.length >= minRequired
+    ? validated
+    : validated.concat(softValidated);
+  if (eligible.length < minRequired) {
+    warmupVaultHealth({ force: true, maxKeys: Math.max(KEY_VAULT_WARMUP_MAX_KEYS, minRequired * 2) }).catch(() => { });
+    throw new Error(`Only ${eligible.length} usable Odds API key${eligible.length === 1 ? '' : 's'} found. ${sourceLabel} requires at least ${minRequired}.`);
   }
+
   primeEligibleVaultKeyCache(eligible);
-  const first = markVaultKeyUsed(eligible[0], sourceLabel);
+  warmupVaultHealth({ force: false, maxKeys: KEY_VAULT_WARMUP_MAX_KEYS }).catch(() => { });
+  const selection = shuffleArray(eligible).slice(0, minRequired);
+  const first = markVaultKeyUsed(selection[0], sourceLabel);
   if (first?.key) syncVaultKeyIntoOddsInputs(first.key);
-  return eligible;
+  return selection;
+}
+
+function getAnimeRuntime() {
+  const runtime = window.anime;
+  if (!runtime || typeof runtime.animate !== 'function') return null;
+  return runtime;
+}
+
+function shouldReduceMotion() {
+  // Product preference: always animate.
+  return false;
+}
+
+function systemPrefersReducedMotion() {
+  try {
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  } catch {
+    return false;
+  }
+}
+
+const MOTION_PRESETS = {
+  viewInitial: { duration: 760, distance: 34, staggerMs: 56, maxItems: 18, scaleFrom: 0.952, ease: 'out(4)' },
+  viewSwitch: { duration: 520, distance: 22, staggerMs: 34, maxItems: 14, scaleFrom: 0.972, ease: 'out(4)' },
+  resultPrimary: { duration: 420, distance: 18, staggerMs: 26, maxItems: 8, scaleFrom: 0.974, ease: 'out(4)' },
+  resultSecondary: { duration: 320, distance: 14, staggerMs: 20, maxItems: 10, scaleFrom: 0.984, ease: 'out(3)' },
+  toastIn: { duration: 320, distance: 26, scaleFrom: 0.94, ease: 'out(4)' },
+  toastOut: { duration: 240, distance: 20, ease: 'in(3)' },
+  bannerPulse: { duration: 320, distance: 12, ease: 'out(4)' },
+  number: { duration: 760, ease: 'out(4)' },
+  orbDrift: { durationA: 7600, durationB: 9200, distance: 30, rotate: 6 },
+  themePulse: { duration: 440, distance: 10, scaleFrom: 0.975, ease: 'out(4)' },
+  navActive: { duration: 320, distance: 12, scaleFrom: 0.96, ease: 'out(4)' },
+};
+const BASE_MOTION_PRESETS = JSON.parse(JSON.stringify(MOTION_PRESETS));
+let currentMotionProfile = 'desktop';
+let motionProfileResizeTimer = null;
+
+const SPRING_INTERACTIVE_SELECTOR = [
+  '.nav-item',
+  '.primary-btn',
+  '.secondary-btn',
+  '.ghost-btn',
+  '.theme-toggle',
+  '.prop-chip',
+  '.filter-chip',
+  '.market-filter-chip',
+  '.overview-board-tab',
+  '.player-card',
+  '.mini-player-card',
+  '.finder-card',
+  '.market-slip-card',
+  '.parlay-leg-card',
+  '.today-game-card',
+].join(', ');
+
+let interactiveSpringBound = false;
+const splitTextState = new WeakMap();
+let scrollRevealMutationObserver = null;
+let actionBannerMotionPathSvg = null;
+let actionBannerMotionPath = null;
+let actionBannerMotionDot = null;
+
+const SCROLL_REVEAL_SELECTOR = [
+  '.market-row',
+  '.market-slip-card',
+  '.tracker-card',
+  '#backtestLog tbody tr',
+  '#backtestLog .backtest-group',
+  '#backtestLog .backtest-group-table',
+  '.history-row',
+].join(', ');
+
+const SVG_DRAW_SELECTOR = [
+  '.nav-icon-svg svg path',
+  '.nav-icon-svg svg line',
+  '.nav-icon-svg svg polyline',
+  '.nav-icon-svg svg rect',
+  '.empty-state-panel svg path',
+  '.empty-state-panel svg line',
+  '.empty-state-panel svg polyline',
+  '.empty-state-panel svg rect',
+].join(', ');
+
+function applyMotionProfile(profile = 'desktop') {
+  currentMotionProfile = profile;
+  Object.keys(BASE_MOTION_PRESETS).forEach((key) => {
+    MOTION_PRESETS[key] = { ...BASE_MOTION_PRESETS[key] };
+  });
+
+  if (profile === 'mobile') {
+    Object.values(MOTION_PRESETS).forEach((preset) => {
+      if (!preset || typeof preset !== 'object') return;
+      if (Number.isFinite(preset.duration)) preset.duration = Math.max(180, Math.round(preset.duration * 0.82));
+      if (Number.isFinite(preset.distance)) preset.distance = Math.max(6, Math.round(preset.distance * 0.78));
+      if (Number.isFinite(preset.staggerMs)) preset.staggerMs = Math.max(10, Math.round(preset.staggerMs * 0.72));
+      if (Number.isFinite(preset.maxItems)) preset.maxItems = Math.max(6, Math.round(preset.maxItems * 0.8));
+    });
+  } else if (profile === 'tablet') {
+    Object.values(MOTION_PRESETS).forEach((preset) => {
+      if (!preset || typeof preset !== 'object') return;
+      if (Number.isFinite(preset.duration)) preset.duration = Math.max(190, Math.round(preset.duration * 0.9));
+      if (Number.isFinite(preset.staggerMs)) preset.staggerMs = Math.max(12, Math.round(preset.staggerMs * 0.86));
+    });
+  }
+}
+
+function resolveMotionProfileFromViewport() {
+  if (window.matchMedia('(max-width: 767px)').matches) return 'mobile';
+  if (window.matchMedia('(max-width: 1100px)').matches) return 'tablet';
+  return 'desktop';
+}
+
+function tuneAnimeEngine() {
+  const runtime = getAnimeRuntime();
+  const engine = runtime?.engine;
+  if (!engine) return;
+  try {
+    engine.fps = currentMotionProfile === 'mobile' ? 50 : currentMotionProfile === 'tablet' ? 54 : 58;
+    engine.precision = currentMotionProfile === 'mobile' ? 0.01 : 0.001;
+    engine.pauseOnDocumentHidden = true;
+  } catch { }
+}
+
+function initMotionScopeProfile() {
+  const runtime = getAnimeRuntime();
+  let profile = resolveMotionProfileFromViewport();
+
+  if (runtime && typeof runtime.createScope === 'function') {
+    try {
+      const scope = runtime.createScope({
+        mediaQueries: {
+          mobile: '(max-width: 767px)',
+          tablet: '(max-width: 1100px)',
+        }
+      });
+      const matches = scope?.matches || {};
+      if (matches.mobile) profile = 'mobile';
+      else if (matches.tablet) profile = 'tablet';
+    } catch { }
+  }
+
+  applyMotionProfile(profile);
+  tuneAnimeEngine();
+
+  window.addEventListener('resize', () => {
+    if (motionProfileResizeTimer) clearTimeout(motionProfileResizeTimer);
+    motionProfileResizeTimer = window.setTimeout(() => {
+      const next = resolveMotionProfileFromViewport();
+      if (next !== currentMotionProfile) {
+        applyMotionProfile(next);
+      }
+      tuneAnimeEngine();
+    }, 180);
+  });
+}
+
+function resolveStaggerDelay(runtime, nodes, staggerMs, staggerConfig = null) {
+  if (!runtime || !nodes?.length) return (_, i) => i * staggerMs;
+  if (typeof staggerConfig === 'function') return staggerConfig(nodes);
+  if (typeof runtime.stagger !== 'function') return (_, i) => i * staggerMs;
+  if (!staggerConfig || typeof staggerConfig !== 'object') return runtime.stagger(staggerMs);
+  try {
+    return runtime.stagger(staggerMs, staggerConfig);
+  } catch {
+    return runtime.stagger(staggerMs);
+  }
+}
+
+function animateElementsIn(targets, {
+  duration = MOTION_PRESETS.viewSwitch.duration,
+  distance = MOTION_PRESETS.viewSwitch.distance,
+  staggerMs = MOTION_PRESETS.viewSwitch.staggerMs,
+  staggerConfig = null,
+  maxItems = MOTION_PRESETS.viewSwitch.maxItems,
+  scaleFrom = MOTION_PRESETS.viewSwitch.scaleFrom,
+  ease = MOTION_PRESETS.viewSwitch.ease,
+} = {}) {
+  const runtime = getAnimeRuntime();
+  if (!runtime || shouldReduceMotion()) return;
+  const nodes = Array.from(targets || []).filter(Boolean).slice(0, maxItems);
+  if (!nodes.length) return;
+  if (typeof runtime.remove === 'function') runtime.remove(nodes);
+  const delay = resolveStaggerDelay(runtime, nodes, staggerMs, staggerConfig);
+  runtime.animate(nodes, {
+    opacity: [0, 1],
+    translateY: [distance, 0],
+    scale: [scaleFrom, 1],
+    duration,
+    delay,
+    ease,
+  });
+}
+
+function getSpringEase(config = {}, fallback = 'out(3)') {
+  const runtime = getAnimeRuntime();
+  if (!runtime) return fallback;
+  const springFn = runtime.spring;
+  if (typeof springFn !== 'function') return fallback;
+  try {
+    return springFn(config);
+  } catch {
+    return fallback;
+  }
+}
+
+function getViewChoreographyTargets(viewEl) {
+  if (!viewEl) return { shellNodes: [], primaryNodes: [], secondaryNodes: [] };
+  const shellNodes = Array.from(viewEl.querySelectorAll('.workspace-header, .tool-intro-card, .controls-panel')).filter(Boolean);
+  const directCards = Array.from(viewEl.querySelectorAll(':scope > .ds-card, :scope > .card, :scope > .empty-state-panel'));
+  const allCards = Array.from(viewEl.querySelectorAll('.ds-card, .card, .empty-state-panel'));
+
+  const shellSet = new Set(shellNodes);
+  const primarySet = new Set(directCards.filter(node => !shellSet.has(node)));
+  const secondaryNodes = allCards.filter(node => !shellSet.has(node) && !primarySet.has(node));
+
+  return {
+    shellNodes,
+    primaryNodes: Array.from(primarySet),
+    secondaryNodes,
+  };
+}
+
+function runViewTimelineChoreography(viewEl, preset) {
+  const runtime = getAnimeRuntime();
+  if (!runtime || shouldReduceMotion() || typeof runtime.createTimeline !== 'function') return false;
+
+  const { shellNodes, primaryNodes, secondaryNodes } = getViewChoreographyTargets(viewEl);
+  const stage1 = shellNodes.slice(0, 4);
+  const stage2 = primaryNodes.slice(0, Math.max(4, Math.floor(preset.maxItems * 0.5)));
+  const stage3 = secondaryNodes.slice(0, preset.maxItems);
+  const allNodes = [...stage1, ...stage2, ...stage3];
+  if (!allNodes.length) return false;
+
+  if (typeof runtime.remove === 'function') runtime.remove(allNodes);
+
+  const tl = runtime.createTimeline({
+    defaults: {
+      ease: preset.ease,
+    },
+  });
+
+  if (stage1.length) {
+    tl.add(stage1, {
+      opacity: [0, 1],
+      translateY: [Math.max(8, preset.distance * 0.8), 0],
+      duration: Math.max(260, Math.round(preset.duration * 0.72)),
+      delay: typeof runtime.stagger === 'function' ? runtime.stagger(Math.max(14, Math.round(preset.staggerMs * 0.5))) : 0,
+    }, 0);
+  }
+
+  if (stage2.length) {
+    tl.add(stage2, {
+      opacity: [0, 1],
+      translateY: [preset.distance, 0],
+      duration: preset.duration,
+      delay: typeof runtime.stagger === 'function' ? runtime.stagger(preset.staggerMs) : 0,
+    }, '+=40');
+  }
+
+  if (stage3.length) {
+    tl.add(stage3, {
+      opacity: [0, 1],
+      translateY: [Math.max(6, Math.round(preset.distance * 0.7)), 0],
+      duration: Math.max(220, Math.round(preset.duration * 0.82)),
+      delay: typeof runtime.stagger === 'function' ? runtime.stagger(Math.max(10, Math.round(preset.staggerMs * 0.65))) : 0,
+    }, '+=60');
+  }
+
+  return true;
+}
+
+function animateActiveView(view, { initial = false } = {}) {
+  const viewEl = document.querySelector(`.dashboard-view[data-view="${view}"]`);
+  if (!viewEl || !viewEl.classList.contains('active')) return;
+  const basePreset = initial ? MOTION_PRESETS.viewInitial : MOTION_PRESETS.viewSwitch;
+  const preset = { ...basePreset, scaleFrom: 1 };
+  const ranTimeline = runViewTimelineChoreography(viewEl, preset);
+  if (ranTimeline) return;
+
+  const shell = viewEl.querySelectorAll('.workspace-header, .tool-intro-card, .controls-panel');
+  const cards = viewEl.querySelectorAll('.ds-card, .card, .empty-state-panel');
+  animateElementsIn(shell, {
+    duration: Math.max(220, Math.round(preset.duration * 0.86)),
+    distance: Math.max(6, preset.distance - 4),
+    staggerMs: Math.max(12, Math.round(preset.staggerMs * 0.6)),
+    maxItems: 4,
+    scaleFrom: preset.scaleFrom,
+    ease: preset.ease,
+  });
+  animateElementsIn(cards, preset);
+}
+
+function animateResultContainer(container, mode = 'default') {
+  if (!container) return;
+  const primarySelectors = {
+    market: '.market-slip-card, .market-results-shell .market-row, .market-table tbody tr, .empty-state-panel',
+    betfinder: '.finder-card, .bet-finder-result-card, .bet-finder-state, .empty-state-panel',
+    analyzer: '.analyzer-decision-strip, .insight-card, .recommendation-card, .empty-state-panel',
+    default: '.card, .ds-card, .empty-state-panel'
+  };
+  const primary = container.querySelectorAll(primarySelectors[mode] || primarySelectors.default);
+  const secondary = container.querySelectorAll('.market-slip-card .market-micro-pill, .finder-chip, tr, li');
+  const primaryNodes = Array.from(primary || []);
+  const secondaryNodes = Array.from(secondary || []);
+  const marketGridCols = Math.max(1, Math.min(4, Math.round(Math.sqrt(primaryNodes.length || 1))));
+  const marketGridRows = Math.max(1, Math.ceil((primaryNodes.length || 1) / marketGridCols));
+
+  const primaryStaggerConfig = mode === 'market'
+    ? { from: 'center', grid: [marketGridCols, marketGridRows], ease: 'out(3)', use: 'x' }
+    : mode === 'betfinder'
+      ? { from: 'first', ease: 'out(3)' }
+      : { from: 'center', ease: 'out(2)' };
+
+  const secondaryStaggerConfig = mode === 'market'
+    ? { from: 'random', ease: 'out(2)' }
+    : mode === 'betfinder'
+      ? { from: 'center', ease: 'out(2)' }
+      : { from: 'last', ease: 'out(2)' };
+
+  animateElementsIn(primaryNodes, { ...MOTION_PRESETS.resultPrimary, staggerConfig: primaryStaggerConfig });
+  animateElementsIn(secondaryNodes, { ...MOTION_PRESETS.resultSecondary, staggerConfig: secondaryStaggerConfig });
+}
+
+function animateActiveNavItem(view) {
+  const runtime = getAnimeRuntime();
+  if (!runtime || shouldReduceMotion()) return;
+  const activeItem = Array.from(navItems || []).find(item => item?.dataset?.view === view);
+  if (!activeItem) return;
+  if (typeof runtime.remove === 'function') runtime.remove(activeItem);
+  runtime.animate(activeItem, {
+    opacity: [0.92, 1],
+    translateX: [MOTION_PRESETS.navActive.distance, 0],
+    scale: [MOTION_PRESETS.navActive.scaleFrom, 1],
+    duration: MOTION_PRESETS.navActive.duration,
+    ease: getSpringEase({ bounce: 0.32, duration: 380 }, MOTION_PRESETS.navActive.ease),
+  });
+}
+
+function animateInteractiveSpringTap(target) {
+  const runtime = getAnimeRuntime();
+  if (!runtime || shouldReduceMotion() || !target) return;
+  if (target.disabled || target.getAttribute('aria-disabled') === 'true') return;
+  if (typeof runtime.remove === 'function') runtime.remove(target);
+  runtime.animate(target, {
+    scale: [1, 0.95, 1],
+    duration: 420,
+    ease: getSpringEase({ bounce: 0.34, duration: 420 }, 'out(3)'),
+  });
+}
+
+function bindInteractiveSpringMotion() {
+  if (interactiveSpringBound) return;
+  interactiveSpringBound = true;
+
+  document.addEventListener('click', (event) => {
+    const target = event.target?.closest?.(SPRING_INTERACTIVE_SELECTOR);
+    if (!target) return;
+    animateInteractiveSpringTap(target);
+  });
+}
+
+function cleanupSplitText(element) {
+  if (!element) return;
+  const split = splitTextState.get(element);
+  if (!split) return;
+  try {
+    if (typeof split.revert === 'function') split.revert();
+  } catch { }
+  splitTextState.delete(element);
+}
+
+function animateWorkspaceHeadingText() {
+  const runtime = getAnimeRuntime();
+  if (!runtime || shouldReduceMotion()) return;
+  const titleEl = workspaceTitle;
+  const subtitleEl = workspaceSubtitle;
+  if (!titleEl && !subtitleEl) return;
+
+  if (typeof runtime.splitText !== 'function') {
+    const fallbackTargets = [titleEl, subtitleEl].filter(Boolean);
+    if (!fallbackTargets.length) return;
+    animateElementsIn(fallbackTargets, {
+      duration: 360,
+      distance: 14,
+      staggerMs: 30,
+      maxItems: 2,
+      scaleFrom: 1,
+      ease: 'out(3)',
+    });
+    return;
+  }
+
+  const animateSplit = (el, { lineOffset = 100, staggerMs = 22, duration = 520 } = {}) => {
+    if (!el) return;
+    cleanupSplitText(el);
+    let split;
+    try {
+      split = runtime.splitText(el, {
+        words: { wrap: 'clip' },
+      });
+    } catch {
+      return;
+    }
+    if (!split) return;
+    splitTextState.set(el, split);
+    const words = Array.isArray(split.words) ? split.words : [];
+    if (!words.length) return;
+    if (typeof runtime.remove === 'function') runtime.remove(words);
+    runtime.animate(words, {
+      opacity: [0, 1],
+      translateY: [`${lineOffset}%`, '0%'],
+      duration,
+      delay: typeof runtime.stagger === 'function' ? runtime.stagger(staggerMs) : 0,
+      ease: 'out(3)',
+      onComplete: () => cleanupSplitText(el),
+    });
+  };
+
+  animateSplit(titleEl, { lineOffset: 110, staggerMs: 26, duration: 560 });
+  animateSplit(subtitleEl, { lineOffset: 90, staggerMs: 14, duration: 460 });
+}
+
+function isElementNearViewport(el, ratio = 0.92) {
+  if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+  const rect = el.getBoundingClientRect();
+  const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+  return rect.top < vh * ratio && rect.bottom > 0;
+}
+
+function markRevealReady(el) {
+  if (!el) return;
+  el.style.opacity = '0';
+  el.style.transform = 'translateY(22px)';
+}
+
+function clearRevealStyles(el) {
+  if (!el) return;
+  el.style.opacity = '';
+  el.style.transform = '';
+}
+
+function animateRevealNow(el) {
+  const runtime = getAnimeRuntime();
+  if (!runtime || !el) return;
+  if (typeof runtime.remove === 'function') runtime.remove(el);
+  runtime.animate(el, {
+    opacity: [0, 1],
+    translateY: [22, 0],
+    duration: 520,
+    ease: 'out(3)',
+    onComplete: () => {
+      clearRevealStyles(el);
+      el.dataset.scrollRevealDone = '1';
+    },
+  });
+}
+
+function bindScrollRevealTarget(el) {
+  const runtime = getAnimeRuntime();
+  if (!runtime || !el) return;
+  if (el.dataset.scrollRevealBound === '1') return;
+  el.dataset.scrollRevealBound = '1';
+
+  if (isElementNearViewport(el)) {
+    animateRevealNow(el);
+    return;
+  }
+
+  markRevealReady(el);
+
+  if (typeof runtime.onScroll === 'function') {
+    runtime.animate(el, {
+      opacity: [0, 1],
+      translateY: [22, 0],
+      duration: 560,
+      ease: 'out(3)',
+      autoplay: runtime.onScroll({ target: el }),
+      onComplete: () => {
+        clearRevealStyles(el);
+        el.dataset.scrollRevealDone = '1';
+      },
+    });
+    return;
+  }
+
+  const io = new IntersectionObserver((entries) => {
+    const entry = entries[0];
+    if (!entry?.isIntersecting) return;
+    io.disconnect();
+    animateRevealNow(el);
+  }, { threshold: 0.12, rootMargin: '0px 0px -5% 0px' });
+  io.observe(el);
+}
+
+function collectRevealTargets(scope = document) {
+  const targets = [];
+  if (!scope) return targets;
+  if (scope.matches && scope.matches(SCROLL_REVEAL_SELECTOR)) targets.push(scope);
+  if (scope.querySelectorAll) {
+    targets.push(...scope.querySelectorAll(SCROLL_REVEAL_SELECTOR));
+  }
+  return Array.from(new Set(targets));
+}
+
+function registerScrollReveals(scope = document) {
+  const runtime = getAnimeRuntime();
+  if (!runtime || shouldReduceMotion()) return;
+  collectRevealTargets(scope).forEach(bindScrollRevealTarget);
+}
+
+function startScrollRevealWatcher() {
+  if (scrollRevealMutationObserver) return;
+  const containers = [
+    marketResults,
+    document.getElementById('trackerCards'),
+    document.getElementById('backtestLog'),
+    document.getElementById('historyList')
+  ].filter(Boolean);
+  if (!containers.length) return;
+  scrollRevealMutationObserver = new MutationObserver((records) => {
+    records.forEach((record) => {
+      record.addedNodes.forEach((node) => {
+        if (!(node instanceof HTMLElement)) return;
+        registerScrollReveals(node);
+      });
+    });
+  });
+  containers.forEach((container) => {
+    scrollRevealMutationObserver.observe(container, { childList: true, subtree: true });
+  });
+}
+
+function animateSvgLineDraw(scope = document) {
+  const runtime = getAnimeRuntime();
+  if (!runtime || shouldReduceMotion()) return;
+  if (!runtime.svg || typeof runtime.svg.createDrawable !== 'function') return;
+
+  const root = scope && scope.querySelectorAll ? scope : document;
+  const svgNodes = Array.from(root.querySelectorAll(SVG_DRAW_SELECTOR))
+    .filter((node) => node instanceof SVGElement && node.dataset.svgDrawn !== '1')
+    .slice(0, 64);
+  if (!svgNodes.length) return;
+
+  const drawables = [];
+  svgNodes.forEach((node) => {
+    try {
+      const list = runtime.svg.createDrawable(node);
+      if (Array.isArray(list) && list.length) {
+        drawables.push(...list);
+        node.dataset.svgDrawn = '1';
+      }
+    } catch { }
+  });
+  if (!drawables.length) return;
+  runtime.animate(drawables, {
+    draw: ['0 0', '0 1'],
+    duration: 780,
+    delay: typeof runtime.stagger === 'function' ? runtime.stagger(24) : 0,
+    ease: 'inOut(2)',
+  });
+}
+
+function buildIntroOverlay(name = 'Patricio\'s') {
+  let overlay = document.getElementById('appIntroOverlay');
+  if (overlay) return overlay;
+
+  const safeName = String(name || 'Patricio\'s').trim() || 'Patricio\'s';
+
+  overlay = document.createElement('div');
+  overlay.id = 'appIntroOverlay';
+  overlay.className = 'app-intro-overlay';
+  overlay.setAttribute('aria-hidden', 'true');
+  overlay.innerHTML = `
+    <div class="app-intro-stage">
+      <svg class="app-intro-signature" viewBox="0 0 900 220" role="img" aria-label="${escapeHtml(safeName)} signature intro">
+        <text class="app-intro-signature-text" x="50%" y="55%">${escapeHtml(safeName)}</text>
+      </svg>
+      <p class="app-intro-tag">NBA Props Tracker</p>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  return overlay;
+}
+
+function runIntroEntrance({ name = 'Patricio\'s' } = {}) {
+  if (window.__introPlayedOnce) return Promise.resolve();
+  window.__introPlayedOnce = true;
+
+  const overlay = buildIntroOverlay(name);
+  if (!overlay) return Promise.resolve();
+
+  const stage = overlay.querySelector('.app-intro-stage');
+  const signature = overlay.querySelector('.app-intro-signature');
+  const tag = overlay.querySelector('.app-intro-tag');
+  const runtime = getAnimeRuntime();
+
+  document.body.classList.add('intro-active');
+  overlay.classList.add('is-visible');
+
+  const cleanup = () => {
+    overlay.classList.remove('is-visible');
+    overlay.classList.add('is-leaving');
+    window.setTimeout(() => {
+      overlay.remove();
+      document.body.classList.remove('intro-active');
+    }, 420);
+  };
+
+  if (!runtime) {
+    return new Promise((resolve) => {
+      window.setTimeout(() => {
+        cleanup();
+        resolve();
+      }, 1500);
+    });
+  }
+
+  if (typeof runtime.remove === 'function') {
+    runtime.remove([stage, signature, tag]);
+  }
+
+  return new Promise((resolve) => {
+    const baseEase = getSpringEase({ bounce: 0.2, duration: 520 }, 'out(3)');
+    const tl = typeof runtime.createTimeline === 'function'
+      ? runtime.createTimeline({ defaults: { ease: baseEase } })
+      : null;
+
+    if (!tl) {
+      runtime.animate(stage, {
+        opacity: [0, 1],
+        translateY: [22, 0],
+        duration: 420,
+        ease: 'out(3)',
+        onComplete: () => {
+          window.setTimeout(() => {
+            cleanup();
+            resolve();
+          }, 1000);
+        }
+      });
+      return;
+    }
+
+    tl
+      .add(stage, {
+        opacity: [0, 1],
+        translateY: [18, 0],
+        duration: 320,
+        ease: 'out(3)',
+      }, 0)
+      .add(signature, {
+        opacity: [0, 1],
+        translateY: [10, 0],
+        duration: 700,
+        ease: 'out(2)',
+      }, 140)
+      .add(signature, {
+        scale: [0.985, 1],
+        duration: 340,
+        ease: 'out(3)',
+      }, 250);
+
+    tl
+      .add(tag, {
+        opacity: [0, 0.92],
+        translateY: [12, 0],
+        duration: 320,
+        ease: 'out(3)',
+      }, 980)
+      .add(stage, {
+        opacity: [1, 0],
+        translateY: [0, -20],
+        scale: [1, 1.015],
+        duration: 380,
+        ease: 'inOut(2)',
+      }, '+=320');
+
+    tl.init?.();
+
+    window.setTimeout(() => {
+      cleanup();
+      resolve();
+    }, 2650);
+  });
+}
+
+function animateThemePulse() {
+  const runtime = getAnimeRuntime();
+  if (!runtime || shouldReduceMotion()) return;
+  const targets = document.querySelectorAll(
+    '.dashboard-sidebar, .workspace-header, .dashboard-view.active .ds-card, .dashboard-view.active .card'
+  );
+  const nodes = Array.from(targets).slice(0, 10);
+  if (!nodes.length) return;
+  if (typeof runtime.remove === 'function') runtime.remove(nodes);
+  const delay = typeof runtime.stagger === 'function' ? runtime.stagger(16) : (_, i) => i * 16;
+  runtime.animate(nodes, {
+    opacity: [0.94, 1],
+    translateY: [MOTION_PRESETS.themePulse.distance, 0],
+    scale: [MOTION_PRESETS.themePulse.scaleFrom, 1],
+    duration: MOTION_PRESETS.themePulse.duration,
+    delay,
+    ease: MOTION_PRESETS.themePulse.ease,
+  });
+}
+
+function startAmbientOrbMotion() {
+  const runtime = getAnimeRuntime();
+  if (!runtime || shouldReduceMotion()) return;
+  const orbOne = document.querySelector('.bg-orb-one');
+  const orbTwo = document.querySelector('.bg-orb-two');
+  if (orbOne) {
+    if (typeof runtime.remove === 'function') runtime.remove(orbOne);
+    runtime.animate(orbOne, {
+      translateX: [0, MOTION_PRESETS.orbDrift.distance],
+      translateY: [0, -MOTION_PRESETS.orbDrift.distance],
+      rotate: [0, MOTION_PRESETS.orbDrift.rotate],
+      duration: MOTION_PRESETS.orbDrift.durationA,
+      loop: true,
+      alternate: true,
+      ease: 'inOut(2)',
+    });
+  }
+  if (orbTwo) {
+    if (typeof runtime.remove === 'function') runtime.remove(orbTwo);
+    runtime.animate(orbTwo, {
+      translateX: [0, -MOTION_PRESETS.orbDrift.distance],
+      translateY: [0, MOTION_PRESETS.orbDrift.distance],
+      rotate: [0, -MOTION_PRESETS.orbDrift.rotate],
+      duration: MOTION_PRESETS.orbDrift.durationB,
+      loop: true,
+      alternate: true,
+      ease: 'inOut(2)',
+    });
+  }
+}
+
+// Temporary debug trigger:
+// - run `window.__animeDebugPulse()` for guarded mode
+// - run `window.__animeDebugPulse(true)` to force animation even if reduced-motion is enabled
+function runDebugAnimePulse(force = false) {
+  const runtime = getAnimeRuntime();
+  const reduced = shouldReduceMotion();
+  if (!runtime) {
+    return { ok: false, reason: 'anime-runtime-missing' };
+  }
+  if (reduced && !force) {
+    return { ok: false, reason: 'reduced-motion-enabled' };
+  }
+  const activeViewEl = document.querySelector(`.dashboard-view[data-view="${activeView}"]`) || document;
+  const cards = Array.from(activeViewEl.querySelectorAll('.ds-card, .card, .empty-state-panel')).slice(0, 14);
+  if (cards.length) {
+    if (typeof runtime.remove === 'function') runtime.remove(cards);
+    const delay = typeof runtime.stagger === 'function' ? runtime.stagger(42) : (_, i) => i * 42;
+    runtime.animate(cards, {
+      opacity: [0.35, 1],
+      translateY: [40, 0],
+      scale: [0.92, 1],
+      rotateZ: [-0.9, 0],
+      duration: 760,
+      delay,
+      ease: 'out(4)',
+    });
+  }
+  if (!reduced || force) animateThemePulse();
+  showAppToast('Anime debug pulse fired', 'info', { duration: 1800 });
+  return { ok: true, reason: reduced ? 'forced-while-reduced-motion' : 'normal' };
+}
+
+window.__animeDebugPulse = runDebugAnimePulse;
+window.__animeDebugInfo = function __animeDebugInfo() {
+  const runtime = getAnimeRuntime();
+  return {
+    animeLoaded: Boolean(runtime),
+    animateFn: runtime ? typeof runtime.animate : 'undefined',
+    reducedMotion: shouldReduceMotion(),
+    systemReducedMotion: systemPrefersReducedMotion(),
+  };
+};
+
+function extractNumericValue(text, fallback = 0) {
+  const parsed = Number.parseFloat(String(text ?? '').replace(/[^0-9.-]/g, ''));
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function animateMetricValue(el, nextValue, {
+  decimals = 1,
+  prefix = '',
+  suffix = '',
+  duration = MOTION_PRESETS.number.duration,
+  forceInteger = false,
+} = {}) {
+  if (!el) return;
+  const runtime = getAnimeRuntime();
+  const target = Number(nextValue);
+  if (!Number.isFinite(target) || !runtime || shouldReduceMotion()) {
+    const resolved = forceInteger ? Math.round(Number(nextValue) || 0) : Number(nextValue || 0);
+    const textValue = forceInteger ? String(resolved) : resolved.toFixed(decimals);
+    el.textContent = `${prefix}${textValue}${suffix}`;
+    return;
+  }
+  const from = extractNumericValue(el.textContent, target);
+  if (Math.abs(from - target) < 0.001) {
+    const sameValue = forceInteger ? Math.round(target) : target.toFixed(decimals);
+    el.textContent = `${prefix}${sameValue}${suffix}`;
+    return;
+  }
+  if (typeof runtime.remove === 'function') runtime.remove(el);
+  const state = { value: from };
+  runtime.animate(state, {
+    value: target,
+    duration,
+    ease: MOTION_PRESETS.number.ease,
+    onUpdate: () => {
+      const rendered = forceInteger ? Math.round(state.value) : Number(state.value).toFixed(decimals);
+      el.textContent = `${prefix}${rendered}${suffix}`;
+    },
+    onComplete: () => {
+      const rendered = forceInteger ? Math.round(target) : target.toFixed(decimals);
+      el.textContent = `${prefix}${rendered}${suffix}`;
+    }
+  });
+}
+
+function animateBannerPulse() {
+  const runtime = getAnimeRuntime();
+  if (!runtime || shouldReduceMotion() || !actionBannerInner) return;
+  if (typeof runtime.remove === 'function') runtime.remove(actionBannerInner);
+  runtime.animate(actionBannerInner, {
+    opacity: [0.85, 1],
+    translateY: [MOTION_PRESETS.bannerPulse.distance, 0],
+    duration: MOTION_PRESETS.bannerPulse.duration,
+    ease: MOTION_PRESETS.bannerPulse.ease,
+  });
+}
+
+function ensureActionBannerMotionPath() {
+  if (!actionBannerTrack) return null;
+  if (actionBannerMotionPathSvg && actionBannerMotionPath && actionBannerMotionDot) {
+    return { svg: actionBannerMotionPathSvg, path: actionBannerMotionPath, dot: actionBannerMotionDot };
+  }
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(svgNS, 'svg');
+  svg.setAttribute('viewBox', '0 0 260 34');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.classList.add('action-banner-motion-path');
+
+  const path = document.createElementNS(svgNS, 'path');
+  path.setAttribute('d', 'M 10 17 C 72 3, 188 31, 250 17');
+  path.classList.add('action-banner-motion-curve');
+
+  const dot = document.createElementNS(svgNS, 'circle');
+  dot.setAttribute('cx', '10');
+  dot.setAttribute('cy', '17');
+  dot.setAttribute('r', '3');
+  dot.classList.add('action-banner-motion-dot');
+
+  svg.appendChild(path);
+  svg.appendChild(dot);
+  actionBannerTrack.appendChild(svg);
+
+  actionBannerMotionPathSvg = svg;
+  actionBannerMotionPath = path;
+  actionBannerMotionDot = dot;
+  return { svg, path, dot };
+}
+
+function syncGlobalLoadingAnimation(meta = {}) {
+  const runtime = getAnimeRuntime();
+  if (!runtime || !actionBanner) return;
+  const isWorking = String(meta.phase || '').toLowerCase() === 'working';
+  const motionPath = ensureActionBannerMotionPath();
+
+  if (!isWorking) {
+    if (!isGlobalLoadingAnimationActive) return;
+    if (actionBannerSpinnerEl) {
+      if (typeof runtime.remove === 'function') runtime.remove(actionBannerSpinnerEl);
+      actionBannerSpinnerEl.style.transform = '';
+      actionBannerSpinnerEl.style.opacity = '';
+    }
+    if (actionBannerTrack) {
+      if (typeof runtime.remove === 'function') runtime.remove(actionBannerTrack);
+      actionBannerTrack.style.opacity = '';
+      actionBannerTrack.style.transform = '';
+    }
+    if (motionPath?.dot && typeof runtime.remove === 'function') {
+      runtime.remove(motionPath.dot);
+      motionPath.dot.style.transform = '';
+      motionPath.dot.style.opacity = '';
+    }
+    isGlobalLoadingAnimationActive = false;
+    return;
+  }
+
+  if (isGlobalLoadingAnimationActive) return;
+  isGlobalLoadingAnimationActive = true;
+
+  if (actionBannerSpinnerEl) {
+    runtime.animate(actionBannerSpinnerEl, {
+      rotate: [0, 360],
+      duration: 900,
+      ease: 'linear',
+      loop: true,
+    });
+  }
+  if (actionBannerTrack) {
+    runtime.animate(actionBannerTrack, {
+      opacity: [0.28, 0.72],
+      scaleX: [0.985, 1.015],
+      duration: 760,
+      alternate: true,
+      loop: true,
+      ease: 'inOut(2)',
+    });
+  }
+  if (motionPath?.dot && motionPath?.path && runtime.svg && typeof runtime.svg.createMotionPath === 'function') {
+    try {
+      const pathAnim = runtime.svg.createMotionPath(motionPath.path, 0);
+      runtime.animate(motionPath.dot, {
+        ...pathAnim,
+        opacity: [0.18, 0.95, 0.18],
+        scale: [0.88, 1.08, 0.88],
+        duration: 1720,
+        ease: 'inOut(2)',
+        loop: true,
+      });
+    } catch { }
+  }
+}
+
+function animateToastIn(toast) {
+  const runtime = getAnimeRuntime();
+  if (!runtime || shouldReduceMotion() || !toast) return;
+  if (typeof runtime.remove === 'function') runtime.remove(toast);
+  runtime.animate(toast, {
+    opacity: [0, 1],
+    translateY: [MOTION_PRESETS.toastIn.distance, 0],
+    scale: [MOTION_PRESETS.toastIn.scaleFrom, 1],
+    duration: MOTION_PRESETS.toastIn.duration,
+    ease: MOTION_PRESETS.toastIn.ease,
+  });
+}
+
+function animateToastOut(toast, done) {
+  const runtime = getAnimeRuntime();
+  if (!runtime || shouldReduceMotion() || !toast) {
+    if (typeof done === 'function') done();
+    return;
+  }
+  if (typeof runtime.remove === 'function') runtime.remove(toast);
+  runtime.animate(toast, {
+    opacity: [1, 0],
+    translateY: [0, MOTION_PRESETS.toastOut.distance],
+    duration: MOTION_PRESETS.toastOut.duration,
+    ease: MOTION_PRESETS.toastOut.ease,
+    onComplete: () => {
+      if (typeof done === 'function') done();
+    },
+  });
 }
 
 //  Global app toast 
@@ -941,6 +2133,8 @@ function showAppToast(msg, type = 'default', options = {}) {
   const toast = document.createElement('div');
   toast.className = `app-toast app-toast--${normalizedType}`;
   toast.setAttribute('role', 'status');
+  toast.style.opacity = '0';
+  toast.style.transform = 'translateY(14px)';
   toast.innerHTML = `
     <span class="app-toast-icon">${icons[normalizedType] || icons.default}</span>
     <div class="app-toast-body"><span class="app-toast-text"></span></div>
@@ -954,9 +2148,9 @@ function showAppToast(msg, type = 'default', options = {}) {
     btn.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
-      try { options.onAction(); } catch (e) {}
+      try { options.onAction(); } catch (e) { }
       toast.classList.remove('show');
-      setTimeout(() => toast.remove(), 220);
+      animateToastOut(toast, () => toast.remove());
     });
     toast.appendChild(btn);
   }
@@ -968,9 +2162,9 @@ function showAppToast(msg, type = 'default', options = {}) {
     undoBtn.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
-      try { options.onUndo(); } catch (e) {}
+      try { options.onUndo(); } catch (e) { }
       toast.classList.remove('show');
-      setTimeout(() => toast.remove(), 220);
+      animateToastOut(toast, () => toast.remove());
     });
     toast.appendChild(undoBtn);
   }
@@ -978,7 +2172,15 @@ function showAppToast(msg, type = 'default', options = {}) {
     toast.classList.add('is-persistent');
   }
   host.appendChild(toast);
-  requestAnimationFrame(() => toast.classList.add('show'));
+  requestAnimationFrame(() => {
+    toast.classList.add('show');
+    if (!getAnimeRuntime() || shouldReduceMotion()) {
+      toast.style.opacity = '';
+      toast.style.transform = '';
+      return;
+    }
+    animateToastIn(toast);
+  });
   const baseDuration = Number(options.duration || 0);
   let ttl = baseDuration;
   if (!ttl) {
@@ -994,7 +2196,7 @@ function showAppToast(msg, type = 'default', options = {}) {
   if (!options.persist) {
     setTimeout(() => {
       toast.classList.remove('show');
-      setTimeout(() => toast.remove(), 240);
+      animateToastOut(toast, () => toast.remove());
     }, ttl);
   }
 }
@@ -1004,6 +2206,7 @@ function switchView(view, options = {}) {
 
   const previousView = activeView;
   const shouldScroll = options.scroll ?? (view !== previousView);
+  const shouldAnimate = options.animate ?? (view !== previousView);
   activeView = view;
 
   dashboardViews.forEach(section => {
@@ -1011,17 +2214,19 @@ function switchView(view, options = {}) {
   });
 
   if (window.innerWidth < 1280) {
-    document.body.classList.remove('sidebar-mobile-open');
+    setMobileSidebarOpen(false);
   }
 
   navItems.forEach(item => {
     item.classList.toggle('active', item.dataset.view === view);
   });
+  syncNavAriaCurrent(view);
 
   const meta = VIEW_META[view];
   if (workspaceEyebrow) workspaceEyebrow.textContent = meta.eyebrow;
   if (workspaceTitle) workspaceTitle.textContent = meta.title;
   if (workspaceSubtitle) workspaceSubtitle.textContent = meta.subtitle;
+  animateWorkspaceHeadingText();
 
   document.body.dataset.activeView = view;
   if (view === 'today') {
@@ -1031,8 +2236,37 @@ function switchView(view, options = {}) {
   if (view === 'analyzer') {
     ensureTeamsLoaded();
   }
+  if (shouldAnimate) {
+    requestAnimationFrame(() => animateActiveView(view, { initial: false }));
+    requestAnimationFrame(() => animateActiveNavItem(view));
+    requestAnimationFrame(() => {
+      const activeSection = document.querySelector(`.dashboard-view[data-view="${view}"]`);
+      if (activeSection) {
+        animateSvgLineDraw(activeSection);
+        registerScrollReveals(activeSection);
+      }
+    });
+  }
   if (shouldScroll) {
     window.scrollTo({ top: 0, behavior: options.instant ? 'auto' : 'smooth' });
+  }
+}
+
+function syncNavAriaCurrent(view) {
+  navItems.forEach(item => {
+    const isActive = item?.dataset?.view === view;
+    if (isActive) {
+      item.setAttribute('aria-current', 'page');
+    } else {
+      item.removeAttribute('aria-current');
+    }
+  });
+}
+
+function setMobileSidebarOpen(open) {
+  document.body.classList.toggle('sidebar-mobile-open', Boolean(open));
+  if (mobileSidebarToggle) {
+    mobileSidebarToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
   }
 }
 
@@ -1040,7 +2274,8 @@ function setSidebarCollapsed(collapsed) {
   document.body.classList.toggle('sidebar-collapsed', collapsed);
   localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? '1' : '0');
   if (sidebarToggle) {
-    sidebarToggle.querySelector('.sidebar-toggle-icon').textContent = collapsed ? '\u203A' : '\u2039';
+    sidebarToggle.classList.toggle('is-collapsed', collapsed);
+    sidebarToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
     sidebarToggle.setAttribute('aria-label', collapsed ? 'Expand sidebar' : 'Collapse sidebar');
   }
 }
@@ -1133,9 +2368,8 @@ function buildTrustDiagnostics({ availability = null, environment = null, teamCo
 
 function renderTrustDiagnostics(items = [], compact = false) {
   if (!Array.isArray(items) || !items.length) return '';
-  return `<div class="trust-diagnostics ${compact ? 'compact' : ''}">${
-    items.map(item => `<span class="trust-pill tone-${escapeHtml(item.tone || 'neutral')}">${escapeHtml(item.label || '')}</span>`).join('')
-  }</div>`;
+  return `<div class="trust-diagnostics ${compact ? 'compact' : ''}">${items.map(item => `<span class="trust-pill tone-${escapeHtml(item.tone || 'neutral')}">${escapeHtml(item.label || '')}</span>`).join('')
+    }</div>`;
 }
 
 function getWithoutPlayerNamesFromPayload(payload) {
@@ -1381,6 +2615,88 @@ function renderMarketExpertFilterChips() {
   `).join('');
 }
 
+function shouldShowOverviewOnboarding() {
+  const stored = loadStoredMarketResults();
+  const hasBoardData = Array.isArray(stored?.results) && stored.results.length > 0;
+  const hasSelectedPlayer = !!selectedPlayer;
+  return !hasBoardData && !hasSelectedPlayer;
+}
+
+function syncOverviewOnboardingState() {
+  if (!overviewViewEl || !overviewStartCardEl) return;
+  const showOnboarding = shouldShowOverviewOnboarding();
+  overviewStartCardEl.classList.toggle('hidden', !showOnboarding);
+  overviewViewEl.classList.toggle('overview-onboarding', showOnboarding);
+}
+
+function hasAnalyzerPayloadForSelectedPlayer() {
+  if (!selectedPlayer || !lastPayload) return false;
+  return String(lastPayload?.player?.id || '') === String(selectedPlayer?.id || '');
+}
+
+function syncAnalyzerOnboardingState() {
+  if (!analyzerViewEl || !analyzerStartCardEl) return;
+  const hasPlayer = !!selectedPlayer;
+  const hasAnalysis = hasAnalyzerPayloadForSelectedPlayer();
+  const mode = !hasPlayer ? 'no-player' : (hasAnalysis ? 'ready' : 'pre-analysis');
+  const showOnboarding = mode !== 'ready';
+
+  analyzerViewEl.classList.toggle('analyzer-onboarding', showOnboarding);
+  analyzerStartCardEl.classList.toggle('hidden', !showOnboarding);
+  if (!showOnboarding) return;
+
+  const title = mode === 'no-player'
+    ? 'Start with team and player selection'
+    : `Ready to analyze ${escapeHtml(selectedPlayer?.full_name || 'this player')}`;
+  const subtitle = mode === 'no-player'
+    ? 'Choose a team and player first. Then run Analyze Prop once to unlock matchup and recommendation panels.'
+    : 'Run Analyze Prop to load the matchup read, traffic-light recommendation, and environment context.';
+  const primaryLabel = mode === 'no-player' ? 'Select Team' : 'Run Analyze Prop';
+  const secondaryLabel = mode === 'no-player' ? 'Open Market Scanner' : 'Adjust Prop Inputs';
+
+  analyzerStartCardEl.innerHTML = `
+    <div class="ds-analyzer-start-head">
+      <span class="empty-icon ds-overview-empty-icon">${getEmptyIconSvg(mode === 'no-player' ? 'calendar' : 'trend')}</span>
+      <div>
+        <p class="section-kicker">Start Here</p>
+        <h3>${title}</h3>
+        <p>${subtitle}</p>
+      </div>
+    </div>
+    <div class="ds-analyzer-start-steps">
+      <div class="ds-analyzer-start-step"><strong>1. Select context</strong><span>Team, player, stat, line, and sample size.</span></div>
+      <div class="ds-analyzer-start-step"><strong>2. Run analyzer</strong><span>Generate recommendation and matchup context in one pass.</span></div>
+      <div class="ds-analyzer-start-step"><strong>3. Validate signal</strong><span>Review trend chart and game log before deciding.</span></div>
+    </div>
+    <div class="ds-analyzer-start-actions">
+      <button class="primary-btn compact-action" id="analyzerStartPrimaryBtn" type="button">${primaryLabel}</button>
+      <button class="secondary-btn compact-action" id="analyzerStartSecondaryBtn" type="button">${secondaryLabel}</button>
+    </div>
+  `;
+  hydrateEmptyIcons(analyzerStartCardEl);
+
+  const primaryBtn = document.getElementById('analyzerStartPrimaryBtn');
+  const secondaryBtn = document.getElementById('analyzerStartSecondaryBtn');
+
+  primaryBtn?.addEventListener('click', async () => {
+    if (!selectedPlayer) {
+      teamSelect?.focus();
+      teamSelect?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+    await analyzePlayerProp({ preserveScroll: true, preserveSection: true });
+  });
+
+  secondaryBtn?.addEventListener('click', () => {
+    if (!selectedPlayer) {
+      switchView('market');
+      return;
+    }
+    lineInput?.focus();
+    lineInput?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  });
+}
+
 function renderOverviewSelection() {
   if (!overviewCurrentCard || !sidebarMiniPlayer) return;
 
@@ -1401,6 +2717,7 @@ function renderOverviewSelection() {
         <small>Pick a team and player to begin.</small>
       </div>
     `;
+    syncOverviewOnboardingState();
     return;
   }
 
@@ -1461,6 +2778,7 @@ function renderOverviewSelection() {
       <small>${escapeHtml(subLine || 'Selected player')}</small>
     </div>
   `;
+  syncOverviewOnboardingState();
 }
 
 function getFallbackHeadshot() {
@@ -1519,6 +2837,7 @@ function getStatusMeta(text) {
 
 function showActionBanner(meta) {
   if (!actionBanner || !actionBannerTitle || !actionBannerDetail || !actionBannerState) return;
+  const wasVisible = actionBanner.classList.contains('is-visible');
   actionBannerTitle.textContent = meta.title;
   actionBannerDetail.textContent = meta.detail;
   actionBannerState.textContent = meta.state;
@@ -1536,6 +2855,12 @@ function showActionBanner(meta) {
     actionBannerProgress.setAttribute('aria-hidden', meta.mode === 'progress' ? 'false' : 'true');
   }
   actionBanner.classList.add('is-visible');
+  const nextPulseKey = `${meta.phase || ''}|${meta.mode || 'default'}|${meta.title || ''}`;
+  if (!wasVisible || nextPulseKey !== actionBannerLastPulseKey) {
+    actionBannerLastPulseKey = nextPulseKey;
+    animateBannerPulse();
+  }
+  syncGlobalLoadingAnimation(meta);
 }
 
 function hideActionBanner(force = false) {
@@ -1544,6 +2869,8 @@ function hideActionBanner(force = false) {
   actionBanner.classList.remove('is-visible');
   actionBanner.dataset.phase = 'idle';
   actionBanner.dataset.mode = 'default';
+  actionBannerLastPulseKey = '';
+  syncGlobalLoadingAnimation({ phase: 'idle' });
 }
 
 function setStatus(text) {
@@ -1657,6 +2984,7 @@ function setTheme(theme) {
   themeToggle.querySelector('.theme-icon').textContent = theme === 'light' ? '\u263E' : '\u2600';
   themeToggle.querySelector('.theme-text').textContent = theme === 'light' ? 'Dark' : 'Light';
   updateAccentForCurrentTheme(currentAccentTeam);
+  animateThemePulse();
 
   if (lastPayload) {
     renderChart(lastPayload);
@@ -2286,7 +3614,7 @@ function bindSlateTeamButtons(root) {
 function renderBetFinderEmpty(message = 'Choose a team, set your prop line, then click Bet Finder.') {
   betFinderResults.className = 'bet-finder-state empty-state-panel compact';
   betFinderResults.innerHTML = `
-    <div class="empty-icon"></div>
+    <div class="empty-icon">${getEmptyIconSvg('trend')}</div>
     <strong>No bet finder results yet.</strong>
     <span>${escapeHtml(message)}</span>
   `;
@@ -2296,6 +3624,19 @@ function formatSignedMetric(value, suffix = '') {
   const num = Number(value);
   if (!Number.isFinite(num)) return '--';
   return `${num >= 0 ? '+' : ''}${num.toFixed(1)}${suffix}`;
+}
+
+function normalizeEvPercentValue(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  // Market scanner EV is already percent; parlay EV is decimal.
+  return Math.abs(num) <= 1 ? (num * 100) : num;
+}
+
+function formatEvPercent(value, decimals = 1) {
+  const normalized = normalizeEvPercentValue(value);
+  if (!Number.isFinite(normalized)) return '--';
+  return normalized.toFixed(decimals);
 }
 
 function getFinderTone(hitRate) {
@@ -2488,7 +3829,42 @@ function getMutedColor() {
 }
 
 function getCssVar(name) {
-  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const rootValue = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  if (rootValue) return rootValue;
+  const bodyValue = document.body ? getComputedStyle(document.body).getPropertyValue(name).trim() : '';
+  return bodyValue || '';
+}
+
+function withAlpha(color, alpha = 1) {
+  const raw = String(color || '').trim();
+  const a = Math.max(0, Math.min(1, Number(alpha)));
+  if (!raw) return `rgba(148, 163, 184, ${a})`;
+
+  const hexMatch = raw.match(/^#([0-9a-f]{3,8})$/i);
+  if (hexMatch) {
+    const hex = hexMatch[1];
+    let r = 0, g = 0, b = 0;
+    if (hex.length === 3 || hex.length === 4) {
+      r = parseInt(hex[0] + hex[0], 16);
+      g = parseInt(hex[1] + hex[1], 16);
+      b = parseInt(hex[2] + hex[2], 16);
+    } else if (hex.length === 6 || hex.length === 8) {
+      r = parseInt(hex.slice(0, 2), 16);
+      g = parseInt(hex.slice(2, 4), 16);
+      b = parseInt(hex.slice(4, 6), 16);
+    }
+    return `rgba(${r}, ${g}, ${b}, ${a})`;
+  }
+
+  const rgbMatch = raw.match(/^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*[\d.]+)?\s*\)$/i);
+  if (rgbMatch) {
+    const r = Number(rgbMatch[1] || 0);
+    const g = Number(rgbMatch[2] || 0);
+    const b = Number(rgbMatch[3] || 0);
+    return `rgba(${r}, ${g}, ${b}, ${a})`;
+  }
+
+  return raw;
 }
 
 function getLeanClass(tone) {
@@ -2696,7 +4072,7 @@ function renderMatchup(payload) {
       badge.textContent = 'No matchup data';
       body.className = 'empty-state-panel compact matchup-empty';
       body.innerHTML = `
-        <div class="empty-icon"></div>
+        <div class="empty-icon">${getEmptyIconSvg('shield')}</div>
         <strong>Matchup context unavailable.</strong>
         <span>We could not resolve the next opponent or position split for this player.</span>
       `;
@@ -2915,7 +4291,7 @@ function renderGameLogTab(view = activeGameLogView) {
   if (!currentGameLogPayload) {
     gameLogMeta.textContent = 'Hit / miss tags included';
     renderGameLogHeader(currentGameLogPayload?.stat || selectedStat);
-    gamesTableBody.innerHTML = buildGameLogRowsMarkup([], 'No data yet.', 'Analyze a player prop to fill the game log.', currentGameLogPayload?.stat || selectedStat, leanSide);
+    gamesTableBody.innerHTML = buildGameLogRowsMarkup([], 'No games logged yet.', 'Analyze a player prop to fill the game log.', currentGameLogPayload?.stat || selectedStat, leanSide);
     return;
   }
 
@@ -2939,7 +4315,7 @@ function renderGameLogTab(view = activeGameLogView) {
 
   gameLogMeta.textContent = `Last ${currentGameLogPayload.last_n} games  Value, minutes, and attempts`;
   renderGameLogHeader(currentGameLogPayload?.stat || selectedStat);
-  gamesTableBody.innerHTML = buildGameLogRowsMarkup(currentGameLogPayload.games || [], 'No data yet.', 'Analyze a player prop to fill the game log.', currentGameLogPayload?.stat || selectedStat, leanSide);
+  gamesTableBody.innerHTML = buildGameLogRowsMarkup(currentGameLogPayload.games || [], 'No games logged yet.', 'Analyze a player prop to fill the game log.', currentGameLogPayload?.stat || selectedStat, leanSide);
 }
 
 function renderTable(payload) {
@@ -3099,21 +4475,24 @@ async function fetchAnalyzerGameContext(source) {
   }
 
   let keyEntry = null;
+  let key = '';
   try {
     keyEntry = await pickRandomVaultKeyForFeature({
       requiredCredits: 1,
       sourceLabel: 'Player Analyzer market context',
     });
+    key = normalizeOddsApiKeyValue(keyEntry?.key);
   } catch (error) {
     console.warn(error.message || error);
     return null;
   }
+  if (!key) return null;
 
   const result = await apiFetch('/api/odds/game-context', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      api_key: keyEntry.key,
+      api_key: key,
       sport: settings.sport || 'basketball_nba',
       regions: settings.regions || 'us',
       odds_format: settings.odds_format || 'decimal',
@@ -3134,66 +4513,103 @@ async function enrichTodayGamesWithMarketContext(payload) {
   );
   if (!pendingGames.length) return false;
 
-  pendingGames.forEach(game => {
-    game.__marketContextPending = true;
-    game.__marketContextAttempted = true;
-  });
-
-  let keyEntries = [];
-  try {
-    keyEntries = await getRotatingVaultKeysForFeature({
-      minimumKeys: 1,
-      requiredCredits: 1,
-      sourceLabel: "Today's Games market context",
-    });
-  } catch (error) {
-    console.warn(error.message || error);
-    return false;
-  }
-  if (!keyEntries.length) return false;
-
   const settings = getOddsApiSettings();
-  let changed = false;
-  await Promise.allSettled(pendingGames.map(async (game, index) => {
-    const cacheKey = `${game?.away?.full_name || ''}|${game?.home?.full_name || ''}|${settings.sport || 'basketball_nba'}|${settings.regions || 'us'}|${settings.odds_format || 'decimal'}`;
-    if (todayGameContextCache.has(cacheKey)) {
-      const cached = todayGameContextCache.get(cacheKey) || {};
-      game.market_context = cached.context || {};
-      game.market_environment = cached.environment || {};
-      game.__marketContextPending = false;
-      changed = true;
-      return;
-    }
-    const keyEntry = keyEntries[index % keyEntries.length];
-    if (!keyEntry?.key) {
-      game.__marketContextPending = false;
-      return;
-    }
-    const result = await apiFetch('/api/odds/game-context', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        api_key: keyEntry.key,
-        sport: settings.sport || 'basketball_nba',
-        regions: settings.regions || 'us',
-        odds_format: settings.odds_format || 'decimal',
-        team_name: game.away.full_name || '',
-        opponent_name: game.home.full_name || '',
-        team_abbreviation: game.away.abbreviation || '',
-        opponent_abbreviation: game.home.abbreviation || '',
-      })
-    }, 12000).catch(() => null);
-    game.__marketContextPending = false;
-    if (!result?.ok) return;
-    game.market_context = result.context || {};
-    game.market_environment = result.environment || {};
-    todayGameContextCache.set(cacheKey, result);
-    changed = true;
-  }));
-  pendingGames.forEach(game => {
-    game.__marketContextPending = false;
+  const flightKey = JSON.stringify({
+    sport: settings.sport || 'basketball_nba',
+    regions: settings.regions || 'us',
+    odds_format: settings.odds_format || 'decimal',
+    games: pendingGames
+      .map(game => `${game?.away?.abbreviation || game?.away?.full_name || ''}|${game?.home?.abbreviation || game?.home?.full_name || ''}`)
+      .sort(),
   });
-  return changed;
+  if (todayGamesContextInFlightByKey.has(flightKey)) {
+    return todayGamesContextInFlightByKey.get(flightKey);
+  }
+
+  const run = (async () => {
+    pendingGames.forEach(game => {
+      game.__marketContextPending = true;
+      game.__marketContextAttempted = true;
+    });
+
+    try {
+      let keyEntries = [];
+      try {
+        keyEntries = await getRotatingVaultKeysForFeature({
+          minimumKeys: 1,
+          requiredCredits: 1,
+          sourceLabel: "Today's Games market context",
+        });
+      } catch (error) {
+        console.warn(error.message || error);
+        return false;
+      }
+      if (!keyEntries.length) return false;
+
+      let changed = false;
+      const maxAttempts = Math.max(1, Math.min(2, keyEntries.length));
+      const fetchMarketContextForGame = async (game, index) => {
+        const cacheKey = `${game?.away?.full_name || ''}|${game?.home?.full_name || ''}|${settings.sport || 'basketball_nba'}|${settings.regions || 'us'}|${settings.odds_format || 'decimal'}`;
+        if (todayGameContextCache.has(cacheKey)) {
+          const cached = todayGameContextCache.get(cacheKey) || {};
+          game.market_context = cached.context || {};
+          game.market_environment = cached.environment || {};
+          changed = true;
+          return;
+        }
+
+        for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+          const keyEntry = keyEntries[(index + attempt) % keyEntries.length];
+          const key = normalizeOddsApiKeyValue(keyEntry?.key);
+          if (!key) continue;
+          const result = await apiFetch('/api/odds/game-context', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              api_key: key,
+              sport: settings.sport || 'basketball_nba',
+              regions: settings.regions || 'us',
+              odds_format: settings.odds_format || 'decimal',
+              team_name: game.away.full_name || '',
+              opponent_name: game.home.full_name || '',
+              team_abbreviation: game.away.abbreviation || '',
+              opponent_abbreviation: game.home.abbreviation || '',
+            })
+          }, 12000).catch(() => null);
+          if (!result?.ok) continue;
+          game.market_context = result.context || {};
+          game.market_environment = result.environment || {};
+          todayGameContextCache.set(cacheKey, result);
+          changed = true;
+          return;
+        }
+      };
+
+      const concurrency = Math.max(1, Math.min(TODAY_GAMES_CONTEXT_CONCURRENCY, pendingGames.length));
+      let cursor = 0;
+      const workers = Array.from({ length: concurrency }, () => (async () => {
+        while (cursor < pendingGames.length) {
+          const index = cursor;
+          cursor += 1;
+          await fetchMarketContextForGame(pendingGames[index], index);
+        }
+      })());
+      await Promise.all(workers);
+      return changed;
+    } finally {
+      pendingGames.forEach(game => {
+        game.__marketContextPending = false;
+      });
+      warmupVaultHealth({ force: false, maxKeys: KEY_VAULT_WARMUP_MAX_KEYS }).catch(() => { });
+    }
+  })();
+
+  todayGamesContextInFlightByKey.set(flightKey, run);
+  try {
+    return await run;
+  } finally {
+    todayGamesContextInFlightByKey.delete(flightKey);
+  }
 }
 
 function persistOddsApiSettings() {
@@ -3237,14 +4653,20 @@ function renderOddsEvents(events) {
 async function loadOddsEvents() {
   const settings = getOddsApiSettings();
   let keyEntry = null;
+  let key = '';
   try {
     keyEntry = await pickRandomVaultKeyForFeature({
       requiredCredits: 1,
       sourceLabel: 'Odds event loading',
       enforceMinimum: false,
     });
+    key = normalizeOddsApiKeyValue(keyEntry?.key);
   } catch (error) {
     alert(error.message || 'No usable Odds API key found in Key Vault.');
+    return;
+  }
+  if (!key) {
+    alert('Selected key is invalid. Please re-add it in Key Vault.');
     return;
   }
   persistOddsApiSettings();
@@ -3255,11 +4677,11 @@ async function loadOddsEvents() {
     const payload = await apiFetch('/api/odds/events', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ api_key: keyEntry.key, sport: settings.sport })
+      body: JSON.stringify({ api_key: key, sport: settings.sport })
     }, 15000);
     renderOddsEvents(payload.events || []);
     setOddsQuotaMeta(payload.quota);
-    setOddsApiKeyMeta(payload.api_key_used || keyEntry.key);
+    setOddsApiKeyMeta(payload.api_key_used || key);
     setOddsApiStatus(`Loaded ${(payload.events || []).length} event(s)`, 'good');
   } catch (error) {
     console.error(error);
@@ -3278,14 +4700,20 @@ async function importOddsPropsAndScan() {
   const settings = getOddsApiSettings();
   const eventId = oddsEventSelect?.value || '';
   let keyEntry = null;
+  let key = '';
   try {
     keyEntry = await pickRandomVaultKeyForFeature({
       requiredCredits: 1,
       sourceLabel: 'Odds props import',
       enforceMinimum: false,
     });
+    key = normalizeOddsApiKeyValue(keyEntry?.key);
   } catch (error) {
     alert(error.message || 'No usable Odds API key found in Key Vault.');
+    return;
+  }
+  if (!key) {
+    alert('Selected key is invalid. Please re-add it in Key Vault.');
     return;
   }
   if (!eventId) {
@@ -3300,7 +4728,7 @@ async function importOddsPropsAndScan() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        api_key: keyEntry.key,
+        api_key: key,
         sport: settings.sport,
         event_id: eventId,
         regions: settings.regions,
@@ -3309,7 +4737,7 @@ async function importOddsPropsAndScan() {
       })
     }, 30000);
     setOddsQuotaMeta(payload.quota);
-    setOddsApiKeyMeta(payload.api_key_used || keyEntry.key);
+    setOddsApiKeyMeta(payload.api_key_used || key);
     const csvRows = Array.isArray(payload.csv_rows) ? payload.csv_rows : [];
     if (!csvRows.length) {
       setOddsApiStatus('No props found', 'bad');
@@ -3364,7 +4792,7 @@ function renderMarketEmpty(message = 'Paste your board using the template, then 
   marketMeta.textContent = 'Paste rows using the template below. Team and opponent are detected automatically from the player.';
   marketResults.className = 'bet-finder-state empty-state-panel compact';
   marketResults.innerHTML = `
-    <div class="empty-icon"></div>
+    <div class="empty-icon">${getEmptyIconSvg('spark')}</div>
     <strong>No market scan yet.</strong>
     <span>${escapeHtml(message)}</span>
   `;
@@ -3864,7 +5292,7 @@ function renderCalibrationChips(source, escFn = escapeHtml) {
     chips.push(`<span class="cal-chip tone-${getCalibrationToneClass(shrink, false)}">Shrink ${shrink.toFixed(0)}%</span>`);
   }
   if (Number.isFinite(evRaw) && Number.isFinite(evAdjusted)) {
-    chips.push(`<span class="cal-chip tone-neutral">EV raw ${evRaw.toFixed(1)}%</span>`);
+    chips.push(`<span class="cal-chip tone-neutral">EV raw ${formatEvPercent(evRaw)}%</span>`);
   }
   if (Number.isFinite(calibratedModel)) {
     chips.push(`<span class="cal-chip tone-neutral">Model ${calibratedModel.toFixed(1)}%</span>`);
@@ -3898,7 +5326,7 @@ function populateMarketInjuryCells(results) {
           applyMarketInjuryDataToCell(cell, data);
         });
       })
-      .catch(() => {});
+      .catch(() => { });
   });
 }
 
@@ -4012,7 +5440,7 @@ function renderMarketResults(payload) {
                 </span>
               </div>
               <div class="market-micro-summary">
-                <span class="market-micro-pill">EV <strong>${item.best_bet.ev ?? '--'}%</strong></span>
+                <span class="market-micro-pill">EV <strong>${formatEvPercent(item.best_bet.ev)}%</strong></span>
                 <span class="market-micro-pill">Edge <strong>${item.best_bet.edge ?? '--'}%</strong></span>
                 <span class="market-micro-pill">Sample <strong>${Number.isFinite(sideSample.sideHitCount) ? sideSample.sideHitCount : '--'}/${item.analysis.games_count ?? '--'}</strong></span>
                 <span class="market-micro-pill market-h2h-chip ${sideSample.h2hGames > 0 ? 'has-h2h' : 'no-h2h'}">H2H <strong>${sideSample.h2hGames > 0 ? `${Number.isFinite(sideSample.h2hSideHitCount) ? sideSample.h2hSideHitCount : '--'}/${sideSample.h2hGames} (${Number.isFinite(sideSample.h2hSideHitRate) ? sideSample.h2hSideHitRate.toFixed(1) : '--'}%)` : 'No sample'}</strong></span>
@@ -4033,7 +5461,7 @@ function renderMarketResults(payload) {
                 </div>
                 <div class="market-slip-stat">
                   <span>EV</span>
-                  <strong class="${(item.best_bet.ev || 0) >= 0 ? 'hit-value' : 'miss-value'}">${item.best_bet.ev ?? '--'}%</strong>
+                  <strong class="${(item.best_bet.ev || 0) >= 0 ? 'hit-value' : 'miss-value'}">${formatEvPercent(item.best_bet.ev)}%</strong>
                   <small>Expected value</small>
                 </div>
                 <div class="market-slip-stat">
@@ -4104,7 +5532,7 @@ function renderMarketResults(payload) {
                     <small class="market-row-summary">${escapeHtml(compactSummary)}</small>
                   </div>
                   <div class="market-row-micro">
-                    <span>EV <strong>${item.best_bet.ev ?? '--'}%</strong></span>
+                    <span>EV <strong>${formatEvPercent(item.best_bet.ev)}%</strong></span>
                     <span>Edge <strong>${item.best_bet.edge ?? '--'}%</strong></span>
                     <span>Sample <strong>${Number.isFinite(sideSample.sideHitCount) ? sideSample.sideHitCount : '--'}/${item.analysis.games_count ?? '--'}</strong></span>
                     <span class="market-h2h-chip ${sideSample.h2hGames > 0 ? 'has-h2h' : 'no-h2h'}">H2H <strong>${sideSample.h2hGames > 0 ? `${Number.isFinite(sideSample.h2hSideHitCount) ? sideSample.h2hSideHitCount : '--'}/${sideSample.h2hGames} (${Number.isFinite(sideSample.h2hSideHitRate) ? sideSample.h2hSideHitRate.toFixed(1) : '--'}%)` : 'No sample'}</strong></span>
@@ -4113,7 +5541,7 @@ function renderMarketResults(payload) {
                 </td>
                 <td>
                   <div class="market-metrics-cell">
-                    <span>EV <strong class="${(item.best_bet.ev || 0) >= 0 ? 'hit-value' : 'miss-value'}">${item.best_bet.ev ?? '--'}%</strong></span>
+                    <span>EV <strong class="${(item.best_bet.ev || 0) >= 0 ? 'hit-value' : 'miss-value'}">${formatEvPercent(item.best_bet.ev)}%</strong></span>
                     <span>Edge <strong class="${(item.best_bet.edge || 0) >= 0 ? 'hit-value' : 'miss-value'}">${item.best_bet.edge ?? '--'}%</strong></span>
                     <span>Model <strong>${item.best_bet.model_probability ?? '--'}%</strong></span>
                     <span>Implied <strong>${item.best_bet.implied_probability ?? '--'}%</strong></span>
@@ -4433,9 +5861,9 @@ function resetDashboardForNoSelection() {
     badge.textContent = 'Waiting for analysis';
     body.className = 'empty-state-panel compact matchup-empty';
     body.innerHTML = `
-      <div class="empty-icon"></div>
-      <strong>No matchup loaded yet.</strong>
-      <span>Analyze a player prop to load the next opponent and defense-vs-position read.</span>
+      <div class="empty-icon">${getEmptyIconSvg('shield')}</div>
+      <strong>Pick a player to load matchup context.</strong>
+      <span>Run Analyzer to fetch the next opponent and defense-vs-position read.</span>
     `;
   });
 
@@ -4486,6 +5914,8 @@ function resetDashboardForNoSelection() {
     chart = null;
   }
   lastPayload = null;
+  syncAnalyzerOnboardingState();
+  hydrateEmptyIcons();
 }
 
 teamSelect.addEventListener('change', async () => {
@@ -4627,6 +6057,26 @@ marketScanBtn.addEventListener('click', runMarketScan);
 oddsLoadEventsBtn?.addEventListener('click', loadOddsEvents);
 oddsImportScanBtn?.addEventListener('click', importOddsPropsAndScan);
 
+function setMarketSectionExpanded(sectionEl, toggleEl, expandedLabel, collapsedLabel, expanded) {
+  if (!sectionEl || !toggleEl) return;
+  sectionEl.classList.toggle('hidden', !expanded);
+  toggleEl.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+  toggleEl.textContent = expanded ? expandedLabel : collapsedLabel;
+}
+
+marketToggleFiltersBtn?.addEventListener('click', () => {
+  const expanded = marketFiltersWrap?.classList.contains('hidden');
+  setMarketSectionExpanded(marketFiltersWrap, marketToggleFiltersBtn, 'Hide filters', 'Show filters', expanded);
+});
+
+marketToggleImportBtn?.addEventListener('click', () => {
+  const expanded = marketImportWrap?.classList.contains('hidden');
+  setMarketSectionExpanded(marketImportWrap, marketToggleImportBtn, 'Hide Odds API import', 'Show Odds API import', expanded);
+});
+
+setMarketSectionExpanded(marketFiltersWrap, marketToggleFiltersBtn, 'Hide filters', 'Show filters', false);
+setMarketSectionExpanded(marketImportWrap, marketToggleImportBtn, 'Hide Odds API import', 'Show Odds API import', false);
+
 if (marketInjuryAwareTop && marketInjuryAware) {
   const syncMarketInjuryAware = (checked) => {
     marketInjuryAwareTop.checked = checked;
@@ -4640,14 +6090,20 @@ if (marketInjuryAwareTop && marketInjuryAware) {
 // Check Balance button -- hits /api/odds/check-quota (costs 0 credits)
 oddsCheckBalBtn?.addEventListener('click', async () => {
   let keyEntry = null;
+  let key = '';
   try {
     keyEntry = await pickRandomVaultKeyForFeature({
       requiredCredits: 0,
       sourceLabel: 'balance check',
       enforceMinimum: false,
     });
+    key = normalizeOddsApiKeyValue(keyEntry?.key);
   } catch (error) {
     alert(error.message || 'No usable Odds API key found in Key Vault.');
+    return;
+  }
+  if (!key) {
+    alert('Selected key is invalid. Please re-add it in Key Vault.');
     return;
   }
   const orig = oddsCheckBalBtn.textContent;
@@ -4657,10 +6113,10 @@ oddsCheckBalBtn?.addEventListener('click', async () => {
     const data = await apiFetch('/api/odds/check-quota', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ api_key: keyEntry.key })
+      body: JSON.stringify({ api_key: key })
     }, 10000);
     setOddsQuotaMeta(data.quota);
-    setOddsApiKeyMeta(data.api_key_masked || keyEntry.key);
+    setOddsApiKeyMeta(data.api_key_masked || key);
     setOddsApiStatus('Balance checked', 'good');
   } catch (err) {
     alert('Could not check balance: ' + err.message);
@@ -4729,12 +6185,12 @@ themeToggle.addEventListener('click', () => {
 
 //  User Guide modal 
 (function () {
-  const modal    = document.getElementById('userGuideModal');
-  const openBtn  = document.getElementById('openUserGuideBtn');
+  const modal = document.getElementById('userGuideModal');
+  const openBtn = document.getElementById('openUserGuideBtn');
   const closeTop = document.getElementById('closeUserGuideBtn');
   const closeBot = document.getElementById('closeUserGuideBtnBottom');
-  function openGuide()  { if (modal) modal.style.display = 'block'; document.body.style.overflow = 'hidden'; }
-  function closeGuide() { if (modal) modal.style.display = 'none';  document.body.style.overflow = ''; }
+  function openGuide() { if (modal) modal.style.display = 'block'; document.body.style.overflow = 'hidden'; }
+  function closeGuide() { if (modal) modal.style.display = 'none'; document.body.style.overflow = ''; }
   openBtn?.addEventListener('click', openGuide);
   closeTop?.addEventListener('click', closeGuide);
   closeBot?.addEventListener('click', closeGuide);
@@ -5000,7 +6456,7 @@ if (sidebarToggle) {
 if (mobileSidebarToggle) {
   mobileSidebarToggle.addEventListener('click', () => {
     if (window.innerWidth < 1280) {
-      document.body.classList.toggle('sidebar-mobile-open');
+      setMobileSidebarOpen(!document.body.classList.contains('sidebar-mobile-open'));
       return;
     }
     if (sidebarToggle) {
@@ -5023,11 +6479,22 @@ document.addEventListener('click', (event) => {
     !event.target.closest('.dashboard-sidebar') &&
     !event.target.closest('#mobileSidebarToggle')
   ) {
-    document.body.classList.remove('sidebar-mobile-open');
+    setMobileSidebarOpen(false);
+  }
+});
+
+window.addEventListener('resize', () => {
+  if (window.innerWidth >= 1280 && document.body.classList.contains('sidebar-mobile-open')) {
+    setMobileSidebarOpen(false);
   }
 });
 
 window.addEventListener('keydown', (event) => {
+  if (event.altKey && event.shiftKey && String(event.key || '').toLowerCase() === 'a') {
+    event.preventDefault();
+    runDebugAnimePulse();
+    return;
+  }
   if (event.key === 'Enter' && document.activeElement !== playerSearchInput) {
     analyzePlayerProp();
   }
@@ -5067,19 +6534,30 @@ let upgradedChartPrefs = (() => {
 })();
 
 (async function init() {
+  hydrateEmptyIcons();
+  startEmptyIconObserver();
   applySavedTheme();
   applySeasonTypeDefaultFromCalendar();
+  await runIntroEntrance({ name: 'Patricio\'s' });
   renderRecentPlayers();
   renderSelectedPlayer();
   renderOverviewSelection();
+  syncOverviewOnboardingState();
+  syncAnalyzerOnboardingState();
   resetDashboardForNoSelection();
   renderBetFinderEmpty();
   renderMarketEmpty();
   renderMarketFilterChips();
   renderMarketExpertFilterChips();
   loadStoredOddsApiSettings();
+  initMotionScopeProfile();
   setActiveProp(selectedStat);
-  switchView(activeView);
+  bindInteractiveSpringMotion();
+  registerScrollReveals(document);
+  startScrollRevealWatcher();
+  animateSvgLineDraw(document);
+  startAmbientOrbMotion();
+  switchView(activeView, { scroll: false, instant: true, animate: true });
   setStatus('Loading teams');
 
   try {
@@ -5113,7 +6591,7 @@ async function ensureFavoritesUpgradeLoaded() {
             favoritesUpgradeCache = legacy.slice(0, 12);
             await saveFavoritesUpgrade(favoritesUpgradeCache, { skipLegacyWrite: true });
           }
-        } catch {}
+        } catch { }
       }
     } catch (error) {
       console.warn('Favorites load failed, using local fallback:', error);
@@ -5331,11 +6809,11 @@ function renderOverviewBestBets() {
   const results = stored?.results || [];
   overviewBestBetsMeta.textContent = results.length ? formatStoredTime(stored.updated_at) : 'Populated by your latest Market Scanner run.';
 
-  const renderBoard = (node, items, icon, title, subtitle) => {
+  const renderBoard = (node, items, iconKey, title, subtitle) => {
     if (!node) return;
     if (!items.length) {
       node.className = 'overview-best-bets-list empty-state-panel compact board-empty-state';
-      node.innerHTML = `<div class="board-empty-head"><div class="empty-icon">${icon}</div><strong>${title}</strong></div><span>${subtitle}</span>`;
+      node.innerHTML = `<div class="board-empty-head"><div class="empty-icon">${getEmptyIconSvg(iconKey)}</div><strong>${title}</strong></div><span>${subtitle}</span>`;
       return;
     }
     node.className = 'overview-best-bets-list';
@@ -5357,7 +6835,7 @@ function renderOverviewBestBets() {
               <div class="overview-best-bet-detail-row">
                 <span class="overview-best-bet-chip stat">${escapeHtml(item.market.stat)} ${item.market.line}</span>
                 <span class="overview-best-bet-chip">Edge ${item.best_bet.edge ?? '--'}%</span>
-                <span class="overview-best-bet-chip">EV ${item.best_bet.ev ?? '--'}%</span>
+                <span class="overview-best-bet-chip">EV ${formatEvPercent(item.best_bet.ev)}%</span>
                 <span class="overview-best-bet-chip">Hit ${item.best_bet.hit_rate ?? item.analysis?.hit_rate ?? '--'}%</span>
               </div>
             </div>
@@ -5380,13 +6858,14 @@ function renderOverviewBestBets() {
   if (overviewEvValueEl) {
     const parsePercent = (value) => {
       const parsed = Number.parseFloat(String(value ?? '').replace('%', '').trim());
-      return Number.isFinite(parsed) ? parsed : null;
+      if (!Number.isFinite(parsed)) return null;
+      return Math.abs(parsed) <= 1 ? (parsed * 100) : parsed;
     };
     const topBoardEv = parsePercent(strongest[0]?.best_bet?.ev);
     const fallbackEv = parsePercent(results[0]?.best_bet?.ev);
     const resolvedEv = topBoardEv ?? fallbackEv;
     if (resolvedEv !== null) {
-      overviewEvValueEl.textContent = `${resolvedEv.toFixed(2)}%`;
+      animateMetricValue(overviewEvValueEl, resolvedEv, { decimals: 2, suffix: '%' });
     } else {
       overviewEvValueEl.textContent = '--%';
     }
@@ -5394,10 +6873,12 @@ function renderOverviewBestBets() {
   if (overviewTopCountEl) overviewTopCountEl.textContent = String(strongest.length);
   if (overviewCautionCountEl) overviewCautionCountEl.textContent = String(caution.length);
   if (overviewBoostCountEl) overviewBoostCountEl.textContent = String(boosts.length);
-  renderBoard(overviewBestBets, strongest, '\u2605', 'No best bets saved yet.', 'Run Market Scanner to pin the strongest current board edges here.');
-  renderBoard(overviewCautionBoardEl, caution, '\u26A0', 'No caution spots yet.', 'Risky plays will appear here after a board scan.');
-  renderBoard(overviewBoostBoardEl, boosts, '\u2728', 'No lineup-context edges yet.', 'Plays with strong teammate-absence context will appear here.');
+  renderBoard(overviewBestBets, strongest, 'trend', 'No best bets saved yet.', 'Run Market Scanner to rank high-EV plays.');
+  renderBoard(overviewCautionBoardEl, caution, 'warning', 'No caution spots yet.', 'Risky plays will appear here after a board scan.');
+  renderBoard(overviewBoostBoardEl, boosts, 'spark', 'No lineup-context edges yet.', 'Plays with strong teammate-absence context will appear here.');
   setOverviewBoardTab(overviewBoardTab);
+  syncOverviewOnboardingState();
+  hydrateEmptyIcons(overviewViewEl || document);
 }
 
 overviewBoardTabsEl?.querySelectorAll('.overview-board-tab').forEach(btn => {
@@ -5444,9 +6925,11 @@ function renderTodayGames(payload) {
     overviewTodayMeta.textContent = payload.fallback_used ? `Next slate: ${payload.resolved_date}` : `${games.length} game${games.length === 1 ? '' : 's'} on ${payload.resolved_date}`;
   }
   if (!games.length) {
-    const emptyHtml = `<div class="empty-state-panel compact today-game-empty"><div class="empty-icon"></div><strong>No games on the active slate.</strong><span>When the NBA schedule posts games, they will appear here with report context.</span></div>`;
+    const emptyHtml = `<div class="empty-state-panel compact today-game-empty"><div class="empty-icon">${getEmptyIconSvg('calendar')}</div><strong>No games on the active slate.</strong><span>When the NBA schedule posts games, they will appear here with report context.</span></div>`;
     if (todayGamesBoard) todayGamesBoard.innerHTML = emptyHtml;
     if (overviewTodayGames) overviewTodayGames.innerHTML = emptyHtml;
+    syncOverviewOnboardingState();
+    hydrateEmptyIcons(overviewViewEl || document);
     return;
   }
   if (todayGamesBoard) {
@@ -5458,6 +6941,8 @@ function renderTodayGames(payload) {
     overviewTodayGames.innerHTML = games.slice(0, 4).map(game => buildTodayGameCard(game, true)).join('');
     bindSlateTeamButtons(overviewTodayGames);
   }
+  syncOverviewOnboardingState();
+  hydrateEmptyIcons(overviewViewEl || document);
 }
 
 function renderDecisionStrip(payload) {
@@ -5831,9 +7316,9 @@ function renderInterpretationPanels(payload) {
       const floor = Number(variance.floor ?? 0);
       const ceiling = Number(variance.ceiling ?? 1);
       const rangeSpan = ceiling - floor || 1;
-      const p25Pct  = Math.round(((Number(variance.p25  ?? floor) - floor) / rangeSpan) * 100);
-      const medPct  = Math.round(((Number(variance.median ?? (floor+ceiling)/2) - floor) / rangeSpan) * 100);
-      const p75Pct  = Math.round(((Number(variance.p75  ?? ceiling) - floor) / rangeSpan) * 100);
+      const p25Pct = Math.round(((Number(variance.p25 ?? floor) - floor) / rangeSpan) * 100);
+      const medPct = Math.round(((Number(variance.median ?? (floor + ceiling) / 2) - floor) / rangeSpan) * 100);
+      const p75Pct = Math.round(((Number(variance.p75 ?? ceiling) - floor) / rangeSpan) * 100);
       const linePct = Math.round(((line - floor) / rangeSpan) * 100);
       const linePctClamped = Math.max(0, Math.min(100, linePct));
 
@@ -5895,13 +7380,13 @@ function renderInterpretationPanels(payload) {
           <div class="insight-summary neutral compact-summary" style="margin-top:10px">
             <span class="insight-summary-label">What this means</span>
             <p>${variance.p25 > line
-              ? `Floor (${Number(variance.p25).toFixed(1)}) sits above the line -- player has barely dipped below in recent games. Strong OVER indicator.`
-              : variance.p75 < line
-              ? `Ceiling (${Number(variance.p75).toFixed(1)}) is under the line -- even good games recently fall short. Strong UNDER indicator.`
-              : cs < 48
+          ? `Floor (${Number(variance.p25).toFixed(1)}) sits above the line -- player has barely dipped below in recent games. Strong OVER indicator.`
+          : variance.p75 < line
+            ? `Ceiling (${Number(variance.p75).toFixed(1)}) is under the line -- even good games recently fall short. Strong UNDER indicator.`
+            : cs < 48
               ? `High variance (std dev ${Number(variance.std_dev ?? 0).toFixed(1)}) -- player output swings widely. Probability model applies a volatility discount.`
               : `Stable output with ${cs.toFixed(0)}/100 consistency. Model edge is more reliable when consistency is high.`
-            }</p>
+        }</p>
           </div>
         </div>`;
     }
@@ -6090,11 +7575,11 @@ function renderChart(payload) {
   const labels = chartGames.map(game => formatTrendAxisDate(game.game_date || game.gameDate || game.date || game.matchup || ''));
   const values = chartGames.map(game => game.value);
   const hits = chartGames.map(game => isGameHitForSide(game, leanSide));
-  const accent = getCssVar('--accent');
-  const good = getCssVar('--good');
-  const bad = getCssVar('--bad');
-  const textColor = getChartTextColor();
-  const muted = getMutedColor();
+  const accent = getCssVar('--accent') || '#60a5fa';
+  const good = getCssVar('--good') || '#39d98a';
+  const bad = getCssVar('--bad') || '#ff6b6b';
+  const textColor = getChartTextColor() || '#e5e7eb';
+  const muted = getMutedColor() || '#94a3b8';
   const linePlugin = createLinePlugin(payload.line);
   const valueLabelPlugin = createTrendValueLabelPlugin(chartGames, payload);
   const hitBandPlugin = createTrendHitBandPlugin(chartGames, payload);
@@ -6135,7 +7620,7 @@ function renderChart(payload) {
       datasets.push({ type: 'line', label: 'Total', data: values, borderColor: accent, pointBackgroundColor: accent, pointRadius: 3, pointHoverRadius: 4, borderWidth: 2, tension: 0.28, fill: false, yAxisID: 'y' });
     }
   } else {
-    const baseColors = hits.map(hit => hit ? `${good}CC` : `${bad}CC`);
+    const baseColors = hits.map(hit => withAlpha(hit ? good : bad, 0.8));
     const baseBorders = hits.map(hit => hit ? good : bad);
     datasets = [{
       type: 'bar', label: getStatLabel(payload.stat), data: values, backgroundColor: baseColors, borderColor: baseBorders, borderWidth: 1.4, borderRadius: 12, borderSkipped: false, maxBarThickness: 42,
@@ -6291,7 +7776,7 @@ renderFavoritesUpgrade();
 ensureFavoritesUpgradeLoaded().then(() => {
   renderFavoritesUpgrade();
   updateStickyAnalyzerSummary();
-}).catch(() => {});
+}).catch(() => { });
 renderOverviewBestBets();
 updateStickyAnalyzerSummary();
 updateChartSampleButtonsUpgrade();
@@ -6448,6 +7933,7 @@ function renderSelectedPlayer() {
     `;
     renderSelectedPlayerContext();
     renderOverviewSelection();
+    syncAnalyzerOnboardingState();
     updateStickyAnalyzerSummary();
     return;
   }
@@ -6484,6 +7970,7 @@ function renderSelectedPlayer() {
   `;
   renderSelectedPlayerContext();
   renderOverviewSelection();
+  syncAnalyzerOnboardingState();
   updateStickyAnalyzerSummary();
 }
 
@@ -7246,12 +8733,22 @@ function renderSummary(payload) {
   const lastGame = payload.games?.[payload.games.length - 1];
   const sideHitCount = getSideHitFromOverHits(payload.hit_count, payload.games_count, leanSide);
   const sideHitRate = Number(payload.games_count || 0) > 0 ? (sideHitCount / Number(payload.games_count || 1)) * 100 : 0;
-  avgValue.textContent = Number(payload.average || 0).toFixed(1);
-  hitRateValue.textContent = `${Number(sideHitRate || 0).toFixed(1)}%`;
+  animateMetricValue(avgValue, Number(payload.average || 0), { decimals: 1 });
+  animateMetricValue(hitRateValue, Number(sideHitRate || 0), { decimals: 1, suffix: '%' });
   hitCountValue.textContent = `${sideHitCount || 0}/${payload.games_count || 0}`;
   seasonValue.textContent = payload.season;
-  streakValue.textContent = streak ? `${streak} straight` : '0';
-  lastGameValue.textContent = lastGame ? `${lastGame.value}` : '--';
+  if (streak) {
+    animateMetricValue(streakValue, Number(streak || 0), { forceInteger: true, suffix: ' straight' });
+  } else {
+    streakValue.textContent = '0';
+  }
+  if (lastGame && Number.isFinite(Number(lastGame.value))) {
+    const lastGameNumber = Number(lastGame.value);
+    const decimals = Number.isInteger(lastGameNumber) ? 0 : 1;
+    animateMetricValue(lastGameValue, lastGameNumber, { decimals, duration: 420 });
+  } else {
+    lastGameValue.textContent = '--';
+  }
 
   const nextGame = payload.matchup?.next_game;
   const vsPosition = payload.matchup?.vs_position;
@@ -7368,6 +8865,7 @@ async function analyzePlayerProp(options = {}) {
     const response = await apiFetch(`/api/player-prop?${params.toString()}${localStorage.getItem(INJURY_DEBUG_STORAGE) === '1' ? '&debug=true' : ''}`, {}, 45000);
     const payload = response;
     if (!payload || typeof payload !== 'object') throw new Error('Failed to analyze player prop.');
+    lastPayload = payload;
 
     const priorAvailability = selectedPlayer?.availability && typeof selectedPlayer.availability === 'object'
       ? selectedPlayer.availability
@@ -7444,6 +8942,7 @@ async function analyzePlayerProp(options = {}) {
     if (options.preserveSection) {
       requestAnimationFrame(() => scrollAnalyzerFocusIntoView());
     }
+    syncAnalyzerOnboardingState();
   } catch (error) {
     console.error(error);
     // Show visual error in chart area instead of alert
@@ -7455,12 +8954,20 @@ async function analyzePlayerProp(options = {}) {
     setStatus('Error');
   } finally {
     analyzeBtn.disabled = false;
+    syncAnalyzerOnboardingState();
   }
 }
 
 toggleAdvancedFiltersBtnEl?.addEventListener('click', () => {
   advancedFiltersPanelEl?.classList.toggle('hidden');
   if (toggleAdvancedFiltersBtnEl) toggleAdvancedFiltersBtnEl.textContent = advancedFiltersPanelEl?.classList.contains('hidden') ? 'Advanced' : 'Hide';
+});
+
+toggleAnalyzerSetupBtnEl?.addEventListener('click', () => {
+  analyzerAdvancedSetupEl?.classList.toggle('hidden');
+  const isExpanded = !analyzerAdvancedSetupEl?.classList.contains('hidden');
+  toggleAnalyzerSetupBtnEl.setAttribute('aria-expanded', isExpanded ? 'true' : 'false');
+  toggleAnalyzerSetupBtnEl.textContent = isExpanded ? 'Hide advanced setup' : 'Show advanced setup';
 });
 
 quickFilterChipButtonsEl.forEach(btn => btn.addEventListener('click', () => applyFilterPresetUpgrade(btn.dataset.filterPreset || 'all')));
@@ -7842,6 +9349,12 @@ function buildSparklineSvg(values, line, width, height) {
   const parlayBuildBtn = document.getElementById('parlayBuildBtn');
   const parlayRebuildBtn = document.getElementById('parlayRebuildBtn');
   const parlayRescrapeBtn = document.getElementById('parlayRescrapeBtn');
+  const parlayMinOddsInput = document.getElementById('parlayMinOdds');
+  const parlayMaxOddsInput = document.getElementById('parlayMaxOdds');
+  const parlayClearOddsFilterBtn = document.getElementById('parlayClearOddsFilterBtn');
+  const parlayBacktestFilterSelect = document.getElementById('parlayBacktestFilterSelect');
+  const parlayLogBacktestBtn = document.getElementById('parlayLogBacktestBtn');
+  const parlayUndoBacktestBtn = document.getElementById('parlayUndoBacktestBtn');
   const parlayStatusMeta = document.getElementById('parlayStatusMeta');
   const parlayQuotaBar = document.getElementById('parlayQuotaBar');
   const parlayQuotaList = document.getElementById('parlayQuotaList');
@@ -7855,6 +9368,7 @@ function buildSparklineSvg(values, line, width, height) {
   const parlayEmptyState = document.getElementById('parlayEmptyState');
   const parlayInjuryAware = document.getElementById('parlayInjuryAware');
   const parlayInjurySummaryEl = document.getElementById('parlayInjurySummary');
+  const parlayFallbackNoticeEl = document.getElementById('parlayFallbackNotice');
   const parlaySetupBlock = document.getElementById('parlaySetupBlock');
   const parlayJumpChips = Array.from(document.querySelectorAll('.ds-parlay .parlay-jump-chip'));
 
@@ -7866,6 +9380,10 @@ function buildSparklineSvg(values, line, width, height) {
   let cachedScoredProps = null;
   let cachedQuotaLog = null;
   let cachedScrapeMeta = null;
+  let cachedPlayoffFallbackApplied = false;
+  let lastParlayBacktestBatchId = '';
+  let parlayReshuffleOffset = 0;
+  let lastParlayLegSignature = '';
 
   //  Persist / restore 
   try {
@@ -7897,6 +9415,69 @@ function buildSparklineSvg(values, line, width, height) {
     parlayStatusMeta.style.color = err ? 'var(--bad)' : '';
   }
   function hitClass(pct) { return pct >= 70 ? 'hit-pct-high' : pct >= 55 ? 'hit-pct-mid' : 'hit-pct-low'; }
+  function parseOddsBound(inputEl) {
+    if (!inputEl) return null;
+    const raw = String(inputEl.value ?? '').trim();
+    if (!raw) return null;
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : null;
+  }
+  function getParlayOddsBounds() {
+    const minOdds = parseOddsBound(parlayMinOddsInput);
+    const maxOdds = parseOddsBound(parlayMaxOddsInput);
+    if (minOdds != null && maxOdds != null && minOdds > maxOdds) {
+      return { minOdds: maxOdds, maxOdds: minOdds };
+    }
+    return { minOdds, maxOdds };
+  }
+  function passesParlayOddsBounds(prop, bounds) {
+    const odds = Number(prop?.odds);
+    if (!Number.isFinite(odds)) return false;
+    if (bounds?.minOdds != null && odds < bounds.minOdds) return false;
+    if (bounds?.maxOdds != null && odds > bounds.maxOdds) return false;
+    return true;
+  }
+  function filterParlayPropsByOdds(props) {
+    const list = Array.isArray(props) ? props : [];
+    const bounds = getParlayOddsBounds();
+    return list.filter(function (prop) { return passesParlayOddsBounds(prop, bounds); });
+  }
+  function rotateParlayProps(props, offset) {
+    const list = Array.isArray(props) ? props.slice() : [];
+    const count = list.length;
+    if (!count) return list;
+    const shift = ((Number(offset) || 0) % count + count) % count;
+    if (!shift) return list;
+    return list.slice(shift).concat(list.slice(0, shift));
+  }
+  function getParlayBacktestThresholds(mode) {
+    const normalized = String(mode || 'action').trim().toLowerCase();
+    if (normalized === 'broad') return { minScore: 60, minGames: 4 };
+    if (normalized === 'playoff_high') return { minScore: 75, minGames: 0 };
+    return { minScore: 72, minGames: 5 };
+  }
+  function passesParlayBacktestMode(prop, mode) {
+    if (!prop || typeof prop !== 'object') return false;
+    const normalized = String(mode || 'action').trim().toLowerCase();
+    if (normalized === 'selected') {
+      return String(prop.selection_status || '').trim().toLowerCase() === 'selected';
+    }
+    const thresholds = getParlayBacktestThresholds(normalized);
+    const score = Number(prop.confidence_score || 0);
+    const gamesCount = Number(prop.games_count || 0);
+    const odds = Number(prop.odds || 0);
+    return score >= thresholds.minScore && gamesCount >= thresholds.minGames && odds >= 1.4;
+  }
+  function getParlayPropsPassingMode(props, mode) {
+    return (Array.isArray(props) ? props : []).filter(function (prop) { return passesParlayBacktestMode(prop, mode); });
+  }
+  function formatParlayOddsBoundsLabel() {
+    const bounds = getParlayOddsBounds();
+    if (bounds.minOdds == null && bounds.maxOdds == null) return '';
+    if (bounds.minOdds != null && bounds.maxOdds != null) return 'odds ' + bounds.minOdds.toFixed(2) + '-' + bounds.maxOdds.toFixed(2);
+    if (bounds.minOdds != null) return 'odds >= ' + bounds.minOdds.toFixed(2);
+    return 'odds <= ' + bounds.maxOdds.toFixed(2);
+  }
 
   function formatEventTime(iso) {
     if (!iso) return '';
@@ -8017,7 +9598,13 @@ function buildSparklineSvg(values, line, width, height) {
         // Clear cache when selection changes -- different events = different scrape
         if (cachedScoredProps) {
           cachedScoredProps = null; cachedQuotaLog = null; cachedScrapeMeta = null;
+          cachedPlayoffFallbackApplied = false;
+          lastParlayBacktestBatchId = '';
+          parlayReshuffleOffset = 0;
+          lastParlayLegSignature = '';
+          renderPlayoffFallbackNotice(false);
           showCacheButtons(false);
+          refreshParlayBacktestActionButtons();
           show(parlayTicketShell, false);
           show(parlayTicket, false);
           show(parlayAllPropsWrap, false);
@@ -8031,6 +9618,18 @@ function buildSparklineSvg(values, line, width, height) {
     show(parlayRebuildBtn, hasCache);
     show(parlayRescrapeBtn, hasCache);
     if (parlayBuildBtn) parlayBuildBtn.style.display = hasCache ? 'none' : '';
+  }
+
+  function refreshParlayBacktestActionButtons() {
+    const filteredProps = filterParlayPropsByOdds(cachedScoredProps || []);
+    const hasScoredProps = filteredProps.length > 0;
+    const selectedMode = String(parlayBacktestFilterSelect?.value || 'action').toLowerCase();
+    const matchingProps = getParlayPropsPassingMode(filteredProps, selectedMode);
+    if (parlayLogBacktestBtn) parlayLogBacktestBtn.disabled = !hasScoredProps || matchingProps.length === 0;
+    if (parlayUndoBacktestBtn) {
+      parlayUndoBacktestBtn.style.display = lastParlayBacktestBatchId ? '' : 'none';
+      parlayUndoBacktestBtn.disabled = !lastParlayBacktestBatchId;
+    }
   }
 
   //  Render quota pills 
@@ -8060,6 +9659,24 @@ function buildSparklineSvg(values, line, width, height) {
     }
     return legs;
   }
+  function getParlayLegSignature(legs) {
+    const list = Array.isArray(legs) ? legs : [];
+    return list.map(function (leg) {
+      return [
+        String(leg?.player_id || ''),
+        String(leg?.event_id || ''),
+        String(leg?.stat || ''),
+        String(leg?.line || ''),
+        String(leg?.side || ''),
+      ].join(':');
+    }).join('|');
+  }
+  function pickLegsForOffset(offset, n) {
+    const filteredProps = filterParlayPropsByOdds(cachedScoredProps || []);
+    const displayProps = rotateParlayProps(filteredProps, offset);
+    const legs = pickLegs(displayProps, n);
+    return { filteredProps, displayProps, legs };
+  }
   function calcOdds(legs) {
     if (!legs.length) return null;
     return Math.round(legs.reduce(function (a, l) { return a * l.odds; }, 1) * 100) / 100;
@@ -8073,15 +9690,58 @@ function buildSparklineSvg(values, line, width, height) {
     return Number(prop.h2h_games_count || 0) > 0 ? 'H2H' : 'Recent';
   }
 
+  function getParlayH2HMetrics(prop) {
+    const games = Math.max(0, Number(prop?.h2h_games_count || 0));
+    if (!games) return { games: 0, hits: null, rate: null };
+    const rawHits = Number(prop?.h2h_hit_count);
+    if (Number.isFinite(rawHits)) {
+      const hits = Math.max(0, Math.min(games, rawHits));
+      return { games, hits, rate: (hits / games) * 100 };
+    }
+    const rawRate = Number(prop?.h2h_hit_rate);
+    if (Number.isFinite(rawRate)) {
+      const rate = Math.max(0, Math.min(100, rawRate));
+      const hits = Math.round((rate / 100) * games);
+      return { games, hits, rate: (hits / games) * 100 };
+    }
+    return { games, hits: null, rate: null };
+  }
+
   function getParlayRankingChip(prop) {
     const label = getParlayRankingLabel(prop);
-    const h2hGames = Number(prop?.h2h_games_count || 0);
-    const h2hRate = Number(prop?.h2h_hit_rate);
+    const h2h = getParlayH2HMetrics(prop);
     const toneClass = label === 'H2H' ? 'h2h' : 'recent';
-    const detail = label === 'H2H' && h2hGames > 0 && Number.isFinite(h2hRate)
-      ? ' (' + h2hRate.toFixed(1) + '%  ' + h2hGames + 'g)'
+    const detail = label === 'H2H' && h2h.games > 0
+      ? (Number.isFinite(h2h.hits)
+        ? ' (' + h2h.hits + '/' + h2h.games + '  ' + Number(h2h.rate || 0).toFixed(1) + '%)'
+        : ' (' + h2h.games + 'g)')
       : '';
     return '<span class="finder-chip parlay-rank-chip ' + toneClass + '">Ranked by: ' + label + detail + '</span>';
+  }
+
+  function renderParlayH2HDebug(prop) {
+    const debug = prop && typeof prop === 'object' ? (prop.h2h_debug || null) : null;
+    if (!debug || typeof debug !== 'object') return '';
+    const opp = debug.opponent_abbreviation ? String(debug.opponent_abbreviation) : '--';
+    const gamesCount = Number(debug.from_games_count || 0);
+    const payloadCount = Number(debug.from_payload_count || 0);
+    const resolvedCount = Number(debug.resolved_count || 0);
+    const seasonType = String(debug.season_type || prop?.season_type || '--');
+    const sampleCount = Number(prop?.games_count || 0);
+    const poolFiltered = Number(debug.filtered_pool_count || 0);
+    const poolSeason = Number(debug.season_pool_count || 0);
+    const source = debug.game_log_source ? String(debug.game_log_source) : '--';
+    return '<div class="parlay-leg-analyze-hint" style="font-size:0.68rem;color:var(--muted);margin-top:6px;text-align:center">' +
+      'Season ' + escHtml(seasonType) +
+      ' | sample ' + sampleCount +
+      ' | pool ' + poolFiltered + '/' + poolSeason +
+      ' | src ' + escHtml(source) +
+      ' | ' +
+      'H2H debug: opp ' + escHtml(opp) +
+      ' | games ' + gamesCount +
+      ' | payload ' + payloadCount +
+      ' | resolved ' + resolvedCount +
+      '</div>';
   }
 
   //  Render ticket 
@@ -8134,6 +9794,7 @@ function buildSparklineSvg(values, line, width, height) {
         '<div class="parlay-leg-details-body">' +
         reasonHtml +
         renderDecisionLensHtml(decisionLens, 'compact') +
+        renderParlayH2HDebug(leg) +
         '<div class="parlay-leg-analyze-hint" style="font-size:0.72rem;color:var(--muted);margin-top:6px;text-align:center">' + escHtml(leg.confidence_summary || 'Click to analyze ') + '</div>' +
         '</div>' +
         '</details>';
@@ -8215,7 +9876,7 @@ function buildSparklineSvg(values, line, width, height) {
         '<td class="hit-pct-cell ' + hitClass(p.hit_rate) + '">' + p.hit_rate + '%</td>' +
         '<td>' + (p.average || '--') + '</td><td>' + (p.games_count || '--') + '</td>' +
         '<td>' + confText + '</td>' +
-        '<td><div class="parlay-row-micro"><span>EV <strong>' + (p.ev ?? '--') + '%</strong></span><span>Edge <strong>' + (p.edge ?? '--') + '%</strong></span><span>Sample <strong>' + (p.hit_count || 0) + '/' + (p.games_count || 0) + '</strong></span></div></td>' +
+        '<td><div class="parlay-row-micro"><span>EV <strong>' + formatEvPercent(p.ev) + '%</strong></span><span>Edge <strong>' + (p.edge ?? '--') + '%</strong></span><span>Sample <strong>' + (p.hit_count || 0) + '/' + (p.games_count || 0) + '</strong></span></div></td>' +
         '<td>' + fmtOdds(p.odds) + '</td>' +
         '<td><div class="parlay-inj-cell">' + renderInjuryCell(p) + '</div></td>' +
         '<td><div class="parlay-action-cell"><button class="parlay-track-btn" data-track-idx="' + idx + '">+ Track</button></div></td>' +
@@ -8252,13 +9913,35 @@ function buildSparklineSvg(values, line, width, height) {
   function rebuildFromCache() {
     if (!cachedScoredProps || !cachedScoredProps.length) return;
     const n = parseInt(parlayLegsSelect.value) || 3;
-    const legs = pickLegs(cachedScoredProps, n);
+    const layout = pickLegsForOffset(parlayReshuffleOffset, n);
+    const filteredProps = layout.filteredProps;
+    const displayProps = layout.displayProps;
+    const oddsLabel = formatParlayOddsBoundsLabel();
+    if (!displayProps.length) {
+      show(parlayTicketShell, false);
+      show(parlayTicket, false);
+      show(parlayAllPropsWrap, false);
+      show(parlayEmptyState, true);
+      const s = parlayEmptyState.querySelector('strong');
+      const sp = parlayEmptyState.querySelector('span');
+      if (s) s.textContent = 'No props match the current odds filter.';
+      if (sp) sp.textContent = oddsLabel ? ('Adjust or clear ' + oddsLabel + ' to see results.') : 'Try changing your filters.';
+      setStatus('No props available for the current odds filter.', true);
+      refreshParlayBacktestActionButtons();
+      return;
+    }
+    show(parlayEmptyState, false);
+    renderPlayoffFallbackNotice(cachedPlayoffFallbackApplied);
+    const legs = layout.legs;
+    lastParlayLegSignature = getParlayLegSignature(legs);
     const odds = calcOdds(legs);
     renderTicket(legs, n, odds);
-    renderAllProps(cachedScoredProps, legs.map(function (l) { return l.player_id; }));
+    renderAllProps(displayProps, legs.map(function (l) { return l.player_id; }));
     const m = cachedScrapeMeta || {};
     const ago = m.scrapedAt ? '  cached ' + Math.round((Date.now() - m.scrapedAt) / 60000) + 'm ago' : '';
-    setStatus((m.evCount || 0) + ' events  ' + (m.analyzed || 0) + ' props analyzed' + ago + ' -- no credits used', false);
+    const filterDetail = oddsLabel ? ('  ' + oddsLabel) : '';
+    setStatus((m.evCount || 0) + ' events  ' + displayProps.length + '/' + (m.analyzed || 0) + ' props shown' + filterDetail + ago + ' -- no credits used', false);
+    refreshParlayBacktestActionButtons();
   }
 
   //  Render injury summary panel 
@@ -8271,12 +9954,25 @@ function buildSparklineSvg(values, line, width, height) {
     parlayInjurySummaryEl.style.display = '';
     parlayInjurySummaryEl.innerHTML =
       '<div class="parlay-inj-summary-label"> Today\'s lineup context used in analysis</div>' +
-      injurySummary.map(function(t) {
+      injurySummary.map(function (t) {
         return '<div class="parlay-inj-team-chip">' +
           '<span class="inj-team-name">' + escHtml(t.team_name) + '</span>' +
           '<span class="inj-player-list">' + (t.injured_player_names || []).map(escHtml).join('<br>') + '</span>' +
           '</div>';
       }).join('');
+  }
+
+  function renderPlayoffFallbackNotice(applied) {
+    if (!parlayFallbackNoticeEl) return;
+    if (!applied) {
+      parlayFallbackNoticeEl.style.display = 'none';
+      parlayFallbackNoticeEl.innerHTML = '';
+      return;
+    }
+    parlayFallbackNoticeEl.style.display = '';
+    parlayFallbackNoticeEl.innerHTML =
+      '<div class="parlay-fallback-pill">Playoff fallback applied</div>' +
+      '<span>Strict playoff filters removed all props, so confidence/H2H gating was relaxed to keep results visible. Re-check each leg before placing bets.</span>';
   }
 
   //  Render single injury cell for all-props table 
@@ -8320,7 +10016,11 @@ function buildSparklineSvg(values, line, width, height) {
       setStatus(error.message || 'No usable rotating keys available.', true);
       return;
     }
-    const keys = keyEntries.map(function (entry) { return entry.key; });
+    const keys = keyEntries.map(function (entry) { return normalizeOddsApiKeyValue(entry.key); }).filter(Boolean);
+    if (!keys.length) {
+      setStatus('No valid keys found in Key Vault. Re-add your Odds API keys.', true);
+      return;
+    }
     if (selectedEventIds.size === 0) { setStatus('Select at least one event first.', true); return; }
     const legs = parseInt(parlayLegsSelect.value) || 2;
     const sport = parlaySportSelect.value;
@@ -8328,9 +10028,15 @@ function buildSparklineSvg(values, line, width, height) {
     const lastN = parseInt(parlayLastNSelect.value) || 10;
 
     saveSettings();
+    lastParlayBacktestBatchId = '';
+    cachedPlayoffFallbackApplied = false;
+    parlayReshuffleOffset = 0;
+    lastParlayLegSignature = '';
+    refreshParlayBacktestActionButtons();
     show(parlayTicketShell, false); show(parlayTicket, false); show(parlayAllPropsWrap, false);
     show(parlayQuotaBar, false); show(parlayEmptyState, false);
     if (parlayInjurySummaryEl) parlayInjurySummaryEl.style.display = 'none';
+    renderPlayoffFallbackNotice(false);
     parlayQuotaList.innerHTML = '';
     const useInjuryAware = parlayInjuryAware && parlayInjuryAware.checked;
     const parlayEndpoint = useInjuryAware ? '/api/parlay-builder-injury-aware' : '/api/parlay-builder';
@@ -8349,6 +10055,7 @@ function buildSparklineSvg(values, line, width, height) {
         odds_format: oddsFormat, last_n: lastN,
         season: seasonInput.value.trim() || undefined,
         season_type: getSelectedSeasonType(),
+        bypass_cache: true,
         event_ids: Array.from(selectedEventIds),
         bookmaker: parlayBookmakerSelect ? parlayBookmakerSelect.value : 'draftkings',
       };
@@ -8380,6 +10087,9 @@ function buildSparklineSvg(values, line, width, height) {
           const total = msg.total || 1;
           pct = 82 + Math.round((done / total) * 16);
           label = 'Scoring ' + done + '/' + total;
+        } else if (msg.stage === 'scoring_relaxed_fallback') {
+          pct = 82;
+          label = 'Playoff strict filters removed all props, applying relaxed fallback...';
         } else if (msg.stage === 'done') {
           pct = 100;
           label = 'Buzzer beater: parlay ready.';
@@ -8406,11 +10116,13 @@ function buildSparklineSvg(values, line, width, height) {
 
       cachedScoredProps = data.all_props_scored || [];
       cachedQuotaLog = data.quota_log || [];
+      cachedPlayoffFallbackApplied = Boolean(data.playoff_relaxed_fallback_applied);
       cachedScrapeMeta = { evCount: data.events_scraped || 0, propCount: data.props_found || 0, analyzed: data.props_analyzed || 0, scrapedAt: Date.now() };
       setParlayProgress(95, 'Fourth quarter: building your ticket...');
       renderQuota(cachedQuotaLog);
+      renderPlayoffFallbackNotice(cachedPlayoffFallbackApplied);
       const m = cachedScrapeMeta;
-      const injBoostCount = (cachedScoredProps || []).filter(function(p){ return p.injury_boost; }).length;
+      const injBoostCount = (cachedScoredProps || []).filter(function (p) { return p.injury_boost; }).length;
       const injStatusMsg = useInjuryAware ? ('   ' + injBoostCount + ' lineup-context edge' + (injBoostCount !== 1 ? 's' : '')) : '';
       setStatus(' Done -- ' + m.evCount + ' event(s) scraped  ' + m.propCount + ' props found  ' + m.analyzed + ' analyzed' + injStatusMsg, false);
       // Render injury summary panel
@@ -8419,6 +10131,7 @@ function buildSparklineSvg(values, line, width, height) {
       setTimeout(function () { setParlayProgress(0, ''); }, 2000);
 
       if (!cachedScoredProps.length) {
+        refreshParlayBacktestActionButtons();
         show(parlayEmptyState, true);
         const s = parlayEmptyState.querySelector('strong'), sp = parlayEmptyState.querySelector('span');
         if (s) s.textContent = data.message || 'No props found for selected events.';
@@ -8427,6 +10140,7 @@ function buildSparklineSvg(values, line, width, height) {
         return;
       }
       showCacheButtons(true);
+      refreshParlayBacktestActionButtons();
       rebuildFromCache();
       if (typeof hideBanner === 'function') hideBanner();
     } catch (err) {
@@ -8437,6 +10151,7 @@ function buildSparklineSvg(values, line, width, height) {
       if (parlayBuildBtn) parlayBuildBtn.disabled = false;
       if (parlayRebuildBtn) parlayRebuildBtn.disabled = false;
       if (parlayRescrapeBtn) parlayRescrapeBtn.disabled = false;
+      refreshParlayBacktestActionButtons();
     }
   }
 
@@ -8476,7 +10191,13 @@ function buildSparklineSvg(values, line, width, height) {
       // Reset state
       selectedEventIds.clear();
       cachedScoredProps = null; cachedQuotaLog = null; cachedScrapeMeta = null;
+      cachedPlayoffFallbackApplied = false;
+      lastParlayBacktestBatchId = '';
+      parlayReshuffleOffset = 0;
+      lastParlayLegSignature = '';
+      renderPlayoffFallbackNotice(false);
       showCacheButtons(false);
+      refreshParlayBacktestActionButtons();
       show(parlayTicketShell, false); show(parlayTicket, false); show(parlayAllPropsWrap, false);
 
       renderEventPicker(allEvents);
@@ -8516,8 +10237,27 @@ function buildSparklineSvg(values, line, width, height) {
   if (parlayRebuildBtn) {
     parlayRebuildBtn.addEventListener('click', function () {
       if (!cachedScoredProps || !cachedScoredProps.length) { setStatus('No cached data. Run Scrape & Build first.', true); return; }
-      // Rotate the cached props so a different combination surfaces
-      if (cachedScoredProps.length > 1) cachedScoredProps.push(cachedScoredProps.shift());
+      const n = parseInt(parlayLegsSelect.value) || 3;
+      const filteredCount = filterParlayPropsByOdds(cachedScoredProps).length;
+      if (filteredCount <= 1) {
+        setStatus('No alternate board order available for current filters.', true);
+        return;
+      }
+      const currentSignature = lastParlayLegSignature;
+      let foundAlternative = false;
+      const maxAttempts = Math.min(filteredCount, 200);
+      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        parlayReshuffleOffset += 1;
+        const candidateSignature = getParlayLegSignature(pickLegsForOffset(parlayReshuffleOffset, n).legs);
+        if (candidateSignature && candidateSignature !== currentSignature) {
+          foundAlternative = true;
+          break;
+        }
+      }
+      if (!foundAlternative) {
+        setStatus('No alternate ticket found for current filters/events.', true);
+        return;
+      }
       rebuildFromCache();
     });
   }
@@ -8526,8 +10266,123 @@ function buildSparklineSvg(values, line, width, height) {
   if (parlayRescrapeBtn) {
     parlayRescrapeBtn.addEventListener('click', function () {
       cachedScoredProps = null; cachedQuotaLog = null; cachedScrapeMeta = null;
+      cachedPlayoffFallbackApplied = false;
+      lastParlayBacktestBatchId = '';
+      parlayReshuffleOffset = 0;
+      lastParlayLegSignature = '';
+      renderPlayoffFallbackNotice(false);
       showCacheButtons(false);
+      refreshParlayBacktestActionButtons();
       runScrape();
+    });
+  }
+
+  async function logParlayBacktestBatch(modeOverride) {
+    if (!Array.isArray(cachedScoredProps) || !cachedScoredProps.length) {
+      setStatus('Build a parlay first so there are scored props to log.', true);
+      return;
+    }
+    const propsForLog = filterParlayPropsByOdds(cachedScoredProps);
+    if (!propsForLog.length) {
+      setStatus('No props match the current odds filter. Adjust min/max odds before logging.', true);
+      return;
+    }
+    const filterMode = String(modeOverride || parlayBacktestFilterSelect?.value || 'action').toLowerCase();
+    const matchingModeProps = getParlayPropsPassingMode(propsForLog, filterMode);
+    if (!matchingModeProps.length) {
+      if (filterMode === 'selected') {
+        setStatus('No selected-leg props available in the current filtered board.', true);
+      } else if (filterMode === 'playoff_high') {
+        setStatus('No props met Playoff High+ thresholds (score >= 75, odds >= 1.40).', true);
+      } else if (filterMode === 'broad') {
+        setStatus('No props met Broad thresholds (score >= 60, games >= 4, odds >= 1.40).', true);
+      } else {
+        setStatus('No props met Actionable thresholds (score >= 72, games >= 5, odds >= 1.40).', true);
+      }
+      showAppToast('No props match the selected log filter.', 'info');
+      return;
+    }
+    const season = (typeof seasonInput !== 'undefined' && seasonInput && seasonInput.value) ? seasonInput.value.trim() : '';
+    const seasonType = (typeof getSelectedSeasonType === 'function') ? getSelectedSeasonType() : 'Combined';
+    const buttons = [parlayLogBacktestBtn].filter(Boolean);
+    const originalLabels = buttons.map(function (btn) { return btn.textContent; });
+    buttons.forEach(function (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Logging...';
+    });
+    try {
+      const payload = await apiFetch('/api/backtest/parlay/log-batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          props: propsForLog,
+          filter_mode: filterMode,
+          season: season || undefined,
+          season_type: seasonType,
+          source: 'parlay_builder',
+        }),
+      }, 20000);
+      if (!payload || payload.ok === false) throw new Error(payload?.error || 'Could not log parlay batch.');
+      lastParlayBacktestBatchId = String(payload.batch_id || '').trim();
+      refreshParlayBacktestActionButtons();
+      const logged = Number(payload.logged || 0);
+      const skipped = Number(payload.skipped_filter || 0) + Number(payload.skipped_duplicate || 0) + Number(payload.skipped_invalid || 0);
+      if (logged === 0 && Number(payload.skipped_filter || 0) > 0) {
+        setStatus('Backend skipped every prop for the selected filter. This usually means stale client code or changed server rules.', true);
+      }
+      showAppToast(`Backtest batch logged: ${logged} added${skipped ? `, ${skipped} skipped` : ''}.`, logged > 0 ? 'success' : 'info');
+    } catch (err) {
+      setStatus('Backtest log failed: ' + (err?.message || 'Unknown error'), true);
+    } finally {
+      buttons.forEach(function (btn, index) {
+        btn.disabled = false;
+        btn.textContent = originalLabels[index];
+      });
+      refreshParlayBacktestActionButtons();
+    }
+  }
+
+  if (parlayLogBacktestBtn) {
+    parlayLogBacktestBtn.addEventListener('click', function () {
+      const selectedMode = String(parlayBacktestFilterSelect?.value || 'action');
+      logParlayBacktestBatch(selectedMode);
+    });
+  }
+  if (parlayBacktestFilterSelect) {
+    parlayBacktestFilterSelect.addEventListener('change', function () {
+      refreshParlayBacktestActionButtons();
+    });
+  }
+
+  if (parlayUndoBacktestBtn) {
+    parlayUndoBacktestBtn.addEventListener('click', async function () {
+      if (!lastParlayBacktestBatchId) {
+        setStatus('No recent parlay backtest batch to undo.', true);
+        return;
+      }
+      const originalLabel = parlayUndoBacktestBtn.textContent;
+      parlayUndoBacktestBtn.disabled = true;
+      parlayUndoBacktestBtn.textContent = 'Undoing...';
+      try {
+        const payload = await apiFetch('/api/backtest/parlay/undo-batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            batch_id: lastParlayBacktestBatchId,
+            source_prefix: 'parlay_builder',
+            only_pending: true,
+          }),
+        }, 30000);
+        if (!payload || payload.ok === false) throw new Error(payload?.error || 'Undo failed.');
+        const deleted = Number(payload.deleted || 0);
+        showAppToast(`Undo complete: ${deleted} pending logged prop${deleted === 1 ? '' : 's'} removed.`, deleted > 0 ? 'success' : 'info');
+        lastParlayBacktestBatchId = '';
+      } catch (err) {
+        setStatus('Undo failed: ' + (err?.message || 'Unknown error'), true);
+      } finally {
+        parlayUndoBacktestBtn.textContent = originalLabel;
+        refreshParlayBacktestActionButtons();
+      }
     });
   }
 
@@ -8537,6 +10392,23 @@ function buildSparklineSvg(values, line, width, height) {
       if (cachedScoredProps && cachedScoredProps.length) rebuildFromCache();
     });
   }
+  [parlayMinOddsInput, parlayMaxOddsInput].forEach(function (inputEl) {
+    if (!inputEl) return;
+    inputEl.addEventListener('input', function () {
+      if (cachedScoredProps && cachedScoredProps.length) rebuildFromCache();
+      else refreshParlayBacktestActionButtons();
+    });
+  });
+  if (parlayClearOddsFilterBtn) {
+    parlayClearOddsFilterBtn.addEventListener('click', function () {
+      if (parlayMinOddsInput) parlayMinOddsInput.value = '';
+      if (parlayMaxOddsInput) parlayMaxOddsInput.value = '';
+      if (cachedScoredProps && cachedScoredProps.length) rebuildFromCache();
+      else refreshParlayBacktestActionButtons();
+    });
+  }
+
+  refreshParlayBacktestActionButtons();
 
 })();
 
@@ -9278,10 +11150,13 @@ function buildSparklineSvg(values, line, width, height) {
   }
 
   function parsePercentLike(value) {
-    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return Math.abs(value) <= 1 ? (value * 100) : value;
+    }
     if (typeof value === 'string') {
       const num = Number(value.replace(/[^\d.-]/g, ''));
-      return Number.isFinite(num) ? num : 0;
+      if (!Number.isFinite(num)) return 0;
+      return Math.abs(num) <= 1 ? (num * 100) : num;
     }
     return 0;
   }
@@ -9379,6 +11254,32 @@ function buildSparklineSvg(values, line, width, height) {
     if (availability.includes('out') || availability.includes('questionable')) chips.push({ label: 'Status risk', tone: 'bad' });
 
     return chips.slice(0, 4);
+  }
+
+  function getSideAwareH2HMetrics(h2h, side = 'OVER') {
+    const games = Math.max(0, safeNumber(h2h?.games_count, 0) || 0);
+    if (!games) return { games: 0, hitCount: 0, hitRate: 0 };
+    const sideLabel = String(side || 'OVER').toUpperCase() === 'UNDER' ? 'UNDER' : 'OVER';
+    const rawOverHits = safeNumber(h2h?.hit_count, NaN);
+    if (Number.isFinite(rawOverHits)) {
+      const overHits = Math.max(0, Math.min(games, rawOverHits));
+      const sideHitCount = getSideHitFromOverHits(overHits, games, sideLabel);
+      return {
+        games,
+        hitCount: sideHitCount,
+        hitRate: (sideHitCount / games) * 100,
+      };
+    }
+    const rawRate = safeNumber(h2h?.hit_rate, NaN);
+    if (Number.isFinite(rawRate)) {
+      const clampedRate = Math.max(0, Math.min(100, rawRate));
+      return {
+        games,
+        hitCount: Math.round((clampedRate / 100) * games),
+        hitRate: clampedRate,
+      };
+    }
+    return { games, hitCount: 0, hitRate: 0 };
   }
 
   function flashSlipToast(message) {
@@ -9595,12 +11496,13 @@ function buildSparklineSvg(values, line, width, height) {
       if (!selectedPlayer) return;
       const payload = lastPayload || {};
       const side = String(payload.recommended_side || payload.best_side || (parsePercentLike(payload.hit_rate) >= 50 ? 'OVER' : 'UNDER')).toUpperCase();
+      const h2hMetrics = getSideAwareH2HMetrics(payload.h2h || {}, side);
       const insightChips = makeInsightChips({
         hit_rate: payload.hit_rate,
         average: payload.average,
         line: payload.line,
-        h2h_hit_rate: payload.h2h?.hit_rate,
-        h2h_games: payload.h2h?.games_count,
+        h2h_hit_rate: h2hMetrics.hitRate,
+        h2h_games: h2hMetrics.games,
         vs_position_delta_pct: payload.matchup?.vs_position?.delta_pct,
         is_back_to_back: payload.environment?.is_back_to_back,
         impact_count: payload.team_context?.impact_count,
@@ -9612,8 +11514,8 @@ function buildSparklineSvg(values, line, width, height) {
       const confidenceScore = computeConfidenceScoreFromParts({
         hit_rate: payload.hit_rate,
         games_count: payload.games_count,
-        h2h_hit_rate: payload.h2h?.hit_rate,
-        h2h_games: payload.h2h?.games_count,
+        h2h_hit_rate: h2hMetrics.hitRate,
+        h2h_games: h2hMetrics.games,
         minutes_last5: payload.opportunity?.minutes_last5
       });
       addToSlip({
@@ -9910,21 +11812,22 @@ function buildSparklineSvg(values, line, width, height) {
       summary.className = 'smart-analyzer-summary';
       chartArea.insertAdjacentElement('afterend', summary);
     }
+    const side = String(payload?.recommended_side || (parsePercentLike(payload?.hit_rate) >= 50 ? 'OVER' : 'UNDER')).toUpperCase();
+    const h2hMetrics = getSideAwareH2HMetrics(payload?.h2h || {}, side);
     const confidenceScore = computeConfidenceScoreFromParts({
       hit_rate: payload?.hit_rate,
       games_count: payload?.games_count,
-      h2h_hit_rate: payload?.h2h?.hit_rate,
-      h2h_games: payload?.h2h?.games_count,
+      h2h_hit_rate: h2hMetrics.hitRate,
+      h2h_games: h2hMetrics.games,
       minutes_last5: payload?.opportunity?.minutes_last5
     });
     const bucket = getConfidenceBucket(confidenceScore);
-    const side = String(payload?.recommended_side || (parsePercentLike(payload?.hit_rate) >= 50 ? 'OVER' : 'UNDER')).toUpperCase();
     const chips = makeInsightChips({
       hit_rate: payload?.hit_rate,
       average: payload?.average,
       line: payload?.line,
-      h2h_hit_rate: payload?.h2h?.hit_rate,
-      h2h_games: payload?.h2h?.games_count,
+      h2h_hit_rate: h2hMetrics.hitRate,
+      h2h_games: h2hMetrics.games,
       vs_position_delta_pct: payload?.matchup?.vs_position?.delta_pct,
       is_back_to_back: payload?.environment?.is_back_to_back,
       impact_count: payload?.team_context?.impact_count,
@@ -9968,6 +11871,9 @@ function buildSparklineSvg(values, line, width, height) {
     _renderMarketResults(payload);
     enhanceMarketUI();
     renderSlipDrawer();
+    animateResultContainer(marketResults, 'market');
+    registerScrollReveals(marketResults);
+    animateSvgLineDraw(marketResults);
   };
 
   const _renderBetFinderResults = renderBetFinderResults;
@@ -9975,6 +11881,9 @@ function buildSparklineSvg(values, line, width, height) {
     _renderBetFinderResults(payload);
     enhanceBetFinderUI();
     renderSlipDrawer();
+    animateResultContainer(betFinderResults, 'betfinder');
+    registerScrollReveals(betFinderResults);
+    animateSvgLineDraw(betFinderResults);
   };
 
   const _renderSummary = renderSummary;
@@ -9982,6 +11891,9 @@ function buildSparklineSvg(values, line, width, height) {
     _renderSummary(payload);
     renderAnalyzerSummaryUpgrade(payload);
     renderSlipDrawer();
+    animateResultContainer(analyzerDecisionStrip || analyzerDecisionStripGrid, 'analyzer');
+    registerScrollReveals(analyzerDecisionStrip || analyzerDecisionStripGrid || document.querySelector('[data-view="analyzer"]'));
+    animateSvgLineDraw(document.querySelector('[data-view="analyzer"]') || document);
   };
 
   const observer = new MutationObserver(() => {
@@ -9994,6 +11906,9 @@ function buildSparklineSvg(values, line, width, height) {
     renderSlipDrawer();
     injectAnalyzerSlipButton();
     observer.observe(document.body, { childList: true, subtree: true });
+    animateActiveView(activeView, { initial: true });
+    registerScrollReveals(document);
+    animateSvgLineDraw(document);
     setTimeout(() => {
       refreshSlipButtons();
       renderSlipDrawer();
@@ -10017,39 +11932,67 @@ function buildSparklineSvg(values, line, width, height) {
   'use strict';
 
   //  Element refs 
-  const btPlayerInput  = document.getElementById('btPlayerInput');
-  const btStatSelect   = document.getElementById('btStatSelect');
-  const btLineInput    = document.getElementById('btLineInput');
-  const btSideSelect   = document.getElementById('btSideSelect');
-  const btTierSelect   = document.getElementById('btTierSelect');
-  const btOddsInput    = document.getElementById('btOddsInput');
+  const btPlayerInput = document.getElementById('btPlayerInput');
+  const btStatSelect = document.getElementById('btStatSelect');
+  const btLineInput = document.getElementById('btLineInput');
+  const btSideSelect = document.getElementById('btSideSelect');
+  const btTierSelect = document.getElementById('btTierSelect');
+  const btOddsInput = document.getElementById('btOddsInput');
   const btPlayerDropdown = document.getElementById('btPlayerDropdown');
-  const btLogBtn       = document.getElementById('btLogBtn');
-  const btLogError     = document.getElementById('btLogError');
-  const btRefreshBtn   = document.getElementById('btRefreshBtn');
-  const btSyncPgBtn    = document.getElementById('btSyncPgBtn');
-  const btPushPgBtn    = document.getElementById('btPushPgBtn');
-  const btExportBtn    = document.getElementById('btExportBtn');
-  const btImportInput  = document.getElementById('btImportInput');
-  const btClearBtn     = document.getElementById('btClearBtn');
-  const backtestLog    = document.getElementById('backtestLog');
-  const backtestStats  = document.getElementById('backtestStats');
+  const btLogBtn = document.getElementById('btLogBtn');
+  const btLogError = document.getElementById('btLogError');
+  const btRefreshBtn = document.getElementById('btRefreshBtn');
+  const btAutoGradeBtn = document.getElementById('btAutoGradeBtn');
+  const btUndoAutoGradeBtn = document.getElementById('btUndoAutoGradeBtn');
+  const btSyncPgBtn = document.getElementById('btSyncPgBtn');
+  const btPushPgBtn = document.getElementById('btPushPgBtn');
+  const btExportBtn = document.getElementById('btExportBtn');
+  const btImportInput = document.getElementById('btImportInput');
+  const btClearBtn = document.getElementById('btClearBtn');
+  const backtestLog = document.getElementById('backtestLog');
+  const backtestStats = document.getElementById('backtestStats');
   const backtestSummaryPill = document.getElementById('backtestSummaryPill');
   const btFilterSearch = document.getElementById('btFilterSearch');
   const btFilterResult = document.getElementById('btFilterResult');
-  const btFilterStat   = document.getElementById('btFilterStat');
-  const btFilterTier   = document.getElementById('btFilterTier');
-  const btFilterSide   = document.getElementById('btFilterSide');
-  const btFilterRange  = document.getElementById('btFilterRange');
-  const btGroupBy      = document.getElementById('btGroupBy');
-  const btPageSize     = document.getElementById('btPageSize');
-  const btPagination   = document.getElementById('btPagination');
-  const btArchiveDays  = document.getElementById('btArchiveDays');
-  const btArchiveBtn   = document.getElementById('btArchiveBtn');
+  const btFilterStat = document.getElementById('btFilterStat');
+  const btFilterTier = document.getElementById('btFilterTier');
+  const btFilterSide = document.getElementById('btFilterSide');
+  const btFilterRange = document.getElementById('btFilterRange');
+  const btGroupBy = document.getElementById('btGroupBy');
+  const btPageSize = document.getElementById('btPageSize');
+  const btPagination = document.getElementById('btPagination');
+  const btArchiveDays = document.getElementById('btArchiveDays');
+  const btArchiveBtn = document.getElementById('btArchiveBtn');
   const btExportSeasonBtn = document.getElementById('btExportSeasonBtn');
-  const btViewTabs     = document.getElementById('btViewTabs');
+  const btViewTabs = document.getElementById('btViewTabs');
+  const backtestJumpChips = Array.from(document.querySelectorAll('.ds-backtest .backtest-jump-chip'));
 
   if (!btLogBtn) return; // backtest section not mounted
+
+  function pingBacktestJumpTarget(el) {
+    if (!el) return;
+    el.classList.remove('parlay-jump-target-glow');
+    void el.offsetWidth;
+    el.classList.add('parlay-jump-target-glow');
+    window.setTimeout(function () {
+      el.classList.remove('parlay-jump-target-glow');
+    }, 900);
+  }
+
+  if (backtestJumpChips.length) {
+    backtestJumpChips.forEach(function (chip) {
+      chip.addEventListener('click', function (event) {
+        event.preventDefault();
+        const targetId = String(chip.getAttribute('data-target') || '').replace('#', '');
+        const targetEl = targetId ? document.getElementById(targetId) : null;
+        if (!targetEl) return;
+        backtestJumpChips.forEach(function (node) { node.classList.remove('is-active'); });
+        chip.classList.add('is-active');
+        targetEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        pingBacktestJumpTarget(targetEl);
+      });
+    });
+  }
 
   if (backtestLog) {
     backtestLog.addEventListener('click', async event => {
@@ -10111,19 +12054,19 @@ function buildSparklineSvg(values, line, width, height) {
     if (tier === 'low' || tier === 'd' || tier === 'very low' || tier === 'verylow' || tier === 'f' || tier === 'x') return 'Low';
     const score = Number(rawScore);
     if (Number.isFinite(score)) {
-      if (score >= 85) return 'Elite';
-      if (score >= 72) return 'High';
-      if (score >= 60) return 'Medium';
+      if (score >= 88) return 'Elite';
+      if (score >= 75) return 'High';
+      if (score >= 62) return 'Medium';
       return 'Low';
     }
     return 'Medium';
   }
 
   function scoreFromBacktestTier(tier) {
-    if (tier === 'Elite') return 87;
-    if (tier === 'High') return 76;
-    if (tier === 'Medium') return 64;
-    return 52;
+    if (tier === 'Elite') return 90;
+    if (tier === 'High') return 79;
+    if (tier === 'Medium') return 66;
+    return 54;
   }
 
   function parseBacktestDate(value) {
@@ -10210,7 +12153,7 @@ function buildSparklineSvg(values, line, width, height) {
     if (!tier) return 'var(--neutral,#9ca3af)';
     const t = tier.toLowerCase();
     if (t === 'elite') return 'var(--good,#4ade80)';
-    if (t === 'high')  return '#60a5fa';
+    if (t === 'high') return '#60a5fa';
     if (t === 'medium') return 'var(--warning,#f59e0b)';
     return 'var(--bad,#f87171)';
   }
@@ -10221,6 +12164,7 @@ function buildSparklineSvg(values, line, width, height) {
   let backtestGroupsCache = [];
   let backtestStatsCache = {};
   let backtestMetaCache = {};
+  let lastBacktestAutoGradeRunId = '';
   const backtestFilters = {
     search: '',
     result: 'all',
@@ -10336,13 +12280,13 @@ function buildSparklineSvg(values, line, width, height) {
       const el = document.getElementById(id);
       if (!el) return;
       el.querySelector('strong').textContent = main;
-      el.querySelector('small').textContent  = sub;
+      el.querySelector('small').textContent = sub;
     };
-    setChip('btStatTotal',   stats.total,              `${stats.pending} pending`);
-    setChip('btStatWin',     `${stats.win_rate}%`,     `${stats.hits}/${stats.hits + stats.misses} resolved`);
+    setChip('btStatTotal', stats.total, `${stats.pending} pending`);
+    setChip('btStatWin', `${stats.win_rate}%`, `${stats.hits}/${stats.hits + stats.misses} resolved`);
     const roiSign = stats.roi_pct > 0 ? '+' : '';
-    setChip('btStatROI',     `${roiSign}${stats.roi_pct}%`, 'vs -110 odds');
-    setChip('btStatPending', stats.pending,            `${stats.logged_total || stats.total + stats.pending} logged`);
+    setChip('btStatROI', `${roiSign}${stats.roi_pct}%`, 'vs -110 odds');
+    setChip('btStatPending', stats.pending, `${stats.logged_total || stats.total + stats.pending} logged`);
 
     // Tier breakdown table
     const tierBreakdown = document.getElementById('btTierBreakdown');
@@ -10396,30 +12340,31 @@ function buildSparklineSvg(values, line, width, height) {
 
     const rows = filteredEntries.map(e => {
       const isPending = e.result === 'pending';
-      const isHit     = e.result === 'hit';
+      const isHit = e.result === 'hit';
       const resultColor = isPending ? 'var(--neutral,#9ca3af)' : isHit ? 'var(--good,#4ade80)' : 'var(--bad,#f87171)';
-      const resultIcon  = isPending ? '\u2026' : isHit ? '\u2713' : '\u2715';
+      const resultIcon = isPending ? '\u2026' : isHit ? '\u2713' : '\u2715';
       const resultLabel = isPending ? 'Pending' : isHit ? 'Hit' : 'Miss';
-      const dateStr = e.logged_at ? new Date(e.logged_at).toLocaleDateString(undefined, { month:'short', day:'numeric' }) : '--';
+      const dateStr = e.logged_at ? new Date(e.logged_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : '--';
 
       return `<tr data-bt-id="${esc(e.id)}" style="border-bottom:1px solid rgba(255,255,255,0.05)">
         <td style="padding:7px 8px;font-weight:600;font-size:12px">${esc(e.player)}</td>
         <td style="padding:7px 6px;font-size:11px;opacity:0.75">${esc(e.stat)}</td>
         <td style="padding:7px 6px;font-size:11px">${esc(String(e.line))}</td>
         <td style="padding:7px 6px">
-          <span style="font-size:10px;font-weight:700;padding:2px 7px;border-radius:10px;background:${e.side==='OVER'?'rgba(74,222,128,0.15)':'rgba(248,113,113,0.15)'};color:${e.side==='OVER'?'var(--good)':'var(--bad)'}">${esc(e.side)}</span>
+          <span style="font-size:10px;font-weight:700;padding:2px 7px;border-radius:10px;background:${e.side === 'OVER' ? 'rgba(74,222,128,0.15)' : 'rgba(248,113,113,0.15)'};color:${e.side === 'OVER' ? 'var(--good)' : 'var(--bad)'}">${esc(e.side)}</span>
         </td>
-        <td style="padding:7px 6px;font-size:11px;color:${tierColor(e.confidence_tier)}">${esc(e.confidence_tier||'--')}</td>
+        <td style="padding:7px 6px;font-size:11px;color:${tierColor(e.confidence_tier)}">${esc(e.confidence_tier || '--')}</td>
         <td style="padding:7px 6px;font-size:11px;color:${resultColor};font-weight:700">${resultIcon} ${resultLabel}${e.actual_value !== null && e.actual_value !== undefined ? ` (${Number(e.actual_value).toFixed(1)})` : ''}</td>
         <td style="padding:7px 6px;font-size:11px;opacity:0.5">${dateStr}</td>
         <td style="padding:7px 6px">
           ${isPending
-            ? `<div style="display:flex;gap:4px;align-items:center">
+          ? `<div style="display:flex;gap:4px;align-items:center">
                 <input type="number" step="0.1" min="0" placeholder="Actual" class="market-api-input bt-actual-input" style="width:70px;padding:3px 6px;font-size:11px" data-bt-resolve-id="${esc(e.id)}"/>
                 <button class="secondary-btn bt-resolve-btn" data-bt-resolve-id="${esc(e.id)}" style="font-size:10px;padding:3px 8px" aria-label="Resolve prop">✓</button>
+                <button class="bt-delete-btn" data-bt-id="${esc(e.id)}" style="background:none;border:none;cursor:pointer;opacity:0.4;font-size:13px;padding:2px 6px" title="Remove pending prop" aria-label="Remove pending prop">×</button>
               </div>`
-            : `<button class="bt-delete-btn" data-bt-id="${esc(e.id)}" style="background:none;border:none;cursor:pointer;opacity:0.4;font-size:13px;padding:2px 6px" title="Remove" aria-label="Remove prop">×</button>`
-          }
+          : `<button class="bt-delete-btn" data-bt-id="${esc(e.id)}" style="background:none;border:none;cursor:pointer;opacity:0.4;font-size:13px;padding:2px 6px" title="Remove" aria-label="Remove prop">×</button>`
+        }
         </td>
       </tr>`;
     }).join('');
@@ -10539,6 +12484,12 @@ function buildSparklineSvg(values, line, width, height) {
     renderBacktestPagination(backtestMetaCache || {});
   }
 
+  function refreshBacktestAutoGradeUndoButton() {
+    if (!btUndoAutoGradeBtn) return;
+    btUndoAutoGradeBtn.style.display = '';
+    btUndoAutoGradeBtn.disabled = false;
+  }
+
   function parseBacktestCsv(text) {
     const lines = String(text || '').split(/\r?\n/).filter(Boolean);
     if (lines.length < 2) return [];
@@ -10588,13 +12539,13 @@ function buildSparklineSvg(values, line, width, height) {
   //  Log prediction 
   btLogBtn.addEventListener('click', async () => {
     const player = btPlayerInput ? btPlayerInput.value.trim() : '';
-    const stat   = btStatSelect  ? btStatSelect.value   : 'PTS';
-    const line   = btLineInput   ? parseFloat(btLineInput.value) : NaN;
-    const side   = btSideSelect  ? btSideSelect.value   : 'OVER';
+    const stat = btStatSelect ? btStatSelect.value : 'PTS';
+    const line = btLineInput ? parseFloat(btLineInput.value) : NaN;
+    const side = btSideSelect ? btSideSelect.value : 'OVER';
     const tierRaw = btTierSelect ? btTierSelect.value : 'Medium';
     const prefilledScore = Number(btLogBtn?.dataset?.prefilledConfidenceScore || NaN);
-    const tier   = normalizeBacktestTier(tierRaw, prefilledScore);
-    const odds   = btOddsInput   ? parseFloat(btOddsInput.value) : 1.91;
+    const tier = normalizeBacktestTier(tierRaw, prefilledScore);
+    const odds = btOddsInput ? parseFloat(btOddsInput.value) : 1.91;
 
     if (!player) { showBtError('Enter a player name.'); return; }
     if (isNaN(line) || line <= 0) { showBtError('Enter a valid line.'); return; }
@@ -10622,8 +12573,8 @@ function buildSparklineSvg(values, line, width, height) {
       clearTimeout(timer);
       if (!r.ok) throw new Error(await r.text());
       if (btPlayerInput) btPlayerInput.value = '';
-      if (btLineInput)   btLineInput.value   = '';
-      if (btOddsInput)   btOddsInput.value   = '';
+      if (btLineInput) btLineInput.value = '';
+      if (btOddsInput) btOddsInput.value = '';
       if (btLogBtn) btLogBtn.dataset.prefilledConfidenceScore = '';
       btSelectedPlayerName = '';
       closeBtDropdown();
@@ -10642,16 +12593,16 @@ function buildSparklineSvg(values, line, width, height) {
     if (!payload) return;
     try {
       const playerName = payload.player?.full_name || '';
-      const stat       = payload.stat || 'PTS';
-      const side       = payload.recommended_side || 'OVER';
-      const score      = Number(payload.confidence?.score ?? payload.confidence_score ?? payload.best_bet?.confidence_score ?? NaN);
-      const tier       = normalizeBacktestTier(payload.confidence?.tier || payload.confidence_tier || payload.best_bet?.confidence_tier, score);
+      const stat = payload.stat || 'PTS';
+      const side = payload.recommended_side || 'OVER';
+      const score = Number(payload.confidence?.score ?? payload.confidence_score ?? payload.best_bet?.confidence_score ?? NaN);
+      const tier = normalizeBacktestTier(payload.confidence?.tier || payload.confidence_tier || payload.best_bet?.confidence_tier, score);
 
       if (btPlayerInput) btPlayerInput.value = playerName;
-      if (btStatSelect)  btStatSelect.value  = stat;
-      if (btSideSelect)  btSideSelect.value  = side;
-      if (btLineInput)   btLineInput.value   = payload.line || '';
-      if (btTierSelect)  btTierSelect.value  = tier;
+      if (btStatSelect) btStatSelect.value = stat;
+      if (btSideSelect) btSideSelect.value = side;
+      if (btLineInput) btLineInput.value = payload.line || '';
+      if (btTierSelect) btTierSelect.value = tier;
       if (btLogBtn) btLogBtn.dataset.prefilledConfidenceScore = Number.isFinite(score) ? String(score) : '';
       btSelectedPlayerName = playerName;
 
@@ -10664,6 +12615,88 @@ function buildSparklineSvg(values, line, width, height) {
   //  Refresh button 
   if (btRefreshBtn) {
     btRefreshBtn.addEventListener('click', loadAndRender);
+  }
+
+  if (btAutoGradeBtn) {
+    btAutoGradeBtn.addEventListener('click', async () => {
+      const originalLabel = btAutoGradeBtn.textContent;
+      btAutoGradeBtn.disabled = true;
+      btAutoGradeBtn.textContent = 'Grading...';
+      try {
+        const payload = await apiFetch('/api/backtest/parlay/grade-batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            all_sources: true,
+            max_entries: 2000,
+          }),
+        }, 30000);
+        if (!payload || payload.ok === false) throw new Error(payload?.error || 'Auto-grade failed.');
+        const graded = Number(payload.graded || 0);
+        const checked = Number(payload.checked || 0);
+        lastBacktestAutoGradeRunId = graded > 0 ? String(payload.run_id || '').trim() : '';
+        refreshBacktestAutoGradeUndoButton();
+        showBtError('');
+        showAppToast(`Auto-grade complete: ${graded}/${checked} resolved.`, graded > 0 ? 'success' : 'info', {
+          undoLabel: graded > 0 ? 'Undo' : '',
+          onUndo: graded > 0 ? async () => {
+            try {
+              const undoBody = lastBacktestAutoGradeRunId ? { run_id: lastBacktestAutoGradeRunId } : {};
+              const undoPayload = await apiFetch('/api/backtest/parlay/undo-grade', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(undoBody),
+              }, 20000);
+              if (!undoPayload || undoPayload.ok === false) throw new Error(undoPayload?.error || 'Undo auto-grade failed.');
+              const reverted = Number(undoPayload.reverted || 0);
+              showAppToast(`Undo auto-grade complete: ${reverted} reverted to pending.`, reverted > 0 ? 'success' : 'info');
+              lastBacktestAutoGradeRunId = '';
+              refreshBacktestAutoGradeUndoButton();
+              backtestFilters.offset = 0;
+              await loadAndRender();
+            } catch (undoErr) {
+              showBtError('Undo auto-grade failed: ' + (undoErr?.message || 'Unknown error'));
+            }
+          } : undefined,
+        });
+        backtestFilters.offset = 0;
+        await loadAndRender();
+      } catch (err) {
+        showBtError('Backtest auto-grade failed: ' + (err?.message || 'Unknown error'));
+      } finally {
+        btAutoGradeBtn.disabled = false;
+        btAutoGradeBtn.textContent = originalLabel;
+      }
+    });
+  }
+
+  if (btUndoAutoGradeBtn) {
+    btUndoAutoGradeBtn.addEventListener('click', async () => {
+      const originalLabel = btUndoAutoGradeBtn.textContent;
+      btUndoAutoGradeBtn.disabled = true;
+      btUndoAutoGradeBtn.textContent = 'Undoing...';
+      try {
+        const undoBody = lastBacktestAutoGradeRunId ? { run_id: lastBacktestAutoGradeRunId } : {};
+        const payload = await apiFetch('/api/backtest/parlay/undo-grade', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(undoBody),
+        }, 20000);
+        if (!payload || payload.ok === false) throw new Error(payload?.error || 'Undo auto-grade failed.');
+        const reverted = Number(payload.reverted || 0);
+        showBtError('');
+        showAppToast(`Undo auto-grade complete: ${reverted} reverted to pending.`, reverted > 0 ? 'success' : 'info');
+        lastBacktestAutoGradeRunId = '';
+        refreshBacktestAutoGradeUndoButton();
+        backtestFilters.offset = 0;
+        await loadAndRender();
+      } catch (err) {
+        showBtError('Undo auto-grade failed: ' + (err?.message || 'Unknown error'));
+      } finally {
+        btUndoAutoGradeBtn.disabled = false;
+        btUndoAutoGradeBtn.textContent = originalLabel;
+      }
+    });
   }
 
   if (btSyncPgBtn) {
@@ -10881,6 +12914,7 @@ function buildSparklineSvg(values, line, width, height) {
   }
 
   //  Initial load 
+  refreshBacktestAutoGradeUndoButton();
   loadAndRender();
 
 })();
@@ -10890,17 +12924,17 @@ function buildSparklineSvg(values, line, width, height) {
 // 
 
 (function initMarketAdvancedFilters() {
-  const bookFilter   = document.getElementById('marketBookFilter');
+  const bookFilter = document.getElementById('marketBookFilter');
   const minOddsInput = document.getElementById('marketMinOdds');
   const maxOddsInput = document.getElementById('marketMaxOdds');
-  const resetBtn     = document.getElementById('marketAdvFilterResetBtn');
+  const resetBtn = document.getElementById('marketAdvFilterResetBtn');
 
   if (!bookFilter && !minOddsInput) return;
 
   function applyAndRerender() {
     currentMarketBookFilter = (bookFilter?.value || '').toLowerCase().trim();
-    currentMarketMinOdds    = minOddsInput?.value ? parseFloat(minOddsInput.value) : null;
-    currentMarketMaxOdds    = maxOddsInput?.value ? parseFloat(maxOddsInput.value) : null;
+    currentMarketMinOdds = minOddsInput?.value ? parseFloat(minOddsInput.value) : null;
+    currentMarketMaxOdds = maxOddsInput?.value ? parseFloat(maxOddsInput.value) : null;
     currentMarketPage = 1;
     if (currentMarketResultsPayload) renderMarketResults(currentMarketResultsPayload);
   }
@@ -10951,17 +12985,17 @@ function passesAdvancedMarketFilters(item) {
 // 
 
 (function initKeyVault() {
-  const kvKeyInput      = document.getElementById('kvKeyInput');
+  const kvKeyInput = document.getElementById('kvKeyInput');
   const kvProviderSelect = document.getElementById('kvProviderSelect');
-  const kvAddBtn        = document.getElementById('kvAddBtn');
+  const kvAddBtn = document.getElementById('kvAddBtn');
   const kvRefreshAllBtn = document.getElementById('kvRefreshAllBtn');
-  const kvKeyList       = document.getElementById('kvKeyList');
-  const kvPrevBtn       = document.getElementById('kvPrevBtn');
-  const kvNextBtn       = document.getElementById('kvNextBtn');
-  const kvPageInfo      = document.getElementById('kvPageInfo');
-  const kvActiveLabel   = document.getElementById('kvActiveLabel');
-  const kvVaultSummary  = document.getElementById('kvVaultSummary');
-  const kvStatus        = document.getElementById('keyVaultStatus');
+  const kvKeyList = document.getElementById('kvKeyList');
+  const kvPrevBtn = document.getElementById('kvPrevBtn');
+  const kvNextBtn = document.getElementById('kvNextBtn');
+  const kvPageInfo = document.getElementById('kvPageInfo');
+  const kvActiveLabel = document.getElementById('kvActiveLabel');
+  const kvVaultSummary = document.getElementById('kvVaultSummary');
+  const kvStatus = document.getElementById('keyVaultStatus');
   const kvHealthHeadline = document.getElementById('kvHealthHeadline');
   const kvHealthDetail = document.getElementById('kvHealthDetail');
   const kvHealthyCount = document.getElementById('kvHealthyCount');
@@ -11105,7 +13139,7 @@ function passesAdvancedMarketFilters(item) {
           </div>
           <div style="display:flex;gap:8px;flex-shrink:0">
             <button class="secondary-btn kv-credits-btn" data-id="${esc(entry.id)}" style="padding:6px 14px;font-size:.8rem" type="button" title="Check remaining credits"> Credits</button>
-            <button class="text-btn kv-delete-btn" data-id="${esc(entry.id)}" style="padding:6px 10px;font-size:.8rem;color:var(--bad);opacity:0.7" type="button" title="Remove key"></button>
+            <button class="text-btn kv-delete-btn" data-id="${esc(entry.id)}" style="padding:6px 10px;font-size:.8rem;color:var(--bad);opacity:0.7" type="button" title="Remove key" aria-label="Remove key">×</button>
           </div>
         </div>`;
     }).join('');
@@ -11190,17 +13224,14 @@ function passesAdvancedMarketFilters(item) {
 
     if (!rawKeys) { setKvStatus('Please paste at least one API key.', 'bad'); return; }
 
-    const parsedKeys = rawKeys
-      .split(/[\s,]+/)
-      .map(part => part.trim())
-      .filter(Boolean);
+    const parsedKeys = extractOddsApiKeysFromInput(rawKeys);
     if (!parsedKeys.length) {
       setKvStatus('Please paste at least one valid API key.', 'bad');
       return;
     }
 
     const vault = loadVault();
-    const seenExisting = new Set(vault.map(entry => entry.key));
+    const seenExisting = new Set(vault.map(entry => normalizeOddsApiKeyValue(entry.key)).filter(Boolean));
     const uniqueIncoming = [...new Set(parsedKeys)];
     const addedEntries = [];
     let duplicateCount = 0;
@@ -11299,4 +13330,3 @@ function passesAdvancedMarketFilters(item) {
     if (activeEntry) syncActiveKeyToPages(activeEntry.key);
   })();
 })();
-

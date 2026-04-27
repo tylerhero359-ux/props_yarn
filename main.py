@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 from threading import Lock
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import requests
 try:
@@ -130,6 +131,8 @@ BACKTEST_PERSIST_PATH = PERSISTENT_CACHE_DIR / "backtest_log.json"
 KEY_VAULT_PERSIST_PATH = PERSISTENT_CACHE_DIR / "key_vault.json"
 FAVORITES_PERSIST_PATH = PERSISTENT_CACHE_DIR / "favorites.json"
 TRACKER_PERSIST_PATH = PERSISTENT_CACHE_DIR / "tracker_props.json"
+KEY_VAULT_SHRINK_GUARD_RATIO = min(0.95, max(0.05, float(os.getenv("NBA_KEY_VAULT_SHRINK_GUARD_RATIO", "0.5"))))
+KEY_VAULT_SHRINK_GUARD_MIN_EXISTING = max(5, int(os.getenv("NBA_KEY_VAULT_SHRINK_GUARD_MIN_EXISTING", "10")))
 PERSISTENT_CACHE_ENABLED = os.getenv("NBA_PERSISTENT_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 PERSISTENT_CACHE_MAX_ROSTERS = max(30, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_ROSTERS", "120")))
 PERSISTENT_CACHE_MAX_PLAYER_INFO = max(100, int(os.getenv("NBA_PERSISTENT_CACHE_MAX_PLAYER_INFO", "600")))
@@ -549,6 +552,15 @@ def init_postgres_cache() -> None:
                 );
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS key_vault_state (
+                    state_key TEXT PRIMARY KEY,
+                    payload JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """
+            )
         LOGGER.info("Postgres cache tables ready")
     except Exception as exc:
         LOGGER.warning("Postgres cache init failed: %s", exc)
@@ -922,6 +934,14 @@ def _pg_delete_backtest_entry(entry_id: str) -> None:
         cur.execute("DELETE FROM backtest_log_entries WHERE entry_id = %s;", (str(entry_id),))
 
 
+def _pg_delete_backtest_entries(entry_ids: list[str]) -> None:
+    cleaned = [str(entry_id).strip() for entry_id in (entry_ids or []) if str(entry_id).strip()]
+    if not cleaned:
+        return
+    with postgres_connect() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM backtest_log_entries WHERE entry_id = ANY(%s);", (cleaned,))
+
+
 def _pg_clear_backtest_entries() -> None:
     with postgres_connect() as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM backtest_log_entries;")
@@ -948,6 +968,62 @@ def _pg_fetch_backtest_entries(limit: int = 5000) -> list[dict[str, Any]]:
     except Exception as exc:
         LOGGER.debug("Postgres backtest fetch failed: %s", exc)
     return entries
+
+
+def _pg_read_key_vault_state() -> dict[str, Any] | None:
+    if not postgres_available():
+        return None
+    for attempt in range(2):
+        try:
+            with postgres_connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT payload
+                    FROM key_vault_state
+                    WHERE state_key = 'default'
+                    LIMIT 1;
+                    """
+                )
+                row = cur.fetchone()
+                if row and isinstance(row[0], dict):
+                    return row[0]
+                return None
+        except Exception as exc:
+            msg = str(exc).lower()
+            recoverable = "ssl connection has been closed unexpectedly" in msg or "server closed the connection unexpectedly" in msg
+            if recoverable and attempt == 0:
+                LOGGER.warning("Postgres key vault read dropped SSL connection; resetting pool and retrying once")
+                close_postgres_pool()
+                init_postgres_pool()
+                continue
+            LOGGER.debug("Postgres key vault read failed: %s", exc)
+            break
+    return None
+
+
+def _pg_write_key_vault_state(state: dict[str, Any]) -> None:
+    for attempt in range(2):
+        try:
+            with postgres_connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO key_vault_state (state_key, payload, updated_at)
+                    VALUES ('default', %s, NOW())
+                    ON CONFLICT (state_key)
+                    DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW();
+                    """,
+                    (PgJson(state),),
+                )
+                return
+        except Exception as exc:
+            msg = str(exc).lower()
+            recoverable = "ssl connection has been closed unexpectedly" in msg or "server closed the connection unexpectedly" in msg
+            if recoverable and attempt == 0:
+                LOGGER.warning("Postgres key vault write dropped SSL connection; resetting pool and retrying once")
+                close_postgres_pool()
+                init_postgres_pool()
+                continue
+            raise
 
 
 def preload_postgres_cache() -> None:
@@ -1142,8 +1218,9 @@ def preload_team_rosters_for_current_season() -> None:
             _fetch(team_id)
         return
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_fetch, team_id) for team_id in team_ids]
+    for chunk_start in range(0, len(team_ids), max_workers):
+        chunk = team_ids[chunk_start:chunk_start + max_workers]
+        futures = [_submit_shared_network_task(_fetch, team_id) for team_id in chunk]
         for future in as_completed(futures):
             try:
                 future.result()
@@ -1238,8 +1315,12 @@ def warm_cache_on_startup() -> None:
             _warm_cache_task(task_name, task_func)
         return
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(_warm_cache_task, task_name, task_func): task_name for task_name, task_func in tasks}
+    for chunk_start in range(0, len(tasks), max_workers):
+        chunk = tasks[chunk_start:chunk_start + max_workers]
+        future_map = {
+            _submit_shared_network_task(_warm_cache_task, task_name, task_func): task_name
+            for task_name, task_func in chunk
+        }
         for future in as_completed(future_map):
             try:
                 future.result()
@@ -1476,7 +1557,7 @@ SCOREBOARD_FETCH_TIMEOUT_FLOOR_SECONDS = 3
 
 INJURY_REPORT_PAGE_TIMEOUT = (3, 6)
 INJURY_REPORT_PDF_TIMEOUT = (3, 8)
-INJURY_REPORT_LINKS_TTL_SECONDS = 300
+INJURY_REPORT_LINKS_TTL_SECONDS = max(30, int(os.getenv("NBA_INJURY_REPORT_LINKS_TTL_SECONDS", "120")))
 INJURY_REPORT_FAILURE_COOLDOWN_SECONDS = 180
 INJURY_REPORT_MAX_STALE_SECONDS = 6 * 60 * 60
 GAME_LOG_FAILURE_COOLDOWN_SECONDS = 60
@@ -1699,9 +1780,10 @@ def get_player_game_log_hybrid(player_id: int, season: str, season_type: str) ->
         stale_window_seconds = HYBRID_GAME_LOG_SOFT_TTL_SECONDS
     if cached and isinstance(cached.get("rows"), list):
         cached_rows = cached.get("rows") or []
-        if normalized_season_type == SEASON_TYPE_PLAYOFFS and len(cached_rows) < 2:
+        low_playoff_sample = normalized_season_type == SEASON_TYPE_PLAYOFFS and len(cached_rows) < 3
+        if low_playoff_sample:
             # Playoff series samples can lag in cache right after new games complete.
-            # Force one live refresh so H2H/series counts catch up promptly.
+            # Force a live refresh path so H2H/series counts catch up promptly.
             try:
                 GAME_LOG_CACHE.pop(cache_key, None)
                 GAME_LOG_FAILURE_META.pop(cache_key, None)
@@ -1710,7 +1792,13 @@ def get_player_game_log_hybrid(player_id: int, season: str, season_type: str) ->
                 fresh_age = _cache_age_seconds(GAME_LOG_CACHE.get(cache_key))
                 return rows, {"source": "live-forced", "seconds_ago": round(fresh_age, 2) if fresh_age is not None else None, "refresh_queued": False}
             except Exception:
+                # Do not silently serve low-sample playoff cache rows.
+                # Fall through to the normal live fetch path below.
                 pass
+            # Skip stale-cache return paths for low playoff samples.
+            rows = fetch_player_game_log(player_id=player_id, season=season, season_type=season_type)
+            fresh_age = _cache_age_seconds(GAME_LOG_CACHE.get(cache_key))
+            return rows, {"source": "live-retry", "seconds_ago": round(fresh_age, 2) if fresh_age is not None else None, "refresh_queued": False}
         if age_seconds is not None and age_seconds < HYBRID_GAME_LOG_SOFT_TTL_SECONDS:
             return cached["rows"], {"source": "cache-fresh", "seconds_ago": round(age_seconds, 2), "refresh_queued": False}
         if age_seconds is not None and age_seconds < stale_window_seconds:
@@ -1792,7 +1880,11 @@ def build_h2h_payload_from_rows(rows_source: list[dict[str, Any]], next_game: di
         opponent_abbreviation = _extract_opponent_from_label(str(next_game.get("matchup_label") or ""))
     if not opponent_abbreviation:
         return payload
-    h2h_rows = [row for row in (rows_source or []) if opponent_abbreviation and opponent_abbreviation in str(row.get("MATCHUP") or "").upper()]
+    h2h_rows = [
+        row
+        for row in (rows_source or [])
+        if matchup_includes_opponent(row.get("MATCHUP"), opponent_abbreviation)
+    ]
     if not h2h_rows:
         return payload
     h2h_games: list[dict[str, Any]] = []
@@ -2148,6 +2240,17 @@ def compute_recent_hit_streak(hit_flags: list[bool]) -> int:
         else:
             break
     return streak
+
+
+def side_hit_rate_from_over_hit_rate(over_hit_rate: Any, side: str) -> float:
+    try:
+        over_rate_value = float(over_hit_rate)
+    except (TypeError, ValueError):
+        over_rate_value = 0.0
+    over_rate = clamp(over_rate_value, 0.0, 100.0)
+    if str(side or "").upper() == "UNDER":
+        return round(100.0 - over_rate, 1)
+    return round(over_rate, 1)
 
 
 def decimal_implied_probability(odds: float | None) -> float | None:
@@ -2628,6 +2731,20 @@ def build_prop_analysis_payload(
         return cached_payload
 
     season_rows, game_log_meta = get_player_game_log_hybrid(player_id=player_id, season=season, season_type=season_type) if HYBRID_ANALYZER_ENABLED else (fetch_player_game_log(player_id=player_id, season=season, season_type=season_type), {"source": "live", "seconds_ago": None, "refresh_queued": False})
+    # Hard guard: playoff samples should not silently stay at 1-game because of stale layers.
+    # If we detect a low playoff sample, force a direct NBA fetch and prefer the larger result.
+    if season_type == SEASON_TYPE_PLAYOFFS and len(season_rows or []) < 3:
+        try:
+            live_rows = PLAYER_DATA_SERVICE.fetch_player_game_log(player_id=player_id, season=season, season_type=season_type)
+            merged_live_rows = merge_game_log_rows(live_rows or [])
+            if len(merged_live_rows) > len(season_rows or []):
+                season_rows = merged_live_rows
+                cache_key = (player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)
+                GAME_LOG_CACHE[cache_key] = {"timestamp": time.time(), "rows": season_rows, "source": "live-guard"}
+                _submit_pg_write(_pg_write_game_log, player_id, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION, season_rows)
+                game_log_meta = {"source": "live-guard", "seconds_ago": 0.0, "refresh_queued": False}
+        except Exception:
+            pass
 
     profile_row = None
     player_info_meta = {"source": "unused", "seconds_ago": None, "refresh_queued": False}
@@ -2723,9 +2840,15 @@ def build_prop_analysis_payload(
         game_date=str((next_game or {}).get("game_date") or "") or None,
     )
     vs_position = build_position_matchup(opponent_team_id=int((next_game or {}).get("opponent_team_id") or 0), position_code=position_code or "", stat=stat, season=season, season_type=season_type) if next_game and position_code else None
-    h2h_payload = build_h2h_payload_from_rows(filtered_pool or enriched_rows, next_game, stat, line)
-    analysis_source_rows = filtered_pool or enriched_rows or season_rows
-    opportunity = build_opportunity_context(analysis_source_rows, last_n)
+    # Keep H2H fully aligned with the active filtered pool so tabs and counts
+    # reflect the same filter context.
+    h2h_payload = build_h2h_payload_from_rows(filtered_pool or [], next_game, stat, line)
+    # Sample-driven trend/schedule context should reflect the same last_n window
+    # used for hit rate / averages.
+    sample_window_rows = rows if rows else (filtered_pool or enriched_rows or season_rows)
+    # For freshness overlays, keep H2H source tied to the filtered pool.
+    analysis_source_rows = filtered_pool
+    opportunity = build_opportunity_context(sample_window_rows, last_n)
     team_context = build_team_opportunity_context(team_name=team_name, player_name=player["full_name"], stat=stat, player_position=resolved_position, team_id=resolved_team_id, season=season)
     if debug:
         team_context = {
@@ -2736,7 +2859,7 @@ def build_prop_analysis_payload(
                 "impact_count": int(team_context.get("impact_count") or 0),
             },
         }
-    environment = build_game_environment_context(analysis_source_rows, next_game, team_id=resolved_team_id, season=season, season_type=season_type)
+    environment = build_game_environment_context(sample_window_rows, next_game, team_id=resolved_team_id, season=season, season_type=season_type)
     matchup_delta_pct = (vs_position or {}).get("delta_pct") if isinstance(vs_position, dict) else None
     model_over, model_under = estimate_model_probabilities(
         hit_rate_pct=float(hit_rate),
@@ -2760,21 +2883,21 @@ def build_prop_analysis_payload(
     )
     model_recommended_side = "OVER" if model_over >= model_under else "UNDER"
     recommended_side = forced_side_normalized or model_recommended_side
+    side_hit_rate = side_hit_rate_from_over_hit_rate(hit_rate, recommended_side)
     side_model_prob = model_over if recommended_side == "OVER" else model_under
     chosen_fair_prob = implied_over if recommended_side == "OVER" else implied_under
     chosen_fair_prob = resolve_fair_probability(chosen_fair_prob, fallback_prob=0.5)
     chosen_edge_pct = edge_pct_from_model_and_fair(side_model_prob, chosen_fair_prob)
-    # Use actual odds-adjusted EV: (prob  decimal_odds) - 1
-    # convert_american_to_decimal is defined later in this file.
+    # /api/player-prop supplies decimal odds; use them directly for EV.
     _chosen_odds_raw = over_odds if recommended_side == "OVER" else under_odds
-    _chosen_decimal = convert_american_to_decimal(_chosen_odds_raw)
-    if _chosen_decimal and _chosen_decimal > 1.0:
-        chosen_ev = round((side_model_prob * _chosen_decimal) - 1.0, 4)
-    else:
-        chosen_ev = round(side_model_prob - chosen_fair_prob, 4)
+    chosen_ev = compute_side_pricing_metrics(
+        probability=side_model_prob,
+        fair_probability=chosen_fair_prob,
+        odds=safe_float_or_none(_chosen_odds_raw),
+    )["ev"]
     confidence_engine = build_confidence_engine(
         side=recommended_side,
-        hit_rate=float(hit_rate),
+        hit_rate=float(side_hit_rate),
         games_count=int(len(values)),
         edge=chosen_edge_pct,
         ev=chosen_ev,
@@ -2972,10 +3095,49 @@ def try_direct_report_match(report_text: str, player_name: str, team_name: str |
     return INJURY_SERVICE.try_direct_report_match(report_text, player_name=player_name, team_name=team_name)
 
 
-def fetch_latest_injury_report_payload() -> dict[str, Any]:
+def _persist_injury_report_payload(payload: dict[str, Any], sync_write: bool = False) -> None:
+    if not payload.get("ok"):
+        return
+    if sync_write:
+        try:
+            _pg_write_injury_report(payload)
+        except Exception as exc:
+            LOGGER.debug("Postgres injury report sync write failed: %s", exc)
+        return
+    _submit_pg_write(_pg_write_injury_report, payload)
+
+
+def _injury_report_has_newer_et_link(payload: dict[str, Any] | None, allow_network: bool = True) -> bool:
+    current_url = str((payload or {}).get("report_url") or "").strip()
+    links: list[str] = []
+    if allow_network:
+        try:
+            links = INJURY_SERVICE.list_recent_report_links(limit=1)
+        except Exception:
+            return False
+    else:
+        cached_links = INJURY_SERVICE.links_cache.get("links") or []
+        cached_ts = float(INJURY_SERVICE.links_cache.get("timestamp") or 0.0)
+        now_ts = time.time()
+        if cached_links and now_ts - cached_ts < float(INJURY_SERVICE.links_ttl_seconds):
+            links = list(cached_links)[:1]
+        else:
+            return False
+    if not links:
+        return False
+    latest_url = str(links[0] or "").strip()
+    if not latest_url:
+        return False
+    if latest_url == current_url:
+        return False
+    latest_dt = parse_injury_report_timestamp(latest_url)
+    current_dt = parse_injury_report_timestamp(current_url)
+    return latest_dt > current_dt
+
+
+def fetch_latest_injury_report_payload(sync_write: bool = False) -> dict[str, Any]:
     payload = INJURY_SERVICE.fetch_latest_report_payload()
-    if payload.get("ok"):
-        _submit_pg_write(_pg_write_injury_report, payload)
+    _persist_injury_report_payload(payload, sync_write=sync_write)
     return payload
 
 
@@ -2992,15 +3154,27 @@ def get_cached_injury_report_payload(force: bool = False) -> dict[str, Any]:
                     cached_copy["source"] = cached_copy.get("source") or "postgres"
                     INJURY_SERVICE.report_cache["timestamp"] = float(pg_ts or time.time())
                     INJURY_SERVICE.report_cache["payload"] = cached_copy
+                    if _injury_report_has_newer_et_link(cached_copy):
+                        refreshed = fetch_latest_injury_report_payload(sync_write=True)
+                        if refreshed.get("ok"):
+                            return refreshed
                     return cached_copy
             if isinstance(cached_payload, dict) and cached_payload.get("ok"):
                 age_seconds = INJURY_SERVICE.report_cache_age_seconds()
                 if age_seconds is not None and age_seconds <= INJURY_REPORT_TTL_SECONDS:
+                    if _injury_report_has_newer_et_link(cached_payload):
+                        refreshed = fetch_latest_injury_report_payload(sync_write=True)
+                        if refreshed.get("ok"):
+                            return refreshed
                     return cached_payload
         else:
             if isinstance(cached_payload, dict) and cached_payload.get("ok"):
                 age_seconds = INJURY_SERVICE.report_cache_age_seconds()
                 if age_seconds is not None and age_seconds <= INJURY_REPORT_TTL_SECONDS:
+                    if _injury_report_has_newer_et_link(cached_payload):
+                        refreshed = fetch_latest_injury_report_payload(sync_write=True)
+                        if refreshed.get("ok"):
+                            return refreshed
                     return cached_payload
             pg_payload, pg_ts = _pg_read_latest_injury_report()
             if isinstance(pg_payload, dict) and pg_payload.get("ok"):
@@ -3008,18 +3182,26 @@ def get_cached_injury_report_payload(force: bool = False) -> dict[str, Any]:
                 cached_copy["source"] = cached_copy.get("source") or "postgres"
                 INJURY_SERVICE.report_cache["timestamp"] = float(pg_ts or time.time())
                 INJURY_SERVICE.report_cache["payload"] = cached_copy
+                if _injury_report_has_newer_et_link(cached_copy):
+                    refreshed = fetch_latest_injury_report_payload(sync_write=True)
+                    if refreshed.get("ok"):
+                        return refreshed
                 return cached_copy
-    return fetch_latest_injury_report_payload()
+    return fetch_latest_injury_report_payload(sync_write=True)
 
 
 def get_cached_injury_report_payload_fast() -> dict[str, Any]:
     """
-    Non-blocking injury payload accessor for latency-sensitive endpoints.
-    Uses in-memory/Postgres cache only and never triggers a live network refresh.
+    Mostly non-blocking accessor for latency-sensitive endpoints.
+    If the official page advertises a newer ET report link, it upgrades to a live fetch.
     """
     cached_payload = INJURY_SERVICE.report_cache.get("payload")
     if isinstance(cached_payload, dict) and cached_payload:
         cached_age = INJURY_SERVICE.report_cache_age_seconds()
+        if _injury_report_has_newer_et_link(cached_payload, allow_network=False):
+            refreshed = fetch_latest_injury_report_payload(sync_write=True)
+            if refreshed.get("ok"):
+                return refreshed
         if cached_age is None or cached_age > INJURY_REPORT_TTL_SECONDS:
             enqueue_hybrid_refresh("injury_report", ("latest",))
         return cached_payload
@@ -3029,10 +3211,17 @@ def get_cached_injury_report_payload_fast() -> dict[str, Any]:
         payload_copy["source"] = payload_copy.get("source") or "postgres"
         INJURY_SERVICE.report_cache["timestamp"] = float(pg_ts or time.time())
         INJURY_SERVICE.report_cache["payload"] = payload_copy
+        if _injury_report_has_newer_et_link(payload_copy, allow_network=False):
+            refreshed = fetch_latest_injury_report_payload(sync_write=True)
+            if refreshed.get("ok"):
+                return refreshed
         pg_age = max(0.0, time.time() - float(pg_ts or 0.0)) if pg_ts else None
         if pg_age is None or pg_age > INJURY_REPORT_TTL_SECONDS:
             enqueue_hybrid_refresh("injury_report", ("latest",))
         return payload_copy
+    refreshed = fetch_latest_injury_report_payload(sync_write=True)
+    if refreshed.get("ok"):
+        return refreshed
     enqueue_hybrid_refresh("injury_report", ("latest",))
     return {
         "ok": False,
@@ -3136,6 +3325,197 @@ def build_availability_payload(player_name: str, team_name: str | None = None, g
 
 def build_team_availability_summary(team_name: str | None, report_payload: dict[str, Any] | None = None, game_date: str | None = None) -> dict[str, Any]:
     return INJURY_SERVICE.build_team_availability_summary(team_name, report_payload=report_payload, game_date=game_date)
+
+
+CONFIDENCE_TIER_ELITE_MIN = 88
+CONFIDENCE_TIER_HIGH_MIN = 75
+CONFIDENCE_TIER_MEDIUM_MIN = 62
+BACKTEST_RANKING_MIN_SAMPLES = 8
+BACKTEST_RANKING_BASE_MIN_SAMPLES = 12
+BACKTEST_RANKING_MAX_ADJUSTMENT = 6.0
+BACKTEST_RANKING_CACHE_TTL_SECONDS = 120
+_BACKTEST_RANKING_CACHE_LOCK = Lock()
+_BACKTEST_RANKING_CACHE: dict[str, Any] = {"timestamp": 0.0, "metrics": {}}
+
+
+def _invalidate_backtest_ranking_cache() -> None:
+    with _BACKTEST_RANKING_CACHE_LOCK:
+        _BACKTEST_RANKING_CACHE["timestamp"] = 0.0
+        _BACKTEST_RANKING_CACHE["metrics"] = {}
+
+
+def _apply_confidence_recalibration(
+    *,
+    score: int,
+    games_count: int,
+    season_type: str | None,
+    playoff_game_number: int | None,
+) -> tuple[int, dict[str, float], list[str]]:
+    normalized_season_type = normalize_requested_season_type(season_type)
+    sample_adj = 0.0
+    playoff_adj = 0.0
+    top_end_adj = 0.0
+    notes: list[str] = []
+
+    if games_count <= 2:
+        sample_adj = -12.0
+    elif games_count == 3:
+        sample_adj = -9.0
+    elif games_count == 4:
+        sample_adj = -6.0
+    elif games_count == 5:
+        sample_adj = -4.0
+    elif games_count == 6:
+        sample_adj = -2.0
+
+    if normalized_season_type == SEASON_TYPE_PLAYOFFS and games_count <= 4:
+        playoff_adj -= 4.0
+    if normalized_season_type == SEASON_TYPE_PLAYOFFS and int(playoff_game_number or 0) in {1, 2, 3}:
+        playoff_adj -= 2.0
+
+    # Compress the top end so 80+/90+ confidence is harder to reach.
+    if score >= 90:
+        top_end_adj -= round((score - 89) * 0.55, 1)
+    elif score >= 80:
+        top_end_adj -= round((score - 79) * 0.25, 1)
+
+    if sample_adj < 0:
+        notes.append("small sample recalibration")
+    if playoff_adj < 0:
+        notes.append("playoff volatility penalty")
+    if top_end_adj < 0:
+        notes.append("top-end confidence compression")
+
+    adjusted = int(max(0, min(99, round(score + sample_adj + playoff_adj + top_end_adj))))
+    components = {
+        "sample_recalibration": round(sample_adj, 1),
+        "playoff_recalibration": round(playoff_adj, 1),
+        "top_end_recalibration": round(top_end_adj, 1),
+    }
+    return adjusted, components, notes
+
+
+def _compute_backtest_ranking_metrics() -> dict[str, Any]:
+    now_ts = time.time()
+    with _BACKTEST_RANKING_CACHE_LOCK:
+        cached_ts = float(_BACKTEST_RANKING_CACHE.get("timestamp") or 0.0)
+        if now_ts - cached_ts < BACKTEST_RANKING_CACHE_TTL_SECONDS:
+            cached_metrics = _BACKTEST_RANKING_CACHE.get("metrics")
+            if isinstance(cached_metrics, dict):
+                return cached_metrics
+
+    with _BACKTEST_LOCK:
+        entries = [copy.deepcopy(entry) for entry in _BACKTEST_LOG]
+
+    stat_totals: dict[str, dict[str, float]] = {}
+    stat_side_totals: dict[tuple[str, str], dict[str, float]] = {}
+    for entry in entries:
+        result = str(entry.get("result") or "").strip().lower()
+        if result not in {"hit", "miss"}:
+            continue
+        stat = str(entry.get("stat") or "").strip().upper()
+        side = str(entry.get("side") or "").strip().upper()
+        if not stat or side not in {"OVER", "UNDER"}:
+            continue
+        odds = safe_float_or_none(entry.get("odds"))
+        profit = (float(odds) - 1.0) if (result == "hit" and odds and float(odds) > 1.0) else (1.0 if result == "hit" else -1.0)
+
+        stat_bucket = stat_totals.setdefault(stat, {"count": 0.0, "hits": 0.0, "profit": 0.0})
+        stat_bucket["count"] += 1.0
+        stat_bucket["hits"] += 1.0 if result == "hit" else 0.0
+        stat_bucket["profit"] += float(profit)
+
+        side_bucket = stat_side_totals.setdefault((stat, side), {"count": 0.0, "hits": 0.0, "profit": 0.0})
+        side_bucket["count"] += 1.0
+        side_bucket["hits"] += 1.0 if result == "hit" else 0.0
+        side_bucket["profit"] += float(profit)
+
+    metrics = {
+        "stat_totals": stat_totals,
+        "stat_side_totals": stat_side_totals,
+    }
+    with _BACKTEST_RANKING_CACHE_LOCK:
+        _BACKTEST_RANKING_CACHE["timestamp"] = now_ts
+        _BACKTEST_RANKING_CACHE["metrics"] = metrics
+    return metrics
+
+
+def get_backtest_ranking_adjustment(stat: str | None, side: str | None) -> tuple[float, dict[str, Any]]:
+    stat_key = str(stat or "").strip().upper()
+    side_key = str(side or "").strip().upper()
+    if not stat_key or side_key not in {"OVER", "UNDER"}:
+        return 0.0, {"reason": "missing_inputs"}
+
+    metrics = _compute_backtest_ranking_metrics()
+    stat_totals = metrics.get("stat_totals") or {}
+    stat_side_totals = metrics.get("stat_side_totals") or {}
+    base = stat_totals.get(stat_key) or {}
+    segment = stat_side_totals.get((stat_key, side_key)) or {}
+    base_count = int(base.get("count") or 0)
+    segment_count = int(segment.get("count") or 0)
+    if base_count < BACKTEST_RANKING_BASE_MIN_SAMPLES:
+        return 0.0, {"reason": "insufficient_base", "base_count": base_count, "segment_count": segment_count}
+    if segment_count < BACKTEST_RANKING_MIN_SAMPLES:
+        return 0.0, {"reason": "insufficient_segment", "base_count": base_count, "segment_count": segment_count}
+
+    base_hit_rate = (float(base.get("hits") or 0.0) / float(base_count)) * 100.0 if base_count > 0 else 0.0
+    segment_hit_rate = (float(segment.get("hits") or 0.0) / float(segment_count)) * 100.0 if segment_count > 0 else 0.0
+    base_roi = float(base.get("profit") or 0.0) / float(base_count) if base_count > 0 else 0.0
+    segment_roi = float(segment.get("profit") or 0.0) / float(segment_count) if segment_count > 0 else 0.0
+
+    hit_rate_delta = segment_hit_rate - base_hit_rate
+    roi_delta_pct = (segment_roi - base_roi) * 100.0
+    sample_strength = max(0.2, min(1.0, float(segment_count) / 40.0))
+    raw_adjustment = ((hit_rate_delta * 0.22) + (roi_delta_pct * 0.18)) * sample_strength
+    adjustment = max(-BACKTEST_RANKING_MAX_ADJUSTMENT, min(BACKTEST_RANKING_MAX_ADJUSTMENT, raw_adjustment))
+
+    if abs(adjustment) < 0.15:
+        return 0.0, {
+            "reason": "neutral",
+            "base_count": base_count,
+            "segment_count": segment_count,
+            "hit_rate_delta": round(hit_rate_delta, 2),
+            "roi_delta_pct": round(roi_delta_pct, 2),
+        }
+
+    return round(adjustment, 1), {
+        "reason": "applied",
+        "base_count": base_count,
+        "segment_count": segment_count,
+        "hit_rate_delta": round(hit_rate_delta, 2),
+        "roi_delta_pct": round(roi_delta_pct, 2),
+    }
+
+
+def apply_backtest_ranking_adjustment(
+    confidence_engine: dict[str, Any],
+    *,
+    stat: str | None,
+    side: str | None,
+) -> dict[str, Any]:
+    adjusted = copy.deepcopy(confidence_engine or {})
+    base_ranking_score = int(adjusted.get("ranking_score") if adjusted.get("ranking_score") is not None else adjusted.get("score") or 0)
+    adjustment, meta = get_backtest_ranking_adjustment(stat, side)
+    adjusted["backtest_ranking_adjustment"] = adjustment
+    adjusted["backtest_ranking_meta"] = meta
+    if abs(adjustment) < 0.1:
+        adjusted["ranking_score"] = base_ranking_score
+        return adjusted
+
+    ranking_score = int(max(0, min(99, round(base_ranking_score + adjustment))))
+    adjusted["ranking_score"] = ranking_score
+
+    components = dict(adjusted.get("components") or {})
+    components["backtest_calibration"] = round(adjustment, 1)
+    adjusted["components"] = components
+
+    tags = list(adjusted.get("tags") or [])
+    tag_text = f"Backtest adj {adjustment:+.1f}"
+    if tag_text not in tags:
+        tags.append(tag_text)
+    adjusted["tags"] = tags[:6]
+    return adjusted
+
 
 def build_confidence_engine(
     *,
@@ -3295,6 +3675,17 @@ def build_confidence_engine(
     }
     score += sum(components.values())
     score = int(max(0, min(99, round(score))))
+    recalibrated_score, recalibration_components, recalibration_notes = _apply_confidence_recalibration(
+        score=score,
+        games_count=int(games_count or 0),
+        season_type=season_type,
+        playoff_game_number=playoff_game_number,
+    )
+    score = recalibrated_score
+    components.update(recalibration_components)
+    for note in recalibration_notes:
+        if note not in tags:
+            tags.append(note)
 
     grade, tone, tier = _confidence_band_from_score(score)
 
@@ -3355,11 +3746,11 @@ def build_confidence_engine(
 
 
 def _confidence_band_from_score(score: int) -> tuple[str, str, str]:
-    if score >= 85:
+    if score >= CONFIDENCE_TIER_ELITE_MIN:
         return 'A', 'elite', 'Elite'
-    if score >= 72:
+    if score >= CONFIDENCE_TIER_HIGH_MIN:
         return 'B', 'good', 'High'
-    if score >= 60:
+    if score >= CONFIDENCE_TIER_MEDIUM_MIN:
         return 'C', 'warm', 'Medium'
     if score >= 48:
         return 'D', 'neutral', 'Low'
@@ -3778,6 +4169,57 @@ def compute_side_h2h_metrics(h2h_payload: dict[str, Any] | None, side: str) -> t
     return h2h_games_count, h2h_side_hit_count, h2h_side_hit_rate
 
 
+def compute_side_h2h_metrics_from_games(
+    games: list[dict[str, Any]] | None,
+    side: str,
+    opponent_abbreviation: str | None,
+) -> tuple[int, int | None, float | None]:
+    opponent = str(opponent_abbreviation or "").upper().strip()
+    if not opponent:
+        return 0, None, None
+    rows = [
+        game
+        for game in (games or [])
+        if matchup_includes_opponent((game or {}).get("matchup"), opponent)
+    ]
+    total = len(rows)
+    if total <= 0:
+        return 0, None, None
+    side_upper = str(side).upper()
+    side_hits = 0
+    for game in rows:
+        over_hit = bool((game or {}).get("hit"))
+        side_hit = (not over_hit) if side_upper == "UNDER" else over_hit
+        if side_hit:
+            side_hits += 1
+    side_rate = (side_hits / total) * 100.0
+    return total, side_hits, side_rate
+
+
+def resolve_side_h2h_metrics(
+    games: list[dict[str, Any]] | None,
+    h2h_payload: dict[str, Any] | None,
+    side: str,
+    opponent_abbreviation: str | None,
+) -> tuple[int, int | None, float | None]:
+    """
+    Resolve side-aware H2H metrics from both sources and prefer the larger
+    valid sample size so we don't undercount to tiny windows like 1/1 when
+    the analyzed H2H payload has a fuller sample (e.g., 1/3).
+    """
+    from_games = compute_side_h2h_metrics_from_games(games, side, opponent_abbreviation)
+    from_payload = compute_side_h2h_metrics(h2h_payload or {}, side)
+
+    games_count_from_games = int(from_games[0] or 0)
+    games_count_from_payload = int(from_payload[0] or 0)
+
+    if games_count_from_payload > games_count_from_games:
+        return from_payload
+    if games_count_from_games > 0:
+        return from_games
+    return from_payload
+
+
 def annotate_parlay_selection(scored: list[dict[str, Any]], legs: int) -> list[dict[str, Any]]:
     parlay_legs: list[dict[str, Any]] = []
     seen_player_ids: set[int] = set()
@@ -3810,6 +4252,9 @@ def annotate_parlay_selection(scored: list[dict[str, Any]], legs: int) -> list[d
         parlay_legs.append(prop)
 
     return parlay_legs
+
+
+MIN_PARLAY_H2H_GAMES_FOR_RANKING = 2
 
 
 def throttle_request() -> None:
@@ -4223,6 +4668,11 @@ def derive_market_environment_signal(stat: str | None, environment: dict[str, An
     }
 
 
+MARKET_CONTEXT_OVERLAY_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+MARKET_CONTEXT_OVERLAY_CACHE_TTL_SECONDS = 15 * 60
+MARKET_CONTEXT_OVERLAY_CACHE_MAX_SIZE = 4096
+
+
 def enrich_environment_with_market_context(
     environment: dict[str, Any] | None,
     event_row: dict[str, Any] | None,
@@ -4236,74 +4686,107 @@ def enrich_environment_with_market_context(
     away_team_text = str(row.get("away_team") or "").strip()
     team_text = player_team_name or player_team_abbreviation
 
-    player_team = resolve_team_from_text(team_text)
-    home_team = resolve_team_from_text(home_team_text)
-    away_team = resolve_team_from_text(away_team_text)
-
-    player_side = None
-    if player_team and home_team and int(player_team.get("id") or 0) == int(home_team.get("id") or 0):
-        player_side = "home"
-    elif player_team and away_team and int(player_team.get("id") or 0) == int(away_team.get("id") or 0):
-        player_side = "away"
-    elif team_text and normalize_name(team_text) == normalize_name(home_team_text):
-        player_side = "home"
-    elif team_text and normalize_name(team_text) == normalize_name(away_team_text):
-        player_side = "away"
-
     game_total = safe_float_or_none(row.get("market_game_total"))
     home_spread = safe_float_or_none(row.get("market_home_spread"))
     away_spread = safe_float_or_none(row.get("market_away_spread"))
     home_total = safe_float_or_none(row.get("market_home_implied_total"))
     away_total = safe_float_or_none(row.get("market_away_implied_total"))
 
-    team_total = None
-    opponent_total = None
-    team_spread = None
-    if player_side == "home":
-        team_total = home_total
-        opponent_total = away_total
-        team_spread = home_spread
-    elif player_side == "away":
-        team_total = away_total
-        opponent_total = home_total
-        team_spread = away_spread
+    cache_key = (
+        normalize_name(team_text),
+        normalize_name(home_team_text),
+        normalize_name(away_team_text),
+        round(float(game_total), 2) if game_total is not None else None,
+        round(float(home_spread), 2) if home_spread is not None else None,
+        round(float(away_spread), 2) if away_spread is not None else None,
+        round(float(home_total), 2) if home_total is not None else None,
+        round(float(away_total), 2) if away_total is not None else None,
+    )
+    now_ts = time.time()
+    overlay: dict[str, Any] | None = None
+    cached = MARKET_CONTEXT_OVERLAY_CACHE.get(cache_key)
+    if cached and now_ts - float(cached.get("timestamp") or 0.0) < MARKET_CONTEXT_OVERLAY_CACHE_TTL_SECONDS:
+        overlay = copy.deepcopy(cached.get("overlay") or {})
+    if overlay is None:
+        overlay = {}
+        player_team = resolve_team_from_text(team_text)
+        home_team = resolve_team_from_text(home_team_text)
+        away_team = resolve_team_from_text(away_team_text)
 
-    if game_total is not None:
-        payload["market_game_total"] = round(game_total, 1)
-    if team_total is not None:
-        payload["market_team_total"] = round(team_total, 1)
-    if opponent_total is not None:
-        payload["market_opponent_total"] = round(opponent_total, 1)
-    if team_spread is not None:
-        team_spread = round(team_spread, 1)
-        payload["market_spread"] = team_spread
-        payload["projected_spread"] = team_spread
-        if abs(team_spread) >= 10:
-            payload["spread_bucket"] = "blowout"
-            payload["spread_label"] = f"Market blowout risk  {team_spread:+.1f}"
-        elif abs(team_spread) <= 3.5:
-            payload["spread_bucket"] = "close"
-            payload["spread_label"] = f"Market close spread  {team_spread:+.1f}"
-        elif team_spread < 0:
-            payload["spread_bucket"] = "favorite"
-            payload["spread_label"] = f"Market favorite  {team_spread:+.1f}"
-        else:
-            payload["spread_bucket"] = "underdog"
-            payload["spread_label"] = f"Market underdog  {team_spread:+.1f}"
+        player_side = None
+        if player_team and home_team and int(player_team.get("id") or 0) == int(home_team.get("id") or 0):
+            player_side = "home"
+        elif player_team and away_team and int(player_team.get("id") or 0) == int(away_team.get("id") or 0):
+            player_side = "away"
+        elif team_text and normalize_name(team_text) == normalize_name(home_team_text):
+            player_side = "home"
+        elif team_text and normalize_name(team_text) == normalize_name(away_team_text):
+            player_side = "away"
 
-    market_bits: list[str] = []
-    if team_total is not None:
-        market_bits.append(f"team total {team_total:.1f}")
-    if game_total is not None:
-        market_bits.append(f"game total {game_total:.1f}")
-    if team_spread is not None:
-        market_bits.append(f"spread {team_spread:+.1f}")
-    if market_bits:
-        market_summary = "Market context: " + "  ".join(market_bits) + "."
+        team_total = None
+        opponent_total = None
+        team_spread = None
+        if player_side == "home":
+            team_total = home_total
+            opponent_total = away_total
+            team_spread = home_spread
+        elif player_side == "away":
+            team_total = away_total
+            opponent_total = home_total
+            team_spread = away_spread
+
+        if game_total is not None:
+            overlay["market_game_total"] = round(game_total, 1)
+        if team_total is not None:
+            overlay["market_team_total"] = round(team_total, 1)
+        if opponent_total is not None:
+            overlay["market_opponent_total"] = round(opponent_total, 1)
+        if team_spread is not None:
+            team_spread = round(team_spread, 1)
+            overlay["market_spread"] = team_spread
+            overlay["projected_spread"] = team_spread
+            if abs(team_spread) >= 10:
+                overlay["spread_bucket"] = "blowout"
+                overlay["spread_label"] = f"Market blowout risk  {team_spread:+.1f}"
+            elif abs(team_spread) <= 3.5:
+                overlay["spread_bucket"] = "close"
+                overlay["spread_label"] = f"Market close spread  {team_spread:+.1f}"
+            elif team_spread < 0:
+                overlay["spread_bucket"] = "favorite"
+                overlay["spread_label"] = f"Market favorite  {team_spread:+.1f}"
+            else:
+                overlay["spread_bucket"] = "underdog"
+                overlay["spread_label"] = f"Market underdog  {team_spread:+.1f}"
+
+        market_bits: list[str] = []
+        if team_total is not None:
+            market_bits.append(f"team total {team_total:.1f}")
+        if game_total is not None:
+            market_bits.append(f"game total {game_total:.1f}")
+        if team_spread is not None:
+            market_bits.append(f"spread {team_spread:+.1f}")
+        if market_bits:
+            overlay["market_summary"] = "Market context: " + "  ".join(market_bits) + "."
+
+        overlay_signal_seed = dict(overlay)
+        overlay["market_context"] = derive_market_environment_signal(None, overlay_signal_seed)
+
+        if len(MARKET_CONTEXT_OVERLAY_CACHE) >= MARKET_CONTEXT_OVERLAY_CACHE_MAX_SIZE:
+            MARKET_CONTEXT_OVERLAY_CACHE.clear()
+        MARKET_CONTEXT_OVERLAY_CACHE[cache_key] = {
+            "timestamp": now_ts,
+            "overlay": copy.deepcopy(overlay),
+        }
+
+    market_summary = str(overlay.get("market_summary") or "").strip()
+    for key, value in overlay.items():
+        if key == "market_summary":
+            continue
+        payload[key] = copy.deepcopy(value)
+    if market_summary:
         payload["market_summary"] = market_summary
         existing_summary = str(payload.get("summary") or "").strip()
         payload["summary"] = f"{existing_summary} {market_summary}".strip() if existing_summary else market_summary
-    payload["market_context"] = derive_market_environment_signal(None, payload)
     return payload
 
 
@@ -4427,6 +4910,25 @@ def parse_matchup_descriptor(matchup: str) -> dict[str, Any]:
         'team_abbreviation': team_abbreviation,
         'opponent_abbreviation': opponent_abbreviation,
     }
+
+
+def matchup_includes_opponent(matchup: str | None, opponent_abbreviation: str | None) -> bool:
+    opponent = str(opponent_abbreviation or "").upper().strip()
+    if not opponent:
+        return False
+    raw_matchup = str(matchup or "").strip()
+    if not raw_matchup:
+        return False
+
+    normalized_matchup = re.sub(r"\s+VS\.?\s+", " vs. ", raw_matchup, flags=re.IGNORECASE)
+    normalized_matchup = re.sub(r"\s+@\s+", " @ ", normalized_matchup)
+    parsed = parse_matchup_descriptor(normalized_matchup)
+    parsed_opponent = str(parsed.get("opponent_abbreviation") or "").upper().strip()
+    if parsed_opponent:
+        return parsed_opponent == opponent
+
+    tokens = [token for token in re.split(r"[^A-Z0-9]+", raw_matchup.upper()) if token]
+    return opponent in tokens
 
 
 def enrich_game_logs_with_context(season_rows: list[dict[str, Any]], team_id: int | None, season: str, season_type: str, player_id: int) -> list[dict[str, Any]]:
@@ -4560,9 +5062,8 @@ def apply_game_log_filters(
             continue
         if max_fga is not None and fga_value > max_fga:
             continue
-        if h2h_only:
-            if not opponent_abbreviation or opponent_abbreviation not in str(row.get('MATCHUP') or '').upper():
-                continue
+        if h2h_only and not matchup_includes_opponent(row.get("MATCHUP"), opponent_abbreviation):
+            continue
         rank_value = row.get('_opponent_rank')
         if opponent_rank_min is not None and (not isinstance(rank_value, int) or rank_value < opponent_rank_min):
             continue
@@ -4737,13 +5238,11 @@ def build_team_rank_map(season: str, season_type: str = DEFAULT_SEASON_TYPE) -> 
                 if record:
                     rows.append(record)
         else:
-            max_workers = min(8, len(team_ids))
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [executor.submit(_fetch_team_record, team_id) for team_id in team_ids]
-                for future in as_completed(futures):
-                    record = future.result()
-                    if record:
-                        rows.append(record)
+            futures = [_submit_shared_network_task(_fetch_team_record, team_id) for team_id in team_ids]
+            for future in as_completed(futures):
+                record = future.result()
+                if record:
+                    rows.append(record)
         rows.sort(key=lambda item: (-float(item.get('win_pct') or 0.0), -int(item.get('wins') or 0), TEAM_LOOKUP.get(int(item.get('team_id') or 0), {}).get('full_name', '')))
         rank_map = {int(item['team_id']): idx + 1 for idx, item in enumerate(rows)}
 
@@ -4858,17 +5357,15 @@ def build_without_player_union_game_ids(player_ids: list[int], season: str, seas
     if len(normalized_ids) == 1:
         game_ids.update(teammate_absence_game_ids(int(normalized_ids[0]), season=season, season_type=season_type))
         return game_ids
-    max_workers = min(8, len(normalized_ids))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(teammate_absence_game_ids, int(teammate_id), season, season_type)
-            for teammate_id in normalized_ids
-        ]
-        for future in as_completed(futures):
-            try:
-                game_ids.update(future.result() or set())
-            except Exception:
-                pass
+    futures = [
+        _submit_shared_network_task(teammate_absence_game_ids, int(teammate_id), season, season_type)
+        for teammate_id in normalized_ids
+    ]
+    for future in as_completed(futures):
+        try:
+            game_ids.update(future.result() or set())
+        except Exception:
+            pass
     return game_ids
 
 def normalize_opponent_rank_range(opponent_rank_range: str | None) -> tuple[int | None, int | None, str]:
@@ -4900,8 +5397,8 @@ def normalize_opponent_rank_range(opponent_rank_range: str | None) -> tuple[int 
 
 def build_opportunity_context(season_rows: list[dict[str, Any]], last_n: int) -> dict[str, Any]:
     recent_rows = season_rows[: max(1, min(last_n, len(season_rows)))]
-    short_rows = season_rows[: max(1, min(5, len(season_rows)))]
-    older_rows = season_rows[5:10] if len(season_rows) >= 10 else season_rows[len(short_rows):]
+    short_rows = recent_rows[: max(1, min(5, len(recent_rows)))]
+    older_rows = recent_rows[5:10] if len(recent_rows) >= 10 else recent_rows[len(short_rows):]
 
     short_minutes = [parse_minutes_to_decimal(row.get("MIN")) for row in short_rows]
     recent_minutes = [parse_minutes_to_decimal(row.get("MIN")) for row in recent_rows]
@@ -5356,7 +5853,24 @@ def _build_filtered_pool_cache_key(
 
 
 def build_stat_summary_block(rows: list[dict[str, Any]], stat: str, line: float) -> dict[str, Any]:
-    cache_key = (tuple(str(row.get("Game_ID") or row.get("GAME_ID") or row.get("GAME_DATE") or "") for row in rows), str(stat), float(line))
+    # Include per-row stat content in the cache key so summaries do not collide
+    # across different players who share the same game IDs/dates.
+    row_signature = tuple(
+        (
+            str(row.get("Game_ID") or row.get("GAME_ID") or ""),
+            str(row.get("GAME_DATE") or ""),
+            str(row.get("MATCHUP") or ""),
+            round(safe_stat_number(row, "PTS"), 3),
+            round(safe_stat_number(row, "REB"), 3),
+            round(safe_stat_number(row, "AST"), 3),
+            round(safe_stat_number(row, "FGA"), 3),
+            round(safe_stat_number(row, "FG3A"), 3),
+            round(safe_stat_number(row, "FTA"), 3),
+            str(row.get("MIN") or "").strip(),
+        )
+        for row in rows
+    )
+    cache_key = (row_signature, str(stat).upper().strip(), float(line))
     cached = STAT_SUMMARY_CACHE.get(cache_key)
     now_ts = time.time()
     if cached and now_ts - float(cached.get("timestamp") or 0.0) < STAT_SUMMARY_CACHE_TTL_SECONDS:
@@ -5458,6 +5972,45 @@ def mask_api_key_for_display(api_key: str) -> str:
     return f"{raw[:4]}{raw[-4:]}"
 
 
+def normalize_odds_api_key(api_key: Any) -> str:
+    raw = str(api_key or "").strip()
+    if not raw:
+        return ""
+
+    key_text = raw.strip().strip(",;")
+    if key_text.lower().startswith("bearer "):
+        key_text = key_text[7:].strip()
+
+    env_match = re.match(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_-]*)\s*[:=]\s*(.+)$", key_text)
+    if env_match:
+        lhs, rhs = env_match.group(1), env_match.group(2)
+        if "KEY" in lhs.upper():
+            key_text = rhs.strip()
+
+    query_source = key_text
+    if "?" in key_text or "://" in key_text:
+        try:
+            parsed = urlparse(key_text)
+            query_source = parsed.query or key_text
+        except Exception:
+            query_source = key_text
+    parsed_query = parse_qs(query_source, keep_blank_values=True)
+    for field_name in ("apiKey", "apikey", "api_key"):
+        values = parsed_query.get(field_name) or []
+        if values:
+            key_text = str(values[-1] or "").strip()
+            break
+    else:
+        query_match = re.search(r"(?i)(?:^|[?&,\s;])(api[_-]?key|apikey)\s*=\s*([^&#,\s;]+)", key_text)
+        if query_match:
+            key_text = str(query_match.group(2) or "").strip()
+
+    while len(key_text) >= 2 and key_text[0] == key_text[-1] and key_text[0] in {"'", '"', "`"}:
+        key_text = key_text[1:-1].strip()
+
+    return key_text.strip().strip(",;")
+
+
 def odds_api_build_query(params: dict[str, Any]) -> str:
     search = []
     for key, value in params.items():
@@ -5496,7 +6049,7 @@ def odds_api_fetch(
     *,
     allow_query_auth_fallback: bool | None = None,
 ) -> dict[str, Any]:
-    key = str(api_key or "").strip()
+    key = normalize_odds_api_key(api_key)
     if not key:
         raise HTTPException(status_code=400, detail="Missing Odds API key.")
 
@@ -6348,16 +6901,14 @@ def bet_finder(
         if candidate:
             results.append(candidate)
     else:
-        max_workers = min(8, len(roster_rows))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_analyze_row, row) for row in roster_rows]
-            for future in as_completed(futures):
-                try:
-                    candidate = future.result()
-                except Exception:
-                    candidate = None
-                if candidate:
-                    results.append(candidate)
+        futures = [_submit_shared_analysis_task(_analyze_row, row) for row in roster_rows]
+        for future in as_completed(futures):
+            try:
+                candidate = future.result()
+            except Exception:
+                candidate = None
+            if candidate:
+                results.append(candidate)
 
     results.sort(
         key=lambda item: (
@@ -6934,9 +7485,10 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
                     best_implied = implied_over
                     market_odds = over_odds
 
+            confidence_hit_rate = side_hit_rate_from_over_hit_rate(analysis.get("hit_rate"), best_side)
             confidence_engine = build_confidence_engine(
                 side=best_side,
-                hit_rate=float(analysis["hit_rate"]),
+                hit_rate=float(confidence_hit_rate),
                 games_count=int(analysis["games_count"]),
                 edge=best_edge_pct,
                 ev=best_ev,
@@ -6951,6 +7503,11 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
                 average=float(analysis["average"]),
                 season_type=analysis.get("season_type"),
                 playoff_game_number=int(((analysis.get("matchup") or {}).get("next_game") or {}).get("playoff_game_number") or 0) or None,
+            )
+            confidence_engine = apply_backtest_ranking_adjustment(
+                confidence_engine,
+                stat=str(bulk_row["stat"]),
+                side=best_side,
             )
 
             display_side = best_side
@@ -7194,7 +7751,7 @@ def market_scan_stream(request: Request, payload: dict[str, Any] = Body(...)) ->
 
 @app.post("/api/odds/events")
 def odds_events(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    api_key = str(payload.get("api_key") or "").strip()
+    api_key = normalize_odds_api_key(payload.get("api_key") or "")
     sport = str(payload.get("sport") or "basketball_nba")
     result = odds_api_fetch(
         f"/sports/{sport}/events",
@@ -7212,7 +7769,7 @@ def odds_events(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
 @app.post("/api/odds/player-props-import")
 def odds_player_props_import(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    api_key = str(payload.get("api_key") or "").strip()
+    api_key = normalize_odds_api_key(payload.get("api_key") or "")
     sport = str(payload.get("sport") or "basketball_nba")
     event_id = str(payload.get("event_id") or "").strip()
     regions = str(payload.get("regions") or "us")
@@ -7284,14 +7841,20 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
     raw_keys = payload.get("api_keys") or []
     if isinstance(raw_keys, str):
         raw_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
-    api_keys: list[str] = [str(k).strip() for k in raw_keys if str(k).strip()]
+    api_keys: list[str] = [
+        normalized for k in raw_keys
+        if (normalized := normalize_odds_api_key(k))
+    ]
     if not api_keys:
         raise HTTPException(status_code=400, detail="Provide at least one Odds API key in 'api_keys'.")
 
     request_hash_value = _request_hash("parlay_builder", payload)
-    cached_run = _pg_read_parlay_builder_cache(payload, cache_scope="parlay_builder")
-    if cached_run:
-        return cached_run
+    season_type  = normalize_requested_season_type(payload.get("season_type"))
+    bypass_cache = bool(payload.get("bypass_cache")) or season_type == SEASON_TYPE_PLAYOFFS
+    if not bypass_cache:
+        cached_run = _pg_read_parlay_builder_cache(payload, cache_scope="parlay_builder")
+        if cached_run:
+            return cached_run
 
     _emit_progress(progress_cb, "start", events_requested=len(payload.get("event_ids") or []))
 
@@ -7304,7 +7867,6 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
     odds_format  = str(payload.get("odds_format") or "decimal")
     last_n       = int(payload.get("last_n") or 10)
     season       = str(payload.get("season") or current_nba_season())
-    season_type  = normalize_requested_season_type(payload.get("season_type"))
     batch_size   = max(1, int(payload.get("batch_size") or 3))
     requested_bookmakers = parse_requested_bookmakers(payload.get("bookmakers") or payload.get("bookmaker") or ODDS_DEFAULT_BOOKMAKERS)
     markets      = ",".join(ODDS_PARLAY_MARKETS)
@@ -7446,37 +8008,13 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
     #  Phase 3: Bulk-analyze all props in one shot (free, parallel) 
     defaults = {"last_n": last_n, "season": season, "season_type": season_type}
     local_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
-    analysis_rows: list[dict[str, Any]] = []
-    analysis_errors: list[dict[str, Any]] = []
-
-    # Resolve player IDs first (same logic as market-scan)
-    prepared: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    for row in all_import_rows:
-        player_name = str(row.get("player_name") or "").strip()
-        player = find_player_by_name(player_name)
-        if not player:
-            analysis_errors.append({"player_name": player_name, "reason": "Player not found."})
-            continue
-        bulk_row = {
-            "player_id": int(player["id"]),
-            "player_name": player_name,
-            "stat": row["stat"],
-            "line": row["line"],
-            "team_id": None,
-            "player_position": None,
-        }
-        prepared.append((bulk_row, row))
-
-    # Deduplicate: one analysis per (player_id, stat, line)
-    seen_analysis_keys: set[tuple[Any, ...]] = set()
-    deduped_prepared: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    for bulk_row, orig_row in prepared:
-        ak = (bulk_row["player_id"], bulk_row["stat"], float(bulk_row["line"]))
-        if ak not in seen_analysis_keys:
-            seen_analysis_keys.add(ak)
-            deduped_prepared.append((bulk_row, orig_row))
-
-    unique_player_ids: set[int] = {int(br["player_id"]) for br, _ in deduped_prepared}
+    analysis_prep = PARLAY_SERVICE.prepare_analysis_jobs(
+        all_import_rows=all_import_rows,
+        resolve_player=lambda player_name: find_player_by_name(player_name),
+    )
+    deduped_prepared: list[tuple[dict[str, Any], dict[str, Any]]] = list(analysis_prep["deduped_prepared"] or [])
+    analysis_errors: list[dict[str, Any]] = list(analysis_prep["analysis_errors"] or [])
+    unique_player_ids: set[int] = set(analysis_prep["unique_player_ids"] or set())
     primary_by_team: dict[int, int] = {}
     for bulk_row, _ in deduped_prepared:
         team_id = _resolve_team_id_for_player(int(bulk_row["player_id"]))
@@ -7493,49 +8031,86 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
     )
 
     max_workers = min(BULK_ANALYSIS_MAX_WORKERS, max(1, len(deduped_prepared)))
-
-    _emit_progress(progress_cb, "analysis_start", total=len(deduped_prepared), workers=max_workers)
-
-    if max_workers <= 1:
-        step = max(1, len(deduped_prepared) // 10) if deduped_prepared else 1
-        done = 0
-        for idx, (bulk_row, orig_row) in enumerate(deduped_prepared, start=1):
-            try:
-                result = _build_bulk_prop_item(idx, bulk_row, defaults, local_cache)
-                analysis_rows.append((result, orig_row))
-            except Exception as exc:
-                analysis_errors.append({"player_name": bulk_row["player_name"], "reason": str(exc)})
-            done += 1
-            if done % step == 0 or done == len(deduped_prepared):
-                _emit_progress(progress_cb, "analysis_progress", done=done, total=len(deduped_prepared))
-    else:
-        step = max(1, len(deduped_prepared) // 10) if deduped_prepared else 1
-        done = 0
-        for batch_start in range(0, len(deduped_prepared), max_workers):
-            chunk = deduped_prepared[batch_start : batch_start + max_workers]
-            futures_list: list[tuple[int, dict[str, Any], dict[str, Any], Any]] = []
-            for idx, (bulk_row, orig_row) in enumerate(chunk, start=batch_start + 1):
-                fut = _submit_shared_analysis_task(_build_bulk_prop_item, idx, bulk_row, defaults, local_cache)
-                futures_list.append((idx, bulk_row, orig_row, fut))
-            for idx, bulk_row, orig_row, fut in futures_list:
-                try:
-                    result = fut.result()
-                    analysis_rows.append((result, orig_row))
-                except Exception as exc:
-                    analysis_errors.append({"player_name": bulk_row["player_name"], "reason": str(exc)})
-                done += 1
-                if done % step == 0 or done == len(deduped_prepared):
-                    _emit_progress(progress_cb, "analysis_progress", done=done, total=len(deduped_prepared))
-
-    _emit_progress(progress_cb, "analysis_done", analyzed=len(analysis_rows), errors=len(analysis_errors))
+    analysis_rows, analysis_errors_run = PARLAY_SERVICE.run_bulk_analysis(
+        deduped_prepared=deduped_prepared,
+        defaults=defaults,
+        local_cache=local_cache,
+        max_workers=max_workers,
+        build_bulk_prop_item=_build_bulk_prop_item,
+        submit_analysis_task=_submit_shared_analysis_task,
+        emit_progress=lambda stage, meta: _emit_progress(progress_cb, stage, **meta),
+    )
+    if analysis_errors_run:
+        analysis_errors.extend(analysis_errors_run)
 
     #  Phase 4: Score every prop by hit rate, pick best N legs 
-    scored: list[dict[str, Any]] = []
-    scoring_step = max(1, len(analysis_rows) // 10) if analysis_rows else 1
-    for idx, (result, orig_row) in enumerate(analysis_rows, start=1):
+    playoff_live_refresh_cache: dict[tuple[int, str, float], dict[str, Any]] = {}
+
+    def _refresh_playoff_low_sample_analysis(
+        result_row: dict[str, Any],
+        market_row: dict[str, Any],
+        analysis_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        # In playoffs, stale cached analysis can occasionally collapse to a 1-game sample.
+        # Hard-refresh low samples so parlay ranking uses current series logs.
+        if season_type != SEASON_TYPE_PLAYOFFS:
+            return analysis_payload
+        current_games = int((analysis_payload or {}).get("games_count") or 0)
+        if current_games >= 3:
+            return analysis_payload
+        player_id_val = int(result_row.get("player_id") or market_row.get("player_id") or 0)
+        stat_val = str(result_row.get("stat") or market_row.get("stat") or "").strip().upper()
+        line_val = float(result_row.get("line") or market_row.get("line") or 0.0)
+        if not player_id_val or not stat_val:
+            return analysis_payload
+        refresh_key = (player_id_val, stat_val, round(line_val, 4))
+        cached_refresh = playoff_live_refresh_cache.get(refresh_key)
+        if cached_refresh:
+            return cached_refresh
+        try:
+            for cache_key in list(ANALYSIS_CACHE.keys()):
+                try:
+                    key_player_id = int(cache_key[1])
+                    key_stat = str(cache_key[2] or "").strip().upper()
+                    key_line = float(cache_key[3] or 0.0)
+                    key_season_type = str(cache_key[6] or "")
+                except Exception:
+                    continue
+                if (
+                    key_player_id == player_id_val
+                    and key_stat == stat_val
+                    and abs(key_line - line_val) <= 1e-6
+                    and key_season_type == SEASON_TYPE_PLAYOFFS
+                ):
+                    ANALYSIS_CACHE.pop(cache_key, None)
+            game_log_key = (player_id_val, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)
+            GAME_LOG_CACHE.pop(game_log_key, None)
+            GAME_LOG_FAILURE_META.pop(game_log_key, None)
+            RECENT_GAME_LOG_CACHE.pop((player_id_val, season, season_type, 20, GAME_LOG_CACHE_SCHEMA_VERSION), None)
+            refreshed = build_prop_analysis_payload(
+                player_id=player_id_val,
+                stat=stat_val,
+                line=line_val,
+                last_n=last_n,
+                season=season,
+                season_type=season_type,
+            )
+            if int((refreshed or {}).get("games_count") or 0) > current_games:
+                playoff_live_refresh_cache[refresh_key] = refreshed
+                return refreshed
+        except Exception:
+            return analysis_payload
+        playoff_live_refresh_cache[refresh_key] = analysis_payload
+        return analysis_payload
+
+    def _score_regular_row(
+        result: dict[str, Any],
+        orig_row: dict[str, Any],
+        *,
+        strict_playoff_rules: bool = True,
+    ) -> dict[str, Any] | None:
         analysis = result.get("analysis") or {}
-        if idx % scoring_step == 0 or idx == len(analysis_rows):
-            _emit_progress(progress_cb, "scoring_progress", done=idx, total=len(analysis_rows))
+        analysis = _refresh_playoff_low_sample_analysis(result, orig_row, analysis)
         hit_rate  = float(analysis.get("hit_rate") or 0)
         avg       = float(analysis.get("average") or 0)
         line      = float(result.get("line") or orig_row.get("line") or 0)
@@ -7548,80 +8123,41 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             side = recommended_side
             if side == "OVER":
                 odds = float(orig_row.get("over_odds") or 1.91)
-                side_hit_rate = hit_rate
             else:
                 odds = float(orig_row.get("under_odds") or 1.91)
-                side_hit_rate = 100.0 - hit_rate
+            side_hit_rate = side_hit_rate_from_over_hit_rate(hit_rate, side)
         else:
             # Over hit_rate > 50  OVER is the stronger side
             if hit_rate >= 50:
                 side = "OVER"
                 odds = float(orig_row.get("over_odds") or 1.91)
-                side_hit_rate = hit_rate
             else:
                 side = "UNDER"
                 odds = float(orig_row.get("under_odds") or 1.91)
-                side_hit_rate = 100.0 - hit_rate
-
-        h2h_games_count, h2h_side_hit_count, h2h_side_hit_rate = compute_side_h2h_metrics(
-            analysis.get("h2h") or {},
-            side,
-        )
-        ranking_hit_rate = h2h_side_hit_rate if h2h_side_hit_rate is not None else side_hit_rate
-        ranking_source = "h2h" if h2h_side_hit_rate is not None else "recent"
+            side_hit_rate = side_hit_rate_from_over_hit_rate(hit_rate, side)
 
         # Skip unavailable players
         availability = analysis.get("availability") or {}
         if availability.get("is_unavailable"):
-            continue
+            return None
 
         # Skip props with odds below 1.40  too low to be meaningful in a parlay
         if odds < 1.40:
-            continue
+            return None
 
         matchup = analysis.get("matchup") or {}
         next_game_info = copy.deepcopy(matchup.get("next_game") or {})
         vs_position = matchup.get("vs_position") or {}
         matchup_delta_pct = vs_position.get("delta_pct") if isinstance(vs_position, dict) else None
-        # Override matchup based on the actual event when available.
-        event_home = resolve_team_from_text(str(orig_row.get("home_team") or "").strip())
-        event_away = resolve_team_from_text(str(orig_row.get("away_team") or "").strip())
         player_team_id_int = int((analysis.get("player") or {}).get("team_id") or 0)
         player_team_abbr = str((analysis.get("player") or {}).get("team_abbreviation") or next_game_info.get("player_team_abbreviation") or "").strip()
-        event_opponent = None
-        is_home = None
-        if player_team_id_int:
-            if event_home and int(event_home.get("id") or 0) == player_team_id_int and event_away:
-                event_opponent = event_away
-                is_home = True
-            elif event_away and int(event_away.get("id") or 0) == player_team_id_int and event_home:
-                event_opponent = event_home
-                is_home = False
-        if not event_opponent and player_team_abbr:
-            home_abbr = str(event_home.get("abbreviation") or "").upper() if event_home else ""
-            away_abbr = str(event_away.get("abbreviation") or "").upper() if event_away else ""
-            if home_abbr and home_abbr == player_team_abbr.upper() and event_away:
-                event_opponent = event_away
-                is_home = True
-            elif away_abbr and away_abbr == player_team_abbr.upper() and event_home:
-                event_opponent = event_home
-                is_home = False
-        if event_opponent and int(event_opponent.get("id") or 0) != player_team_id_int:
-            opp_abbr = str(event_opponent.get("abbreviation") or "").strip()
-            opp_name = str(event_opponent.get("full_name") or "").strip()
-            team_abbr = player_team_abbr or (event_home.get("abbreviation") if event_home else "") or (event_away.get("abbreviation") if event_away else "")
-            matchup_label = None
-            if team_abbr and opp_abbr:
-                matchup_label = f"{team_abbr} vs {opp_abbr}" if is_home else f"{team_abbr} @ {opp_abbr}"
-            next_game_info.update({
-                "opponent_team_id": int(event_opponent.get("id") or 0),
-                "opponent_abbreviation": opp_abbr,
-                "opponent_name": opp_name,
-                "player_team_abbreviation": team_abbr,
-                "is_home": is_home,
-                "is_override": True,
-                "matchup_label": matchup_label or next_game_info.get("matchup_label"),
-            })
+        next_game_info = PARLAY_SERVICE.apply_event_matchup_override(
+            next_game_info=next_game_info,
+            orig_row=orig_row,
+            player_team_id=player_team_id_int,
+            player_team_abbreviation=player_team_abbr,
+            resolve_team_from_text=resolve_team_from_text,
+        )
         pricing_snapshot = build_shared_market_pricing_snapshot(
             market_row=orig_row,
             over_odds=float(orig_row.get("over_odds") or 0.0),
@@ -7698,28 +8234,69 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             under_probability=fair_under_prob,
             odds=odds,
         )
+        confidence_engine = apply_backtest_ranking_adjustment(
+            confidence_engine,
+            stat=stat,
+            side=side,
+        )
+
+        scoring_season_type = str(analysis.get("season_type") or season_type or "")
+        is_playoffs_mode = scoring_season_type == SEASON_TYPE_PLAYOFFS
+        confidence_score_value = int(float(confidence_engine.get("score") or 0))
+        if is_playoffs_mode and strict_playoff_rules and confidence_score_value < 75:
+            return None
 
         # Resolve team + opponent IDs from the analysis payload so the frontend
         # can auto-populate the analyzer without the user having to re-select manually.
         player_info    = analysis.get("player") or {}
         resolved_team_id_scored    = player_info.get("team_id")
-        resolved_opponent_team_id  = next_game_info.get("opponent_team_id")
-        resolved_opponent_abbr     = str(next_game_info.get("opponent_abbreviation") or "").strip()
-        if not resolved_opponent_team_id:
-            home_candidate = resolve_team_from_text(str(orig_row.get("home_team") or ""))
-            away_candidate = resolve_team_from_text(str(orig_row.get("away_team") or ""))
-            player_team_id_int = int(resolved_team_id_scored or 0)
-            for candidate in [away_candidate, home_candidate]:
-                if candidate and int(candidate.get("id") or 0) != player_team_id_int:
-                    resolved_opponent_team_id = int(candidate.get("id") or 0)
-                    if not resolved_opponent_abbr:
-                        resolved_opponent_abbr = str(candidate.get("abbreviation") or "").strip()
-                    break
+        resolved_opp_info = PARLAY_SERVICE.fill_missing_opponent_from_event(
+            opponent_info={
+                "opponent_team_id": next_game_info.get("opponent_team_id"),
+                "opponent_abbreviation": str(next_game_info.get("opponent_abbreviation") or "").strip(),
+                "opponent_name": str(next_game_info.get("opponent_name") or "").strip(),
+            },
+            orig_row=orig_row,
+            player_team_id=int(resolved_team_id_scored or 0),
+            resolve_team_from_text=resolve_team_from_text,
+        )
+        resolved_opponent_team_id = resolved_opp_info.get("opponent_team_id")
+        resolved_opponent_abbr = str(resolved_opp_info.get("opponent_abbreviation") or "").strip()
+        h2h_games_count, h2h_side_hit_count, h2h_side_hit_rate = resolve_side_h2h_metrics(
+            games=analysis.get("games") or [],
+            h2h_payload=analysis.get("h2h") or {},
+            side=side,
+            opponent_abbreviation=resolved_opponent_abbr,
+        )
+        h2h_from_games = compute_side_h2h_metrics_from_games(
+            games=analysis.get("games") or [],
+            side=side,
+            opponent_abbreviation=resolved_opponent_abbr,
+        )
+        h2h_from_payload = compute_side_h2h_metrics(
+            h2h_payload=analysis.get("h2h") or {},
+            side=side,
+        )
+        has_reliable_h2h = h2h_side_hit_rate is not None and int(h2h_games_count or 0) >= MIN_PARLAY_H2H_GAMES_FOR_RANKING
+        if is_playoffs_mode:
+            if h2h_side_hit_rate is None or int(h2h_games_count or 0) <= 0:
+                if strict_playoff_rules:
+                    return None
+                ranking_hit_rate = float(side_hit_rate)
+                ranking_source = "recent"
+            else:
+                ranking_hit_rate = float(h2h_side_hit_rate)
+                ranking_source = "h2h"
+        else:
+            ranking_hit_rate = h2h_side_hit_rate if has_reliable_h2h else side_hit_rate
+            ranking_source = "h2h" if has_reliable_h2h else "recent"
 
+        scored_games_count = int(analysis.get("games_count") or 0)
+        side_hit_count = max(0, min(scored_games_count, int(round((float(side_hit_rate) / 100.0) * scored_games_count))))
         matchup_payload = copy.deepcopy(analysis.get("matchup") or {})
         if next_game_info:
             matchup_payload["next_game"] = copy.deepcopy(next_game_info)
-        scored.append({
+        return {
             "player_name": result.get("player_name") or "",
             "player_id": result.get("player_id"),
             "season_type": analysis.get("season_type") or season_type,
@@ -7740,8 +8317,22 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             "h2h_games_count": h2h_games_count,
             "h2h_hit_count": h2h_side_hit_count,
             "h2h_hit_rate": round(h2h_side_hit_rate, 1) if h2h_side_hit_rate is not None else None,
+            "h2h_debug": {
+                "opponent_abbreviation": resolved_opponent_abbr,
+                "from_games_count": int(h2h_from_games[0] or 0),
+                "from_games_hits": int(h2h_from_games[1] or 0) if h2h_from_games[1] is not None else None,
+                "from_payload_count": int(h2h_from_payload[0] or 0),
+                "from_payload_hits": int(h2h_from_payload[1] or 0) if h2h_from_payload[1] is not None else None,
+                "resolved_count": int(h2h_games_count or 0),
+                "resolved_hits": int(h2h_side_hit_count or 0) if h2h_side_hit_count is not None else None,
+                "season_type": scoring_season_type,
+                "game_log_source": str(((analysis.get("debug") or {}).get("freshness") or {}).get("game_log_source") or ""),
+                "filtered_pool_count": int(analysis.get("filtered_pool_count") or 0),
+                "season_pool_count": int(analysis.get("season_pool_count") or 0),
+            },
             "average": round(avg, 2),
-            "games_count": int(analysis.get("games_count") or 0),
+            "games_count": scored_games_count,
+            "hit_count": side_hit_count,
             "last_n": int(analysis.get("last_n") or last_n),
             "model_probability": round(model_prob * 100.0, 1),
             "model_probability_raw": round((model_under if side == "UNDER" else model_over) * 100.0, 1),
@@ -7754,7 +8345,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             "matchup": matchup_payload,
             "environment": copy.deepcopy(enriched_environment),
             "confidence": confidence_engine.get("grade"),
-            "confidence_score": confidence_engine.get("score"),
+            "confidence_score": confidence_score_value,
             "confidence_tone": confidence_engine.get("tone"),
             "confidence_tier": confidence_engine.get("tier"),
             "confidence_summary": confidence_engine.get("summary"),
@@ -7784,7 +8375,27 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             "best_under_odds": orig_row.get("best_under_odds"),
             "best_over_bookmaker": orig_row.get("best_over_bookmaker"),
             "best_under_bookmaker": orig_row.get("best_under_bookmaker"),
-        })
+        }
+
+    scored = PARLAY_SERVICE.run_scoring_rows(
+        analysis_rows=analysis_rows,
+        score_row=lambda result, orig_row: _score_regular_row(result, orig_row, strict_playoff_rules=True),
+        emit_progress=lambda stage, meta: _emit_progress(progress_cb, stage, **meta),
+    )
+    playoff_relaxed_fallback_applied = False
+    if season_type == SEASON_TYPE_PLAYOFFS and not scored and analysis_rows:
+        _emit_progress(
+            progress_cb,
+            "scoring_relaxed_fallback",
+            total=len(analysis_rows),
+            reason="strict_playoff_filters_removed_all",
+        )
+        scored = PARLAY_SERVICE.run_scoring_rows(
+            analysis_rows=analysis_rows,
+            score_row=lambda result, orig_row: _score_regular_row(result, orig_row, strict_playoff_rules=False),
+            emit_progress=lambda stage, meta: _emit_progress(progress_cb, stage, **meta),
+        )
+        playoff_relaxed_fallback_applied = bool(scored)
 
     # Primary rank: opponent-specific H2H side hit rate.
     # Fallback: regular side hit rate when no H2H sample exists.
@@ -7832,6 +8443,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
         "quota_log": quota_log,
         "bookmakers": requested_bookmakers,
         "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
+        "playoff_relaxed_fallback_applied": playoff_relaxed_fallback_applied,
     }
     _submit_pg_write(_pg_write_parlay_builder_run, payload, request_hash_value)
     return payload
@@ -7906,14 +8518,20 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
     raw_keys = payload.get("api_keys") or []
     if isinstance(raw_keys, str):
         raw_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
-    api_keys: list[str] = [str(k).strip() for k in raw_keys if str(k).strip()]
+    api_keys: list[str] = [
+        normalized for k in raw_keys
+        if (normalized := normalize_odds_api_key(k))
+    ]
     if not api_keys:
         raise HTTPException(status_code=400, detail="Provide at least one Odds API key in 'api_keys'.")
 
     request_hash_value = _request_hash("parlay_builder_injury_aware", payload)
-    cached_run = _pg_read_parlay_builder_cache(payload, cache_scope="parlay_builder_injury_aware")
-    if cached_run:
-        return cached_run
+    season_type = normalize_requested_season_type(payload.get("season_type"))
+    bypass_cache = bool(payload.get("bypass_cache")) or season_type == SEASON_TYPE_PLAYOFFS
+    if not bypass_cache:
+        cached_run = _pg_read_parlay_builder_cache(payload, cache_scope="parlay_builder_injury_aware")
+        if cached_run:
+            return cached_run
 
     legs = int(payload.get("legs") or 3)
     if legs < 2 or legs > 6:
@@ -7924,7 +8542,6 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
     odds_format = str(payload.get("odds_format") or "decimal")
     last_n      = int(payload.get("last_n") or 10)
     season      = str(payload.get("season") or current_nba_season())
-    season_type = normalize_requested_season_type(payload.get("season_type"))
     batch_size  = max(1, int(payload.get("batch_size") or 3))
     requested_bookmakers = parse_requested_bookmakers(payload.get("bookmakers") or payload.get("bookmaker") or ODDS_DEFAULT_BOOKMAKERS)
     markets     = ",".join(ODDS_PARLAY_MARKETS)
@@ -8096,29 +8713,14 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
 
     defaults = {"last_n": last_n, "season": season, "season_type": season_type}
     local_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
-    analysis_rows: list[dict[str, Any]] = []
-    analysis_errors: list[dict[str, Any]] = []
-
-    prepared: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    for row in all_import_rows:
-        player_name = str(row.get("player_name") or "").strip()
-        player = cached_find_player_by_name(player_name)
-        if not player:
-            analysis_errors.append({"player_name": player_name, "reason": "Player not found."})
-            continue
-        bulk_row = {"player_id": int(player["id"]), "player_name": player_name,
-                    "stat": row["stat"], "line": row["line"], "team_id": None, "player_position": None}
-        prepared.append((bulk_row, row))
-
-    seen_analysis_keys: set[tuple[Any, ...]] = set()
-    deduped_prepared: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    for bulk_row, orig_row in prepared:
-        ak = (bulk_row["player_id"], bulk_row["stat"], float(bulk_row["line"]))
-        if ak not in seen_analysis_keys:
-            seen_analysis_keys.add(ak)
-            deduped_prepared.append((bulk_row, orig_row))
-
-    unique_player_ids: set[int] = {int(br["player_id"]) for br, _ in deduped_prepared}
+    local_cache_lock = Lock()
+    analysis_prep = PARLAY_SERVICE.prepare_analysis_jobs(
+        all_import_rows=all_import_rows,
+        resolve_player=lambda player_name: cached_find_player_by_name(player_name),
+    )
+    deduped_prepared: list[tuple[dict[str, Any], dict[str, Any]]] = list(analysis_prep["deduped_prepared"] or [])
+    analysis_errors: list[dict[str, Any]] = list(analysis_prep["analysis_errors"] or [])
+    unique_player_ids: set[int] = set(analysis_prep["unique_player_ids"] or set())
     already_cached_ids = {pid for pid in unique_player_ids
                           if GAME_LOG_CACHE.get((pid, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)) and
                           (time.time() - float(GAME_LOG_CACHE[(pid, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)].get("timestamp", 0))) < CACHE_TTL_SECONDS}
@@ -8141,46 +8743,85 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
                     pass
 
     max_workers = min(BULK_ANALYSIS_MAX_WORKERS, max(1, len(deduped_prepared)))
-
-    _emit_progress(progress_cb, "analysis_start", total=len(deduped_prepared), workers=max_workers)
-
-    if max_workers <= 1:
-        step = max(1, len(deduped_prepared) // 10) if deduped_prepared else 1
-        done = 0
-        for idx, (bulk_row, orig_row) in enumerate(deduped_prepared, start=1):
-            try:
-                result = _build_bulk_prop_item(idx, bulk_row, defaults, local_cache)
-                analysis_rows.append((result, orig_row))
-            except Exception as exc:
-                analysis_errors.append({"player_name": bulk_row["player_name"], "reason": str(exc)})
-            done += 1
-            if done % step == 0 or done == len(deduped_prepared):
-                _emit_progress(progress_cb, "analysis_progress", done=done, total=len(deduped_prepared))
-    else:
-        step = max(1, len(deduped_prepared) // 10) if deduped_prepared else 1
-        done = 0
-        for batch_start in range(0, len(deduped_prepared), max_workers):
-            chunk = deduped_prepared[batch_start : batch_start + max_workers]
-            futures_list: list[tuple[int, dict[str, Any], dict[str, Any], Any]] = []
-            for idx, (bulk_row, orig_row) in enumerate(chunk, start=batch_start + 1):
-                fut = _submit_shared_analysis_task(_build_bulk_prop_item, idx, bulk_row, defaults, local_cache)
-                futures_list.append((idx, bulk_row, orig_row, fut))
-            for idx, bulk_row, orig_row, fut in futures_list:
-                try:
-                    result = fut.result()
-                    analysis_rows.append((result, orig_row))
-                except Exception as exc:
-                    analysis_errors.append({"player_name": bulk_row["player_name"], "reason": str(exc)})
-                done += 1
-                if done % step == 0 or done == len(deduped_prepared):
-                    _emit_progress(progress_cb, "analysis_progress", done=done, total=len(deduped_prepared))
-
-    _emit_progress(progress_cb, "analysis_done", analyzed=len(analysis_rows), errors=len(analysis_errors))
+    analysis_rows, analysis_errors_run = PARLAY_SERVICE.run_bulk_analysis(
+        deduped_prepared=deduped_prepared,
+        defaults=defaults,
+        local_cache=local_cache,
+        max_workers=max_workers,
+        build_bulk_prop_item=_build_bulk_prop_item,
+        submit_analysis_task=_submit_shared_analysis_task,
+        emit_progress=lambda stage, meta: _emit_progress(progress_cb, stage, **meta),
+    )
+    if analysis_errors_run:
+        analysis_errors.extend(analysis_errors_run)
 
     #  Injury-aware scoring 
-    def injury_aware_score(result: dict[str, Any], orig_row: dict[str, Any]) -> dict[str, Any] | None:
+    playoff_live_refresh_cache: dict[tuple[int, str, float], dict[str, Any]] = {}
+
+    def _refresh_playoff_low_sample_analysis(
+        result_row: dict[str, Any],
+        market_row: dict[str, Any],
+        analysis_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        if season_type != SEASON_TYPE_PLAYOFFS:
+            return analysis_payload
+        current_games = int((analysis_payload or {}).get("games_count") or 0)
+        if current_games >= 3:
+            return analysis_payload
+        player_id_val = int(result_row.get("player_id") or market_row.get("player_id") or 0)
+        stat_val = str(result_row.get("stat") or market_row.get("stat") or "").strip().upper()
+        line_val = float(result_row.get("line") or market_row.get("line") or 0.0)
+        if not player_id_val or not stat_val:
+            return analysis_payload
+        refresh_key = (player_id_val, stat_val, round(line_val, 4))
+        cached_refresh = playoff_live_refresh_cache.get(refresh_key)
+        if cached_refresh:
+            return cached_refresh
+        try:
+            for cache_key in list(ANALYSIS_CACHE.keys()):
+                try:
+                    key_player_id = int(cache_key[1])
+                    key_stat = str(cache_key[2] or "").strip().upper()
+                    key_line = float(cache_key[3] or 0.0)
+                    key_season_type = str(cache_key[6] or "")
+                except Exception:
+                    continue
+                if (
+                    key_player_id == player_id_val
+                    and key_stat == stat_val
+                    and abs(key_line - line_val) <= 1e-6
+                    and key_season_type == SEASON_TYPE_PLAYOFFS
+                ):
+                    ANALYSIS_CACHE.pop(cache_key, None)
+            game_log_key = (player_id_val, season, season_type, GAME_LOG_CACHE_SCHEMA_VERSION)
+            GAME_LOG_CACHE.pop(game_log_key, None)
+            GAME_LOG_FAILURE_META.pop(game_log_key, None)
+            RECENT_GAME_LOG_CACHE.pop((player_id_val, season, season_type, 20, GAME_LOG_CACHE_SCHEMA_VERSION), None)
+            refreshed = build_prop_analysis_payload(
+                player_id=player_id_val,
+                stat=stat_val,
+                line=line_val,
+                last_n=last_n,
+                season=season,
+                season_type=season_type,
+            )
+            if int((refreshed or {}).get("games_count") or 0) > current_games:
+                playoff_live_refresh_cache[refresh_key] = refreshed
+                return refreshed
+        except Exception:
+            return analysis_payload
+        playoff_live_refresh_cache[refresh_key] = analysis_payload
+        return analysis_payload
+
+    def injury_aware_score(
+        result: dict[str, Any],
+        orig_row: dict[str, Any],
+        *,
+        strict_playoff_rules: bool = True,
+    ) -> dict[str, Any] | None:
         """Score a prop with injury-aware without_player boosting."""
         analysis = result.get("analysis") or {}
+        analysis = _refresh_playoff_low_sample_analysis(result, orig_row, analysis)
         hit_rate = float(analysis.get("hit_rate") or 0)
         avg      = float(analysis.get("average") or 0)
         line     = float(result.get("line") or orig_row.get("line") or 0)
@@ -8242,6 +8883,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         active_games_count = base_games_count
         active_over_hit_count = base_over_hit_count
         active_h2h_payload: dict[str, Any] = copy.deepcopy(analysis.get("h2h") or {})
+        active_h2h_games: list[dict[str, Any]] = list(analysis.get("games") or [])
 
         if team_name and player_id:
             injury_context = get_injured_context_for_team(team_name, team_id=int(team_id_raw) if team_id_raw else None)
@@ -8249,6 +8891,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             # Collect names for display
             team_injury_player_names = cached_without_player_names(inj_ids) if inj_ids else list(injury_context.get("names") or [])
             best_usable_combo: tuple[list[int], float, float, int, int, dict[str, Any]] | None = None
+            min_boost_games_required = 1 if str(season_type or "") == SEASON_TYPE_PLAYOFFS else 5
             combo_plan = _build_injury_combo_plan(base_hit_rate=base_hit_rate)
             # Try top 1, top 2, then top 3 impacted absences.
             for max_filters in combo_plan:
@@ -8286,7 +8929,9 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
                         break
                     boosted_games = int(boosted_analysis.get("games_count") or 0)
                     boosted_hr    = float(boosted_analysis.get("hit_rate") or 0)
-                    if boosted_games >= 5:
+                    # Playoff "without player" windows are naturally small (series-level).
+                    # Allow those contexts instead of forcing regular-season sized samples.
+                    if boosted_games >= min_boost_games_required:
                         boosted_avg = float(boosted_analysis.get("average") or avg)
                         boosted_over_hit_count = int(boosted_analysis.get("hit_count") or 0)
                         if best_usable_combo is None or boosted_hr > best_usable_combo[1] or (
@@ -8299,6 +8944,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
                                 boosted_games,
                                 boosted_over_hit_count,
                                 copy.deepcopy(boosted_analysis.get("h2h") or {}),
+                                list(boosted_analysis.get("games") or []),
                             )
                         if _should_stop_injury_combo_search(
                             base_hit_rate=base_hit_rate,
@@ -8317,6 +8963,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
                 active_games_count = int(best_usable_combo[3])
                 active_over_hit_count = int(best_usable_combo[4])
                 active_h2h_payload = copy.deepcopy(best_usable_combo[5] or {})
+                active_h2h_games = list(best_usable_combo[6] or [])
                 if float(best_usable_combo[1]) > hit_rate:
                     hit_rate = float(best_usable_combo[1])
                     avg = float(best_usable_combo[2])
@@ -8346,13 +8993,6 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             side_hit_count = max(0, clamped_games_count - clamped_over_hits)
         side_hit_rate = round((side_hit_count / clamped_games_count) * 100.0, 1) if clamped_games_count > 0 else 0.0
 
-        h2h_games_count, h2h_side_hit_count, h2h_side_hit_rate = compute_side_h2h_metrics(
-            active_h2h_payload or {},
-            side,
-        )
-        ranking_hit_rate = h2h_side_hit_rate if h2h_side_hit_rate is not None else side_hit_rate
-        ranking_source = "h2h" if h2h_side_hit_rate is not None else "recent"
-
         if odds < 1.40:
             return None
 
@@ -8360,45 +9000,15 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         next_game_info = copy.deepcopy(matchup.get("next_game") or {})
         vs_position = matchup.get("vs_position") or {}
         matchup_delta_pct = vs_position.get("delta_pct") if isinstance(vs_position, dict) else None
-        # Override matchup based on the actual event when available.
-        event_home = resolve_team_from_text(str(orig_row.get("home_team") or "").strip())
-        event_away = resolve_team_from_text(str(orig_row.get("away_team") or "").strip())
         player_team_id_int = int((analysis.get("player") or {}).get("team_id") or 0)
         player_team_abbr = str((analysis.get("player") or {}).get("team_abbreviation") or next_game_info.get("player_team_abbreviation") or "").strip()
-        event_opponent = None
-        is_home = None
-        if player_team_id_int:
-            if event_home and int(event_home.get("id") or 0) == player_team_id_int and event_away:
-                event_opponent = event_away
-                is_home = True
-            elif event_away and int(event_away.get("id") or 0) == player_team_id_int and event_home:
-                event_opponent = event_home
-                is_home = False
-        if not event_opponent and player_team_abbr:
-            home_abbr = str(event_home.get("abbreviation") or "").upper() if event_home else ""
-            away_abbr = str(event_away.get("abbreviation") or "").upper() if event_away else ""
-            if home_abbr and home_abbr == player_team_abbr.upper() and event_away:
-                event_opponent = event_away
-                is_home = True
-            elif away_abbr and away_abbr == player_team_abbr.upper() and event_home:
-                event_opponent = event_home
-                is_home = False
-        if event_opponent and int(event_opponent.get("id") or 0) != player_team_id_int:
-            opp_abbr = str(event_opponent.get("abbreviation") or "").strip()
-            opp_name = str(event_opponent.get("full_name") or "").strip()
-            team_abbr = player_team_abbr or (event_home.get("abbreviation") if event_home else "") or (event_away.get("abbreviation") if event_away else "")
-            matchup_label = None
-            if team_abbr and opp_abbr:
-                matchup_label = f"{team_abbr} vs {opp_abbr}" if is_home else f"{team_abbr} @ {opp_abbr}"
-            next_game_info.update({
-                "opponent_team_id": int(event_opponent.get("id") or 0),
-                "opponent_abbreviation": opp_abbr,
-                "opponent_name": opp_name,
-                "player_team_abbreviation": team_abbr,
-                "is_home": is_home,
-                "is_override": True,
-                "matchup_label": matchup_label or next_game_info.get("matchup_label"),
-            })
+        next_game_info = PARLAY_SERVICE.apply_event_matchup_override(
+            next_game_info=next_game_info,
+            orig_row=orig_row,
+            player_team_id=player_team_id_int,
+            player_team_abbreviation=player_team_abbr,
+            resolve_team_from_text=resolve_team_from_text,
+        )
         pricing_snapshot = build_shared_market_pricing_snapshot(
             market_row=orig_row,
             over_odds=float(orig_row.get("over_odds") or 0.0),
@@ -8412,8 +9022,8 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             team_context=analysis.get("team_context") or {},
             environment=analysis.get("environment") or {},
             variance=analysis.get("variance") or {},
-            games_count=int(analysis.get("games_count") or 0),
-            h2h_games_count=int((analysis.get("h2h") or {}).get("games_count") or 0),
+            games_count=int(active_games_count or 0),
+            h2h_games_count=int((active_h2h_payload or {}).get("games_count") or 0),
         )
         fair_over_prob = pricing_snapshot["market"].get("fair_over")
         fair_under_prob = pricing_snapshot["market"].get("fair_under")
@@ -8448,7 +9058,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             player_team_abbreviation=player_info.get("team_abbreviation") or "",
         )
         confidence_engine = build_confidence_engine(
-            side=side, hit_rate=float(side_hit_rate), games_count=base_games_count,
+            side=side, hit_rate=float(side_hit_rate), games_count=int(active_games_count or 0),
             edge=_computed_edge,
             ev=_computed_ev,
             matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
@@ -8466,22 +9076,69 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             under_probability=fair_under_prob,
             odds=odds,
         )
+        confidence_engine = apply_backtest_ranking_adjustment(
+            confidence_engine,
+            stat=stat,
+            side=side,
+        )
+
+        scoring_season_type = str(analysis.get("season_type") or season_type or "")
+        is_playoffs_mode = scoring_season_type == SEASON_TYPE_PLAYOFFS
+        confidence_score_value = int(float(confidence_engine.get("score") or 0))
+        if is_playoffs_mode and strict_playoff_rules and confidence_score_value < 75:
+            return None
 
         resolved_team_id = player_info.get("team_id")
         matchup_payload = copy.deepcopy(analysis.get("matchup") or {})
         if next_game_info:
             matchup_payload["next_game"] = copy.deepcopy(next_game_info)
-        opponent_info    = copy.deepcopy(next_game_info)
-        if not opponent_info.get("opponent_team_id"):
-            home_candidate = resolve_team_from_text(str(orig_row.get("home_team") or ""))
-            away_candidate = resolve_team_from_text(str(orig_row.get("away_team") or ""))
-            player_team_id_int = int(resolved_team_id or 0)
-            for candidate in [away_candidate, home_candidate]:
-                if candidate and int(candidate.get("id") or 0) != player_team_id_int:
-                    opponent_info["opponent_team_id"] = int(candidate.get("id") or 0)
-                    opponent_info["opponent_abbreviation"] = str(candidate.get("abbreviation") or "").strip()
-                    opponent_info["opponent_name"] = str(candidate.get("full_name") or "").strip()
-                    break
+        opponent_info = PARLAY_SERVICE.fill_missing_opponent_from_event(
+            opponent_info=copy.deepcopy(next_game_info),
+            orig_row=orig_row,
+            player_team_id=int(resolved_team_id or 0),
+            resolve_team_from_text=resolve_team_from_text,
+        )
+        h2h_games_count, h2h_side_hit_count, h2h_side_hit_rate = resolve_side_h2h_metrics(
+            games=active_h2h_games,
+            h2h_payload=active_h2h_payload or {},
+            side=side,
+            opponent_abbreviation=str(opponent_info.get("opponent_abbreviation") or ""),
+        )
+        h2h_from_games = compute_side_h2h_metrics_from_games(
+            games=active_h2h_games,
+            side=side,
+            opponent_abbreviation=str(opponent_info.get("opponent_abbreviation") or ""),
+        )
+        h2h_from_payload = compute_side_h2h_metrics(
+            h2h_payload=active_h2h_payload or {},
+            side=side,
+        )
+        # Keep injury-aware matchup context, but never downsample playoff H2H ranking/sample
+        # versus the base analyzer payload. Prefer the larger valid H2H sample so parlay cards
+        # stay consistent with the player context modal.
+        base_h2h_games_count, base_h2h_side_hit_count, base_h2h_side_hit_rate = resolve_side_h2h_metrics(
+            games=analysis.get("games") or [],
+            h2h_payload=analysis.get("h2h") or {},
+            side=side,
+            opponent_abbreviation=str(opponent_info.get("opponent_abbreviation") or ""),
+        )
+        if int(base_h2h_games_count or 0) > int(h2h_games_count or 0):
+            h2h_games_count = int(base_h2h_games_count or 0)
+            h2h_side_hit_count = int(base_h2h_side_hit_count or 0)
+            h2h_side_hit_rate = float(base_h2h_side_hit_rate) if base_h2h_side_hit_rate is not None else None
+        has_reliable_h2h = h2h_side_hit_rate is not None and int(h2h_games_count or 0) >= MIN_PARLAY_H2H_GAMES_FOR_RANKING
+        if is_playoffs_mode:
+            if h2h_side_hit_rate is None or int(h2h_games_count or 0) <= 0:
+                if strict_playoff_rules:
+                    return None
+                ranking_hit_rate = float(side_hit_rate)
+                ranking_source = "recent"
+            else:
+                ranking_hit_rate = float(h2h_side_hit_rate)
+                ranking_source = "h2h"
+        else:
+            ranking_hit_rate = h2h_side_hit_rate if has_reliable_h2h else side_hit_rate
+            ranking_source = "h2h" if has_reliable_h2h else "recent"
 
         return {
             "player_name": result.get("player_name") or "",
@@ -8501,6 +9158,19 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             "h2h_games_count": h2h_games_count,
             "h2h_hit_count": h2h_side_hit_count,
             "h2h_hit_rate": round(h2h_side_hit_rate, 1) if h2h_side_hit_rate is not None else None,
+            "h2h_debug": {
+                "opponent_abbreviation": str(opponent_info.get("opponent_abbreviation") or ""),
+                "from_games_count": int(h2h_from_games[0] or 0),
+                "from_games_hits": int(h2h_from_games[1] or 0) if h2h_from_games[1] is not None else None,
+                "from_payload_count": int(h2h_from_payload[0] or 0),
+                "from_payload_hits": int(h2h_from_payload[1] or 0) if h2h_from_payload[1] is not None else None,
+                "resolved_count": int(h2h_games_count or 0),
+                "resolved_hits": int(h2h_side_hit_count or 0) if h2h_side_hit_count is not None else None,
+                "season_type": scoring_season_type,
+                "game_log_source": str(((analysis.get("debug") or {}).get("freshness") or {}).get("game_log_source") or ""),
+                "filtered_pool_count": int(analysis.get("filtered_pool_count") or 0),
+                "season_pool_count": int(analysis.get("season_pool_count") or 0),
+            },
             "base_hit_rate": round(base_hit_rate, 1),
             "average": round(avg, 2),
             "games_count": clamped_games_count,
@@ -8527,7 +9197,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             "matchup": matchup_payload,
             "environment": copy.deepcopy(enriched_environment),
             "confidence": confidence_engine.get("grade"),
-            "confidence_score": confidence_engine.get("score"),
+            "confidence_score": confidence_score_value,
             "confidence_tone": confidence_engine.get("tone"),
             "confidence_tier": confidence_engine.get("tier"),
             "confidence_summary": confidence_engine.get("summary"),
@@ -8558,14 +9228,25 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             "best_under_bookmaker": orig_row.get("best_under_bookmaker"),
         }
 
-    scored: list[dict[str, Any]] = []
-    scoring_step = max(1, len(analysis_rows) // 10) if analysis_rows else 1
-    for idx, (result, orig_row) in enumerate(analysis_rows, start=1):
-        item = injury_aware_score(result, orig_row)
-        if item:
-            scored.append(item)
-        if idx % scoring_step == 0 or idx == len(analysis_rows):
-            _emit_progress(progress_cb, "scoring_progress", done=idx, total=len(analysis_rows))
+    scored = PARLAY_SERVICE.run_scoring_rows(
+        analysis_rows=analysis_rows,
+        score_row=lambda result, orig_row: injury_aware_score(result, orig_row, strict_playoff_rules=True),
+        emit_progress=lambda stage, meta: _emit_progress(progress_cb, stage, **meta),
+    )
+    playoff_relaxed_fallback_applied = False
+    if season_type == SEASON_TYPE_PLAYOFFS and not scored and analysis_rows:
+        _emit_progress(
+            progress_cb,
+            "scoring_relaxed_fallback",
+            total=len(analysis_rows),
+            reason="strict_playoff_filters_removed_all",
+        )
+        scored = PARLAY_SERVICE.run_scoring_rows(
+            analysis_rows=analysis_rows,
+            score_row=lambda result, orig_row: injury_aware_score(result, orig_row, strict_playoff_rules=False),
+            emit_progress=lambda stage, meta: _emit_progress(progress_cb, stage, **meta),
+        )
+        playoff_relaxed_fallback_applied = bool(scored)
 
     scored.sort(
         key=lambda x: (
@@ -8628,6 +9309,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         "bookmakers": requested_bookmakers,
         "cost_hint": build_odds_api_cost_hint(markets, requested_bookmakers),
         "injury_summary": injury_summary,
+        "playoff_relaxed_fallback_applied": playoff_relaxed_fallback_applied,
     }
     _submit_pg_write(_pg_write_parlay_builder_run, payload, request_hash_value)
     return payload
@@ -8636,13 +9318,13 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
 @app.post("/api/parlay-builder-injury-aware")
 def parlay_builder_injury_aware(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     enforce_heavy_rate_limit(request, "parlay_builder_injury_aware")
-    return _parlay_builder_injury_aware_core(payload)
+    return PARLAY_SERVICE.run_sync(_parlay_builder_injury_aware_core, payload)
 
 
 @app.post("/api/parlay-builder-injury-aware/async")
 def parlay_builder_injury_aware_async(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     enforce_heavy_rate_limit(request, "parlay_builder_injury_aware_async")
-    return submit_async_job("parlay_builder_injury_aware", _parlay_builder_injury_aware_core, payload)
+    return PARLAY_SERVICE.run_async(_parlay_builder_injury_aware_core, payload)
 
 
 @app.post("/api/parlay-builder-injury-aware/stream")
@@ -9164,16 +9846,18 @@ def prefetch_bulk_analysis_context(
         workers,
     )
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = []
-        futures.extend(executor.submit(_prefetch_log, pid) for pid in game_log_jobs)
-        futures.extend(executor.submit(_prefetch_info, pid) for pid in player_info_jobs)
-        futures.extend(executor.submit(_prefetch_team_next_game, team_id, primary_pid) for team_id, primary_pid in team_jobs)
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception:
-                pass
+    futures = []
+    futures.extend(_submit_shared_network_task(_prefetch_log, pid) for pid in game_log_jobs)
+    futures.extend(_submit_shared_network_task(_prefetch_info, pid) for pid in player_info_jobs)
+    futures.extend(
+        _submit_shared_network_task(_prefetch_team_next_game, team_id, primary_pid)
+        for team_id, primary_pid in team_jobs
+    )
+    for future in as_completed(futures):
+        try:
+            future.result()
+        except Exception:
+            pass
 
     return {
         "game_logs": len(game_log_jobs),
@@ -9182,7 +9866,13 @@ def prefetch_bulk_analysis_context(
     }
 
 
-def _build_bulk_prop_item(row_index: int, row: dict[str, Any], defaults: dict[str, Any], local_cache: dict[tuple[Any, ...], dict[str, Any]]) -> dict[str, Any]:
+def _build_bulk_prop_item(
+    row_index: int,
+    row: dict[str, Any],
+    defaults: dict[str, Any],
+    local_cache: dict[tuple[Any, ...], dict[str, Any]],
+    local_cache_lock: Lock | None = None,
+) -> dict[str, Any]:
     player_id_raw = row.get("player_id")
     player_name = str(row.get("player_name") or "").strip()
     stat = str(row.get("stat") or defaults.get("stat") or "").upper().strip()
@@ -9249,8 +9939,15 @@ def _build_bulk_prop_item(row_index: int, row: dict[str, Any], defaults: dict[st
         override_opponent_id,
     )
 
-    if cache_key in local_cache:
-        analysis = copy.deepcopy(local_cache[cache_key])
+    cached_analysis: dict[str, Any] | None = None
+    if local_cache_lock is not None:
+        with local_cache_lock:
+            cached_analysis = local_cache.get(cache_key)
+    else:
+        cached_analysis = local_cache.get(cache_key)
+
+    if cached_analysis is not None:
+        analysis = copy.deepcopy(cached_analysis)
     else:
         analysis = build_prop_analysis_payload(
             player_id=resolved_player_id,
@@ -9273,7 +9970,11 @@ def _build_bulk_prop_item(row_index: int, row: dict[str, Any], defaults: dict[st
             debug=bool(debug),
             override_opponent_id=override_opponent_id,
         )
-        local_cache[cache_key] = copy.deepcopy(analysis)
+        if local_cache_lock is not None:
+            with local_cache_lock:
+                local_cache.setdefault(cache_key, copy.deepcopy(analysis))
+        else:
+            local_cache.setdefault(cache_key, copy.deepcopy(analysis))
 
     return {
         "row": row_index,
@@ -9316,6 +10017,7 @@ def _bulk_player_props_core(payload: dict[str, Any], request: Request | None = N
     max_workers = min(max_workers, len(rows))
 
     local_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+    local_cache_lock = Lock()
     results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
@@ -9367,26 +10069,33 @@ def _bulk_player_props_core(payload: dict[str, Any], request: Request | None = N
                 errors.append({"row": row_index, "reason": "Invalid row format."})
                 continue
             try:
-                results.append(_build_bulk_prop_item(row_index, row, defaults, local_cache))
+                results.append(_build_bulk_prop_item(row_index, row, defaults, local_cache, local_cache_lock))
             except HTTPException as exc:
                 errors.append({"row": row_index, "reason": exc.detail})
             except Exception as exc:
                 errors.append({"row": row_index, "reason": str(exc)})
     else:
         futures: list[tuple[int, Any]] = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for row_index, row in enumerate(rows, start=1):
-                if not isinstance(row, dict):
-                    errors.append({"row": row_index, "reason": "Invalid row format."})
-                    continue
-                futures.append((row_index, executor.submit(_build_bulk_prop_item, row_index, row, defaults, local_cache)))
-            for row_index, future in futures:
-                try:
-                    results.append(future.result())
-                except HTTPException as exc:
-                    errors.append({"row": row_index, "reason": exc.detail})
-                except Exception as exc:
-                    errors.append({"row": row_index, "reason": str(exc)})
+        for row_index, row in enumerate(rows, start=1):
+            if not isinstance(row, dict):
+                errors.append({"row": row_index, "reason": "Invalid row format."})
+                continue
+            future = _submit_shared_analysis_task(
+                _build_bulk_prop_item,
+                row_index,
+                row,
+                defaults,
+                local_cache,
+                local_cache_lock,
+            )
+            futures.append((row_index, future))
+        for row_index, future in futures:
+            try:
+                results.append(future.result())
+            except HTTPException as exc:
+                errors.append({"row": row_index, "reason": exc.detail})
+            except Exception as exc:
+                errors.append({"row": row_index, "reason": str(exc)})
 
     results.sort(key=lambda item: int(item.get("row") or 0))
     errors.sort(key=lambda item: int(item.get("row") or 0))
@@ -9456,6 +10165,7 @@ _TRACKER_STATE: list[dict[str, Any]] = []
 
 
 def _save_backtest_log() -> None:
+    _invalidate_backtest_ranking_cache()
     def _payload_factory() -> dict[str, Any]:
         with _BACKTEST_LOCK:
             return {"entries": list(_BACKTEST_LOG)}
@@ -9469,6 +10179,7 @@ def _save_backtest_log() -> None:
 
 
 def _load_backtest_log() -> None:
+    _invalidate_backtest_ranking_cache()
     def _extract_entries(payload: dict[str, Any]) -> Any:
         entries = payload.get("entries") or []
         return entries if isinstance(entries, list) else []
@@ -9512,13 +10223,66 @@ def _load_backtest_log() -> None:
     )
 
 
+def _sanitize_key_vault_entries(entries: Any) -> list[dict[str, Any]]:
+    if not isinstance(entries, list):
+        return []
+    merged_by_key: dict[str, dict[str, Any]] = {}
+    for raw in entries:
+        if not isinstance(raw, dict):
+            continue
+        key_text = normalize_odds_api_key(raw.get("key") or raw.get("api_key") or "")
+        if not key_text:
+            continue
+        previous = merged_by_key.get(key_text) or {}
+        normalized: dict[str, Any] = {**previous, **copy.deepcopy(raw)}
+        normalized["key"] = key_text
+        provider = str(normalized.get("provider") or "odds_api").strip() or "odds_api"
+        normalized["provider"] = provider
+        entry_id = str(normalized.get("id") or "").strip()
+        if not entry_id:
+            entry_id = uuid4().hex[:12]
+        normalized["id"] = entry_id
+        label = str(normalized.get("label") or "").strip()
+        if not label:
+            label = "Odds API Key"
+        normalized["label"] = label
+        merged_by_key[key_text] = normalized
+    return list(merged_by_key.values())
+
+
+def _read_local_key_vault_backup_state() -> dict[str, Any] | None:
+    if not PERSISTENT_CACHE_ENABLED or not KEY_VAULT_PERSIST_PATH.exists():
+        return None
+    try:
+        payload = json.loads(KEY_VAULT_PERSIST_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    entries = _sanitize_key_vault_entries(payload.get("entries") or [])
+    active_id = str(payload.get("active_id") or "")
+    valid_ids = {str(entry.get("id") or "") for entry in entries}
+    if active_id and active_id not in valid_ids:
+        active_id = ""
+    return {"entries": entries, "active_id": active_id}
+
+
 def _save_key_vault_state() -> None:
+    state: dict[str, Any]
+    with _KEY_VAULT_LOCK:
+        state = {
+            "entries": list(_sanitize_key_vault_entries(_KEY_VAULT_STATE.get("entries") or [])),
+            "active_id": str(_KEY_VAULT_STATE.get("active_id") or ""),
+        }
+
+    if postgres_available() and POSTGRES_CACHE_WRITE_ENABLED:
+        try:
+            _pg_write_key_vault_state(state)
+        except Exception as exc:
+            LOGGER.warning("Key vault Postgres save failed: %s", exc)
+
     def _payload_factory() -> dict[str, Any]:
-        with _KEY_VAULT_LOCK:
-            return {
-                "entries": list(_KEY_VAULT_STATE.get("entries") or []),
-                "active_id": str(_KEY_VAULT_STATE.get("active_id") or ""),
-            }
+        return state
 
     save_json_snapshot(
         enabled=PERSISTENT_CACHE_ENABLED,
@@ -9555,12 +10319,27 @@ def _save_tracker_state() -> None:
 
 
 def _load_key_vault_state() -> None:
+    if postgres_available():
+        pg_state = _pg_read_key_vault_state()
+        if isinstance(pg_state, dict):
+            entries = _sanitize_key_vault_entries(pg_state.get("entries") or [])
+            active_id = str(pg_state.get("active_id") or "")
+            valid_ids = {str(entry.get("id") or "") for entry in entries}
+            if active_id and active_id not in valid_ids:
+                active_id = ""
+            with _KEY_VAULT_LOCK:
+                _KEY_VAULT_STATE["entries"] = entries
+                _KEY_VAULT_STATE["active_id"] = active_id
+            LOGGER.info("Loaded %s key vault entrie(s) from Postgres", len(entries))
+            return
+
     def _extract_entries(payload: dict[str, Any]) -> Any:
-        entries = payload.get("entries") or []
+        entries = _sanitize_key_vault_entries(payload.get("entries") or [])
         active_id = str(payload.get("active_id") or "")
-        if not isinstance(entries, list):
-            entries = []
-        return {"entries": [entry for entry in entries if isinstance(entry, dict)], "active_id": active_id}
+        valid_ids = {str(entry.get("id") or "") for entry in entries}
+        if active_id and active_id not in valid_ids:
+            active_id = ""
+        return {"entries": entries, "active_id": active_id}
 
     def _apply_entries(state: Any) -> None:
         entries = list((state or {}).get("entries") or [])
@@ -9653,11 +10432,11 @@ def _normalize_backtest_confidence_tier(raw_tier: Any, confidence_score: Any = N
         score = None
 
     if score is not None:
-        if score >= 85:
+        if score >= CONFIDENCE_TIER_ELITE_MIN:
             return "Elite"
-        if score >= 72:
+        if score >= CONFIDENCE_TIER_HIGH_MIN:
             return "High"
-        if score >= 60:
+        if score >= CONFIDENCE_TIER_MEDIUM_MIN:
             return "Medium"
         return "Low"
 
@@ -9672,12 +10451,12 @@ def _normalize_backtest_confidence_score(raw_score: Any, fallback_tier: str) -> 
         pass
     tier = str(fallback_tier or "").strip().lower()
     if tier == "elite":
-        return 87
+        return 90
     if tier == "high":
-        return 76
+        return 79
     if tier == "medium":
-        return 64
-    return 52
+        return 66
+    return 54
 
 
 def _merge_backtest_entries(raw_entries: list[Any]) -> tuple[int, int, int, list[dict[str, Any]]]:
@@ -10178,6 +10957,248 @@ def _compute_backtest_stats(entries: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _nba_season_for_datetime(value: datetime | None) -> str:
+    dt_value = value or nba_now()
+    start_year = dt_value.year if dt_value.month >= 10 else dt_value.year - 1
+    return f"{start_year}-{str(start_year + 1)[-2:]}"
+
+
+def _backtest_parlay_filter_thresholds(mode: str) -> tuple[int, int]:
+    normalized = str(mode or "action").strip().lower()
+    if normalized == "selected":
+        return 0, 0
+    if normalized == "broad":
+        return 60, 4
+    if normalized == "playoff_high":
+        return 75, 0
+    return 72, 5
+
+
+def _backtest_parlay_prop_passes_action_filter(prop: dict[str, Any], mode: str) -> bool:
+    if not isinstance(prop, dict):
+        return False
+    normalized = str(mode or "action").strip().lower()
+    if normalized == "selected":
+        return str(prop.get("selection_status") or "").strip().lower() == "selected"
+    min_score, min_games = _backtest_parlay_filter_thresholds(normalized)
+    try:
+        score = int(float(prop.get("confidence_score") or 0))
+    except Exception:
+        score = 0
+    games_count = int(prop.get("games_count") or 0)
+    odds = float(prop.get("odds") or 0.0)
+    return score >= min_score and games_count >= min_games and odds >= 1.40
+
+
+def _backtest_parlay_event_date(prop: dict[str, Any]) -> str:
+    matchup = prop.get("matchup") or {}
+    next_game = matchup.get("next_game") if isinstance(matchup, dict) else {}
+    if isinstance(next_game, dict):
+        game_date = str(next_game.get("game_date") or "").strip()
+        if game_date:
+            return game_date
+    return str(prop.get("event_date") or "").strip()
+
+
+def _backtest_parlay_unique_key(prop: dict[str, Any], event_date: str) -> str:
+    player_id = int(prop.get("player_id") or 0)
+    stat = str(prop.get("stat") or "").strip().upper()
+    line = round(float(prop.get("line") or 0.0), 3)
+    side = str(prop.get("side") or "").strip().upper()
+    event_id = str(prop.get("event_id") or "").strip()
+    game_label = str(prop.get("game_label") or "").strip()
+    opponent = str(prop.get("opponent_abbreviation") or "").strip().upper()
+    return "|".join(
+        [
+            str(player_id),
+            stat,
+            f"{line:.3f}",
+            side,
+            event_id,
+            game_label,
+            event_date,
+            opponent,
+        ]
+    )
+
+
+def _extract_opponent_abbreviation_from_entry(entry: dict[str, Any]) -> str:
+    explicit = str(entry.get("opponent_abbreviation") or "").strip().upper()
+    if explicit:
+        return explicit
+    game_label = str(entry.get("game_label") or "").strip().upper()
+    if game_label:
+        match = re.search(r"(?:@|VS)\s*([A-Z]{2,3})\b", game_label)
+        if match:
+            return str(match.group(1) or "").strip().upper()
+    return ""
+
+
+def _normalize_backtest_compare_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is not None and value.tzinfo.utcoffset(value) is not None:
+        try:
+            return value.astimezone(NBA_GAME_DATE_ZONEINFO).replace(tzinfo=None)
+        except Exception:
+            return value.replace(tzinfo=None)
+    return value
+
+
+def _build_today_scoreboard_status() -> tuple[set[tuple[str, str]], dict[str, bool], bool]:
+    try:
+        rows = fetch_scoreboard_games(_today_scoreboard_date())
+    except Exception:
+        return set(), {}, False
+    pairs: set[tuple[str, str]] = set()
+    team_final_map: dict[str, bool] = {}
+    for row in rows:
+        game_status = str(row.get("GAME_STATUS_TEXT") or "").strip()
+        is_final = "Final" in game_status
+        try:
+            home_team_id = int(row.get("HOME_TEAM_ID") or 0)
+            away_team_id = int(row.get("VISITOR_TEAM_ID") or 0)
+        except Exception:
+            continue
+        home_abbr = str(TEAM_LOOKUP.get(home_team_id, {}).get("abbreviation") or "").strip().upper()
+        away_abbr = str(TEAM_LOOKUP.get(away_team_id, {}).get("abbreviation") or "").strip().upper()
+        if not home_abbr or not away_abbr:
+            continue
+        team_final_map[home_abbr] = is_final
+        team_final_map[away_abbr] = is_final
+        if is_final:
+            pairs.add(tuple(sorted((home_abbr, away_abbr))))
+    return pairs, team_final_map, True
+
+
+def _pick_game_log_row_for_backtest_entry(
+    entry: dict[str, Any],
+    rows: list[dict[str, Any]],
+    now_local: datetime | None = None,
+    today_final_matchup_pairs: set[tuple[str, str]] | None = None,
+    today_team_final_map: dict[str, bool] | None = None,
+    today_scoreboard_available: bool = False,
+) -> dict[str, Any] | None:
+    if not rows:
+        return None
+    now_dt = _normalize_backtest_compare_datetime(now_local or nba_now())
+    if not now_dt:
+        return None
+    today_date = now_dt.date()
+
+    target_date_raw = parse_game_date_any(entry.get("event_date"))
+    logged_at_raw = _coerce_datetime(entry.get("logged_at"))
+    opponent_abbr = _extract_opponent_abbreviation_from_entry(entry)
+    has_game_label = bool(str(entry.get("game_label") or "").strip())
+
+    target_date = _normalize_backtest_compare_datetime(target_date_raw)
+    logged_at = _normalize_backtest_compare_datetime(logged_at_raw)
+
+    # Some logged rows may carry stale event_date (older than the log time),
+    # so don't hard-fail date matching in that case.
+    if target_date and logged_at:
+        if target_date.date() < (logged_at.date() - timedelta(days=1)):
+            target_date = None
+
+    if target_date and target_date.date() > today_date:
+        return None
+
+    candidates: list[tuple[datetime, dict[str, Any], str, str]] = []
+    for row in rows:
+        game_dt_raw = parse_game_date_any(row.get("GAME_DATE"))
+        game_dt = _normalize_backtest_compare_datetime(game_dt_raw)
+        if not game_dt:
+            continue
+        matchup_info = parse_matchup_descriptor(str(row.get("MATCHUP") or ""))
+        row_team = str(matchup_info.get("team_abbreviation") or "").strip().upper()
+        row_opp = str(matchup_info.get("opponent_abbreviation") or "").strip().upper()
+        candidates.append((game_dt, row, row_team, row_opp))
+    if not candidates:
+        return None
+
+    if target_date:
+        same_date = [item for item in candidates if item[0].date() == target_date.date()]
+        if same_date:
+            candidates = same_date
+        elif logged_at:
+            cutoff = logged_at - timedelta(hours=12)
+            filtered = [item for item in candidates if item[0] >= cutoff]
+            if filtered:
+                candidates = filtered
+            else:
+                return None
+        else:
+            return None
+    elif logged_at:
+        cutoff = logged_at - timedelta(hours=12)
+        filtered = [item for item in candidates if item[0] >= cutoff]
+        if filtered:
+            candidates = filtered
+
+    if opponent_abbr:
+        opp_filtered = [
+            item
+            for item in candidates
+            if opponent_abbr and (opponent_abbr == item[3] or opponent_abbr in str(item[1].get("MATCHUP") or "").upper())
+        ]
+        if opp_filtered:
+            candidates = opp_filtered
+        elif target_date:
+            return None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    chosen = candidates[0]
+    chosen_dt = chosen[0]
+    chosen_row = chosen[1]
+    chosen_team_abbr = chosen[2]
+    chosen_opp_abbr = chosen[3]
+
+    weak_context = not target_date and not opponent_abbr and not has_game_label
+    if weak_context and logged_at and chosen_dt.date() < today_date:
+        # If team is currently playing and game is not final, don't grade from an older row.
+        if today_scoreboard_available and today_team_final_map and chosen_team_abbr:
+            team_final = today_team_final_map.get(chosen_team_abbr)
+            recent_log = (today_date - logged_at.date()).days <= 1
+            if recent_log and team_final is False:
+                return None
+
+    if chosen_dt.date() == today_date:
+        if not today_scoreboard_available:
+            return None
+        if not chosen_team_abbr or not chosen_opp_abbr:
+            return None
+        pair = tuple(sorted((chosen_team_abbr, chosen_opp_abbr)))
+        if not today_final_matchup_pairs or pair not in today_final_matchup_pairs:
+            return None
+    elif chosen_dt.date() > today_date:
+        # NBA game logs can sometimes carry a next-day date stamp relative to ET.
+        # Allow grading only if today's scoreboard confirms this matchup finished.
+        if not today_scoreboard_available:
+            return None
+        if not chosen_team_abbr or not chosen_opp_abbr:
+            return None
+        pair = tuple(sorted((chosen_team_abbr, chosen_opp_abbr)))
+        if not today_final_matchup_pairs or pair not in today_final_matchup_pairs:
+            return None
+
+    return chosen_row
+
+
+def _backtest_get_live_final_stat_value(player_id: int, stat: str) -> tuple[float | None, str]:
+    try:
+        payload = tracker_live_stat(player_id=player_id, stat=stat)
+    except Exception:
+        return None, "no_game"
+    game_status = str(payload.get("game_status") or "").strip().lower()
+    live_val = payload.get("live_val")
+    if game_status == "final" and live_val is not None:
+        try:
+            return round(float(live_val), 1), game_status
+        except Exception:
+            return None, game_status
+    return None, game_status
+
+
 @app.post("/api/backtest/log")
 def backtest_log_prediction(payload: dict = Body(...)) -> dict[str, Any]:
     """
@@ -10186,9 +11207,15 @@ def backtest_log_prediction(payload: dict = Body(...)) -> dict[str, Any]:
     """
     normalized_tier = _normalize_backtest_confidence_tier(payload.get("confidence_tier"), payload.get("confidence_score"))
     normalized_score = _normalize_backtest_confidence_score(payload.get("confidence_score"), normalized_tier)
+    player_id_raw = payload.get("player_id")
+    try:
+        player_id = int(player_id_raw) if player_id_raw not in (None, "", "null") else None
+    except Exception:
+        player_id = None
     entry = {
         "id": _backtest_new_id(),
         "player": str(payload.get("player") or ""),
+        "player_id": player_id,
         "stat": str(payload.get("stat") or ""),
         "line": float(payload.get("line") or 0),
         "side": str(payload.get("side") or ""),
@@ -10201,6 +11228,13 @@ def backtest_log_prediction(payload: dict = Body(...)) -> dict[str, Any]:
         "logged_at": _utc_iso_z(),
         "resolved_at": None,
         "event_date": str(payload.get("event_date") or ""),
+        "season": str(payload.get("season") or ""),
+        "season_type": str(payload.get("season_type") or ""),
+        "event_id": str(payload.get("event_id") or ""),
+        "game_label": str(payload.get("game_label") or ""),
+        "opponent_abbreviation": str(payload.get("opponent_abbreviation") or ""),
+        "batch_id": str(payload.get("batch_id") or ""),
+        "parlay_prop_key": str(payload.get("parlay_prop_key") or ""),
         "source": str(payload.get("source") or ""),
         "market_side": str(payload.get("market_side") or ""),
         "market_disagrees": bool(payload.get("market_disagrees")) if payload.get("market_disagrees") is not None else False,
@@ -10239,6 +11273,404 @@ def backtest_resolve_prediction(payload: dict = Body(...)) -> dict[str, Any]:
                 _require_pg_backtest_write(_pg_write_backtest_entries, [entry])
                 return {"ok": True, "entry": entry}
     raise HTTPException(status_code=404, detail=f"No prediction found with id={pred_id}")
+
+
+@app.post("/api/backtest/parlay/log-batch")
+def backtest_log_parlay_batch(payload: dict = Body(...)) -> dict[str, Any]:
+    raw_props = payload.get("props")
+    if raw_props is None:
+        raw_props = payload.get("all_props_scored")
+    if not isinstance(raw_props, list) or not raw_props:
+        raise HTTPException(status_code=400, detail="props list is required")
+
+    filter_mode = str(payload.get("filter_mode") or "action").strip().lower()
+    if filter_mode not in {"action", "selected", "broad", "playoff_high"}:
+        filter_mode = "action"
+    source_label = str(payload.get("source") or "parlay_builder").strip() or "parlay_builder"
+    season_input = str(payload.get("season") or "").strip()
+    season_type_input = normalize_requested_season_type(payload.get("season_type"))
+    batch_id = str(payload.get("batch_id") or uuid4().hex[:10]).strip()
+    now_iso = _utc_iso_z()
+
+    with _BACKTEST_LOCK:
+        existing_prop_keys = {
+            str(entry.get("parlay_prop_key") or "").strip()
+            for entry in _BACKTEST_LOG
+            if isinstance(entry, dict) and str(entry.get("parlay_prop_key") or "").strip()
+        }
+
+    logged_entries: list[dict[str, Any]] = []
+    skipped_invalid = 0
+    skipped_filter = 0
+    skipped_duplicate = 0
+
+    for raw_prop in raw_props:
+        if not isinstance(raw_prop, dict):
+            skipped_invalid += 1
+            continue
+        if not _backtest_parlay_prop_passes_action_filter(raw_prop, filter_mode):
+            skipped_filter += 1
+            continue
+        player_name = str(raw_prop.get("player_name") or "").strip()
+        stat = str(raw_prop.get("stat") or "").strip().upper()
+        side = str(raw_prop.get("side") or "").strip().upper()
+        if not player_name or not stat or side not in {"OVER", "UNDER"}:
+            skipped_invalid += 1
+            continue
+        try:
+            line = float(raw_prop.get("line"))
+        except Exception:
+            skipped_invalid += 1
+            continue
+        try:
+            model_prob = float(raw_prop.get("model_probability") or 50.0) / 100.0
+        except Exception:
+            model_prob = 0.5
+        event_date = _backtest_parlay_event_date(raw_prop)
+        event_dt = parse_game_date_any(event_date)
+        season = season_input or _nba_season_for_datetime(event_dt)
+        season_type = normalize_requested_season_type(raw_prop.get("season_type") or season_type_input)
+        unique_key = _backtest_parlay_unique_key(raw_prop, event_date)
+        if unique_key in existing_prop_keys:
+            skipped_duplicate += 1
+            continue
+        existing_prop_keys.add(unique_key)
+
+        confidence_score = _normalize_backtest_confidence_score(
+            raw_prop.get("confidence_score"),
+            _normalize_backtest_confidence_tier(raw_prop.get("confidence_tier"), raw_prop.get("confidence_score")),
+        )
+        confidence_tier = _normalize_backtest_confidence_tier(raw_prop.get("confidence_tier"), confidence_score)
+        try:
+            player_id = int(raw_prop.get("player_id")) if raw_prop.get("player_id") not in (None, "", "null") else None
+        except Exception:
+            player_id = None
+
+        entry = {
+            "id": _backtest_new_id(),
+            "player": player_name,
+            "player_id": player_id,
+            "stat": stat,
+            "line": line,
+            "side": side,
+            "confidence_score": confidence_score,
+            "confidence_tier": confidence_tier,
+            "model_prob": max(0.0, min(1.0, model_prob)),
+            "odds": raw_prop.get("odds"),
+            "result": "pending",
+            "actual_value": None,
+            "logged_at": now_iso,
+            "resolved_at": None,
+            "event_date": event_date,
+            "season": season,
+            "season_type": season_type,
+            "event_id": str(raw_prop.get("event_id") or ""),
+            "game_label": str(raw_prop.get("game_label") or ""),
+            "opponent_abbreviation": str(raw_prop.get("opponent_abbreviation") or ""),
+            "batch_id": batch_id,
+            "parlay_prop_key": unique_key,
+            "source": source_label,
+            "market_side": str(raw_prop.get("market_side") or ""),
+            "market_disagrees": bool(raw_prop.get("market_disagrees")) if raw_prop.get("market_disagrees") is not None else False,
+            "notes": str(raw_prop.get("selection_reason") or ""),
+        }
+        logged_entries.append(entry)
+
+    if logged_entries:
+        with _BACKTEST_LOCK:
+            _BACKTEST_LOG.extend(logged_entries)
+            _save_backtest_log()
+        _require_pg_backtest_write(_pg_write_backtest_entries, logged_entries)
+
+    return {
+        "ok": True,
+        "batch_id": batch_id,
+        "filter_mode": filter_mode,
+        "logged": len(logged_entries),
+        "skipped_filter": skipped_filter,
+        "skipped_invalid": skipped_invalid,
+        "skipped_duplicate": skipped_duplicate,
+        "total_props": len(raw_props),
+    }
+
+
+@app.post("/api/backtest/parlay/grade-batch")
+def backtest_grade_parlay_batch(payload: dict = Body(default={})) -> dict[str, Any]:
+    batch_id = str(payload.get("batch_id") or "").strip()
+    all_sources = bool(payload.get("all_sources")) if payload.get("all_sources") is not None else False
+    source_prefix = "" if all_sources else str(payload.get("source_prefix") or "parlay_builder").strip().lower()
+    max_entries = max(1, min(int(payload.get("max_entries") or 500), 2000))
+    run_id = str(payload.get("run_id") or uuid4().hex[:12]).strip()
+    now_local = nba_now()
+    now_local_normalized = _normalize_backtest_compare_datetime(now_local) or now_local
+    today_final_matchup_pairs, today_team_final_map, today_scoreboard_available = _build_today_scoreboard_status()
+
+    with _BACKTEST_LOCK:
+        candidates = [
+            copy.deepcopy(entry)
+            for entry in _BACKTEST_LOG
+            if isinstance(entry, dict)
+            and str(entry.get("result") or "").strip().lower() == "pending"
+            and (not batch_id or str(entry.get("batch_id") or "").strip() == batch_id)
+            and (all_sources or str(entry.get("source") or "").strip().lower().startswith(source_prefix))
+        ][:max_entries]
+
+    checked = 0
+    graded = 0
+    skipped_no_player = 0
+    skipped_no_game = 0
+    skipped_not_finished = 0
+    errors: list[str] = []
+    updates_by_id: dict[str, dict[str, Any]] = {}
+
+    for entry in candidates:
+        checked += 1
+        entry_id = str(entry.get("id") or "").strip()
+        if not entry_id:
+            continue
+
+        player_id_raw = entry.get("player_id")
+        player_id: int | None = None
+        try:
+            player_id = int(player_id_raw) if player_id_raw not in (None, "", "null") else None
+        except Exception:
+            player_id = None
+        if not player_id:
+            player_name = str(entry.get("player") or "").strip()
+            player = find_player_by_name(player_name) if player_name else None
+            player_id = int(player["id"]) if player else None
+        if not player_id:
+            skipped_no_player += 1
+            continue
+
+        event_dt = parse_game_date_any(entry.get("event_date")) or _coerce_datetime(entry.get("logged_at"))
+        season = str(entry.get("season") or "").strip() or _nba_season_for_datetime(event_dt)
+        season_type = normalize_requested_season_type(entry.get("season_type") or DEFAULT_SEASON_TYPE)
+        stat = str(entry.get("stat") or "").strip().upper()
+        side = str(entry.get("side") or "").strip().upper()
+        try:
+            line = float(entry.get("line"))
+        except Exception:
+            line = None
+        if not stat or side not in {"OVER", "UNDER"} or line is None:
+            skipped_no_game += 1
+            continue
+        if not event_dt:
+            skipped_no_game += 1
+            continue
+
+        # Prefer live/final today-game feed so completed games grade immediately,
+        # and live games are safely skipped.
+        live_actual, live_status = _backtest_get_live_final_stat_value(player_id=player_id, stat=stat)
+        if live_status in {"live", "scheduled"}:
+            skipped_not_finished += 1
+            continue
+        if live_status == "final" and live_actual is not None:
+            hit = live_actual >= line if side == "OVER" else live_actual < line
+            updates_by_id[entry_id] = {
+                "actual_value": live_actual,
+                "result": "hit" if hit else "miss",
+                "resolved_at": _utc_iso_z(),
+                "resolved_game_date": _today_scoreboard_date(),
+                "resolved_matchup": "",
+                "auto_grade_run_id": run_id,
+                "auto_graded_at": _utc_iso_z(),
+            }
+            continue
+
+        try:
+            game_rows = fetch_player_game_log(player_id=player_id, season=season, season_type=season_type)
+        except Exception as exc:
+            errors.append(f"{entry_id}: game log fetch failed ({exc})")
+            continue
+
+        picked_row = _pick_game_log_row_for_backtest_entry(
+            entry=entry,
+            rows=game_rows,
+            now_local=now_local_normalized,
+            today_final_matchup_pairs=today_final_matchup_pairs,
+            today_team_final_map=today_team_final_map,
+            today_scoreboard_available=today_scoreboard_available,
+        )
+        if not picked_row:
+            entry_target_date = _normalize_backtest_compare_datetime(event_dt)
+            if entry_target_date and entry_target_date.date() >= now_local_normalized.date():
+                skipped_not_finished += 1
+            else:
+                skipped_no_game += 1
+            continue
+
+        game_dt = parse_game_date_any(picked_row.get("GAME_DATE"))
+        game_dt = _normalize_backtest_compare_datetime(game_dt)
+        if game_dt and game_dt.date() > now_local_normalized.date():
+            matchup_info = parse_matchup_descriptor(str(picked_row.get("MATCHUP") or ""))
+            row_team = str(matchup_info.get("team_abbreviation") or "").strip().upper()
+            row_opp = str(matchup_info.get("opponent_abbreviation") or "").strip().upper()
+            pair = tuple(sorted((row_team, row_opp))) if row_team and row_opp else None
+            if (not today_scoreboard_available) or (not pair) or (pair not in today_final_matchup_pairs):
+                skipped_not_finished += 1
+                continue
+
+        try:
+            actual_value = round(float(compute_stat_value(picked_row, stat)), 1)
+        except Exception as exc:
+            errors.append(f"{entry_id}: stat compute failed ({exc})")
+            continue
+
+        hit = actual_value >= line if side == "OVER" else actual_value < line
+        updates_by_id[entry_id] = {
+            "actual_value": actual_value,
+            "result": "hit" if hit else "miss",
+            "resolved_at": _utc_iso_z(),
+            "resolved_game_date": str(picked_row.get("GAME_DATE") or ""),
+            "resolved_matchup": str(picked_row.get("MATCHUP") or ""),
+            "auto_grade_run_id": run_id,
+            "auto_graded_at": _utc_iso_z(),
+        }
+
+    if updates_by_id:
+        updated_rows: list[dict[str, Any]] = []
+        with _BACKTEST_LOCK:
+            for entry in _BACKTEST_LOG:
+                if not isinstance(entry, dict):
+                    continue
+                update = updates_by_id.get(str(entry.get("id") or "").strip())
+                if not update:
+                    continue
+                entry.update(update)
+                updated_rows.append(copy.deepcopy(entry))
+            if updated_rows:
+                _save_backtest_log()
+        if updated_rows:
+            graded = len(updated_rows)
+            _require_pg_backtest_write(_pg_write_backtest_entries, updated_rows)
+
+    return {
+        "ok": True,
+        "batch_id": batch_id,
+        "run_id": run_id,
+        "all_sources": all_sources,
+        "checked": checked,
+        "graded": graded,
+        "pending_remaining": max(0, checked - graded - skipped_no_player - skipped_no_game - skipped_not_finished),
+        "skipped_no_player": skipped_no_player,
+        "skipped_no_game": skipped_no_game,
+        "skipped_not_finished": skipped_not_finished,
+        "errors": errors[:20],
+    }
+
+
+@app.post("/api/backtest/parlay/undo-grade")
+def backtest_undo_parlay_grade(payload: dict = Body(...)) -> dict[str, Any]:
+    run_id = str(payload.get("run_id") or "").strip()
+    reverted_rows: list[dict[str, Any]] = []
+    reverted = 0
+    fallback_latest_ts: float | None = None
+    fallback_candidate_ids: set[str] = set()
+
+    if not run_id:
+        with _BACKTEST_LOCK:
+            for entry in _BACKTEST_LOG:
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("result") or "").strip().lower() not in {"hit", "miss"}:
+                    continue
+                if not (str(entry.get("resolved_game_date") or "").strip() or str(entry.get("resolved_matchup") or "").strip()):
+                    continue
+                ts = _datetime_to_ts(entry.get("resolved_at"))
+                if ts is None:
+                    continue
+                if fallback_latest_ts is None or ts > fallback_latest_ts:
+                    fallback_latest_ts = ts
+        if fallback_latest_ts is not None:
+            cutoff = fallback_latest_ts - 20 * 60
+            with _BACKTEST_LOCK:
+                for entry in _BACKTEST_LOG:
+                    if not isinstance(entry, dict):
+                        continue
+                    if str(entry.get("result") or "").strip().lower() not in {"hit", "miss"}:
+                        continue
+                    if not (str(entry.get("resolved_game_date") or "").strip() or str(entry.get("resolved_matchup") or "").strip()):
+                        continue
+                    ts = _datetime_to_ts(entry.get("resolved_at"))
+                    if ts is None or ts < cutoff:
+                        continue
+                    fallback_candidate_ids.add(str(entry.get("id") or "").strip())
+
+    with _BACKTEST_LOCK:
+        for entry in _BACKTEST_LOG:
+            if not isinstance(entry, dict):
+                continue
+            if run_id:
+                if str(entry.get("auto_grade_run_id") or "").strip() != run_id:
+                    continue
+            else:
+                if str(entry.get("id") or "").strip() not in fallback_candidate_ids:
+                    continue
+            if str(entry.get("result") or "").strip().lower() not in {"hit", "miss"}:
+                continue
+            entry["result"] = "pending"
+            entry["actual_value"] = None
+            entry["resolved_at"] = None
+            entry["resolved_game_date"] = ""
+            entry["resolved_matchup"] = ""
+            entry["auto_grade_run_id"] = ""
+            entry["auto_graded_at"] = ""
+            reverted += 1
+            reverted_rows.append(copy.deepcopy(entry))
+        if reverted_rows:
+            _save_backtest_log()
+
+    if reverted_rows:
+        _require_pg_backtest_write(_pg_write_backtest_entries, reverted_rows)
+
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "fallback_used": not bool(run_id),
+        "reverted": reverted,
+    }
+
+
+@app.post("/api/backtest/parlay/undo-batch")
+def backtest_undo_parlay_batch(payload: dict = Body(...)) -> dict[str, Any]:
+    batch_id = str(payload.get("batch_id") or "").strip()
+    if not batch_id:
+        raise HTTPException(status_code=400, detail="batch_id is required")
+
+    source_prefix = str(payload.get("source_prefix") or "parlay_builder").strip().lower()
+    only_pending = bool(payload.get("only_pending")) if payload.get("only_pending") is not None else True
+
+    deleted_ids: list[str] = []
+    with _BACKTEST_LOCK:
+        keep_entries: list[dict[str, Any]] = []
+        for entry in _BACKTEST_LOG:
+            if not isinstance(entry, dict):
+                keep_entries.append(entry)
+                continue
+            entry_batch = str(entry.get("batch_id") or "").strip()
+            entry_source = str(entry.get("source") or "").strip().lower()
+            entry_result = str(entry.get("result") or "").strip().lower()
+            matches_batch = entry_batch == batch_id
+            matches_source = entry_source.startswith(source_prefix)
+            matches_pending = (entry_result == "pending") if only_pending else True
+            if matches_batch and matches_source and matches_pending:
+                deleted_ids.append(str(entry.get("id") or ""))
+                continue
+            keep_entries.append(entry)
+        if deleted_ids:
+            _BACKTEST_LOG[:] = keep_entries
+            _save_backtest_log()
+
+    if deleted_ids:
+        _require_pg_backtest_write(_pg_delete_backtest_entries, deleted_ids)
+
+    return {
+        "ok": True,
+        "batch_id": batch_id,
+        "deleted": len(deleted_ids),
+        "only_pending": only_pending,
+    }
 
 
 @app.get("/api/backtest/log")
@@ -10708,7 +12140,7 @@ def backtest_clear_log() -> dict[str, Any]:
 @app.post("/api/odds/check-quota")
 def odds_check_quota(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """Check remaining Odds API quota without loading events (uses a lightweight sports list call)."""
-    api_key = str(payload.get("api_key") or "").strip()
+    api_key = normalize_odds_api_key(payload.get("api_key") or "")
     if not api_key:
         raise HTTPException(status_code=400, detail="Missing API key.")
     # Hit the /sports endpoint  it's the cheapest call (costs 0 credits on free tier)
@@ -10735,9 +12167,27 @@ def odds_check_quota(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
 @app.get("/api/key-vault")
 def key_vault_get() -> dict[str, Any]:
+    if postgres_available():
+        pg_state = _pg_read_key_vault_state()
+        if isinstance(pg_state, dict):
+            raw_entries = pg_state.get("entries") or []
+            entries = _sanitize_key_vault_entries(raw_entries)
+            active_id = str(pg_state.get("active_id") or "")
+            valid_ids = {str(entry.get("id") or "") for entry in entries}
+            if active_id and active_id not in valid_ids:
+                active_id = ""
+            if len(entries) != len(raw_entries) and POSTGRES_CACHE_WRITE_ENABLED:
+                try:
+                    _pg_write_key_vault_state({"entries": list(entries), "active_id": active_id})
+                except Exception:
+                    pass
+            with _KEY_VAULT_LOCK:
+                _KEY_VAULT_STATE["entries"] = entries
+                _KEY_VAULT_STATE["active_id"] = active_id
+            return {"entries": entries, "active_id": active_id}
     with _KEY_VAULT_LOCK:
         return {
-            "entries": list(_KEY_VAULT_STATE.get("entries") or []),
+            "entries": list(_sanitize_key_vault_entries(_KEY_VAULT_STATE.get("entries") or [])),
             "active_id": str(_KEY_VAULT_STATE.get("active_id") or ""),
         }
 
@@ -10746,14 +12196,98 @@ def key_vault_get() -> dict[str, Any]:
 def key_vault_put(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     entries = payload.get("entries") or []
     active_id = str(payload.get("active_id") or "")
+    mode = str(payload.get("mode") or "merge").strip().lower()
+    if mode not in {"merge", "replace"}:
+        mode = "merge"
     if not isinstance(entries, list):
         raise HTTPException(status_code=400, detail="entries must be a list")
-    sanitized = [entry for entry in entries if isinstance(entry, dict)]
+    incoming = _sanitize_key_vault_entries(entries)
+
+    existing_entries: list[dict[str, Any]] = []
+    existing_active_id = ""
+    if postgres_available():
+        pg_state = _pg_read_key_vault_state()
+        if isinstance(pg_state, dict):
+            existing_entries = _sanitize_key_vault_entries(pg_state.get("entries") or [])
+            existing_active_id = str(pg_state.get("active_id") or "")
+    if not existing_entries:
+        with _KEY_VAULT_LOCK:
+            existing_entries = _sanitize_key_vault_entries(_KEY_VAULT_STATE.get("entries") or [])
+            existing_active_id = str(_KEY_VAULT_STATE.get("active_id") or "")
+    if not existing_entries:
+        local_backup = _read_local_key_vault_backup_state()
+        if isinstance(local_backup, dict):
+            existing_entries = list(local_backup.get("entries") or [])
+            existing_active_id = str(local_backup.get("active_id") or "")
+
+    effective_mode = mode
+    shrink_guard_applied = False
+    if mode == "replace":
+        sanitized = incoming
+        existing_count = len(existing_entries)
+        incoming_count = len(sanitized)
+        allow_shrink = bool(payload.get("allow_shrink")) if payload.get("allow_shrink") is not None else False
+        if (
+            not allow_shrink
+            and existing_count >= KEY_VAULT_SHRINK_GUARD_MIN_EXISTING
+            and incoming_count < existing_count
+            and (incoming_count / float(max(1, existing_count))) < KEY_VAULT_SHRINK_GUARD_RATIO
+        ):
+            # Defensive fallback: avoid destructive replace from stale/partial clients.
+            merged_by_key: dict[str, dict[str, Any]] = {}
+            for entry in existing_entries:
+                key_text = str(entry.get("key") or "").strip()
+                if key_text:
+                    merged_by_key[key_text] = copy.deepcopy(entry)
+            for entry in incoming:
+                key_text = str(entry.get("key") or "").strip()
+                if key_text:
+                    prev = merged_by_key.get(key_text) or {}
+                    merged_by_key[key_text] = {**prev, **copy.deepcopy(entry)}
+            sanitized = list(merged_by_key.values())
+            effective_mode = "merge_guarded"
+            shrink_guard_applied = True
+            LOGGER.warning(
+                "Key vault shrink guard prevented destructive replace (incoming=%s existing=%s)",
+                incoming_count,
+                existing_count,
+            )
+    else:
+        merged_by_key: dict[str, dict[str, Any]] = {}
+        for entry in existing_entries:
+            key_text = str(entry.get("key") or "").strip()
+            if key_text:
+                merged_by_key[key_text] = copy.deepcopy(entry)
+        for entry in incoming:
+            key_text = str(entry.get("key") or "").strip()
+            if not key_text:
+                continue
+            prev = merged_by_key.get(key_text) or {}
+            merged_by_key[key_text] = {**prev, **copy.deepcopy(entry)}
+        sanitized = list(merged_by_key.values())
+
+    chosen_active_id = active_id or existing_active_id
+    if chosen_active_id:
+        valid_ids = {str(entry.get("id") or "") for entry in sanitized}
+        if chosen_active_id not in valid_ids:
+            chosen_active_id = ""
+
     with _KEY_VAULT_LOCK:
         _KEY_VAULT_STATE["entries"] = sanitized
-        _KEY_VAULT_STATE["active_id"] = active_id
+        _KEY_VAULT_STATE["active_id"] = chosen_active_id
+    if postgres_available() and POSTGRES_CACHE_WRITE_ENABLED:
+        try:
+            _pg_write_key_vault_state({"entries": list(sanitized), "active_id": chosen_active_id})
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"Key vault Postgres write failed: {exc}")
     _save_key_vault_state()
-    return {"ok": True, "count": len(sanitized), "active_id": active_id}
+    return {
+        "ok": True,
+        "count": len(sanitized),
+        "active_id": chosen_active_id,
+        "mode": effective_mode,
+        "shrink_guard_applied": shrink_guard_applied,
+    }
 
 
 @app.get("/api/favorites")
@@ -10815,7 +12349,7 @@ def tracker_props_put(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
 @app.post("/api/odds/game-context")
 def odds_game_context(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    api_key = str(payload.get("api_key") or "").strip()
+    api_key = normalize_odds_api_key(payload.get("api_key") or "")
     if not api_key:
         raise HTTPException(status_code=400, detail="Provide an Odds API key.")
 

@@ -25,16 +25,22 @@
   --ds-color-brand-primary-hover: #18965a;
   --ds-color-brand-secondary: #1d7ef2;
   --ds-color-brand-secondary-hover: #1765c2;
+  --ds-color-brand-secondary-rgb: 29, 126, 242;
 
   --ds-color-good: #31c46c;
   --ds-color-bad: #e45757;
   --ds-color-warn: #f2b84b;
   --ds-color-info: #4ea3ff;
+  --ds-color-good-rgb: 49, 196, 108;
+  --ds-color-bad-rgb: 228, 87, 87;
+  --ds-color-warn-rgb: 242, 184, 75;
+  --ds-color-info-rgb: 78, 163, 255;
 
   --ds-color-good-soft: rgba(49, 196, 108, 0.16);
   --ds-color-bad-soft: rgba(228, 87, 87, 0.16);
   --ds-color-warn-soft: rgba(242, 184, 75, 0.16);
   --ds-color-info-soft: rgba(78, 163, 255, 0.16);
+  --ds-color-panel-soft: rgba(255, 255, 255, 0.04);
 
   /* Spacing scale (4px grid) */
   --ds-space-0: 0;
@@ -59,6 +65,8 @@
   --ds-shadow-1: 0 1px 2px rgba(0, 0, 0, 0.24);
   --ds-shadow-2: 0 6px 16px rgba(0, 0, 0, 0.28);
   --ds-shadow-3: 0 12px 28px rgba(0, 0, 0, 0.32);
+  --ds-shadow-soft: 0 14px 34px rgba(0, 0, 0, 0.2);
+  --ds-shadow-xl: 0 22px 50px rgba(0, 0, 0, 0.3);
 
   /* Typography */
   --ds-font-ui: "Inter", "Segoe UI", Arial, sans-serif;
@@ -1043,6 +1051,71 @@
   stroke-linejoin: round;
 }
 
+.ds-overview .ds-overview-start-card {
+  border-color: #31517f;
+  background:
+    radial-gradient(125% 140% at 100% -15%, rgba(46, 96, 176, 0.28), transparent 58%),
+    linear-gradient(155deg, #101b2f 0%, #15233b 58%, #111b2f 100%);
+  display: grid;
+  gap: var(--ds-space-3);
+}
+
+.ds-overview .ds-overview-start-head {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--ds-space-3);
+  align-items: start;
+}
+
+.ds-overview .ds-overview-start-head h2 {
+  margin: 0;
+  font-size: clamp(22px, 2.6vw, 30px);
+  line-height: 1.12;
+  color: #f0f6ff;
+}
+
+.ds-overview .ds-overview-start-head p {
+  margin: 8px 0 0;
+  color: #b5c5de;
+  max-width: 66ch;
+}
+
+.ds-overview .ds-overview-start-steps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--ds-space-3);
+}
+
+.ds-overview .ds-overview-start-step {
+  border: 1px solid #2d4568;
+  background: rgba(9, 16, 29, 0.34);
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: grid;
+  gap: 6px;
+}
+
+.ds-overview .ds-overview-start-step strong {
+  font-size: 13px;
+  color: #f3f8ff;
+}
+
+.ds-overview .ds-overview-start-step span {
+  font-size: 12px;
+  color: #b4c4de;
+  line-height: 1.5;
+}
+
+.ds-overview .ds-overview-start-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--ds-space-2);
+}
+
+.ds-overview.overview-onboarding #matchupPanel {
+  display: none;
+}
+
 .ds-overview .spotlight-pill {
   border-radius: 999px;
   min-height: 24px;
@@ -1692,6 +1765,74 @@
 .ds-analyzer .analyzer-insight-grid .empty-state-panel {
   min-height: 128px;
   padding: 16px;
+}
+
+.ds-analyzer .ds-analyzer-start-card {
+  border-color: #2f4f76;
+  background:
+    radial-gradient(135% 165% at 100% -22%, rgba(48, 104, 190, 0.25), transparent 58%),
+    linear-gradient(160deg, #101f35 0%, #13253d 55%, #101e33 100%);
+  display: grid;
+  gap: var(--ds-space-3);
+}
+
+.ds-analyzer .ds-analyzer-start-head {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--ds-space-3);
+  align-items: start;
+}
+
+.ds-analyzer .ds-analyzer-start-head h3 {
+  margin: 0;
+  color: #eef5ff;
+  font-size: clamp(21px, 2.3vw, 28px);
+  line-height: 1.12;
+}
+
+.ds-analyzer .ds-analyzer-start-head p {
+  margin: 6px 0 0;
+  color: #a9bddb;
+  max-width: 62ch;
+}
+
+.ds-analyzer .ds-analyzer-start-steps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--ds-space-3);
+}
+
+.ds-analyzer .ds-analyzer-start-step {
+  border: 1px solid #325074;
+  border-radius: 10px;
+  background: rgba(9, 18, 34, 0.36);
+  padding: 12px 14px;
+  display: grid;
+  gap: 6px;
+}
+
+.ds-analyzer .ds-analyzer-start-step strong {
+  color: #eef5ff;
+  font-size: 13px;
+}
+
+.ds-analyzer .ds-analyzer-start-step span {
+  color: #a9bfdc;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ds-analyzer .ds-analyzer-start-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.ds-analyzer.analyzer-onboarding .analyzer-matchup-panel,
+.ds-analyzer.analyzer-onboarding .analyzer-insight-grid,
+.ds-analyzer.analyzer-onboarding .dashboard-analysis-stack,
+.ds-analyzer.analyzer-onboarding .analyzer-decision-strip {
+  display: none;
 }
 
 .ds-analyzer .analyzer-insight-grid .recommendation-card,
@@ -2440,10 +2581,27 @@
   flex: 0 0 auto;
 }
 
+.ds-parlay .parlay-action-row .field-inline {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 188px;
+}
+
+.ds-parlay .parlay-action-row .field-inline .small-label {
+  margin: 0;
+}
+
+.ds-parlay .parlay-action-row .field-inline .market-api-input {
+  min-height: 38px;
+  border-radius: 11px;
+  padding: 0 12px;
+}
+
 .ds-parlay .parlay-action-row .parlay-build-btn,
 .ds-parlay .parlay-action-row .text-btn {
   min-height: 38px;
-  padding: 0 14px;
+  padding: 0 12px;
   border-radius: 11px;
   font-size: 0.86rem;
   font-weight: 700;
@@ -2473,6 +2631,10 @@
 
 .ds-parlay .parlay-action-row .text-btn {
   background: linear-gradient(160deg, #16304f 0%, #122a44 100%);
+}
+
+.ds-parlay .parlay-action-row #parlayUndoBacktestBtn {
+  min-width: 118px;
 }
 
 .ds-parlay .parlay-action-row .parlay-injury-toggle-wrap {
@@ -2526,6 +2688,34 @@
 .ds-parlay .parlay-status-meta {
   margin-top: 8px;
   color: #a8c0df;
+}
+
+.ds-parlay .parlay-fallback-notice {
+  margin-top: 10px;
+  border: 1px solid #7a6232;
+  border-radius: 12px;
+  background: linear-gradient(160deg, rgba(98, 70, 18, 0.28) 0%, rgba(19, 31, 48, 0.9) 100%);
+  padding: 10px 12px;
+  color: #ffe3ad;
+  display: grid;
+  gap: 6px;
+  line-height: 1.35;
+  font-size: 0.78rem;
+}
+
+.ds-parlay .parlay-fallback-notice .parlay-fallback-pill {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 203, 116, 0.4);
+  background: rgba(252, 191, 89, 0.16);
+  color: #ffd89a;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-size: 0.62rem;
+  padding: 4px 8px;
 }
 
 .ds-parlay .parlay-injury-summary-panel {
@@ -2811,6 +3001,14 @@
     grid-template-columns: 1fr;
   }
 
+  .ds-analyzer .ds-analyzer-start-head {
+    grid-template-columns: 1fr;
+  }
+
+  .ds-analyzer .ds-analyzer-start-steps {
+    grid-template-columns: 1fr;
+  }
+
   .ds-analyzer .controls-top h2 {
     font-size: clamp(32px, 7vw, 42px);
     max-width: none;
@@ -2916,6 +3114,14 @@
 
 @media (max-width: 760px) {
   .ds-overview .ds-overview-header-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .ds-overview .ds-overview-start-head {
+    grid-template-columns: 1fr;
+  }
+
+  .ds-overview .ds-overview-start-steps {
     grid-template-columns: 1fr;
   }
 

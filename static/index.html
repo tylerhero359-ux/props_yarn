@@ -80,16 +80,16 @@ tailwind.config = {
 };
 </script>
 <link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/>
-<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&amp;family=Inter:wght@400;500;600;700;800&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&amp;family=Caveat:wght@600;700&amp;family=Great+Vibes&amp;family=Inter:wght@400;500;600;700;800&amp;display=swap" rel="stylesheet"/>
 <link href="/static/style.css" rel="stylesheet">
 <link href="/static/design-system.css" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </link></head>
 <body class="font-sans antialiased selection:bg-sky-400/20 selection:text-white">
-<div class="bg-orb bg-orb-one hidden md:block"></div>
-<div class="bg-orb bg-orb-two hidden md:block"></div>
+<div class="bg-orb bg-orb-one"></div>
+<div class="bg-orb bg-orb-two"></div>
 <div class="dashboard-layout relative z-10 mx-auto grid max-w-[1520px] gap-5 px-3 pb-8 pt-4 2xl:px-4 xl:grid-cols-[300px_minmax(0,1fr)]">
-<aside class="dashboard-sidebar card glass rounded-[28px] border border-white/10 bg-slate-950/50 p-4 shadow-softxl backdrop-blur-xl xl:sticky xl:top-4 xl:self-start xl:p-5">
+<aside class="dashboard-sidebar card glass rounded-[28px] border border-white/10 bg-slate-950/50 p-4 shadow-softxl backdrop-blur-xl xl:sticky xl:top-4 xl:self-start xl:p-5" id="dashboardSidebar">
 <div class="sidebar-brand-shell flex items-center justify-between gap-3">
 <div class="sidebar-brand flex items-start gap-3">
 <div class="brand-mark brand-mark-icon">
@@ -101,11 +101,12 @@ tailwind.config = {
 </div>
 </div>
 <button aria-label="Collapse sidebar" class="sidebar-toggle" id="sidebarToggle" type="button">
-<span class="sidebar-toggle-icon">&lt;</span>
+<span class="sidebar-toggle-icon nav-icon-svg" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></span>
 </button>
 </div>
-<nav aria-label="Dashboard sections" class="sidebar-nav grid gap-2 md:grid-cols-2 xl:grid-cols-1">
-<button class="nav-item active w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition duration-200" data-view="overview" type="button">
+<nav aria-label="Dashboard sections" class="sidebar-nav grid gap-2 xl:grid-cols-1">
+<p class="nav-group-label">Workspace</p>
+<button aria-current="page" class="nav-item active w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition duration-200" data-view="overview" type="button">
 <span class="nav-icon nav-icon-svg"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/></svg></span>
 <span>
 <strong>Overview</strong>
@@ -119,6 +120,7 @@ tailwind.config = {
 <small>Slate, status, team notes</small>
 </span>
 </button>
+<p class="nav-group-label">Analysis</p>
 <button class="nav-item w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition duration-200" data-view="analyzer" type="button">
 <span class="nav-icon nav-icon-svg"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V4"/><path d="M4 20h16"/><path d="M8 16l4-4 3 2 5-6"/></svg></span>
 <span>
@@ -140,6 +142,7 @@ tailwind.config = {
 <small>Paste and rank a full board</small>
 </span>
 </button>
+<p class="nav-group-label">Tracking</p>
 <button class="nav-item w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition duration-200" data-view="parlay" type="button">
 <span class="nav-icon nav-icon-svg"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h6l2 12h8"/><path d="M7 6l2 12"/><path d="M11 10h9"/></svg></span>
 <span>
@@ -151,9 +154,10 @@ tailwind.config = {
 <span class="nav-icon nav-icon-svg"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 18v-3a8 8 0 0 1 16 0v3"/><circle cx="12" cy="18" r="1.5"/><path d="M12 4v3"/></svg></span>
 <span>
 <strong>Prop Tracker</strong>
-<small>Live bar tracking for active bets</small>
+<small>Live tracking + backtest logging</small>
 </span>
 </button>
+<p class="nav-group-label">Settings</p>
 <button class="nav-item w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition duration-200" data-view="keyvault" type="button">
 <span class="nav-icon nav-icon-svg"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 11a4 4 0 1 1 4 4H4v-2h3v-2h4"/><circle cx="11" cy="11" r="1"/></svg></span>
 <span>
@@ -177,11 +181,11 @@ tailwind.config = {
 </div>
 <div class="sidebar-footer grid gap-3">
 <button aria-label="Toggle theme" class="theme-toggle inline-flex items-center justify-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 font-semibold" id="themeToggle" type="button">
-<span class="theme-icon">☀</span>
+<span class="theme-icon">?</span>
 <span class="theme-text">Light</span>
 </button>
 <button class="inline-flex items-center justify-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 font-semibold w-full" id="openUserGuideBtn" type="button" title="Open the full user guide">
-<span class="nav-icon nav-icon-svg"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h9a3 3 0 0 1 3 3v13H8a3 3 0 0 0-3 3z"/><path d="M8 4v16"/></svg></span><span>User Guide</span>
+<span class="nav-icon nav-icon-svg"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h9a3 3 0 0 1 3 3v13H8a3 3 0 0 0-3 3z"/><path d="M8 4v16"/></svg></span><span class="user-guide-text">User Guide</span>
 </button>
 <p class="sidebar-footnote">Professional workflow for player props, matchup analysis, availability, and market scanning.</p>
 </div>
@@ -193,7 +197,7 @@ tailwind.config = {
 <h2 id="workspaceTitle">Overview</h2>
 <p class="workspace-subtitle" id="workspaceSubtitle">A structured view of the selected player, current matchup, and key prop indicators.</p>
 </div>
-<button aria-label="Toggle navigation" class="ghost-btn inline-flex items-center gap-2 self-start xl:hidden" id="mobileSidebarToggle" type="button">Menu</button></header>
+<button aria-controls="dashboardSidebar" aria-expanded="false" aria-label="Toggle navigation" class="ghost-btn mobile-nav-toggle inline-flex items-center gap-2 self-start xl:hidden" id="mobileSidebarToggle" type="button"><span class="mobile-nav-icon nav-icon-svg" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h16"/></svg></span><span>Menu</span></button></header>
 <section class="dashboard-view active gap-4 premium-overview-view ds-overview" data-view="overview">
 <header class="ds-card ds-overview-header">
 <div class="ds-overview-header-copy">
@@ -212,6 +216,25 @@ tailwind.config = {
 </div>
 </div>
 </header>
+<article class="ds-card ds-overview-start-card hidden" id="overviewStartCard">
+<div class="ds-overview-start-head">
+<span class="empty-icon ds-overview-empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V6"/><path d="M4 20h16"/><path d="M8 16v-4M12 16v-7M16 16v-2"/></svg></span>
+<div>
+<p class="section-kicker">Start Here</p>
+<h2>First board run in under a minute</h2>
+<p>Run Market Scanner to rank high-EV plays, then open Analyzer for a quick green/yellow/red decision.</p>
+</div>
+</div>
+<div class="ds-overview-start-steps">
+<div class="ds-overview-start-step"><strong>1. Scan market board</strong><span>Paste props in Market Scanner and run the ranking pass.</span></div>
+<div class="ds-overview-start-step"><strong>2. Open top pick</strong><span>Click any ranked row to load player context instantly.</span></div>
+<div class="ds-overview-start-step"><strong>3. Validate matchup</strong><span>Use the analyzer read before locking a play.</span></div>
+</div>
+<div class="ds-overview-start-actions">
+<button class="ds-btn ds-btn--md ds-btn--primary" data-go-view="market" type="button">Run Market Scanner</button>
+<button class="ds-btn ds-btn--md ds-btn--ghost" data-go-view="analyzer" type="button">Go to Analyzer</button>
+</div>
+</article>
 <section class="ds-overview-primary-grid">
 <article class="ds-card ds-overview-board-shell">
 <div class="ds-overview-section-head">
@@ -343,13 +366,6 @@ tailwind.config = {
 </select>
 </div>
 </div>
-<div class="control-group control-group-wide search-group">
-<label for="playerSearch">Search fallback</label>
-<div class="input-shell">
-<input autocomplete="off" id="playerSearch" placeholder="Search any NBA player" type="text"/>
-</div>
-<div class="search-results hidden" id="searchResults"></div>
-</div>
 <div class="control-group">
 <label for="lineInput">Prop line</label>
 <div class="input-shell">
@@ -368,12 +384,6 @@ tailwind.config = {
 </div>
 </div>
 <div class="control-group">
-<label for="seasonInput">Season</label>
-<div class="input-shell">
-<input id="seasonInput" placeholder="2025-26" type="text"/>
-</div>
-</div>
-<div class="control-group">
 <label for="seasonTypeSelect">Season type</label>
 <div class="input-shell">
 <select id="seasonTypeSelect">
@@ -381,6 +391,25 @@ tailwind.config = {
 <option value="Regular Season">Regular Season</option>
 <option value="Playoffs">Playoffs</option>
 </select>
+</div>
+</div>
+</div>
+<div class="analyzer-advanced-toggle-row">
+<button aria-expanded="false" class="text-btn" id="toggleAnalyzerSetupBtn" type="button">Show advanced setup</button>
+<span class="small-meta">Search fallback, season override, and opponent override.</span>
+</div>
+<div class="controls-grid analyzer-controls-grid analyzer-advanced-setup hidden" id="analyzerAdvancedSetup">
+<div class="control-group control-group-wide search-group">
+<label for="playerSearch">Search fallback</label>
+<div class="input-shell">
+<input autocomplete="off" id="playerSearch" placeholder="Search any NBA player" type="text"/>
+</div>
+<div class="search-results hidden" id="searchResults"></div>
+</div>
+<div class="control-group">
+<label for="seasonInput">Season</label>
+<div class="input-shell">
+<input id="seasonInput" placeholder="2025-26" type="text"/>
 </div>
 </div>
 <div class="control-group">
@@ -613,7 +642,7 @@ tailwind.config = {
 </div>
 <div class="player-grid empty-grid" id="playerGrid">
 <div class="empty-roster-state empty-state-panel">
-<div class="empty-icon"></div>
+<div class="empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V6"/><path d="M4 20h16"/><path d="M8 16v-4M12 16v-7M16 16v-2"/></svg></div>
 <strong>Choose a team to load player cards.</strong>
 <span>You'll get clickable headshots, jersey numbers, and positions.</span>
 </div>
@@ -621,6 +650,7 @@ tailwind.config = {
 </article>
 </section>
 <section class="selected-player-matchup-section hidden" id="selectedPlayerMatchupSection"></section>
+<article class="ds-card ds-analyzer-start-card hidden" id="analyzerStartCard"></article>
 <section class="ds-card card glass matchup-panel analyzer-matchup-panel rounded-[28px] border border-white/10 backdrop-blur-xl">
 <div class="section-head collapsible-head">
 <div>
@@ -633,7 +663,7 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="analyzerMatchupBody">
-<div class="empty-icon"></div>
+<div class="empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V6"/><path d="M4 20h16"/><path d="M8 16v-4M12 16v-7M16 16v-2"/></svg></div>
 <strong>No matchup loaded yet.</strong>
 <span>Analyze a player prop to load the next opponent and defense-vs-position read.</span>
 </div>
@@ -651,7 +681,7 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="recommendationBody">
-<div class="empty-icon"></div>
+<div class="empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V6"/><path d="M4 20h16"/><path d="M8 16v-4M12 16v-7M16 16v-2"/></svg></div>
 <strong>No recommendation yet.</strong>
 <span>Analyze a player prop to get a simple green / yellow / red read.</span>
 </div>
@@ -668,7 +698,7 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="interpretationBody">
-<div class="empty-icon"></div>
+<div class="empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V6"/><path d="M4 20h16"/><path d="M8 16v-4M12 16v-7M16 16v-2"/></svg></div>
 <strong>No interpretation yet.</strong>
 <span>Analyze a player prop to get a simple read on whether the line looks supportive, mixed, or risky.</span>
 </div>
@@ -685,7 +715,7 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="opportunityBody">
-<div class="empty-icon"></div>
+<div class="empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V6"/><path d="M4 20h16"/><path d="M8 16v-4M12 16v-7M16 16v-2"/></svg></div>
 <strong>No opportunity profile yet.</strong>
 <span>Analyze a player prop to see minutes, shot attempts, and teammate absence context.</span>
 </div>
@@ -702,7 +732,7 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="environmentBody">
-<div class="empty-icon"></div>
+<div class="empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V6"/><path d="M4 20h16"/><path d="M8 16v-4M12 16v-7M16 16v-2"/></svg></div>
 <strong>No schedule read yet.</strong>
 <span>Analyze a player prop to see rest, back-to-back risk, and next-game setup.</span>
 </div>
@@ -720,7 +750,7 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="marketBody">
-<div class="empty-icon"></div>
+<div class="empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V6"/><path d="M4 20h16"/><path d="M8 16v-4M12 16v-7M16 16v-2"/></svg></div>
 <strong>No market context yet.</strong>
 <span>Analyze a player prop to see team total, spread, and game total for the matchup.</span>
 </div>
@@ -738,7 +768,7 @@ tailwind.config = {
 </div>
 </div>
 <div class="empty-state-panel compact matchup-empty" id="varianceBody">
-<div class="empty-icon"></div>
+<div class="empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V6"/><path d="M4 20h16"/><path d="M8 16v-4M12 16v-7M16 16v-2"/></svg></div>
 <strong>No distribution data yet.</strong>
 <span>Analyze a player prop to see consistency score, median, floor, ceiling and percentile bands.</span>
 </div>
@@ -812,8 +842,8 @@ tailwind.config = {
 <tr>
 <td colspan="4">
 <div class="empty-state-panel compact">
-<div class="empty-icon"></div>
-<strong>No data yet.</strong>
+<div class="empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V6"/><path d="M4 20h16"/><path d="M8 16v-4M12 16v-7M16 16v-2"/></svg></div>
+<strong>No games logged yet.</strong>
 <span>Analyze a player prop to fill the game log.</span>
 </div>
 </td>
@@ -953,7 +983,7 @@ tailwind.config = {
 </div>
 </div>
 <div class="bet-finder-state empty-state-panel compact" id="betFinderResults">
-<div class="empty-icon"></div>
+<div class="empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V6"/><path d="M4 20h16"/><path d="M8 16v-4M12 16v-7M16 16v-2"/></svg></div>
 <strong>No bet finder results yet.</strong>
 <span>Choose a team, set your line, and run Bet Finder.</span>
 </div>
@@ -969,6 +999,8 @@ tailwind.config = {
 </div>
 <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
 <span class="small-badge">Manual paste template</span>
+<button aria-expanded="false" class="text-btn" id="marketToggleFiltersBtn" type="button">Show filters</button>
+<button aria-expanded="false" class="text-btn" id="marketToggleImportBtn" type="button">Show Odds API import</button>
 <label class="small-meta" for="marketSeasonTypeSelect" style="margin:0;">Season type</label>
 <select id="marketSeasonTypeSelect" style="min-width:170px;">
 <option selected="" value="Combined">Combined</option>
@@ -988,6 +1020,7 @@ tailwind.config = {
 </label>
 </div>
 </div>
+<div class="market-filters-wrap hidden" id="marketFiltersWrap">
 <div class="market-filter-group market-advanced-filters ds-market-filter-shell">
 <span class="small-label market-filter-label">Narrow results</span>
 <div class="market-advanced-filter-row">
@@ -1024,6 +1057,8 @@ tailwind.config = {
 <span class="small-label market-filter-label">Expert angles</span>
 <div class="market-filter-chip-row flex flex-wrap gap-2" id="marketExpertFilterChips"></div>
 </div>
+</div>
+<div class="market-import-wrap hidden" id="marketImportWrap">
 <div class="market-api-panel card rounded-[28px] border border-white/10 market-api-command">
 <div class="section-head compact-inline-head">
 <div>
@@ -1073,6 +1108,7 @@ tailwind.config = {
 <div class="small-meta" id="oddsApiKeyMeta">API source: Key Vault rotation</div>
 </div>
 </div>
+</div>
 <div class="market-input-grid market-premium-grid grid gap-3 md:grid-cols-2 xl:grid-cols-4">
 <div class="market-form market-primary-form">
 <label class="small-label" for="marketTextarea">Paste or import market rows</label>
@@ -1099,7 +1135,7 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 </div>
 </div>
 <div class="bet-finder-state empty-state-panel compact" id="marketResults">
-<div class="empty-icon">🧾</div>
+<div class="empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V4"/><path d="M4 20h16"/><path d="M8 15l3-3 3 2 6-7"/></svg></div>
 <strong>No market scan yet.</strong>
 <span>Paste your board using the template, then click Analyze Board.</span>
 </div>
@@ -1211,17 +1247,42 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 <input id="parlayInjuryAware" type="checkbox">
 <span class="small-label">Injury-Aware</span>
 </label>
+<label class="field-inline">
+<span class="small-label">Min odds</span>
+<input class="market-api-input" id="parlayMinOdds" type="number" min="1.01" max="50" step="0.05" placeholder="1.50"/>
+</label>
+<label class="field-inline">
+<span class="small-label">Max odds</span>
+<input class="market-api-input" id="parlayMaxOdds" type="number" min="1.01" max="50" step="0.05" placeholder="3.00"/>
+</label>
+<button class="text-btn" id="parlayClearOddsFilterBtn" type="button" title="Clear min/max odds filters">Clear odds filter</button>
 <button class="primary-btn parlay-build-btn" id="parlayBuildBtn" type="button">
 Build Parlay
 </button>
 <button class="secondary-btn parlay-build-btn" id="parlayRebuildBtn" style="display:none" title="Re-pick legs from cache - no API calls" type="button">
-<span class="parlay-btn-icon">Reshuffle</span> Reshuffle
+Reshuffle
 </button>
 <button class="secondary-btn parlay-build-btn" id="parlayRescrapeBtn" style="display:none" title="Re-scrape selected events - uses API credits" type="button">
 Re-scrape
 </button>
+<label class="field-inline">
+<span class="small-label">Log filter</span>
+<select class="market-api-input" id="parlayBacktestFilterSelect">
+<option selected="" value="action">Actionable (High+)</option>
+<option value="playoff_high">Playoff High+ (75+, odds 1.40+)</option>
+<option value="selected">Selected legs only</option>
+<option value="broad">Broad (Medium+)</option>
+</select>
+</label>
+<button class="secondary-btn parlay-build-btn" id="parlayLogBacktestBtn" title="Log filtered props to Backtest as pending entries" type="button">
+Log Actionable Props
+</button>
+<button class="text-btn" id="parlayUndoBacktestBtn" style="display:none" title="Undo the most recent parlay batch log" type="button">
+Undo Last Log
+</button>
 </div>
 <div class="small-meta parlay-status-meta" id="parlayStatusMeta"></div>
+<div class="parlay-fallback-notice" id="parlayFallbackNotice" style="display:none" aria-live="polite"></div>
 </section>
 
 <section id="parlayInjurySummaryWrap">
@@ -1304,7 +1365,7 @@ Re-scrape
 </section>
 
 <div class="bet-finder-state empty-state-panel compact parlay-empty-shell" id="parlayEmptyState">
-<div class="empty-icon"></div>
+<div class="empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V6"/><path d="M4 20h16"/><path d="M8 16v-4M12 16v-7M16 16v-2"/></svg></div>
 <strong>No parlay built yet.</strong>
 <span>Add at least 5 usable Odds API keys in Key Vault, choose your legs, and click Build Parlay.</span>
 </div>
@@ -1319,7 +1380,7 @@ Re-scrape
 </div>
 <div class="tracker-hero-actions">
 <button class="primary-btn tracker-refresh-btn" id="trackerRefreshBtn" type="button">
-<span class="tracker-refresh-icon">↻</span> Refresh Live Board
+<span class="tracker-refresh-icon">?</span> Refresh Live Board
 </button>
 <div class="tracker-toolbar-summary" id="trackerBoardSummary">Standing by</div>
 </div>
@@ -1417,13 +1478,13 @@ Re-scrape
 </div>
 <div class="tracker-cards" id="trackerCards"></div>
 <div class="bet-finder-state empty-state-panel compact" id="trackerEmpty">
-<div class="empty-icon"></div>
+<div class="empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V6"/><path d="M4 20h16"/><path d="M8 16v-4M12 16v-7M16 16v-2"/></svg></div>
 <strong>No props tracked yet.</strong>
 <span>Add a prop above to start watching it fill toward the line.</span>
 </div>
 </section>
 
-<!-- ── Backtest Performance Dashboard ─────────────────────────────────── -->
+<!-- -- Backtest Performance Dashboard ----------------------------------- -->
 <section class="card glass rounded-[28px] border border-white/10 backdrop-blur-xl ds-card ds-backtest" id="backtestSection">
  <div class="section-head collapsible-head">
  <div>
@@ -1436,8 +1497,14 @@ Re-scrape
  </div>
  </div>
  <div class="ds-backtest-body" id="backtestBody">
+ <div class="parlay-jump-row backtest-jump-row" aria-label="Backtest sections">
+ <button class="parlay-jump-chip backtest-jump-chip is-active" data-target="btLogBlock" type="button">Log</button>
+ <button class="parlay-jump-chip backtest-jump-chip" data-target="backtestStats" type="button">Stats</button>
+ <button class="parlay-jump-chip backtest-jump-chip" data-target="backtestLogWrap" type="button">Review</button>
+ <button class="parlay-jump-chip backtest-jump-chip" data-target="btOpsBlock" type="button">Ops</button>
+ </div>
  <!-- Log prediction form -->
- <div class="tracker-add-panel backtest-entry-panel">
+ <div class="tracker-add-panel backtest-entry-panel" id="btLogBlock">
  <div class="parlay-step-label"><span class="parlay-step-num">+</span> Log a Prediction</div>
  <div class="tracker-add-grid backtest-entry-grid">
  <label class="field-inline">
@@ -1489,10 +1556,10 @@ Re-scrape
  <!-- Stats summary row -->
  <div class="ds-backtest-stats" id="backtestStats" style="display:none">
  <div class="opportunity-chip-grid ds-backtest-stat-grid">
- <div class="opportunity-chip" id="btStatTotal"><span class="small-label">Logged</span><strong>—</strong><small>predictions</small></div>
- <div class="opportunity-chip" id="btStatWin"><span class="small-label">Win rate</span><strong>—</strong><small>resolved bets</small></div>
- <div class="opportunity-chip" id="btStatROI"><span class="small-label">ROI</span><strong>—</strong><small>at -110 avg</small></div>
- <div class="opportunity-chip" id="btStatPending"><span class="small-label">Pending</span><strong>—</strong><small>unresolved</small></div>
+ <div class="opportunity-chip" id="btStatTotal"><span class="small-label">Logged</span><strong>--</strong><small>predictions</small></div>
+ <div class="opportunity-chip" id="btStatWin"><span class="small-label">Win rate</span><strong>--</strong><small>resolved bets</small></div>
+ <div class="opportunity-chip" id="btStatROI"><span class="small-label">ROI</span><strong>--</strong><small>at -110 avg</small></div>
+ <div class="opportunity-chip" id="btStatPending"><span class="small-label">Pending</span><strong>--</strong><small>unresolved</small></div>
  </div>
  <!-- Tier breakdown -->
  <div class="ds-backtest-tier" id="btTierBreakdown"></div>
@@ -1574,6 +1641,7 @@ Re-scrape
  </div>
  <div class="ds-backtest-log" id="backtestLog"></div>
  <div class="backtest-pagination" id="btPagination"></div>
+ <div class="backtest-ops-wrap" id="btOpsBlock">
  <div class="backtest-archive-bar">
  <label class="field-inline">
  <span class="small-label">Archive resolved older than</span>
@@ -1587,7 +1655,9 @@ Re-scrape
  <button class="secondary-btn" id="btArchiveBtn" type="button">Archive older resolved</button>
  </div>
  <div class="backtest-actions-row">
- <button class="secondary-btn" id="btRefreshBtn" type="button">↻ Refresh log</button>
+ <button class="secondary-btn" id="btRefreshBtn" type="button">? Refresh log</button>
+ <button class="secondary-btn" id="btAutoGradeBtn" title="Auto-grade pending logged props with actual stats once games are complete" type="button">Auto Grade Logged Props</button>
+ <button class="secondary-btn" id="btUndoAutoGradeBtn" style="display:none" title="Undo the most recent auto-grade run" type="button">Undo Auto Grade</button>
  <button class="secondary-btn" id="btSyncPgBtn" type="button">Sync from Postgres</button>
  <button class="secondary-btn" id="btPushPgBtn" type="button">Push to Postgres</button>
  <button class="secondary-btn" id="btExportBtn" type="button">Export current view</button>
@@ -1600,10 +1670,11 @@ Re-scrape
  </div>
  </div>
  </div>
+ </div>
 </section>
 </section>
 
-<!-- ── Key Vault ─────────────────────────────────────────────────── -->
+<!-- -- Key Vault --------------------------------------------------- -->
 <section class="dashboard-view gap-4 ds-keyvault" data-view="keyvault">
  <header class="ds-card ds-keyvault-header">
  <div>
@@ -1667,7 +1738,7 @@ Re-scrape
  <div class="small-meta" id="kvVaultSummary">Store at least 5 usable keys to unlock automatic rotation.</div>
  <div id="kvKeyList">
  <div class="bet-finder-state empty-state-panel compact" style="padding:32px 0">
- <div class="empty-icon"></div>
+ <div class="empty-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V6"/><path d="M4 20h16"/><path d="M8 16v-4M12 16v-7M16 16v-2"/></svg></div>
  <strong>No keys saved yet.</strong>
  <span>Add a key above to get started.</span>
  </div>
@@ -1722,7 +1793,7 @@ Re-scrape
 <div class="action-banner-inner">
 <div aria-hidden="true" class="action-banner-spinner"></div>
 <div class="action-banner-copy">
-<strong id="actionBannerTitle">Working on it…</strong>
+<strong id="actionBannerTitle">Working on it...</strong>
 <span id="actionBannerDetail">Please wait while the dashboard updates.</span>
 <div class="action-banner-progress" id="actionBannerProgress" aria-hidden="true">
 <div class="action-banner-progress-rail">
@@ -1740,9 +1811,9 @@ Re-scrape
  ================================================================== -->
 <div id="userGuideModal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.75);backdrop-filter:blur(6px);overflow-y:auto;padding:24px 16px">
  <div style="max-width:780px;margin:0 auto;background:var(--card-bg,#0f1117);border:1px solid rgba(255,255,255,0.1);border-radius:24px;padding:32px;color:var(--text,#e8eaf0);font-family:inherit;position:relative">
- <button id="closeUserGuideBtn" type="button" style="position:absolute;top:16px;right:16px;background:none;border:none;color:inherit;font-size:22px;cursor:pointer;opacity:0.5;line-height:1" title="Close">✕</button>
+ <button id="closeUserGuideBtn" type="button" style="position:absolute;top:16px;right:16px;background:none;border:none;color:inherit;font-size:22px;cursor:pointer;opacity:0.5;line-height:1" title="Close">&times;</button>
  <div style="display:flex;align-items:center;gap:12px;margin-bottom:28px">
- <span style="font-size:32px">📖</span>
+ <span style="font-size:32px">Guide</span>
  <div>
  <p style="font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;opacity:.45;margin:0">NBA Props Tracker</p>
  <h2 style="font-size:22px;font-weight:800;margin:2px 0 0">User Guide</h2>
@@ -1751,31 +1822,31 @@ Re-scrape
 
  <!-- SECTION: What each section does -->
  <div class="ug-section">
- <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">🗺️ Section Overview</h3>
+ <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">Section Overview</h3>
  <div style="display:grid;gap:10px">
- <div class="ug-card"><span class="ug-icon">⌂</span><div><strong>Overview</strong> — Dashboard snapshot. Shows today's schedule, quick-access favorites, and recent tracker bets at a glance.</div></div>
- <div class="ug-card"><span class="ug-icon">🗓️</span><div><strong>Today's Games</strong> — Full slate with team injury notes and game status. Use this to spot missing key players before analyzing props.</div></div>
- <div class="ug-card"><span class="ug-icon">📊</span><div><strong>Player Analyzer</strong> — Deep-dive on one player prop. Pick a player, stat, and line to get hit rate, averages, trends, matchup data, and a confidence score.</div></div>
- <div class="ug-card"><span class="ug-icon">🔍</span><div><strong>Bet Finder</strong> — Bulk analysis mode. Enter multiple props (or import from Odds API) and the scanner ranks them by EV, edge, and hit rate.</div></div>
- <div class="ug-card"><span class="ug-icon">📡</span><div><strong>Live Tracker</strong> — Real-time monitoring for props you are tracking today. Add props here to watch their live stat as games progress.</div></div>
- <div class="ug-card"><span class="ug-icon">🔗</span><div><strong>Parlay Builder</strong> — Provide Odds API keys and event IDs; the tool scrapes props, analyzes all of them, and builds the statistically strongest N-leg parlay.</div></div>
- <div class="ug-card"><span class="ug-icon">📈</span><div><strong>Backtest Performance</strong> — Log your predictions <em>before</em> games, then resolve them after. Tracks win rate, ROI, and accuracy by confidence tier.</div></div>
+ <div class="ug-card"><span class="ug-icon">OVR</span><div><strong>Overview</strong> - Dashboard snapshot. Shows today's schedule, quick-access favorites, and recent tracker bets at a glance.</div></div>
+ <div class="ug-card"><span class="ug-icon">TOD</span><div><strong>Today's Games</strong> -- Full slate with team injury notes and game status. Use this to spot missing key players before analyzing props.</div></div>
+ <div class="ug-card"><span class="ug-icon">ANA</span><div><strong>Player Analyzer</strong> -- Deep-dive on one player prop. Pick a player, stat, and line to get hit rate, averages, trends, matchup data, and a confidence score.</div></div>
+ <div class="ug-card"><span class="ug-icon">FND</span><div><strong>Bet Finder</strong> -- Bulk analysis mode. Enter multiple props (or import from Odds API) and the scanner ranks them by EV, edge, and hit rate.</div></div>
+ <div class="ug-card"><span class="ug-icon">TRK</span><div><strong>Live Tracker</strong> -- Real-time monitoring for props you are tracking today. Add props here to watch their live stat as games progress.</div></div>
+ <div class="ug-card"><span class="ug-icon">PAR</span><div><strong>Parlay Builder</strong> -- Provide Odds API keys and event IDs; the tool scrapes props, analyzes all of them, and builds the statistically strongest N-leg parlay.</div></div>
+ <div class="ug-card"><span class="ug-icon">BKT</span><div><strong>Backtest Performance</strong> -- Log your predictions <em>before</em> games, then resolve them after. Tracks win rate, ROI, and accuracy by confidence tier.</div></div>
  </div>
  </div>
 
  <!-- SECTION: Key Metrics Explained -->
  <div class="ug-section" style="margin-top:28px">
- <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">🧮 Key Metrics Explained</h3>
+ <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">Key Metrics Explained</h3>
  <div style="display:grid;gap:8px">
  <div class="ug-metric"><span class="ug-label">Hit Rate</span><span>% of last N games where the player went OVER the line. Above 60% is strong; above 70% is elite.</span></div>
- <div class="ug-metric"><span class="ug-label">Average</span><span>Mean stat value across the sample window. Compare to the line — a big gap is your edge.</span></div>
+ <div class="ug-metric"><span class="ug-label">Average</span><span>Mean stat value across the sample window. Compare to the line -- a big gap is your edge.</span></div>
  <div class="ug-metric"><span class="ug-label">Edge</span><span>How far the average sits from the line, as a percentage. Higher edge = more statistical buffer.</span></div>
- <div class="ug-metric"><span class="ug-label">EV (Expected Value)</span><span>Estimated profit per $100 based on hit rate × odds. Positive EV (green) = theoretically profitable long-term.</span></div>
- <div class="ug-metric"><span class="ug-label">Confidence Score</span><span>0–100 composite score built from hit rate, sample size, H2H data, and minutes trend. 70+ = High, 50–69 = Medium, below 50 = Low.</span></div>
+ <div class="ug-metric"><span class="ug-label">EV (Expected Value)</span><span>Estimated profit per $100 based on hit rate -- odds. Positive EV (green) = theoretically profitable long-term.</span></div>
+ <div class="ug-metric"><span class="ug-label">Confidence Score</span><span>0-100 composite score built from hit rate, sample size, H2H data, and minutes trend. 70+ = High, 50-69 = Medium, below 50 = Low.</span></div>
  <div class="ug-metric"><span class="ug-label">Confidence Tier</span><span><strong style="color:#4ade80">High</strong> = strong lean, large sample. <strong style="color:#facc15">Medium</strong> = moderate lean. <strong style="color:#f87171">Low</strong> = small sample or mixed signals.</span></div>
  <div class="ug-metric"><span class="ug-label">H2H Hit Rate</span><span>Hit rate in games specifically against today's opponent. Useful to confirm or override the overall trend.</span></div>
  <div class="ug-metric"><span class="ug-label">vs. Position Delta</span><span>How much opponents at the same position allow compared to league average. Positive = the defense is weak at defending this stat.</span></div>
- <div class="ug-metric"><span class="ug-label">Back-to-Back</span><span>Whether the player is playing on zero rest today. B2B typically reduces minutes and output — factor this in for OVER bets.</span></div>
+ <div class="ug-metric"><span class="ug-label">Back-to-Back</span><span>Whether the player is playing on zero rest today. B2B typically reduces minutes and output -- factor this in for OVER bets.</span></div>
  <div class="ug-metric"><span class="ug-label">Minutes Trend</span><span>Whether the player's minutes are trending UP, DOWN, or FLAT over recent games. Rising minutes usually means rising prop output.</span></div>
  <div class="ug-metric"><span class="ug-label">Impact Count</span><span>Number of key teammates missing (injured/out). Higher impact count = player may absorb extra usage and volume.</span></div>
  <div class="ug-metric"><span class="ug-label">Odds API Credits</span><span>Each "Load Events" or "Import Props" call costs credits. Use <strong>Check Balance</strong> (free) to see remaining credits without spending any.</span></div>
@@ -1784,46 +1855,45 @@ Re-scrape
 
  <!-- SECTION: Step-by-step workflow -->
  <div class="ug-section" style="margin-top:28px">
- <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">🚀 Recommended Workflow</h3>
+ <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">Recommended Workflow</h3>
  <ol style="margin:0;padding-left:20px;display:grid;gap:10px;font-size:13.5px;line-height:1.6">
- <li><strong>Check Today's Games</strong> — Go to Today's Games to see the full slate. Note any injury news that could boost a player's usage or minutes.</li>
- <li><strong>Fill the Key Vault</strong> — Go to Key Vault, paste your Odds API keys, then use <em>Check credits</em> so the app can rotate only usable keys.</li>
- <li><strong>Load Events &amp; Import Props</strong> — Click <em>Load Events</em>, pick a game from the dropdown, then click <em>Import Props &amp; Scan</em>. The scanner will rank all available props by EV and edge.</li>
- <li><strong>Deep-dive with Player Analyzer</strong> — Click any player row in the scanner to open Player Analyzer. Review hit rate, average, H2H, matchup, and environment signals. Use Analyzer Filters to narrow by Home/Away, win/loss context, or opponent quality.</li>
- <li><strong>Send results to other tools</strong> — Use the three action buttons at the top of the Analyzer results:
+ <li><strong>Check Today's Games</strong> -- Go to Today's Games to see the full slate. Note any injury news that could boost a player's usage or minutes.</li>
+ <li><strong>Fill the Key Vault</strong> -- Go to Key Vault, paste your Odds API keys, then use <em>Check credits</em> so the app can rotate only usable keys.</li>
+ <li><strong>Load Events &amp; Import Props</strong> -- Click <em>Load Events</em>, pick a game from the dropdown, then click <em>Import Props &amp; Scan</em>. The scanner will rank all available props by EV and edge.</li>
+ <li><strong>Deep-dive with Player Analyzer</strong> -- Click any player row in the scanner to open Player Analyzer. Review hit rate, average, H2H, matchup, and environment signals. Use Analyzer Filters to narrow by Home/Away, win/loss context, or opponent quality.</li>
+ <li><strong>Send results to other tools</strong> -- Use the three action buttons at the top of the Analyzer results:
  <ul style="margin-top:6px;padding-left:18px;display:grid;gap:4px">
- <li><strong>Add to Slip</strong> — Adds the prop to your Prop Slip for a quick multi-pick summary.</li>
- <li><strong>📡 Send to Tracker</strong> — Adds to Live Tracker so you can monitor the stat in real time during the game.</li>
- <li><strong>📊 Send to Backtest</strong> — Pre-fills the Backtest log form so you can record this prediction before the game starts.</li>
+ <li><strong>Add to Slip</strong> -- Adds the prop to your Prop Slip for a quick multi-pick summary.</li>
+ <li><strong>Send to Tracker</strong> -- Adds to Live Tracker so you can monitor the stat in real time during the game.</li>
+ <li><strong>Send to Backtest</strong> -- Pre-fills the Backtest log form so you can record this prediction before the game starts.</li>
  </ul>
  </li>
- <li><strong>Log predictions in Backtest</strong> — Before games tip off, use Backtest Performance to log your picks. After the game, enter the actual stat value to resolve each prediction as a hit or miss.</li>
- <li><strong>Review your performance</strong> — The Backtest dashboard shows overall win rate, ROI, and accuracy broken down by confidence tier. Use this to learn which tier and stat types you call best.</li>
+ <li><strong>Log predictions in Backtest</strong> -- Before games tip off, use Backtest Performance to log your picks. After the game, enter the actual stat value to resolve each prediction as a hit or miss.</li>
+ <li><strong>Review your performance</strong> -- The Backtest dashboard shows overall win rate, ROI, and accuracy broken down by confidence tier. Use this to learn which tier and stat types you call best.</li>
  </ol>
  </div>
 
  <!-- SECTION: Tips -->
  <div class="ug-section" style="margin-top:28px">
- <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">💡 Pro Tips</h3>
+ <h3 style="font-size:14px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;opacity:.5;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08)">Pro Tips</h3>
  <ul style="margin:0;padding-left:20px;display:grid;gap:8px;font-size:13.5px;line-height:1.6">
- <li>Always log predictions in Backtest <em>before</em> the game starts — resolving after the fact defeats the purpose of tracking your forecast accuracy.</li>
+ <li>Always log predictions in Backtest <em>before</em> the game starts -- resolving after the fact defeats the purpose of tracking your forecast accuracy.</li>
  <li>A High confidence tier alone is not enough. Check H2H hit rate against today's opponent and confirm no back-to-back or key teammate is missing.</li>
- <li>Use the "Last N" filter (5/10/15/20 games) in the Analyzer. A player with a 70% hit rate over 20 games but 90% in the last 5 is on a hot streak — lean on the recent form.</li>
+ <li>Use the "Last N" filter (5/10/15/20 games) in the Analyzer. A player with a 70% hit rate over 20 games but 90% in the last 5 is on a hot streak -- lean on the recent form.</li>
  <li>In Bet Finder, sort by EV first to find the most mispriced props. Sort by hit rate to find the most consistent ones. The best bets usually score well on both.</li>
- <li>Use Parlay Builder only when you have 2–3 High-tier props already identified. The builder will round out the remaining legs with the best available stats.</li>
+ <li>Use Parlay Builder only when you have 2-3 High-tier props already identified. The builder will round out the remaining legs with the best available stats.</li>
  <li>Save your Odds API key once and it will be remembered between sessions. You won't need to re-enter it.</li>
- <li>The <em>✕</em> button on Backtest logs removes just that one entry. The <em>Clear All</em> button wipes the entire log — use it carefully.</li>
+ <li>The <em>?</em> button on Backtest logs removes just that one entry. The <em>Clear All</em> button wipes the entire log -- use it carefully.</li>
  </ul>
  </div>
 
  <div style="margin-top:32px;text-align:center">
- <button id="closeUserGuideBtnBottom" type="button" style="background:var(--accent,#7c6ef5);color:#fff;border:none;border-radius:40px;padding:12px 40px;font-size:14px;font-weight:700;cursor:pointer;letter-spacing:.02em">Got it — close guide</button>
+ <button id="closeUserGuideBtnBottom" type="button" style="background:var(--ds-color-info,#7c6ef5);color:#fff;border:none;border-radius:40px;padding:12px 40px;font-size:14px;font-weight:700;cursor:pointer;letter-spacing:.02em">Got it - close guide</button>
  </div>
  </div>
 </div>
 
 <style>
-.ug-section{}
 .ug-card{display:flex;align-items:flex-start;gap:12px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:12px 14px;font-size:13.5px;line-height:1.55}
 .ug-icon{font-size:20px;flex-shrink:0;margin-top:1px}
 .ug-metric{display:grid;grid-template-columns:160px 1fr;gap:10px;padding:8px 12px;background:rgba(255,255,255,0.03);border-radius:10px;font-size:13px;line-height:1.5;align-items:start}
@@ -1831,9 +1901,18 @@ Re-scrape
 @media(max-width:540px){.ug-metric{grid-template-columns:1fr;gap:2px}}
 </style>
 
+<script src="https://cdn.jsdelivr.net/npm/animejs/dist/bundles/anime.umd.min.js"></script>
 <script src="/static/app.js"></script>
 
 </body>
 </html>
+
+
+
+
+
+
+
+
 
 

@@ -19,6 +19,8 @@ class PersistenceSafetyTests(unittest.TestCase):
         self._stack.enter_context(patch.object(main, "KEY_VAULT_PERSIST_PATH", temp_root / "key_vault.json"))
         self._stack.enter_context(patch.object(main, "FAVORITES_PERSIST_PATH", temp_root / "favorites.json"))
         self._stack.enter_context(patch.object(main, "TRACKER_PERSIST_PATH", temp_root / "tracker_props.json"))
+        self._stack.enter_context(patch.object(main, "postgres_available", return_value=False))
+        self._stack.enter_context(patch.object(main, "POSTGRES_CACHE_WRITE_ENABLED", False))
 
         with main._BACKTEST_LOCK:
             main._BACKTEST_LOG.clear()
@@ -90,6 +92,7 @@ class PersistenceSafetyTests(unittest.TestCase):
                 {"id": "k2", "provider": "odds_api", "api_key": "def456", "label": "Odds API Key 2"},
             ],
             "active_id": "k2",
+            "mode": "replace",
         }
 
         result = main.key_vault_put(payload)
