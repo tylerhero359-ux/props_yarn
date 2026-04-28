@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Callable
 
 
@@ -33,19 +34,69 @@ class MarketScanCoreService:
     prefetch_bulk_analysis_context: Callable[..., None]
     submit_analysis_task: Callable[..., Any]
     http_exception_cls: Any
+    max_rows: int = 100
+    max_last_n: int = 82
+
+    def _parse_bounded_int(self, value: Any, *, default: int, min_value: int, max_value: int, field_name: str) -> int:
+        raw_value = default if value in (None, "") else value
+        try:
+            parsed = int(raw_value)
+        except (TypeError, ValueError):
+            raise self.http_exception_cls(status_code=400, detail=f"{field_name} must be an integer.")
+        if parsed < min_value or parsed > max_value:
+            raise self.http_exception_cls(
+                status_code=400,
+                detail=f"{field_name} must be between {min_value} and {max_value}.",
+            )
+        return parsed
+
+    def _parse_market_number(
+        self,
+        value: Any,
+        *,
+        field_name: str,
+        min_value: float,
+        max_value: float,
+    ) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            raise self.http_exception_cls(status_code=400, detail=f"{field_name} must be numeric.")
+        if not math.isfinite(parsed) or parsed < min_value or parsed > max_value:
+            raise self.http_exception_cls(
+                status_code=400,
+                detail=f"{field_name} must be between {min_value:g} and {max_value:g}.",
+            )
+        return parsed
 
     def prepare_request(self, payload: dict[str, Any]) -> dict[str, Any]:
         rows = payload.get("rows") or []
-        default_last_n = int(payload.get("last_n") or 10)
+        default_last_n = self._parse_bounded_int(
+            payload.get("last_n"),
+            default=10,
+            min_value=1,
+            max_value=int(self.max_last_n),
+            field_name="last_n",
+        )
         selected_season = str(payload.get("season") or self.current_nba_season())
         season_type = self.normalize_requested_season_type(payload.get("season_type"))
         injury_aware = bool(payload.get("injury_aware"))
 
         if not isinstance(rows, list) or not rows:
             raise self.http_exception_cls(status_code=400, detail="Please provide at least one market row.")
+        if len(rows) > int(self.max_rows):
+            raise self.http_exception_cls(status_code=400, detail=f"Maximum {int(self.max_rows)} market rows per request.")
 
-        request_hash_value = self.request_hash("market_scan", payload)
-        cached_run = self.read_market_scan_cache(payload)
+        canonical_request_payload = {
+            **payload,
+            "rows": rows,
+            "last_n": default_last_n,
+            "season": selected_season,
+            "season_type": season_type,
+            "injury_aware": injury_aware,
+        }
+        request_hash_value = self.request_hash("market_scan", canonical_request_payload)
+        cached_run = self.read_market_scan_cache(canonical_request_payload)
         if cached_run:
             return {
                 "cached_run": cached_run,
@@ -83,11 +134,14 @@ class MarketScanCoreService:
                 errors.append({"row": index, "player_name": player_name, "reason": f"Unsupported stat: {stat}"})
                 continue
             try:
-                line = float(row.get("line"))
-                over_odds = float(row.get("over_odds"))
-                under_odds = float(row.get("under_odds"))
-            except (TypeError, ValueError):
+                line = self._parse_market_number(row.get("line"), field_name="line", min_value=0.01, max_value=250.0)
+                over_odds = self._parse_market_number(row.get("over_odds"), field_name="over_odds", min_value=1.01, max_value=1000.0)
+                under_odds = self._parse_market_number(row.get("under_odds"), field_name="under_odds", min_value=1.01, max_value=1000.0)
+            except self.http_exception_cls as exc:
                 errors.append({"row": index, "player_name": player_name, "reason": "Line and odds must be numeric."})
+                detail = getattr(exc, "detail", None)
+                if detail:
+                    errors[-1]["reason"] = str(detail)
                 continue
 
             team = self.resolve_team_from_text(team_text) if team_text else None
@@ -149,6 +203,7 @@ class MarketScanCoreService:
         return {
             "cached_run": None,
             "request_hash_value": request_hash_value,
+            "canonical_request_payload": canonical_request_payload,
             "rows": rows,
             "default_last_n": default_last_n,
             "selected_season": selected_season,

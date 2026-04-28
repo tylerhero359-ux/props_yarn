@@ -163,6 +163,11 @@ POSTGRES_RETENTION_BACKTEST_DAYS = max(1, int(os.getenv("NBA_POSTGRES_RETENTION_
 POSTGRES_DEDUPE_ENABLED = os.getenv("NBA_POSTGRES_DEDUPE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 POSTGRES_BACKFILL_HASHES_ENABLED = os.getenv("NBA_POSTGRES_BACKFILL_HASHES_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 POSTGRES_BACKFILL_HASHES_LIMIT = max(100, int(os.getenv("NBA_POSTGRES_BACKFILL_HASHES_LIMIT", "5000")))
+MARKET_SCAN_CACHE_TTL_SECONDS = max(0, int(os.getenv("NBA_MARKET_SCAN_CACHE_TTL_SECONDS", "900")))
+PARLAY_BUILDER_CACHE_TTL_SECONDS = max(0, int(os.getenv("NBA_PARLAY_BUILDER_CACHE_TTL_SECONDS", "900")))
+MARKET_SCAN_MAX_ROWS = max(1, int(os.getenv("NBA_MARKET_SCAN_MAX_ROWS", os.getenv("NBA_BULK_ANALYSIS_MAX_ROWS", "100"))))
+PROP_ANALYSIS_MAX_LAST_N = max(1, int(os.getenv("NBA_PROP_ANALYSIS_MAX_LAST_N", "82")))
+PARLAY_BUILDER_MAX_BATCH_SIZE = max(1, int(os.getenv("NBA_PARLAY_BUILDER_MAX_BATCH_SIZE", "6")))
 ODDS_API_MAX_RETRIES = max(0, int(os.getenv("NBA_ODDS_API_MAX_RETRIES", "2")))
 ODDS_API_RETRY_BACKOFF_SECONDS = max(0.2, float(os.getenv("NBA_ODDS_API_RETRY_BACKOFF_SECONDS", "0.8")))
 ODDS_API_QUERY_AUTH_FALLBACK_ENABLED = os.getenv("NBA_ODDS_API_QUERY_AUTH_FALLBACK_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -584,6 +589,24 @@ def _request_hash(cache_scope: str, request_payload: dict[str, Any]) -> str:
     return _payload_hash({"cache_scope": str(cache_scope), "request": request_payload})
 
 
+def _parse_bounded_int(
+    value: Any,
+    *,
+    default: int,
+    min_value: int,
+    max_value: int,
+    field_name: str,
+) -> int:
+    raw_value = default if value in (None, "") else value
+    try:
+        parsed = int(raw_value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{field_name} must be an integer.")
+    if parsed < min_value or parsed > max_value:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be between {min_value} and {max_value}.")
+    return parsed
+
+
 def _require_pg_backtest_write(func, *args) -> None:
     if not (postgres_available() and POSTGRES_CACHE_WRITE_ENABLED):
         return
@@ -798,6 +821,29 @@ def _pg_write_parlay_builder_run(payload: dict[str, Any], request_hash: str | No
         LOGGER.debug("Postgres parlay write failed: %s", exc)
 
 
+def _postgres_cached_run_is_fresh(requested_at: Any, ttl_seconds: int) -> tuple[bool, float | None]:
+    if ttl_seconds <= 0:
+        return False, None
+    requested_ts = _datetime_to_ts(requested_at)
+    if requested_ts is None:
+        return False, None
+    age_seconds = max(0.0, time.time() - float(requested_ts))
+    return age_seconds <= ttl_seconds, age_seconds
+
+
+def _build_postgres_cached_run(payload: Any, requested_at: Any, ttl_seconds: int, source: str) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    is_fresh, age_seconds = _postgres_cached_run_is_fresh(requested_at, ttl_seconds)
+    if not is_fresh:
+        return None
+    cached = copy.deepcopy(payload)
+    cached["cache_hit"] = True
+    cached["cache_source"] = source
+    cached["cache_age_seconds"] = round(age_seconds or 0.0, 2)
+    return cached
+
+
 def _pg_read_market_scan_cache(request_payload: dict[str, Any], *, cache_scope: str = "market_scan") -> dict[str, Any] | None:
     if not postgres_available():
         return None
@@ -806,7 +852,7 @@ def _pg_read_market_scan_cache(request_payload: dict[str, Any], *, cache_scope: 
         with postgres_connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT payload
+                SELECT payload, requested_at
                 FROM market_scan_runs
                 WHERE request_hash = %s
                 ORDER BY requested_at DESC
@@ -815,17 +861,16 @@ def _pg_read_market_scan_cache(request_payload: dict[str, Any], *, cache_scope: 
                 (request_hash,),
             )
             row = cur.fetchone()
-            if row and isinstance(row[0], dict):
-                cached = copy.deepcopy(row[0])
-                cached["cache_hit"] = True
-                cached["cache_source"] = "postgres"
-                return cached
+            if row:
+                cached = _build_postgres_cached_run(row[0], row[1], MARKET_SCAN_CACHE_TTL_SECONDS, "postgres")
+                if cached:
+                    return cached
 
             # Backward-compatible fallback for historical rows that only had payload_hash.
             legacy_payload_hash = _payload_hash(request_payload)
             cur.execute(
                 """
-                SELECT payload
+                SELECT payload, requested_at
                 FROM market_scan_runs
                 WHERE payload_hash = %s
                 ORDER BY requested_at DESC
@@ -834,11 +879,10 @@ def _pg_read_market_scan_cache(request_payload: dict[str, Any], *, cache_scope: 
                 (legacy_payload_hash,),
             )
             row = cur.fetchone()
-            if row and isinstance(row[0], dict):
-                cached = copy.deepcopy(row[0])
-                cached["cache_hit"] = True
-                cached["cache_source"] = "postgres_legacy"
-                return cached
+            if row:
+                cached = _build_postgres_cached_run(row[0], row[1], MARKET_SCAN_CACHE_TTL_SECONDS, "postgres_legacy")
+                if cached:
+                    return cached
     except Exception as exc:
         LOGGER.debug("Postgres market scan cache read failed: %s", exc)
     return None
@@ -852,7 +896,7 @@ def _pg_read_parlay_builder_cache(request_payload: dict[str, Any], *, cache_scop
         with postgres_connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT payload
+                SELECT payload, requested_at
                 FROM parlay_builder_runs
                 WHERE request_hash = %s
                 ORDER BY requested_at DESC
@@ -861,17 +905,16 @@ def _pg_read_parlay_builder_cache(request_payload: dict[str, Any], *, cache_scop
                 (request_hash,),
             )
             row = cur.fetchone()
-            if row and isinstance(row[0], dict):
-                cached = copy.deepcopy(row[0])
-                cached["cache_hit"] = True
-                cached["cache_source"] = "postgres"
-                return cached
+            if row:
+                cached = _build_postgres_cached_run(row[0], row[1], PARLAY_BUILDER_CACHE_TTL_SECONDS, "postgres")
+                if cached:
+                    return cached
 
             # Backward-compatible fallback for historical rows that only had payload_hash.
             legacy_payload_hash = _payload_hash(request_payload)
             cur.execute(
                 """
-                SELECT payload
+                SELECT payload, requested_at
                 FROM parlay_builder_runs
                 WHERE payload_hash = %s
                 ORDER BY requested_at DESC
@@ -880,11 +923,10 @@ def _pg_read_parlay_builder_cache(request_payload: dict[str, Any], *, cache_scop
                 (legacy_payload_hash,),
             )
             row = cur.fetchone()
-            if row and isinstance(row[0], dict):
-                cached = copy.deepcopy(row[0])
-                cached["cache_hit"] = True
-                cached["cache_source"] = "postgres_legacy"
-                return cached
+            if row:
+                cached = _build_postgres_cached_run(row[0], row[1], PARLAY_BUILDER_CACHE_TTL_SECONDS, "postgres_legacy")
+                if cached:
+                    return cached
     except Exception as exc:
         LOGGER.debug("Postgres parlay cache read failed: %s", exc)
     return None
@@ -1032,37 +1074,43 @@ def preload_postgres_cache() -> None:
     try:
         with postgres_connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "SELECT player_id, payload FROM player_info_cache ORDER BY updated_at DESC LIMIT %s;",
+                "SELECT player_id, payload, updated_at FROM player_info_cache ORDER BY updated_at DESC LIMIT %s;",
                 (POSTGRES_CACHE_PRELOAD_LIMIT,),
             )
-            for player_id, payload in cur.fetchall():
+            for player_id, payload, updated_at in cur.fetchall():
                 if not isinstance(payload, dict):
                     continue
-                PLAYER_INFO_CACHE[int(player_id)] = {"timestamp": time.time(), "row": payload}
+                PLAYER_INFO_CACHE[int(player_id)] = {
+                    "timestamp": float(_datetime_to_ts(updated_at) or 0.0),
+                    "row": payload,
+                    "source": "postgres-preload",
+                }
             cur.execute(
-                "SELECT player_id, season, season_type, schema_version, payload FROM player_game_logs ORDER BY updated_at DESC LIMIT %s;",
+                "SELECT player_id, season, season_type, schema_version, payload, updated_at FROM player_game_logs ORDER BY updated_at DESC LIMIT %s;",
                 (POSTGRES_CACHE_PRELOAD_LIMIT,),
             )
-            for player_id, season, season_type, schema_version, payload in cur.fetchall():
+            for player_id, season, season_type, schema_version, payload, updated_at in cur.fetchall():
                 rows = (payload or {}).get("rows") if isinstance(payload, dict) else None
                 if not isinstance(rows, list):
                     continue
                 GAME_LOG_CACHE[(int(player_id), str(season), str(season_type), str(schema_version))] = {
-                    "timestamp": time.time(),
+                    "timestamp": float(_datetime_to_ts(updated_at) or 0.0),
                     "rows": rows,
+                    "source": "postgres-preload",
                 }
             cur.execute(
-                "SELECT team_id, season, season_type, payload FROM team_next_game_cache ORDER BY updated_at DESC LIMIT %s;",
+                "SELECT team_id, season, season_type, payload, updated_at FROM team_next_game_cache ORDER BY updated_at DESC LIMIT %s;",
                 (POSTGRES_CACHE_PRELOAD_LIMIT,),
             )
-            for team_id, season, season_type, payload in cur.fetchall():
+            for team_id, season, season_type, payload, updated_at in cur.fetchall():
                 TEAM_NEXT_GAME_CACHE[(int(team_id), str(season), str(season_type))] = {
-                    "timestamp": time.time(),
+                    "timestamp": float(_datetime_to_ts(updated_at) or 0.0),
                     "row": payload if isinstance(payload, dict) else {},
+                    "source": "postgres-preload",
                 }
             cur.execute(
                 """
-                SELECT report_url, report_timestamp, report_label, payload
+                SELECT report_url, report_timestamp, report_label, payload, fetched_at
                 FROM injury_reports
                 ORDER BY report_timestamp DESC NULLS LAST, fetched_at DESC
                 LIMIT 1;
@@ -1070,9 +1118,9 @@ def preload_postgres_cache() -> None:
             )
             latest_report = cur.fetchone()
             if latest_report:
-                report_url, report_timestamp, report_label, payload = latest_report
+                report_url, report_timestamp, report_label, payload, fetched_at = latest_report
                 if isinstance(payload, dict):
-                    INJURY_SERVICE.report_cache["timestamp"] = time.time()
+                    INJURY_SERVICE.report_cache["timestamp"] = float(_datetime_to_ts(fetched_at) or 0.0)
                     INJURY_SERVICE.report_cache["payload"] = {
                         **payload,
                         "report_url": report_url or payload.get("report_url"),
@@ -5792,6 +5840,48 @@ def _game_log_cache_is_reliable_stale(cached: dict[str, Any] | None, cached_ts: 
     return (time.time() - float(cached_ts or 0.0)) <= GAME_LOG_MAX_STALE_SECONDS
 
 
+def _coerce_cache_timestamp(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _cache_timestamp_is_fresh(timestamp: Any, ttl_seconds: float) -> bool:
+    cache_ts = _coerce_cache_timestamp(timestamp)
+    return bool(cache_ts and (time.time() - cache_ts) < ttl_seconds)
+
+
+def _store_game_log_cache_rows(
+    cache_key: tuple[Any, ...],
+    rows: list[dict[str, Any]],
+    *,
+    timestamp: Any,
+    source: str,
+) -> tuple[list[dict[str, Any]], float]:
+    cached_ts = _coerce_cache_timestamp(timestamp)
+    normalized_rows = dedupe_game_log_rows(rows or [])
+    GAME_LOG_CACHE[cache_key] = {
+        "timestamp": cached_ts,
+        "rows": normalized_rows,
+        "source": source,
+    }
+    return normalized_rows, cached_ts
+
+
+def _get_cached_game_log_rows(cache_key: tuple[Any, ...], *, fresh_only: bool = False) -> list[dict[str, Any]] | None:
+    cached = GAME_LOG_CACHE.get(cache_key)
+    if not cached or not isinstance(cached.get("rows"), list) or not cached.get("rows"):
+        return None
+    cached_ts = _coerce_cache_timestamp(cached.get("timestamp"))
+    if fresh_only:
+        if not _cache_timestamp_is_fresh(cached_ts, CACHE_TTL_SECONDS):
+            return None
+    elif not _game_log_cache_is_reliable_stale(cached, cached_ts):
+        return None
+    return cached.get("rows") or []
+
+
 def _player_info_cache_is_reliable_stale(cached: dict[str, Any] | None, cached_ts: float) -> bool:
     if not cached or not cached.get("row"):
         return False
@@ -6300,57 +6390,93 @@ def _position_dash_cache_is_reliable_stale(cached: dict[str, Any] | None, cached
 def fetch_player_game_log(player_id: int, season: str, season_type: str) -> list[dict[str, Any]]:
     normalized_season_type = normalize_requested_season_type(season_type)
     cache_key = (player_id, season, normalized_season_type, GAME_LOG_CACHE_SCHEMA_VERSION)
-    cached = GAME_LOG_CACHE.get(cache_key)
-    if cached and isinstance(cached.get("rows"), list) and cached["rows"]:
-        cached_ts = float(cached.get("timestamp") or 0.0)
-        if cached_ts and (time.time() - cached_ts) < CACHE_TTL_SECONDS:
-            return cached["rows"]
+    fresh_cached_rows = _get_cached_game_log_rows(cache_key, fresh_only=True)
+    if fresh_cached_rows is not None:
+        return fresh_cached_rows
+
     season_parts = season_types_for_analysis(normalized_season_type)
+
+    def _read_postgres_rows(pg_season_type: str, target_cache_key: tuple[Any, ...]) -> tuple[list[dict[str, Any]] | None, float]:
+        pg_rows, pg_ts = _pg_read_game_log(player_id, season, pg_season_type)
+        if isinstance(pg_rows, list) and pg_rows:
+            return _store_game_log_cache_rows(
+                target_cache_key,
+                pg_rows,
+                timestamp=pg_ts,
+                source="postgres",
+            )
+        return None, 0.0
+
+    def _write_live_rows_if_fresh(pg_season_type: str, rows: list[dict[str, Any]]) -> None:
+        source_cache_key = (player_id, season, pg_season_type, GAME_LOG_CACHE_SCHEMA_VERSION)
+        source_cached = GAME_LOG_CACHE.get(source_cache_key)
+        source_ts = _coerce_cache_timestamp((source_cached or {}).get("timestamp"))
+        if _cache_timestamp_is_fresh(source_ts, CACHE_TTL_SECONDS):
+            _submit_pg_write(_pg_write_game_log, player_id, season, pg_season_type, GAME_LOG_CACHE_SCHEMA_VERSION, rows)
+
     if len(season_parts) > 1:
-        if POSTGRES_SOURCE_OF_TRUTH:
-            pg_rows, pg_ts = _pg_read_game_log(player_id, season, normalized_season_type)
-            if isinstance(pg_rows, list) and pg_rows:
-                GAME_LOG_CACHE[cache_key] = {"timestamp": float(pg_ts or time.time()), "rows": pg_rows, "source": "postgres"}
-                return pg_rows
-            if cached and isinstance(cached.get("rows"), list):
-                return cached["rows"]
-        else:
-            if cached and isinstance(cached.get("rows"), list):
-                return cached["rows"]
-            pg_rows, pg_ts = _pg_read_game_log(player_id, season, normalized_season_type)
-            if isinstance(pg_rows, list) and pg_rows:
-                GAME_LOG_CACHE[cache_key] = {"timestamp": float(pg_ts or time.time()), "rows": pg_rows, "source": "postgres"}
-                return pg_rows
+        pg_rows, pg_ts = _read_postgres_rows(normalized_season_type, cache_key)
+        if pg_rows is not None and _cache_timestamp_is_fresh(pg_ts, CACHE_TTL_SECONDS):
+            return pg_rows
+
         merged_rows: list[dict[str, Any]] = []
-        for part in season_parts:
-            try:
-                merged_rows.extend(fetch_player_game_log(player_id=player_id, season=season, season_type=part))
-            except HTTPException as exc:
-                if exc.status_code != 404:
-                    raise
+        part_cache_timestamps: list[float] = []
+        try:
+            for part in season_parts:
+                try:
+                    part_rows = fetch_player_game_log(player_id=player_id, season=season, season_type=part)
+                    merged_rows.extend(part_rows)
+                    part_cache = GAME_LOG_CACHE.get((player_id, season, part, GAME_LOG_CACHE_SCHEMA_VERSION))
+                    part_cache_timestamps.append(_coerce_cache_timestamp((part_cache or {}).get("timestamp")))
+                except HTTPException as exc:
+                    if exc.status_code != 404:
+                        raise
+        except Exception:
+            reliable_stale_rows = _get_cached_game_log_rows(cache_key, fresh_only=False)
+            if reliable_stale_rows is not None:
+                return reliable_stale_rows
+            raise
+
         merged_rows = merge_game_log_rows(merged_rows)
         if not merged_rows:
+            reliable_stale_rows = _get_cached_game_log_rows(cache_key, fresh_only=False)
+            if reliable_stale_rows is not None:
+                return reliable_stale_rows
             raise HTTPException(status_code=404, detail="No game logs found for this player and season.")
-        GAME_LOG_CACHE[cache_key] = {"timestamp": time.time(), "rows": merged_rows}
-        _submit_pg_write(_pg_write_game_log, player_id, season, normalized_season_type, GAME_LOG_CACHE_SCHEMA_VERSION, merged_rows)
+        merged_ts = min([ts for ts in part_cache_timestamps if ts] or [time.time()])
+        all_parts_fresh = bool(part_cache_timestamps) and all(
+            _cache_timestamp_is_fresh(ts, CACHE_TTL_SECONDS) for ts in part_cache_timestamps
+        )
+        _store_game_log_cache_rows(
+            cache_key,
+            merged_rows,
+            timestamp=time.time() if all_parts_fresh else merged_ts,
+            source="live-merged" if all_parts_fresh else "stale-merged",
+        )
+        if all_parts_fresh:
+            _submit_pg_write(_pg_write_game_log, player_id, season, normalized_season_type, GAME_LOG_CACHE_SCHEMA_VERSION, merged_rows)
         return merged_rows
+
     source_season_type = season_parts[0]
-    if POSTGRES_SOURCE_OF_TRUTH:
-        pg_rows, pg_ts = _pg_read_game_log(player_id, season, source_season_type)
-        if isinstance(pg_rows, list) and pg_rows:
-            GAME_LOG_CACHE[cache_key] = {"timestamp": float(pg_ts or time.time()), "rows": pg_rows, "source": "postgres"}
-            return pg_rows
-        if cached and isinstance(cached.get("rows"), list):
-            return cached["rows"]
-    else:
-        if cached and isinstance(cached.get("rows"), list):
-            return cached["rows"]
-        pg_rows, pg_ts = _pg_read_game_log(player_id, season, source_season_type)
-        if isinstance(pg_rows, list) and pg_rows:
-            GAME_LOG_CACHE[cache_key] = {"timestamp": float(pg_ts or time.time()), "rows": pg_rows, "source": "postgres"}
-            return pg_rows
-    rows = PLAYER_DATA_SERVICE.fetch_player_game_log(player_id, season, source_season_type)
-    _submit_pg_write(_pg_write_game_log, player_id, season, source_season_type, GAME_LOG_CACHE_SCHEMA_VERSION, rows)
+    source_cache_key = (player_id, season, source_season_type, GAME_LOG_CACHE_SCHEMA_VERSION)
+    if source_cache_key != cache_key:
+        fresh_source_rows = _get_cached_game_log_rows(source_cache_key, fresh_only=True)
+        if fresh_source_rows is not None:
+            return fresh_source_rows
+
+    pg_rows, pg_ts = _read_postgres_rows(source_season_type, source_cache_key)
+    if pg_rows is not None and _cache_timestamp_is_fresh(pg_ts, CACHE_TTL_SECONDS):
+        return pg_rows
+
+    try:
+        rows = PLAYER_DATA_SERVICE.fetch_player_game_log(player_id, season, source_season_type)
+    except Exception:
+        reliable_stale_rows = _get_cached_game_log_rows(source_cache_key, fresh_only=False)
+        if reliable_stale_rows is not None:
+            return reliable_stale_rows
+        raise
+
+    _write_live_rows_if_fresh(source_season_type, rows)
     return rows
 
 
@@ -6972,6 +7098,8 @@ MARKET_SCAN_CORE_SERVICE = MarketScanCoreService(
     prefetch_bulk_analysis_context=lambda **kwargs: prefetch_bulk_analysis_context(**kwargs),
     submit_analysis_task=lambda func, *args, **kwargs: _submit_shared_analysis_task(func, *args, **kwargs),
     http_exception_cls=HTTPException,
+    max_rows=MARKET_SCAN_MAX_ROWS,
+    max_last_n=PROP_ANALYSIS_MAX_LAST_N,
 )
 
 
@@ -6981,6 +7109,38 @@ def _emit_progress(progress_cb, stage: str, **extra: Any) -> None:
 
 def _stream_with_progress(run_func, payload: dict[str, Any]) -> StreamingResponse:
     return PROGRESS_STREAM_SERVICE.stream_with_progress(run_func, payload)
+
+
+def _apply_parlay_event_context_to_bulk_row(
+    bulk_row: dict[str, Any],
+    orig_row: dict[str, Any],
+) -> dict[str, Any]:
+    updated = dict(bulk_row or {})
+    player_id = int(updated.get("player_id") or 0)
+    player_team_id = _resolve_team_id_for_player(player_id) if player_id else 0
+    if player_team_id:
+        updated["team_id"] = player_team_id
+
+    event_home = resolve_team_from_text(str(orig_row.get("home_team") or updated.get("home_team") or "").strip())
+    event_away = resolve_team_from_text(str(orig_row.get("away_team") or updated.get("away_team") or "").strip())
+    if not (event_home and event_away and player_team_id):
+        return updated
+
+    home_id = int(event_home.get("id") or 0)
+    away_id = int(event_away.get("id") or 0)
+    home_abbr = str(event_home.get("abbreviation") or "").strip()
+    away_abbr = str(event_away.get("abbreviation") or "").strip()
+    if home_id == player_team_id and away_id:
+        updated["team_id"] = home_id
+        updated["override_opponent_id"] = away_id
+        if home_abbr and away_abbr:
+            updated["game_label"] = f"{home_abbr} vs {away_abbr}"
+    elif away_id == player_team_id and home_id:
+        updated["team_id"] = away_id
+        updated["override_opponent_id"] = home_id
+        if away_abbr and home_abbr:
+            updated["game_label"] = f"{away_abbr} @ {home_abbr}"
+    return updated
 
 
 def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, Any]:
@@ -7342,6 +7502,7 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
                             str(selected_season),
                             str(season_type),
                             tuple(candidate_ids),
+                            int(bulk_row.get("team_id") or 0),
                             int(bulk_row.get("override_opponent_id") or 0),
                             injury_report_identity,
                         )
@@ -7360,6 +7521,7 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
                                     season=selected_season,
                                     season_type=season_type,
                                     without_player_ids=candidate_ids,
+                                    team_id=int(bulk_row.get("team_id") or 0) or None,
                                     override_opponent_id=int(bulk_row.get("override_opponent_id") or 0) or None,
                                 )
                                 _set_injury_aware_boost_cache(boost_cache_key, boosted_analysis)
@@ -7848,26 +8010,33 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
     if not api_keys:
         raise HTTPException(status_code=400, detail="Provide at least one Odds API key in 'api_keys'.")
 
-    request_hash_value = _request_hash("parlay_builder", payload)
     season_type  = normalize_requested_season_type(payload.get("season_type"))
-    bypass_cache = bool(payload.get("bypass_cache")) or season_type == SEASON_TYPE_PLAYOFFS
-    if not bypass_cache:
-        cached_run = _pg_read_parlay_builder_cache(payload, cache_scope="parlay_builder")
-        if cached_run:
-            return cached_run
-
-    _emit_progress(progress_cb, "start", events_requested=len(payload.get("event_ids") or []))
-
-    legs = int(payload.get("legs") or 3)
-    if legs < 2 or legs > 6:
-        raise HTTPException(status_code=400, detail="'legs' must be between 2 and 6.")
+    legs = _parse_bounded_int(
+        payload.get("legs"),
+        default=3,
+        min_value=2,
+        max_value=6,
+        field_name="legs",
+    )
 
     sport        = str(payload.get("sport") or "basketball_nba")
     regions      = str(payload.get("regions") or "us")
     odds_format  = str(payload.get("odds_format") or "decimal")
-    last_n       = int(payload.get("last_n") or 10)
+    last_n       = _parse_bounded_int(
+        payload.get("last_n"),
+        default=10,
+        min_value=1,
+        max_value=PROP_ANALYSIS_MAX_LAST_N,
+        field_name="last_n",
+    )
     season       = str(payload.get("season") or current_nba_season())
-    batch_size   = max(1, int(payload.get("batch_size") or 3))
+    batch_size   = _parse_bounded_int(
+        payload.get("batch_size"),
+        default=3,
+        min_value=1,
+        max_value=PARLAY_BUILDER_MAX_BATCH_SIZE,
+        field_name="batch_size",
+    )
     requested_bookmakers = parse_requested_bookmakers(payload.get("bookmakers") or payload.get("bookmaker") or ODDS_DEFAULT_BOOKMAKERS)
     markets      = ",".join(ODDS_PARLAY_MARKETS)
 
@@ -7876,6 +8045,27 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
     raw_event_ids = payload.get("event_ids") or []
     if isinstance(raw_event_ids, list):
         requested_event_ids = {str(e).strip() for e in raw_event_ids if str(e).strip()}
+    canonical_request_payload = {
+        "event_ids": sorted(requested_event_ids),
+        "legs": legs,
+        "sport": sport,
+        "regions": regions,
+        "odds_format": odds_format,
+        "last_n": last_n,
+        "season": season,
+        "season_type": season_type,
+        "batch_size": batch_size,
+        "bookmakers": requested_bookmakers,
+        "markets": list(ODDS_PARLAY_MARKETS),
+    }
+    request_hash_value = _request_hash("parlay_builder", canonical_request_payload)
+    bypass_cache = bool(payload.get("bypass_cache")) or season_type == SEASON_TYPE_PLAYOFFS
+    if not bypass_cache:
+        cached_run = _pg_read_parlay_builder_cache(canonical_request_payload, cache_scope="parlay_builder")
+        if cached_run:
+            return cached_run
+
+    _emit_progress(progress_cb, "start", events_requested=len(requested_event_ids))
 
     #  Phase 1: Resolve events 
     key_index = 0
@@ -7890,7 +8080,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
     if requested_event_ids:
         # User already selected specific events  build stub dicts directly
         # so we don't spend a credit on the events list
-        events: list[dict[str, Any]] = [{"id": eid} for eid in requested_event_ids]
+        events: list[dict[str, Any]] = [{"id": eid} for eid in sorted(requested_event_ids)]
     else:
         try:
             events_result = odds_api_fetch(
@@ -8013,11 +8203,15 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
         resolve_player=lambda player_name: find_player_by_name(player_name),
     )
     deduped_prepared: list[tuple[dict[str, Any], dict[str, Any]]] = list(analysis_prep["deduped_prepared"] or [])
+    deduped_prepared = [
+        (_apply_parlay_event_context_to_bulk_row(bulk_row, orig_row), orig_row)
+        for bulk_row, orig_row in deduped_prepared
+    ]
     analysis_errors: list[dict[str, Any]] = list(analysis_prep["analysis_errors"] or [])
     unique_player_ids: set[int] = set(analysis_prep["unique_player_ids"] or set())
     primary_by_team: dict[int, int] = {}
     for bulk_row, _ in deduped_prepared:
-        team_id = _resolve_team_id_for_player(int(bulk_row["player_id"]))
+        team_id = int(bulk_row.get("team_id") or 0) or _resolve_team_id_for_player(int(bulk_row["player_id"]))
         if team_id and team_id not in primary_by_team:
             primary_by_team[team_id] = int(bulk_row["player_id"])
     prefetch_bulk_analysis_context(
@@ -8063,7 +8257,15 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
         line_val = float(result_row.get("line") or market_row.get("line") or 0.0)
         if not player_id_val or not stat_val:
             return analysis_payload
-        refresh_key = (player_id_val, stat_val, round(line_val, 4))
+        team_id_val = int(result_row.get("team_id") or market_row.get("team_id") or 0) or None
+        override_opponent_id_val = int(result_row.get("override_opponent_id") or market_row.get("override_opponent_id") or 0) or None
+        refresh_key = (
+            player_id_val,
+            stat_val,
+            round(line_val, 4),
+            int(team_id_val or 0),
+            int(override_opponent_id_val or 0),
+        )
         cached_refresh = playoff_live_refresh_cache.get(refresh_key)
         if cached_refresh:
             return cached_refresh
@@ -8094,6 +8296,8 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
                 last_n=last_n,
                 season=season,
                 season_type=season_type,
+                team_id=team_id_val,
+                override_opponent_id=override_opponent_id_val,
             )
             if int((refreshed or {}).get("games_count") or 0) > current_games:
                 playoff_live_refresh_cache[refresh_key] = refreshed
@@ -8525,24 +8729,33 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
     if not api_keys:
         raise HTTPException(status_code=400, detail="Provide at least one Odds API key in 'api_keys'.")
 
-    request_hash_value = _request_hash("parlay_builder_injury_aware", payload)
     season_type = normalize_requested_season_type(payload.get("season_type"))
-    bypass_cache = bool(payload.get("bypass_cache")) or season_type == SEASON_TYPE_PLAYOFFS
-    if not bypass_cache:
-        cached_run = _pg_read_parlay_builder_cache(payload, cache_scope="parlay_builder_injury_aware")
-        if cached_run:
-            return cached_run
-
-    legs = int(payload.get("legs") or 3)
-    if legs < 2 or legs > 6:
-        raise HTTPException(status_code=400, detail="'legs' must be between 2 and 6.")
+    legs = _parse_bounded_int(
+        payload.get("legs"),
+        default=3,
+        min_value=2,
+        max_value=6,
+        field_name="legs",
+    )
 
     sport       = str(payload.get("sport") or "basketball_nba")
     regions     = str(payload.get("regions") or "us")
     odds_format = str(payload.get("odds_format") or "decimal")
-    last_n      = int(payload.get("last_n") or 10)
+    last_n      = _parse_bounded_int(
+        payload.get("last_n"),
+        default=10,
+        min_value=1,
+        max_value=PROP_ANALYSIS_MAX_LAST_N,
+        field_name="last_n",
+    )
     season      = str(payload.get("season") or current_nba_season())
-    batch_size  = max(1, int(payload.get("batch_size") or 3))
+    batch_size  = _parse_bounded_int(
+        payload.get("batch_size"),
+        default=3,
+        min_value=1,
+        max_value=PARLAY_BUILDER_MAX_BATCH_SIZE,
+        field_name="batch_size",
+    )
     requested_bookmakers = parse_requested_bookmakers(payload.get("bookmakers") or payload.get("bookmaker") or ODDS_DEFAULT_BOOKMAKERS)
     markets     = ",".join(ODDS_PARLAY_MARKETS)
 
@@ -8550,6 +8763,25 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
     raw_event_ids = payload.get("event_ids") or []
     if isinstance(raw_event_ids, list):
         requested_event_ids = {str(e).strip() for e in raw_event_ids if str(e).strip()}
+    canonical_request_payload = {
+        "event_ids": sorted(requested_event_ids),
+        "legs": legs,
+        "sport": sport,
+        "regions": regions,
+        "odds_format": odds_format,
+        "last_n": last_n,
+        "season": season,
+        "season_type": season_type,
+        "batch_size": batch_size,
+        "bookmakers": requested_bookmakers,
+        "markets": list(ODDS_PARLAY_MARKETS),
+    }
+    request_hash_value = _request_hash("parlay_builder_injury_aware", canonical_request_payload)
+    bypass_cache = bool(payload.get("bypass_cache")) or season_type == SEASON_TYPE_PLAYOFFS
+    if not bypass_cache:
+        cached_run = _pg_read_parlay_builder_cache(canonical_request_payload, cache_scope="parlay_builder_injury_aware")
+        if cached_run:
+            return cached_run
 
     key_index = 0
     quota_log: list[dict[str, Any]] = []
@@ -8561,7 +8793,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         return key
 
     if requested_event_ids:
-        events: list[dict[str, Any]] = [{"id": eid} for eid in requested_event_ids]
+        events: list[dict[str, Any]] = [{"id": eid} for eid in sorted(requested_event_ids)]
     else:
         try:
             events_result = odds_api_fetch(
@@ -8719,6 +8951,10 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         resolve_player=lambda player_name: cached_find_player_by_name(player_name),
     )
     deduped_prepared: list[tuple[dict[str, Any], dict[str, Any]]] = list(analysis_prep["deduped_prepared"] or [])
+    deduped_prepared = [
+        (_apply_parlay_event_context_to_bulk_row(bulk_row, orig_row), orig_row)
+        for bulk_row, orig_row in deduped_prepared
+    ]
     analysis_errors: list[dict[str, Any]] = list(analysis_prep["analysis_errors"] or [])
     unique_player_ids: set[int] = set(analysis_prep["unique_player_ids"] or set())
     already_cached_ids = {pid for pid in unique_player_ids
@@ -8773,7 +9009,15 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         line_val = float(result_row.get("line") or market_row.get("line") or 0.0)
         if not player_id_val or not stat_val:
             return analysis_payload
-        refresh_key = (player_id_val, stat_val, round(line_val, 4))
+        team_id_val = int(result_row.get("team_id") or market_row.get("team_id") or 0) or None
+        override_opponent_id_val = int(result_row.get("override_opponent_id") or market_row.get("override_opponent_id") or 0) or None
+        refresh_key = (
+            player_id_val,
+            stat_val,
+            round(line_val, 4),
+            int(team_id_val or 0),
+            int(override_opponent_id_val or 0),
+        )
         cached_refresh = playoff_live_refresh_cache.get(refresh_key)
         if cached_refresh:
             return cached_refresh
@@ -8804,6 +9048,8 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
                 last_n=last_n,
                 season=season,
                 season_type=season_type,
+                team_id=team_id_val,
+                override_opponent_id=override_opponent_id_val,
             )
             if int((refreshed or {}).get("games_count") or 0) > current_games:
                 playoff_live_refresh_cache[refresh_key] = refreshed
@@ -8899,6 +9145,8 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
                 if not candidate_ids:
                     break
                 try:
+                    boost_team_id = int(result.get("team_id") or team_id_raw or 0) or None
+                    boost_override_opponent_id = int(result.get("override_opponent_id") or orig_row.get("override_opponent_id") or 0) or None
                     boost_cache_key = (
                         player_id,
                         stat,
@@ -8907,6 +9155,8 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
                         str(season),
                         str(season_type),
                         tuple(candidate_ids),
+                        int(boost_team_id or 0),
+                        int(boost_override_opponent_id or 0),
                         injury_report_identity,
                     )
                     if boost_cache_key not in boosted_analysis_cache:
@@ -8922,6 +9172,8 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
                                 season=season,
                                 season_type=season_type,
                                 without_player_ids=candidate_ids,
+                                team_id=boost_team_id,
+                                override_opponent_id=boost_override_opponent_id,
                             )
                             _set_injury_aware_boost_cache(boost_cache_key, boosted_analysis_cache[boost_cache_key])
                     boosted_analysis = boosted_analysis_cache[boost_cache_key]
@@ -9886,7 +10138,13 @@ def _build_bulk_prop_item(
 
     season = str(row.get("season") or defaults.get("season") or current_nba_season())
     season_type = normalize_requested_season_type(row.get("season_type") or defaults.get("season_type"))
-    last_n = int(row.get("last_n") or defaults.get("last_n") or 10)
+    last_n = _parse_bounded_int(
+        row.get("last_n", defaults.get("last_n")),
+        default=10,
+        min_value=1,
+        max_value=PROP_ANALYSIS_MAX_LAST_N,
+        field_name="last_n",
+    )
     team_id = row.get("team_id", defaults.get("team_id"))
     team_id = int(team_id) if team_id not in (None, "") else None
     player_position = row.get("player_position", defaults.get("player_position"))
@@ -9980,6 +10238,13 @@ def _build_bulk_prop_item(
         "row": row_index,
         "player_id": resolved_player_id,
         "player_name": analysis.get("player", {}).get("full_name") or player_name,
+        "team_id": resolved_team_id,
+        "player_position": player_position,
+        "override_opponent_id": override_opponent_id,
+        "event_id": row.get("event_id") or "",
+        "game_label": row.get("game_label") or "",
+        "home_team": row.get("home_team") or "",
+        "away_team": row.get("away_team") or "",
         "stat": stat,
         "line": float(line),
         "analysis": analysis,

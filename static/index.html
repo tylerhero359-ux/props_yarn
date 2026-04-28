@@ -17,70 +17,9 @@
 <meta name="twitter:image" content="/static/favicon.svg"/>
 <link href="/static/favicon.svg" rel="icon" type="image/svg+xml"/>
 <link href="https://fonts.googleapis.com" rel="preconnect"/>
-<script>
- (function () {
- const warn = console.warn;
- console.warn = function (...args) {
- const msg = args && args[0] ? String(args[0]) : "";
- if (msg.includes("cdn.tailwindcss.com should not be used in production")) return;
- return warn.apply(console, args);
- };
- })();
-</script>
-<script src="https://cdn.tailwindcss.com"></script><script>
-tailwind.config = {
- theme: {
- extend: {
- fontFamily: {
- sans: ['Inter', 'Arial', 'sans-serif'],
- display: ['Barlow Condensed', 'Inter', 'Arial', 'sans-serif'],
- ui: ['Inter', 'Arial', 'sans-serif'],
- numeric: ['Barlow Condensed', 'Inter', 'Arial', 'sans-serif']
- },
- colors: {
- ds: {
- canvas: 'var(--ds-color-bg-canvas)',
- surface1: 'var(--ds-color-bg-surface-1)',
- surface2: 'var(--ds-color-bg-surface-2)',
- border: 'var(--ds-color-border-subtle)',
- text: 'var(--ds-color-text-primary)',
- muted: 'var(--ds-color-text-secondary)',
- primary: 'var(--ds-color-brand-primary)',
- secondary: 'var(--ds-color-brand-secondary)',
- good: 'var(--ds-color-good)',
- bad: 'var(--ds-color-bad)',
- warn: 'var(--ds-color-warn)'
- }
- },
- spacing: {
- ds1: '4px',
- ds2: '8px',
- ds3: '12px',
- ds4: '16px',
- ds5: '20px',
- ds6: '24px',
- ds8: '32px',
- ds10: '40px',
- ds12: '48px'
- },
- borderRadius: {
- dsSm: '8px',
- dsMd: '12px',
- dsLg: '16px',
- dsXl: '20px'
- },
- boxShadow: {
- softxl: '0 22px 50px rgba(0,0,0,0.30)',
- ds1: '0 1px 2px rgba(0,0,0,0.24)',
- ds2: '0 6px 16px rgba(0,0,0,0.28)',
- ds3: '0 12px 28px rgba(0,0,0,0.32)'
- }
- }
- }
-};
-</script>
 <link crossorigin="" href="https://fonts.gstatic.com" rel="preconnect"/>
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&amp;family=Caveat:wght@600;700&amp;family=Great+Vibes&amp;family=Inter:wght@400;500;600;700;800&amp;display=swap" rel="stylesheet"/>
+<link href="/static/tailwind-lite.css" rel="stylesheet">
 <link href="/static/style.css" rel="stylesheet">
 <link href="/static/design-system.css" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -181,7 +120,7 @@ tailwind.config = {
 </div>
 <div class="sidebar-footer grid gap-3">
 <button aria-label="Toggle theme" class="theme-toggle inline-flex items-center justify-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 font-semibold" id="themeToggle" type="button">
-<span class="theme-icon">?</span>
+<span class="theme-icon nav-icon-svg" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3v2"/><path d="M12 19v2"/><path d="M4.22 4.22l1.42 1.42"/><path d="M18.36 18.36l1.42 1.42"/><path d="M3 12h2"/><path d="M19 12h2"/><path d="M4.22 19.78l1.42-1.42"/><path d="M18.36 5.64l1.42-1.42"/><circle cx="12" cy="12" r="4"/></svg></span>
 <span class="theme-text">Light</span>
 </button>
 <button class="inline-flex items-center justify-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 font-semibold w-full" id="openUserGuideBtn" type="button" title="Open the full user guide">
@@ -1144,11 +1083,16 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 </section>
 <section class="dashboard-view gap-4 ds-parlay" data-view="parlay">
 <section class="tool-intro-card ds-card ds-parlay-header card glass parlay-intro-card flex flex-col gap-4 rounded-[28px] border border-white/10 bg-slate-950/40 p-5 shadow-softxl backdrop-blur-xl xl:flex-row xl:items-center xl:justify-between">
-<div>
+<div class="parlay-hero-copy">
 <p class="section-kicker">Parlay Builder</p>
 <h2>Scan today's games, rank the strongest props, and build a clean ticket fast.</h2>
 <p class="small-meta">Uses key rotation so no single API key burns out. Single-bookmaker runs keep credit usage efficient while props are scored and ranked by hit rate.</p>
 </div>
+<aside class="parlay-hero-rail" aria-label="Parlay workflow summary">
+<div class="parlay-hero-rail-card"><span>01</span><strong>Load slate</strong><small>Pull today's events once.</small></div>
+<div class="parlay-hero-rail-card"><span>02</span><strong>Rank props</strong><small>Sort by hit rate and context.</small></div>
+<div class="parlay-hero-rail-card"><span>03</span><strong>Build ticket</strong><small>Review the cleanest legs.</small></div>
+</aside>
 </section>
 <section class="ds-card ds-parlay-shell card glass parlay-panel rounded-[28px] border border-white/10 backdrop-blur-xl" id="parlayPanel">
 <div class="parlay-jump-row" aria-label="Parlay sections">
@@ -1380,7 +1324,7 @@ Undo Last Log
 </div>
 <div class="tracker-hero-actions">
 <button class="primary-btn tracker-refresh-btn" id="trackerRefreshBtn" type="button">
-<span class="tracker-refresh-icon">?</span> Refresh Live Board
+<span class="tracker-refresh-icon nav-icon-svg" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M20 6v6h-6"/><path d="M4 18v-6h6"/><path d="M19 13a7 7 0 0 1-12 4.9L4 15"/><path d="M5 11a7 7 0 0 1 12-4.9L20 9"/></svg></span> Refresh Live Board
 </button>
 <div class="tracker-toolbar-summary" id="trackerBoardSummary">Standing by</div>
 </div>
@@ -1655,7 +1599,7 @@ Undo Last Log
  <button class="secondary-btn" id="btArchiveBtn" type="button">Archive older resolved</button>
  </div>
  <div class="backtest-actions-row">
- <button class="secondary-btn" id="btRefreshBtn" type="button">? Refresh log</button>
+ <button class="secondary-btn" id="btRefreshBtn" type="button"><span class="nav-icon-svg" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M20 6v6h-6"/><path d="M4 18v-6h6"/><path d="M19 13a7 7 0 0 1-12 4.9L4 15"/><path d="M5 11a7 7 0 0 1 12-4.9L20 9"/></svg></span> Refresh log</button>
  <button class="secondary-btn" id="btAutoGradeBtn" title="Auto-grade pending logged props with actual stats once games are complete" type="button">Auto Grade Logged Props</button>
  <button class="secondary-btn" id="btUndoAutoGradeBtn" style="display:none" title="Undo the most recent auto-grade run" type="button">Undo Auto Grade</button>
  <button class="secondary-btn" id="btSyncPgBtn" type="button">Sync from Postgres</button>
@@ -1883,7 +1827,7 @@ Undo Last Log
  <li>In Bet Finder, sort by EV first to find the most mispriced props. Sort by hit rate to find the most consistent ones. The best bets usually score well on both.</li>
  <li>Use Parlay Builder only when you have 2-3 High-tier props already identified. The builder will round out the remaining legs with the best available stats.</li>
  <li>Save your Odds API key once and it will be remembered between sessions. You won't need to re-enter it.</li>
- <li>The <em>?</em> button on Backtest logs removes just that one entry. The <em>Clear All</em> button wipes the entire log -- use it carefully.</li>
+ <li>The remove button on Backtest logs deletes just that one entry. The <em>Clear All</em> button wipes the entire log -- use it carefully.</li>
  </ul>
  </div>
 

@@ -1,6 +1,6 @@
 fastapi==0.111.0
 uvicorn[standard]==0.40.0
-nba_api
+nba_api==1.11.4
 pandas==2.2.3
 requests==2.32.3
 pypdf==5.1.0

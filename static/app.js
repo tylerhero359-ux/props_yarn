@@ -408,6 +408,7 @@ const EMPTY_ICON_SVG_MAP = Object.freeze({
   calendar: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 10h18"/></svg>',
   shield: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v6c0 4.5-3.2 7.4-7 9-3.8-1.6-7-4.5-7-9V6l7-3z"/></svg>',
   spark: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V4"/><path d="M4 20h16"/><path d="M8 15l3-3 3 2 6-7"/></svg>',
+  key: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="7.5" cy="12.5" r="3.5"/><path d="M11 12.5h9"/><path d="M16 12.5v3"/><path d="M19 12.5v2"/></svg>',
 });
 
 function getEmptyIconSvg(kind = 'trend') {
@@ -424,7 +425,8 @@ function hydrateEmptyIcons(root = document) {
 }
 
 function startEmptyIconObserver() {
-  if (emptyIconObserver || !document.body) return;
+  const observerRoot = document.querySelector('.workspace-main') || document.querySelector('main');
+  if (emptyIconObserver || !observerRoot) return;
   emptyIconObserver = new MutationObserver((records) => {
     records.forEach(record => {
       record.addedNodes.forEach(node => {
@@ -434,7 +436,7 @@ function startEmptyIconObserver() {
       });
     });
   });
-  emptyIconObserver.observe(document.body, { childList: true, subtree: true });
+  emptyIconObserver.observe(observerRoot, { childList: true, subtree: true });
 }
 
 function normalizeSeasonTypeValue(raw) {
@@ -2981,7 +2983,12 @@ function updateAccentForCurrentTheme(teamAbbreviation) {
 function setTheme(theme) {
   document.body.classList.toggle('light-theme', theme === 'light');
   localStorage.setItem(THEME_KEY, theme);
-  themeToggle.querySelector('.theme-icon').textContent = theme === 'light' ? '\u263E' : '\u2600';
+  const themeIcon = themeToggle.querySelector('.theme-icon');
+  if (themeIcon) {
+    themeIcon.innerHTML = theme === 'light'
+      ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.5A8.5 8.5 0 0 1 8.5 4a7 7 0 1 0 11.5 11.5z"/></svg>'
+      : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v2"/><path d="M12 19v2"/><path d="M4.22 4.22l1.42 1.42"/><path d="M18.36 18.36l1.42 1.42"/><path d="M3 12h2"/><path d="M19 12h2"/><path d="M4.22 19.78l1.42-1.42"/><path d="M18.36 5.64l1.42-1.42"/><circle cx="12" cy="12" r="4"/></svg>';
+  }
   themeToggle.querySelector('.theme-text').textContent = theme === 'light' ? 'Dark' : 'Light';
   updateAccentForCurrentTheme(currentAccentTeam);
   animateThemePulse();
@@ -3653,6 +3660,24 @@ function getFinderLabel(hitRate) {
   return 'Thin';
 }
 
+function runMarketResultsEnhancements(payload) {
+  if (window.nbaUiEnhancements && typeof window.nbaUiEnhancements.market === 'function') {
+    window.nbaUiEnhancements.market(payload);
+  }
+}
+
+function runBetFinderResultsEnhancements(payload) {
+  if (window.nbaUiEnhancements && typeof window.nbaUiEnhancements.betFinder === 'function') {
+    window.nbaUiEnhancements.betFinder(payload);
+  }
+}
+
+function runAnalyzerSummaryEnhancements(payload) {
+  if (window.nbaUiEnhancements && typeof window.nbaUiEnhancements.analyzer === 'function') {
+    window.nbaUiEnhancements.analyzer(payload);
+  }
+}
+
 /*  Mini sparkline SVG  */
 function renderBetFinderResults(payload) {
   const results = payload.results || [];
@@ -3763,6 +3788,8 @@ function renderBetFinderResults(payload) {
       }
     });
   });
+  enhanceBetFinderSparklines(payload);
+  runBetFinderResultsEnhancements(payload);
 }
 
 async function runBetFinder() {
@@ -3779,7 +3806,7 @@ async function runBetFinder() {
   betFinderMeta.textContent = 'Scanning the selected roster using your current prop settings...';
   betFinderResults.className = 'bet-finder-state empty-state-panel compact';
   betFinderResults.innerHTML = `
-    <div class="empty-icon">[...]</div>
+    <div class="empty-icon">${getEmptyIconSvg('spark')}</div>
     <strong>Finding the best recent overs...</strong>
     <span>This checks the currently selected team roster so it stays faster and safer.</span>
   `;
@@ -5630,6 +5657,7 @@ function renderMarketResults(payload) {
   });
 
   populateMarketInjuryCells(results);
+  runMarketResultsEnhancements(payload);
 }
 
 async function streamNdjson(url, payload, onMessage) {
@@ -6236,7 +6264,7 @@ themeToggle.addEventListener('click', () => {
   function renderEmpty(message) {
     historyList.innerHTML = `
       <div class="bet-finder-state empty-state-panel compact history-empty">
-        <div class="empty-icon">\uD83D\uDD11</div>
+        <div class="empty-icon">${getEmptyIconSvg('key')}</div>
         <strong>${escapeHtml(message)}</strong>
         <span>Run a scan or analysis to populate history.</span>
       </div>`;
@@ -6781,7 +6809,7 @@ function updateChartSampleButtonsUpgrade() {
   chartSampleBtnsEl.forEach(btn => btn.classList.toggle('active', btn.dataset.sample === String(gamesSelect?.value || '10')));
 }
 
-function renderPanelSkeletonUpgrade(body, icon = '[...]', title = 'Loading...', subtitle = 'Pulling current data...') {
+function renderPanelSkeletonUpgrade(body, icon = getEmptyIconSvg('spark'), title = 'Loading...', subtitle = 'Pulling current data...') {
   if (!body) return;
   body.className = 'empty-state-panel compact skeleton-panel';
   body.innerHTML = `
@@ -7768,7 +7796,7 @@ analyzeBtn?.addEventListener('click', () => {
   renderPanelSkeletonUpgrade(environmentBody, '', 'Loading schedule...', 'Checking the current rest and schedule spot.');
 }, true);
 marketScanBtn?.addEventListener('click', () => {
-  if (marketResults) marketResults.innerHTML = `<div class="empty-state-panel compact skeleton-panel"><div class="empty-icon">[...]</div><strong>Scanning your board...</strong><span>Comparing hit rate, implied odds, EV, and matchup context.</span><div class="skeleton-line"></div><div class="skeleton-line short"></div></div>`;
+  if (marketResults) marketResults.innerHTML = `<div class="empty-state-panel compact skeleton-panel"><div class="empty-icon">${getEmptyIconSvg('spark')}</div><strong>Scanning your board...</strong><span>Comparing hit rate, implied odds, EV, and matchup context.</span><div class="skeleton-line"></div><div class="skeleton-line short"></div></div>`;
 }, true);
 applyDensityModeUpgrade(analyzerDensityMode);
 saveChartPrefsUpgrade();
@@ -8802,6 +8830,7 @@ function renderSummary(payload) {
   if (typeof window._backtestPrefillFromPayload === 'function') {
     window._backtestPrefillFromPayload(payload);
   }
+  runAnalyzerSummaryEnhancements(payload);
 }
 
 async function analyzePlayerProp(options = {}) {
@@ -9074,36 +9103,30 @@ function buildSparklineSvg(values, line, width, height) {
 }
 
 /*  Inject sparklines + grade into Bet Finder results  */
-(function patchBetFinderSparklines() {
-  const _orig = renderBetFinderResults;
-  renderBetFinderResults = function (payload) {
-    _orig.call(this, payload);
-    const results = payload.results || [];
-    document.querySelectorAll('.finder-card').forEach(function (card, idx) {
-      const item = results[idx];
-      if (!item) return;
-      const values = (item.games || []).map(function (g) { return Number(g.value || 0); });
-      const grade = computeConfidenceGrade(item.hit_rate, item.avg_edge || 0, item.games_count || 0);
-      const footer = card.querySelector('.finder-footer');
-      // Sparkline
-      if (values.length >= 2 && footer) {
-        const svg = buildSparklineSvg(values, payload.line);
-        const sparkWrap = document.createElement('div');
-        sparkWrap.className = 'finder-sparkline';
-        sparkWrap.innerHTML = svg;
-        card.insertBefore(sparkWrap, footer);
-      }
-      // Grade chip
-      const chipRow = card.querySelector('.finder-chip-row');
-      if (chipRow && !chipRow.querySelector('.grade-chip')) {
-        const gradeEl = document.createElement('span');
-        gradeEl.className = 'finder-chip grade-chip grade-' + grade.toLowerCase();
-        gradeEl.textContent = grade + '  ' + gradeLabel(grade);
-        chipRow.appendChild(gradeEl);
-      }
-    });
-  };
-})();
+function enhanceBetFinderSparklines(payload) {
+  const results = payload.results || [];
+  document.querySelectorAll('.finder-card').forEach(function (card, idx) {
+    const item = results[idx];
+    if (!item) return;
+    const values = (item.games || []).map(function (g) { return Number(g.value || 0); });
+    const grade = computeConfidenceGrade(item.hit_rate, item.avg_edge || 0, item.games_count || 0);
+    const footer = card.querySelector('.finder-ticket-footer') || card.querySelector('.finder-footer');
+    if (values.length >= 2 && footer && !card.querySelector('.finder-sparkline')) {
+      const svg = buildSparklineSvg(values, payload.line);
+      const sparkWrap = document.createElement('div');
+      sparkWrap.className = 'finder-sparkline';
+      sparkWrap.innerHTML = svg;
+      card.insertBefore(sparkWrap, footer);
+    }
+    const chipRow = card.querySelector('.finder-chip-row');
+    if (chipRow && !chipRow.querySelector('.grade-chip')) {
+      const gradeEl = document.createElement('span');
+      gradeEl.className = 'finder-chip grade-chip grade-' + grade.toLowerCase();
+      gradeEl.textContent = grade + '  ' + gradeLabel(grade);
+      chipRow.appendChild(gradeEl);
+    }
+  });
+}
 
 /*  Session cache: intercept analyzePlayerProp  */
 (function patchAnalyzeCache() {
@@ -9849,6 +9872,9 @@ function buildSparklineSvg(values, line, width, height) {
         } catch (err) { console.warn('Parlay ticket leg nav failed:', err); }
       });
     });
+    if (window.nbaUiEnhancements && typeof window.nbaUiEnhancements.refresh === 'function') {
+      window.nbaUiEnhancements.refresh();
+    }
   }
 
   //  Render all props table (clickable  analyzer) 
@@ -9907,6 +9933,9 @@ function buildSparklineSvg(values, line, width, height) {
         }
       });
     });
+    if (window.nbaUiEnhancements && typeof window.nbaUiEnhancements.refresh === 'function') {
+      window.nbaUiEnhancements.refresh();
+    }
   }
 
   //  Rebuild from cache (zero API calls) 
@@ -10856,6 +10885,9 @@ function buildSparklineSvg(values, line, width, height) {
         bar.style.transition = 'width 1.1s cubic-bezier(0.34,1.56,0.64,1), background 0.5s';
       });
     });
+    if (window.nbaUiEnhancements && typeof window.nbaUiEnhancements.refresh === 'function') {
+      window.nbaUiEnhancements.refresh();
+    }
   }
 
   //  Fetch live stat -- today/future only, no historical fallback 
@@ -11866,46 +11898,37 @@ function buildSparklineSvg(values, line, width, height) {
     enhanceTrackerUI();
   }
 
-  const _renderMarketResults = renderMarketResults;
-  renderMarketResults = function (payload) {
-    _renderMarketResults(payload);
-    enhanceMarketUI();
-    renderSlipDrawer();
-    animateResultContainer(marketResults, 'market');
-    registerScrollReveals(marketResults);
-    animateSvgLineDraw(marketResults);
-  };
-
-  const _renderBetFinderResults = renderBetFinderResults;
-  renderBetFinderResults = function (payload) {
-    _renderBetFinderResults(payload);
-    enhanceBetFinderUI();
-    renderSlipDrawer();
-    animateResultContainer(betFinderResults, 'betfinder');
-    registerScrollReveals(betFinderResults);
-    animateSvgLineDraw(betFinderResults);
-  };
-
-  const _renderSummary = renderSummary;
-  renderSummary = function (payload) {
-    _renderSummary(payload);
-    renderAnalyzerSummaryUpgrade(payload);
-    renderSlipDrawer();
-    animateResultContainer(analyzerDecisionStrip || analyzerDecisionStripGrid, 'analyzer');
-    registerScrollReveals(analyzerDecisionStrip || analyzerDecisionStripGrid || document.querySelector('[data-view="analyzer"]'));
-    animateSvgLineDraw(document.querySelector('[data-view="analyzer"]') || document);
-  };
-
-  const observer = new MutationObserver(() => {
-    enhanceParlayUI();
-    enhanceTrackerUI();
+  window.nbaUiEnhancements = Object.assign({}, window.nbaUiEnhancements || {}, {
+    market(payload) {
+      enhanceMarketUI();
+      renderSlipDrawer();
+      animateResultContainer(marketResults, 'market');
+      registerScrollReveals(marketResults);
+      animateSvgLineDraw(marketResults);
+    },
+    betFinder(payload) {
+      enhanceBetFinderUI();
+      renderSlipDrawer();
+      animateResultContainer(betFinderResults, 'betfinder');
+      registerScrollReveals(betFinderResults);
+      animateSvgLineDraw(betFinderResults);
+    },
+    analyzer(payload) {
+      renderAnalyzerSummaryUpgrade(payload);
+      renderSlipDrawer();
+      animateResultContainer(analyzerDecisionStrip || analyzerDecisionStripGrid, 'analyzer');
+      registerScrollReveals(analyzerDecisionStrip || analyzerDecisionStripGrid || document.querySelector('[data-view="analyzer"]'));
+      animateSvgLineDraw(document.querySelector('[data-view="analyzer"]') || document);
+    },
+    refresh() {
+      refreshSlipButtons();
+    }
   });
 
   window.addEventListener('DOMContentLoaded', () => {
     mountSlipDrawer();
     renderSlipDrawer();
     injectAnalyzerSlipButton();
-    observer.observe(document.body, { childList: true, subtree: true });
     animateActiveView(activeView, { initial: true });
     registerScrollReveals(document);
     animateSvgLineDraw(document);
@@ -13106,7 +13129,7 @@ function passesAdvancedMarketFilters(item) {
       updateKvPager(0);
       kvKeyList.innerHTML = `
         <div class="bet-finder-state empty-state-panel compact" style="padding:32px 0">
-          <div class="empty-icon">\uD83D\uDD11</div>
+          <div class="empty-icon">${getEmptyIconSvg('key')}</div>
           <strong>No keys saved yet.</strong>
           <span>Add a key above to get started.</span>
         </div>`;

@@ -229,7 +229,7 @@ class FrontendParlayE2ETests(unittest.TestCase):
                         return
 
                     # Keep startup requests deterministic and offline-safe.
-                    if path == "/api/today-games":
+                    if path == "/api/todays-games":
                         route.fulfill(
                             status=200,
                             content_type="application/json",

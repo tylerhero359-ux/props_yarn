@@ -30,6 +30,9 @@ class ParlayService:
             if not player:
                 analysis_errors.append({"player_name": player_name, "reason": "Player not found."})
                 continue
+            event_id = str(row.get("event_id") or "").strip()
+            home_team = str(row.get("home_team") or "").strip()
+            away_team = str(row.get("away_team") or "").strip()
             bulk_row = {
                 "player_id": int(player["id"]),
                 "player_name": player_name,
@@ -37,13 +40,24 @@ class ParlayService:
                 "line": row["line"],
                 "team_id": None,
                 "player_position": None,
+                "event_id": event_id,
+                "game_label": str(row.get("game_label") or "").strip(),
+                "home_team": home_team,
+                "away_team": away_team,
             }
             prepared.append((bulk_row, row))
 
         seen_analysis_keys: set[tuple[Any, ...]] = set()
         deduped_prepared: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for bulk_row, orig_row in prepared:
-            analysis_key = (bulk_row["player_id"], bulk_row["stat"], float(bulk_row["line"]))
+            analysis_key = (
+                bulk_row["player_id"],
+                bulk_row["stat"],
+                float(bulk_row["line"]),
+                str(bulk_row.get("event_id") or ""),
+                str(bulk_row.get("home_team") or "").lower(),
+                str(bulk_row.get("away_team") or "").lower(),
+            )
             if analysis_key in seen_analysis_keys:
                 continue
             seen_analysis_keys.add(analysis_key)
