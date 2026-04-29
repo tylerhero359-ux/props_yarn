@@ -10565,6 +10565,45 @@ body.light-theme {
   margin-bottom: 16px;
 }
 
+.today-game-context-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: -6px 0 12px;
+}
+
+.today-season-pill,
+.today-series-pill,
+.today-standings-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  background: rgba(15, 23, 42, 0.34);
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 800;
+  line-height: 1.15;
+}
+
+.today-season-pill.playoff {
+  color: #ffd38a;
+  border-color: rgba(255, 185, 92, 0.48);
+  background: rgba(255, 185, 92, 0.11);
+}
+
+.today-season-pill.regular {
+  color: #b9d2ff;
+  border-color: rgba(104, 145, 214, 0.38);
+}
+
+.today-season-pill.preseason {
+  color: #bfe7d2;
+  border-color: rgba(82, 190, 128, 0.34);
+}
+
 .today-game-time,
 .today-game-scoreline {
   min-height: 48px;
@@ -13292,6 +13331,99 @@ body.light-theme {
   color: #cbd8f0;
   border-color: rgba(116, 146, 196, 0.45);
   background: linear-gradient(180deg, rgba(84, 110, 152, 0.2), rgba(84, 110, 152, 0.08));
+}
+
+.finder-chip.parlay-rank-chip.playoff {
+  color: #ffd38a;
+  border-color: rgba(255, 185, 92, 0.58);
+  background: linear-gradient(180deg, rgba(255, 185, 92, 0.2), rgba(110, 76, 37, 0.08));
+}
+
+.parlay-strategy-panel {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid rgba(255, 185, 92, 0.2);
+  border-radius: 8px;
+  background: linear-gradient(180deg, rgba(255, 185, 92, 0.08), rgba(31, 44, 68, 0.16));
+}
+
+.parlay-strategy-head,
+.parlay-rank-lens-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.parlay-strategy-head strong,
+.parlay-rank-lens-head span {
+  display: block;
+  color: var(--text);
+  font-size: 0.88rem;
+  line-height: 1.25;
+}
+
+.parlay-strategy-score,
+.parlay-rank-lens-head strong {
+  flex: 0 0 auto;
+  color: #ffd38a;
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.parlay-strategy-metrics,
+.parlay-rank-note-row,
+.parlay-rank-components {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 9px;
+}
+
+.parlay-strategy-metrics span,
+.parlay-rank-note,
+.parlay-rank-components span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  color: var(--muted);
+  background: rgba(8, 13, 24, 0.28);
+  font-size: 0.72rem;
+  line-height: 1.2;
+}
+
+.parlay-strategy-metrics b,
+.parlay-rank-components b {
+  color: var(--text);
+}
+
+.parlay-strategy-tips,
+.parlay-rank-tips {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.parlay-rank-lens {
+  margin-top: 8px;
+  padding: 10px;
+  border: 1px solid rgba(255, 185, 92, 0.18);
+  border-radius: 8px;
+  background: rgba(8, 13, 24, 0.24);
+}
+
+.bet-finder-playoff-panel {
+  grid-column: 1 / -1;
+  margin-top: 0;
+}
+
+.finder-card .parlay-rank-lens {
+  text-align: left;
 }
 
 @media (max-width: 900px) {

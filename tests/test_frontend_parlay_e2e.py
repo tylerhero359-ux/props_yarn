@@ -267,10 +267,12 @@ class FrontendParlayE2ETests(unittest.TestCase):
 
                 fallback_notice = page.locator("#parlayFallbackNotice")
                 self.assertTrue(fallback_notice.is_visible())
-                self.assertIn("Playoff fallback applied", fallback_notice.inner_text())
+                self.assertIn("playoff fallback applied", fallback_notice.inner_text().lower())
 
                 browser.close()
         except unittest.SkipTest:
+            raise
+        except AssertionError:
             raise
         except Exception as exc:
             raise unittest.SkipTest(f"Playwright runtime unavailable in this environment: {exc}")

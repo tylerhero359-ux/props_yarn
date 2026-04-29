@@ -3500,6 +3500,34 @@ function buildTodayGameCard(game, compact = false) {
     ? `${Number(marketContext.market_home_spread) > 0 ? '+' : ''}${Number(marketContext.market_home_spread).toFixed(1)}`
     : '--';
   const trustDiagnostics = buildTodayTrustDiagnostics(game, hasMarketContext);
+  const seasonType = String(game.season_type || '').trim() || 'Regular Season';
+  const seasonTone = /playoff/i.test(seasonType) ? 'playoff' : (/preseason/i.test(seasonType) ? 'preseason' : 'regular');
+  const competitionParts = [
+    game.competition_label,
+    game.playoff_round && game.playoff_round !== game.competition_label ? game.playoff_round : '',
+    game.game_sub_label,
+  ].map(part => String(part || '').trim()).filter(Boolean);
+  const seriesText = String(game.series_summary || game.series_text || '').trim();
+  const recordText = String(game.standings_summary || '').trim();
+  const contextText = /playoff/i.test(seasonType)
+    ? (seriesText || recordText || 'Series standing unavailable')
+    : (recordText || `${game.away.abbreviation} ${game.away.record || '--'} | ${game.home.abbreviation} ${game.home.record || '--'}`);
+  const gameNumberText = game.playoff_game_number ? `Game ${game.playoff_game_number}` : '';
+  const contextMetaParts = [];
+  [...competitionParts, gameNumberText].forEach(part => {
+    const cleanPart = String(part || '').trim();
+    if (!cleanPart) return;
+    const normalizedPart = cleanPart.toLowerCase();
+    if (contextMetaParts.some(existing => existing.toLowerCase() === normalizedPart)) return;
+    contextMetaParts.push(cleanPart);
+  });
+  const contextMetaText = contextMetaParts.join(' - ');
+  const contextRow = `
+    <div class="today-game-context-row">
+      <span class="today-season-pill ${seasonTone}">${escapeHtml(seasonType)}</span>
+      ${contextMetaText ? `<span class="today-series-pill">${escapeHtml(contextMetaText)}</span>` : ''}
+      <span class="today-standings-pill">${escapeHtml(contextText)}</span>
+    </div>`;
   const marketRow = hasMarketContext
     ? `<div class="today-market-row">
         <span class="today-market-pill">GT ${escapeHtml(gameTotalValue)}</span>
@@ -3543,6 +3571,7 @@ function buildTodayGameCard(game, compact = false) {
         <span class="small-badge ${statusClass}">${escapeHtml(statusTextDisplay)}</span>
         <span class="small-meta">${escapeHtml(game.game_label)}</span>
       </div>
+      ${contextRow}
       ${renderTrustDiagnostics(trustDiagnostics, true)}
       ${marketRow}
       <div class="today-game-main">
@@ -3689,10 +3718,31 @@ function renderBetFinderResults(payload) {
 
   betFinderMeta.textContent = `${payload.team.full_name} - ${getStatLabel(payload.stat)} ${payload.line} - Last ${payload.last_n} - Min ${payload.min_games} games`;
   betFinderResults.className = 'bet-finder-grid sportsbook-grid';
-  betFinderResults.innerHTML = results.map((item, index) => {
-    const tone = getFinderTone(item.hit_rate);
-    const sideGuess = item.average >= payload.line ? 'OVER' : 'UNDER';
+  const playoffItems = results.filter(item => getRankingProfileFromPayload(item).source === 'playoff_blend');
+  const playoffPanel = playoffItems.length ? `
+    <div class="bet-finder-playoff-panel parlay-strategy-panel">
+      <div class="parlay-strategy-head">
+        <div><span class="section-kicker">Playoff Bet Finder</span><strong>Roster ranked by blend, not raw H2H</strong></div>
+        <span class="parlay-strategy-score">${playoffItems.length} blend-ranked</span>
+      </div>
+      <div class="parlay-strategy-metrics">
+        <span>New H2H <b>${playoffItems.filter(item => Number(item.h2h_games_count || 0) <= 0).length}</b></span>
+        <span>Avg H2H weight <b>${Math.round(playoffItems.reduce((sum, item) => sum + Number(item.h2h_weight_pct || 0), 0) / playoffItems.length)}%</b></span>
+        <span>Mode <b>Playoffs</b></span>
+      </div>
+      <ul class="parlay-strategy-tips">
+        <li>Favor locked minutes, model edge, and role stability before tiny H2H samples.</li>
+        <li>Use the card tap-through to inspect the full Player Analyzer lens.</li>
+      </ul>
+    </div>` : '';
+  betFinderResults.innerHTML = playoffPanel + results.map((item, index) => {
+    const displayHitRate = Number(item.hit_rate || 0);
+    const tone = getFinderTone(displayHitRate);
+    const sideGuess = String(item.side || (item.average >= payload.line ? 'OVER' : 'UNDER')).toUpperCase();
     const sideClass = sideGuess.toLowerCase();
+    const rankChip = renderPlayoffRankingChipHtml(item);
+    const confidence = item.confidence || {};
+    const confidenceText = confidence.grade ? `${confidence.grade} ${confidence.score || ''}`.trim() : getFinderLabel(displayHitRate);
     return `
       <button class="finder-card sportsbook-tile ${tone}" type="button"
         data-id="${item.player.id}"
@@ -3720,11 +3770,13 @@ function renderBetFinderResults(payload) {
           <div class="finder-rank">#${index + 1}</div>
         </div>
         <div class="finder-chip-row">
-          <span class="finder-chip">${item.hit_rate.toFixed(1)}% hit</span>
+          <span class="finder-chip">${displayHitRate.toFixed(1)}% ${sideGuess.toLowerCase()}</span>
           <span class="finder-chip">${item.hit_count}/${item.games_count}</span>
           <span class="finder-chip">Avg ${item.average.toFixed(1)}</span>
           <span class="finder-chip ${item.avg_edge >= 0 ? 'positive' : 'negative'}">Edge ${formatSignedMetric(item.avg_edge)}</span>
+          ${rankChip}
         </div>
+        ${renderPlayoffRankingLensHtml(item, 'compact')}
         <div class="finder-ticket-grid">
           <div class="finder-ticket-stat">
             <span>Last game</span>
@@ -3732,23 +3784,23 @@ function renderBetFinderResults(payload) {
             <small>Most recent output</small>
           </div>
           <div class="finder-ticket-stat">
-            <span>Over streak</span>
+            <span>${escapeHtml(sideGuess)} streak</span>
             <strong>${item.hit_streak}</strong>
             <small>Current run</small>
           </div>
           <div class="finder-ticket-stat">
-            <span>Projection edge</span>
+            <span>Line cushion</span>
             <strong>${formatSignedMetric(item.avg_edge)}</strong>
-            <small>Average vs line</small>
+            <small>${escapeHtml(sideGuess)} side</small>
           </div>
           <div class="finder-ticket-stat">
             <span>Read</span>
-            <strong>${getFinderLabel(item.hit_rate)}</strong>
-            <small>Quick confidence</small>
+            <strong>${escapeHtml(confidenceText)}</strong>
+            <small>${escapeHtml(getRankingSourceLabel(item.ranking_source) || 'Quick confidence')}</small>
           </div>
         </div>
         <div class="finder-ticket-footer">
-          <span class="finder-badge ${tone}">${getFinderLabel(item.hit_rate)}</span>
+          <span class="finder-badge ${tone}">${getFinderLabel(displayHitRate)}</span>
           <span class="finder-odds-pill">Tap to open analyzer</span>
         </div>
       </button>
@@ -3807,8 +3859,8 @@ async function runBetFinder() {
   betFinderResults.className = 'bet-finder-state empty-state-panel compact';
   betFinderResults.innerHTML = `
     <div class="empty-icon">${getEmptyIconSvg('spark')}</div>
-    <strong>Finding the best recent overs...</strong>
-    <span>This checks the currently selected team roster so it stays faster and safer.</span>
+    <strong>Finding the best roster props...</strong>
+    <span>This checks recent form, side fit, and playoff matchup context for the selected roster.</span>
   `;
 
   try {
@@ -5073,6 +5125,68 @@ function renderDecisionLensHtml(lens, variant = '') {
     </div>`;
 }
 
+function getRankingProfileFromPayload(payload) {
+  const candidates = [
+    payload?.ranking_profile,
+    payload?.confidence?.ranking_profile,
+    payload?.best_bet?.ranking_profile,
+    payload?.analysis?.ranking_profile,
+  ];
+  const profile = candidates.find(item => item && typeof item === 'object') || {};
+  const fallbackSource = payload?.ranking_source || payload?.confidence?.ranking_source || payload?.best_bet?.ranking_source || payload?.analysis?.ranking_source || '';
+  const fallbackTips = payload?.playoff_strategy_tips || payload?.confidence?.playoff_strategy_tips || payload?.best_bet?.playoff_strategy_tips || payload?.analysis?.playoff_strategy_tips || [];
+  return {
+    source: String(profile.source || fallbackSource || '').toLowerCase(),
+    sortScore: Number(profile.sort_score ?? payload?.ranking_sort_score ?? payload?.confidence?.ranking_sort_score ?? payload?.best_bet?.ranking_sort_score ?? payload?.analysis?.ranking_sort_score),
+    blendScore: Number(profile.blend_score ?? payload?.ranking_blend_score ?? payload?.confidence?.ranking_blend_score ?? payload?.best_bet?.ranking_blend_score ?? payload?.analysis?.ranking_blend_score),
+    h2hWeight: Number(profile.h2h_weight_pct ?? payload?.h2h_weight_pct ?? payload?.confidence?.h2h_weight_pct ?? payload?.best_bet?.h2h_weight_pct ?? payload?.analysis?.h2h_weight_pct ?? 0),
+    notes: Array.isArray(profile.notes) ? profile.notes : [],
+    tips: Array.isArray(profile.tips) ? profile.tips : (Array.isArray(fallbackTips) ? fallbackTips : []),
+    components: profile.components && typeof profile.components === 'object' ? profile.components : {},
+  };
+}
+
+function getRankingSourceLabel(source) {
+  const normalized = String(source || '').toLowerCase();
+  if (normalized === 'playoff_blend') return 'Playoff Blend';
+  if (normalized === 'h2h') return 'H2H';
+  if (normalized === 'recent') return 'Recent';
+  return normalized ? normalized.replace(/_/g, ' ') : '';
+}
+
+function renderPlayoffRankingChipHtml(payload) {
+  const profile = getRankingProfileFromPayload(payload);
+  if (profile.source !== 'playoff_blend') return '';
+  const score = Number.isFinite(profile.blendScore) ? profile.blendScore : profile.sortScore;
+  const scoreText = Number.isFinite(score) ? score.toFixed(1) : '--';
+  return `<span class="finder-chip parlay-rank-chip playoff">Ranked by: Playoff Blend (${scoreText} score, H2H cap ${Math.round(profile.h2hWeight || 0)}%)</span>`;
+}
+
+function renderPlayoffRankingLensHtml(payload, variant = '') {
+  const profile = getRankingProfileFromPayload(payload);
+  if (profile.source !== 'playoff_blend' && !profile.notes.length && !profile.tips.length) return '';
+  const score = Number.isFinite(profile.blendScore) ? profile.blendScore : profile.sortScore;
+  const scoreText = Number.isFinite(score) ? score.toFixed(1) : '--';
+  const entries = [
+    ['Model', profile.components.model],
+    ['Recent', profile.components.recent],
+    ['Edge', profile.components.edge],
+    ['H2H', profile.components.h2h],
+  ].filter((entry) => Number.isFinite(Number(entry[1])));
+  const notes = profile.notes.length ? profile.notes : ['Playoff Blend active'];
+  const tips = profile.tips.length ? profile.tips : ['Trust role, price, and minutes before tiny H2H samples.'];
+  return `
+    <div class="parlay-rank-lens ${escapeHtml(String(variant || ''))}">
+      <div class="parlay-rank-lens-head"><span>Playoff betting lens</span><strong>${escapeHtml(scoreText)}</strong></div>
+      <div class="parlay-rank-note-row">
+        ${notes.slice(0, 3).map(note => `<span class="parlay-rank-note">${escapeHtml(note)}</span>`).join('')}
+        <span class="parlay-rank-note">H2H weight ${Math.round(profile.h2hWeight || 0)}%</span>
+      </div>
+      ${entries.length ? `<div class="parlay-rank-components">${entries.map(entry => `<span><b>${escapeHtml(entry[0])}</b> ${Number(entry[1]).toFixed(1)}</span>`).join('')}</div>` : ''}
+      <ul class="parlay-rank-tips">${tips.slice(0, 3).map(tip => `<li>${escapeHtml(tip)}</li>`).join('')}</ul>
+    </div>`;
+}
+
 function getMarketInspectDetails(item) {
   const analysis = item?.analysis || {};
   const matchup = analysis.matchup || item?.matchup || {};
@@ -5992,7 +6106,7 @@ teamSelect.addEventListener('change', async () => {
   try {
     await loadRoster(teamId);
     betFinderMeta.textContent = `${selectedOption.dataset.name}  ${getStatLabel(selectedStat)} ${lineInput.value}  Last ${gamesSelect.value}`;
-    renderBetFinderEmpty('Click Bet Finder to rank this roster by recent hit rate.');
+    renderBetFinderEmpty('Click Bet Finder to rank this roster by recent form, role, and playoff blend context.');
     setStatus('Roster ready');
   } catch (error) {
     console.error(error);
@@ -7174,6 +7288,7 @@ function renderInterpretationPanels(payload) {
     recommendationBodyEl.className = 'interpretation-body';
     recommendationBodyEl.innerHTML = `
       ${warningHtml}
+      ${renderPlayoffRankingLensHtml(payload, 'analyzer')}
       <div class="insight-summary ${trafficToneClass}">
         <span class="insight-summary-label">Traffic light</span>
         <strong>${escapeHtml(recommendation.label || 'Caution')}</strong>
@@ -9392,6 +9507,7 @@ function enhanceBetFinderSparklines(payload) {
   const parlayInjuryAware = document.getElementById('parlayInjuryAware');
   const parlayInjurySummaryEl = document.getElementById('parlayInjurySummary');
   const parlayFallbackNoticeEl = document.getElementById('parlayFallbackNotice');
+  const parlayStrategyPanelEl = document.getElementById('parlayStrategyPanel');
   const parlaySetupBlock = document.getElementById('parlaySetupBlock');
   const parlayJumpChips = Array.from(document.querySelectorAll('.ds-parlay .parlay-jump-chip'));
 
@@ -9709,6 +9825,7 @@ function enhanceBetFinderSparklines(payload) {
     if (!prop) return 'Recent';
     const source = String(prop.ranking_source || '').toLowerCase();
     if (source === 'h2h') return 'H2H';
+    if (source === 'playoff_blend') return 'Playoff Blend';
     if (source === 'recent') return 'Recent';
     return Number(prop.h2h_games_count || 0) > 0 ? 'H2H' : 'Recent';
   }
@@ -9733,13 +9850,63 @@ function enhanceBetFinderSparklines(payload) {
   function getParlayRankingChip(prop) {
     const label = getParlayRankingLabel(prop);
     const h2h = getParlayH2HMetrics(prop);
-    const toneClass = label === 'H2H' ? 'h2h' : 'recent';
-    const detail = label === 'H2H' && h2h.games > 0
-      ? (Number.isFinite(h2h.hits)
+    const toneClass = label === 'H2H' ? 'h2h' : (label === 'Playoff Blend' ? 'playoff' : 'recent');
+    let detail = '';
+    if (label === 'H2H' && h2h.games > 0) {
+      detail = Number.isFinite(h2h.hits)
         ? ' (' + h2h.hits + '/' + h2h.games + '  ' + Number(h2h.rate || 0).toFixed(1) + '%)'
-        : ' (' + h2h.games + 'g)')
-      : '';
+        : ' (' + h2h.games + 'g)';
+    } else if (label === 'Playoff Blend') {
+      const blendScore = Number(prop?.ranking_blend_score ?? prop?.ranking_sort_score ?? prop?.ranking_hit_rate);
+      const h2hWeight = Number(prop?.h2h_weight_pct || 0);
+      const blendText = Number.isFinite(blendScore) ? Number(blendScore).toFixed(1) : '--';
+      const h2hText = h2h.games > 0 && Number.isFinite(h2h.hits)
+        ? 'H2H ' + h2h.hits + '/' + h2h.games + ', cap ' + Math.round(h2hWeight) + '%'
+        : 'H2H cap ' + Math.round(h2hWeight) + '%';
+      detail = ' (' + blendText + ' score, ' + h2hText + ')';
+    }
     return '<span class="finder-chip parlay-rank-chip ' + toneClass + '">Ranked by: ' + label + detail + '</span>';
+  }
+
+  function getParlayRankingProfile(prop) {
+    const profile = prop && typeof prop === 'object' && prop.ranking_profile && typeof prop.ranking_profile === 'object'
+      ? prop.ranking_profile
+      : {};
+    return {
+      source: String(profile.source || prop?.ranking_source || '').toLowerCase(),
+      sortScore: Number(profile.sort_score ?? prop?.ranking_sort_score ?? prop?.ranking_blend_score ?? prop?.ranking_hit_rate),
+      h2hWeight: Number(profile.h2h_weight_pct ?? prop?.h2h_weight_pct ?? 0),
+      notes: Array.isArray(profile.notes) ? profile.notes : [],
+      tips: Array.isArray(profile.tips) ? profile.tips : (Array.isArray(prop?.playoff_strategy_tips) ? prop.playoff_strategy_tips : []),
+      components: profile.components && typeof profile.components === 'object' ? profile.components : {},
+    };
+  }
+
+  function renderParlayRankingProfile(prop) {
+    const profile = getParlayRankingProfile(prop);
+    if (profile.source !== 'playoff_blend' && !profile.tips.length && !profile.notes.length) return '';
+    const componentEntries = [
+      ['Model', profile.components.model],
+      ['Recent', profile.components.recent],
+      ['Edge', profile.components.edge],
+      ['H2H', profile.components.h2h],
+    ].filter(function (entry) { return Number.isFinite(Number(entry[1])); });
+    const scoreText = Number.isFinite(profile.sortScore) ? Number(profile.sortScore).toFixed(1) : '--';
+    const noteHtml = profile.notes.slice(0, 3).map(function (note) {
+      return '<span class="parlay-rank-note">' + escHtml(note) + '</span>';
+    }).join('');
+    const componentHtml = componentEntries.map(function (entry) {
+      return '<span><b>' + escHtml(entry[0]) + '</b> ' + Number(entry[1]).toFixed(1) + '</span>';
+    }).join('');
+    const tipsHtml = profile.tips.slice(0, 3).map(function (tip) {
+      return '<li>' + escHtml(tip) + '</li>';
+    }).join('');
+    return '<div class="parlay-rank-lens">' +
+      '<div class="parlay-rank-lens-head"><span>Playoff betting lens</span><strong>' + scoreText + '</strong></div>' +
+      '<div class="parlay-rank-note-row">' + noteHtml + '<span class="parlay-rank-note">H2H weight ' + Math.round(profile.h2hWeight || 0) + '%</span></div>' +
+      (componentHtml ? '<div class="parlay-rank-components">' + componentHtml + '</div>' : '') +
+      (tipsHtml ? '<ul class="parlay-rank-tips">' + tipsHtml + '</ul>' : '') +
+      '</div>';
   }
 
   function renderParlayH2HDebug(prop) {
@@ -9817,6 +9984,7 @@ function enhanceBetFinderSparklines(payload) {
         '<div class="parlay-leg-details-body">' +
         reasonHtml +
         renderDecisionLensHtml(decisionLens, 'compact') +
+        renderParlayRankingProfile(leg) +
         renderParlayH2HDebug(leg) +
         '<div class="parlay-leg-analyze-hint" style="font-size:0.72rem;color:var(--muted);margin-top:6px;text-align:center">' + escHtml(leg.confidence_summary || 'Click to analyze ') + '</div>' +
         '</div>' +
@@ -9882,7 +10050,12 @@ function enhanceBetFinderSparklines(payload) {
     if (!all || !all.length) return;
     show(parlayAllPropsWrap, true);
     if (parlayPropCount) parlayPropCount.textContent = all.length + ' props -- click any row to analyze';
-    if (parlayAllPropsTitle) parlayAllPropsTitle.textContent = all.length + ' props ranked by H2H hit rate (fallback recent)';
+    if (parlayAllPropsTitle) {
+      const hasPlayoffBlend = all.some(function (p) { return String(p?.ranking_source || '').toLowerCase() === 'playoff_blend'; });
+      parlayAllPropsTitle.textContent = hasPlayoffBlend
+        ? all.length + ' props ranked by playoff blend'
+        : all.length + ' props ranked by H2H hit rate (fallback recent)';
+    }
     const sel = new Set((selectedIds || []).map(Number));
     parlayAllPropsBody.innerHTML = all.map(function (p, idx) {
       const isSel = sel.has(Number(p.player_id));
@@ -9950,6 +10123,7 @@ function enhanceBetFinderSparklines(payload) {
       show(parlayTicketShell, false);
       show(parlayTicket, false);
       show(parlayAllPropsWrap, false);
+      renderParlayStrategyPanel([]);
       show(parlayEmptyState, true);
       const s = parlayEmptyState.querySelector('strong');
       const sp = parlayEmptyState.querySelector('span');
@@ -9961,6 +10135,7 @@ function enhanceBetFinderSparklines(payload) {
     }
     show(parlayEmptyState, false);
     renderPlayoffFallbackNotice(cachedPlayoffFallbackApplied);
+    renderParlayStrategyPanel(displayProps);
     const legs = layout.legs;
     lastParlayLegSignature = getParlayLegSignature(legs);
     const odds = calcOdds(legs);
@@ -10001,7 +10176,61 @@ function enhanceBetFinderSparklines(payload) {
     parlayFallbackNoticeEl.style.display = '';
     parlayFallbackNoticeEl.innerHTML =
       '<div class="parlay-fallback-pill">Playoff fallback applied</div>' +
-      '<span>Strict playoff filters removed all props, so confidence/H2H gating was relaxed to keep results visible. Re-check each leg before placing bets.</span>';
+      '<span>Strict playoff filters removed all props, so confidence gating was relaxed to keep results visible. Re-check each leg before placing bets.</span>';
+  }
+
+  function isPlayoffParlayProp(prop) {
+    const source = String(prop?.ranking_source || '').toLowerCase();
+    const seasonType = String(prop?.season_type || '').toLowerCase();
+    return source === 'playoff_blend' || seasonType === 'playoffs';
+  }
+
+  function renderParlayStrategyPanel(props) {
+    if (!parlayStrategyPanelEl) return;
+    const list = Array.isArray(props) ? props : [];
+    const playoffProps = list.filter(isPlayoffParlayProp);
+    if (!playoffProps.length) {
+      parlayStrategyPanelEl.style.display = 'none';
+      parlayStrategyPanelEl.innerHTML = '';
+      return;
+    }
+    const blendCount = playoffProps.filter(function (p) { return String(p.ranking_source || '').toLowerCase() === 'playoff_blend'; }).length;
+    const newMatchups = playoffProps.filter(function (p) { return Number(p.h2h_games_count || 0) <= 0; }).length;
+    const cappedH2h = playoffProps.filter(function (p) {
+      const h2hGames = Number(p.h2h_games_count || 0);
+      return h2hGames > 0 && h2hGames < 4;
+    }).length;
+    const avgH2hWeight = playoffProps.length
+      ? playoffProps.reduce(function (sum, p) { return sum + Number(p.h2h_weight_pct || 0); }, 0) / playoffProps.length
+      : 0;
+    const tips = [];
+    playoffProps.forEach(function (prop) {
+      const profile = getParlayRankingProfile(prop);
+      (profile.tips || []).forEach(function (tip) {
+        if (tip && tips.indexOf(tip) === -1) tips.push(tip);
+      });
+    });
+    [
+      'Favor locked minutes, model edge, and role stability before tiny H2H samples.',
+      'Keep early-series parlays shorter; let rotations and coverage reveal themselves.',
+      'Avoid stocks as anchor legs unless the price is clearly mis-set.',
+    ].forEach(function (tip) {
+      if (tips.indexOf(tip) === -1) tips.push(tip);
+    });
+    parlayStrategyPanelEl.style.display = '';
+    parlayStrategyPanelEl.innerHTML =
+      '<div class="parlay-strategy-head">' +
+      '<div><span class="section-kicker">Playoff board logic</span><strong>H2H is capped until the series earns it</strong></div>' +
+      '<span class="parlay-strategy-score">' + blendCount + ' blend-ranked</span>' +
+      '</div>' +
+      '<div class="parlay-strategy-metrics">' +
+      '<span>New matchups <b>' + newMatchups + '</b></span>' +
+      '<span>Capped H2H <b>' + cappedH2h + '</b></span>' +
+      '<span>Avg H2H weight <b>' + Math.round(avgH2hWeight) + '%</b></span>' +
+      '</div>' +
+      '<ul class="parlay-strategy-tips">' +
+      tips.slice(0, 3).map(function (tip) { return '<li>' + escHtml(tip) + '</li>'; }).join('') +
+      '</ul>';
   }
 
   //  Render single injury cell for all-props table 
@@ -10161,6 +10390,7 @@ function enhanceBetFinderSparklines(payload) {
 
       if (!cachedScoredProps.length) {
         refreshParlayBacktestActionButtons();
+        renderParlayStrategyPanel([]);
         show(parlayEmptyState, true);
         const s = parlayEmptyState.querySelector('strong'), sp = parlayEmptyState.querySelector('span');
         if (s) s.textContent = data.message || 'No props found for selected events.';

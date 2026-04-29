@@ -2961,6 +2961,40 @@ def build_prop_analysis_payload(
         season_type=season_type,
         playoff_game_number=int((next_game or {}).get("playoff_game_number") or 0) or None,
     )
+    h2h_games_count, h2h_side_hit_count, h2h_side_hit_rate = resolve_side_h2h_metrics(
+        games=games,
+        h2h_payload=h2h_payload,
+        side=recommended_side,
+        opponent_abbreviation=(next_game or {}).get("opponent_abbreviation"),
+    )
+    ranking_context = build_parlay_ranking_context(
+        season_type=season_type,
+        side=recommended_side,
+        stat=stat,
+        side_hit_rate=float(side_hit_rate),
+        games_count=int(len(values)),
+        h2h_games_count=int(h2h_games_count or 0),
+        h2h_side_hit_rate=float(h2h_side_hit_rate) if h2h_side_hit_rate is not None else None,
+        model_probability=side_model_prob,
+        fair_probability=chosen_fair_prob,
+        edge_pct=chosen_edge_pct,
+        ev_decimal=chosen_ev,
+        confidence_score=confidence_engine.get("score"),
+        engine_ranking_score=confidence_engine.get("ranking_score"),
+        line=line,
+        average=average,
+    )
+    confidence_engine = {
+        **confidence_engine,
+        "ranking_source": ranking_context.get("ranking_source"),
+        "ranking_sort_score": ranking_context.get("ranking_sort_score"),
+        "ranking_blend_score": ranking_context.get("ranking_blend_score"),
+        "ranking_profile": ranking_context.get("ranking_profile") or {},
+        "playoff_strategy_tips": ranking_context.get("playoff_strategy_tips") or [],
+        "h2h_weight_pct": ranking_context.get("h2h_weight_pct"),
+        "model_probability": round(side_model_prob * 100.0, 1),
+        "implied_probability": round(chosen_fair_prob * 100.0, 1),
+    }
 
     traffic_tone = "yellow"
     traffic_label = "Caution"
@@ -3036,8 +3070,19 @@ def build_prop_analysis_payload(
         "confidence": confidence_engine,
         "recommended_side": recommended_side,
         "recommended_side_source": "forced" if forced_side_normalized else "model",
+        "side_hit_rate": round(side_hit_rate, 1),
+        "h2h_side_hit_count": h2h_side_hit_count,
+        "h2h_side_hit_rate": round(h2h_side_hit_rate, 1) if h2h_side_hit_rate is not None else None,
+        "ranking_source": ranking_context.get("ranking_source"),
+        "ranking_hit_rate": ranking_context.get("ranking_hit_rate"),
+        "ranking_sort_score": ranking_context.get("ranking_sort_score"),
+        "ranking_blend_score": ranking_context.get("ranking_blend_score"),
+        "ranking_profile": ranking_context.get("ranking_profile") or {},
+        "playoff_strategy_tips": ranking_context.get("playoff_strategy_tips") or [],
+        "h2h_weight_pct": ranking_context.get("h2h_weight_pct"),
         "edge": chosen_edge_pct,
         "edge_pct": chosen_edge_pct,
+        "ev": chosen_ev,
         "edge_definition": EDGE_DEFINITION_MODEL_FAIR,
         "fair_probability": round(chosen_fair_prob * 100.0, 1),
         "traffic_light": {
@@ -4268,6 +4313,190 @@ def resolve_side_h2h_metrics(
     return from_payload
 
 
+MIN_PARLAY_H2H_GAMES_FOR_RANKING = 2
+MIN_PARLAY_PLAYOFF_H2H_GAMES_FOR_PRIMARY = 4
+MAX_PARLAY_PLAYOFF_H2H_WEIGHT = 0.35
+
+
+def playoff_h2h_weight_for_sample(games_count: int | None) -> float:
+    games = max(0, int(games_count or 0))
+    if games <= 0:
+        return 0.0
+    if games == 1:
+        return 0.08
+    if games == 2:
+        return 0.15
+    if games == 3:
+        return 0.24
+    if games == 4:
+        return 0.32
+    return MAX_PARLAY_PLAYOFF_H2H_WEIGHT
+
+
+def _score_from_pct(value: Any, default: float = 50.0) -> float:
+    try:
+        number = float(value)
+        if math.isnan(number) or math.isinf(number):
+            return default
+        return clamp(number, 0.0, 100.0)
+    except Exception:
+        return default
+
+
+def build_parlay_ranking_context(
+    *,
+    season_type: str | None,
+    side: str,
+    stat: str,
+    side_hit_rate: float,
+    games_count: int,
+    h2h_games_count: int,
+    h2h_side_hit_rate: float | None,
+    model_probability: float | None,
+    fair_probability: float | None,
+    edge_pct: float | None,
+    ev_decimal: float | None,
+    confidence_score: int | float | None,
+    engine_ranking_score: int | float | None,
+    line: float | None,
+    average: float | None,
+) -> dict[str, Any]:
+    normalized_season_type = normalize_requested_season_type(season_type)
+    side_upper = str(side or "").upper()
+    stat_upper = str(stat or "").upper()
+
+    recent_score = _score_from_pct(side_hit_rate)
+    h2h_count = max(0, int(h2h_games_count or 0))
+    h2h_score = _score_from_pct(h2h_side_hit_rate, default=recent_score) if h2h_side_hit_rate is not None else None
+    confidence_component = _score_from_pct(
+        engine_ranking_score if engine_ranking_score is not None else confidence_score,
+        default=50.0,
+    )
+
+    model_raw = safe_float_or_none(model_probability)
+    if model_raw is None:
+        model_component = recent_score
+    else:
+        model_component = clamp(model_raw * 100.0 if model_raw <= 1.0 else model_raw, 0.0, 100.0)
+
+    edge_component = 50.0 + (clamp(float(edge_pct or 0.0), -24.0, 24.0) * 1.25)
+    ev_component = 50.0 + (clamp(float(ev_decimal or 0.0), -0.25, 0.25) * 110.0)
+    fair_raw = safe_float_or_none(fair_probability)
+    fair_component = 50.0
+    if fair_raw is not None:
+        fair_pct = fair_raw * 100.0 if fair_raw <= 1.0 else fair_raw
+        fair_component = 50.0 + clamp(model_component - fair_pct, -18.0, 18.0) * 1.1
+
+    line_component = 50.0
+    avg_value = safe_float_or_none(average)
+    line_value = safe_float_or_none(line)
+    if avg_value is not None and line_value is not None:
+        raw_cushion = avg_value - line_value
+        side_cushion = -raw_cushion if side_upper == "UNDER" else raw_cushion
+        scale = max(1.0, abs(line_value) * 0.16)
+        line_component = 50.0 + clamp((side_cushion / scale) * 18.0, -18.0, 18.0)
+
+    base_blend = (
+        model_component * 0.27
+        + confidence_component * 0.23
+        + recent_score * 0.18
+        + edge_component * 0.13
+        + ev_component * 0.08
+        + fair_component * 0.06
+        + line_component * 0.05
+    )
+    if int(games_count or 0) <= 4:
+        base_blend -= max(0, 5 - int(games_count or 0)) * 1.3
+    base_blend = clamp(base_blend, 0.0, 100.0)
+
+    notes: list[str] = []
+    tips: list[str] = []
+    h2h_weight = 0.0
+    ranking_source = "recent"
+    ranking_hit_rate = recent_score
+    ranking_sort_score = recent_score
+    ranking_blend_score = recent_score
+
+    if normalized_season_type == SEASON_TYPE_PLAYOFFS:
+        h2h_weight = playoff_h2h_weight_for_sample(h2h_count) if h2h_score is not None else 0.0
+        ranking_blend_score = base_blend
+        if h2h_score is not None:
+            ranking_blend_score = (base_blend * (1.0 - h2h_weight)) + (h2h_score * h2h_weight)
+        ranking_blend_score = clamp(ranking_blend_score, 0.0, 100.0)
+        ranking_source = "playoff_blend"
+        ranking_hit_rate = ranking_blend_score
+        ranking_sort_score = ranking_blend_score
+
+        if h2h_count <= 0:
+            notes.append("New playoff matchup")
+            tips.append("H2H is parked at 0% until this series creates real matchup data.")
+        elif h2h_count < MIN_PARLAY_PLAYOFF_H2H_GAMES_FOR_PRIMARY:
+            notes.append("Tiny H2H sample capped")
+            tips.append(f"H2H is capped at {round(h2h_weight * 100)}% because the series sample is still small.")
+        else:
+            notes.append("H2H weighted, not absolute")
+            tips.append(f"H2H contributes {round(h2h_weight * 100)}%; model edge, role, and price still drive the rank.")
+
+        if int(games_count or 0) <= 4:
+            notes.append("Small playoff sample")
+            tips.append("Keep early-series slips short until minutes and coverage stabilize.")
+    else:
+        has_reliable_h2h = h2h_score is not None and h2h_count >= MIN_PARLAY_H2H_GAMES_FOR_RANKING
+        if has_reliable_h2h:
+            ranking_source = "h2h"
+            ranking_hit_rate = h2h_score
+            ranking_sort_score = h2h_score
+            ranking_blend_score = h2h_score
+        else:
+            ranking_source = "recent"
+            ranking_hit_rate = recent_score
+            ranking_sort_score = recent_score
+            ranking_blend_score = recent_score
+
+    if stat_upper in {"STL", "BLK"}:
+        tips.append("Stocks are high-variance props; use them as leans, not parlay anchors.")
+    elif stat_upper == "3PM":
+        tips.append("For threes, trust stable attempts more than one hot shooting result.")
+    elif stat_upper in {"PRA", "PR", "PA", "RA"}:
+        tips.append("Combo props need role security; minutes volatility matters more than one box score.")
+
+    if float(edge_pct or 0.0) >= 4.0:
+        tips.append("Model price is ahead of the fair market number.")
+    elif float(edge_pct or 0.0) <= -2.0:
+        tips.append("Market edge is thin; require strong role or matchup support.")
+
+    unique_tips: list[str] = []
+    for tip in tips:
+        if tip and tip not in unique_tips:
+            unique_tips.append(tip)
+
+    return {
+        "ranking_source": ranking_source,
+        "ranking_hit_rate": round(ranking_hit_rate, 1),
+        "ranking_sort_score": round(ranking_sort_score, 1),
+        "ranking_blend_score": round(ranking_blend_score, 1),
+        "h2h_weight_pct": round(h2h_weight * 100.0, 1),
+        "ranking_profile": {
+            "source": ranking_source,
+            "sort_score": round(ranking_sort_score, 1),
+            "blend_score": round(ranking_blend_score, 1),
+            "h2h_weight_pct": round(h2h_weight * 100.0, 1),
+            "notes": notes[:4],
+            "tips": unique_tips[:4],
+            "components": {
+                "recent": round(recent_score, 1),
+                "model": round(model_component, 1),
+                "confidence": round(confidence_component, 1),
+                "edge": round(edge_component, 1),
+                "ev": round(ev_component, 1),
+                "line_value": round(line_component, 1),
+                "h2h": round(h2h_score, 1) if h2h_score is not None else None,
+            },
+        },
+        "playoff_strategy_tips": unique_tips[:4],
+    }
+
+
 def annotate_parlay_selection(scored: list[dict[str, Any]], legs: int) -> list[dict[str, Any]]:
     parlay_legs: list[dict[str, Any]] = []
     seen_player_ids: set[int] = set()
@@ -4300,9 +4529,6 @@ def annotate_parlay_selection(scored: list[dict[str, Any]], legs: int) -> list[d
         parlay_legs.append(prop)
 
     return parlay_legs
-
-
-MIN_PARLAY_H2H_GAMES_FOR_RANKING = 2
 
 
 def throttle_request() -> None:
@@ -6965,6 +7191,85 @@ def bet_finder(
             return None
 
         player_id = int(raw_player_id)
+        analysis_payload: dict[str, Any] | None = None
+        try:
+            analysis_payload = build_prop_analysis_payload(
+                player_id=player_id,
+                stat=stat,
+                line=line,
+                last_n=last_n,
+                season=selected_season,
+                season_type=season_type,
+                team_id=int(team["id"]),
+                player_position=str(row.get("POSITION", "")).strip() or None,
+            )
+        except Exception:
+            analysis_payload = None
+
+        if isinstance(analysis_payload, dict) and int(analysis_payload.get("games_count") or 0) >= min_games:
+            games_count = int(analysis_payload.get("games_count") or 0)
+            over_hit_count = max(0, min(games_count, int(analysis_payload.get("hit_count") or 0)))
+            average = round(float(analysis_payload.get("average") or 0.0), 2)
+            side = str(analysis_payload.get("recommended_side") or ("OVER" if average >= line else "UNDER")).upper()
+            if side not in {"OVER", "UNDER"}:
+                side = "OVER" if average >= line else "UNDER"
+            side_hit_count = over_hit_count if side == "OVER" else max(0, games_count - over_hit_count)
+            side_hit_rate = round(side_hit_rate_from_over_hit_rate(analysis_payload.get("hit_rate"), side), 1)
+            avg_edge = round((average - line) if side == "OVER" else (line - average), 2)
+            analysis_games = list(analysis_payload.get("games") or [])
+            recent_game = analysis_games[-1] if analysis_games else {}
+            last_value = safe_float_or_none((recent_game or {}).get("value"))
+            if last_value is None and analysis_games:
+                last_value = safe_float_or_none((analysis_games[0] or {}).get("value"))
+            h2h_payload = analysis_payload.get("h2h") or {}
+            h2h_games_count = int(h2h_payload.get("games_count") or 0)
+            h2h_side_hit_count = analysis_payload.get("h2h_side_hit_count")
+            h2h_side_hit_rate = analysis_payload.get("h2h_side_hit_rate")
+
+            return {
+                "player": {
+                    "id": player_id,
+                    "full_name": str(row.get("PLAYER", "")).strip() or str((analysis_payload.get("player") or {}).get("full_name") or ""),
+                    "team_id": team["id"],
+                    "team_name": team["full_name"],
+                    "team_abbreviation": team["abbreviation"],
+                    "position": str(row.get("POSITION", "")).strip() or str((analysis_payload.get("player") or {}).get("position") or ""),
+                    "jersey": str(row.get("NUM", "")).strip() or str((analysis_payload.get("player") or {}).get("jersey") or ""),
+                    "is_active": True,
+                },
+                "stat": stat,
+                "line": line,
+                "side": side,
+                "games_count": games_count,
+                "hit_count": side_hit_count,
+                "hit_rate": side_hit_rate,
+                "over_hit_count": over_hit_count,
+                "over_hit_rate": round(float(analysis_payload.get("hit_rate") or 0.0), 1),
+                "average": average,
+                "avg_edge": avg_edge,
+                "last_value": round(float(last_value or 0.0), 1),
+                "hit_streak": compute_recent_hit_streak([bool(game.get("hit")) for game in analysis_games]),
+                "season_type": season_type,
+                "ranking_source": analysis_payload.get("ranking_source"),
+                "ranking_hit_rate": analysis_payload.get("ranking_hit_rate"),
+                "ranking_sort_score": analysis_payload.get("ranking_sort_score"),
+                "ranking_blend_score": analysis_payload.get("ranking_blend_score"),
+                "ranking_profile": analysis_payload.get("ranking_profile") or {},
+                "playoff_strategy_tips": analysis_payload.get("playoff_strategy_tips") or [],
+                "h2h_weight_pct": analysis_payload.get("h2h_weight_pct"),
+                "h2h_games_count": h2h_games_count,
+                "h2h_hit_count": h2h_side_hit_count,
+                "h2h_hit_rate": h2h_side_hit_rate,
+                "confidence": analysis_payload.get("confidence") or {},
+                "edge": analysis_payload.get("edge"),
+                "ev": analysis_payload.get("ev"),
+                "model_probability": (analysis_payload.get("confidence") or {}).get("model_probability"),
+                "matchup": analysis_payload.get("matchup") or {},
+                "opportunity": analysis_payload.get("opportunity") or {},
+                "team_context": analysis_payload.get("team_context") or {},
+                "environment": analysis_payload.get("environment") or {},
+            }
+
         try:
             game_rows = fetch_recent_player_game_log(
                 player_id=player_id,
@@ -7011,13 +7316,20 @@ def bet_finder(
             },
             "stat": stat,
             "line": line,
+            "side": "OVER",
             "games_count": games_count,
             "hit_count": hit_count,
             "hit_rate": hit_rate,
+            "over_hit_count": hit_count,
+            "over_hit_rate": hit_rate,
             "average": average,
             "avg_edge": avg_edge,
             "last_value": last_value,
             "hit_streak": hit_streak,
+            "season_type": season_type,
+            "ranking_source": "recent",
+            "ranking_hit_rate": hit_rate,
+            "ranking_sort_score": hit_rate,
         }
 
     if not roster_rows:
@@ -7038,7 +7350,7 @@ def bet_finder(
 
     results.sort(
         key=lambda item: (
-            item["hit_rate"],
+            item.get("ranking_sort_score", item["hit_rate"]),
             item["avg_edge"],
             item["hit_count"],
             item["average"],
@@ -8481,19 +8793,25 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             h2h_payload=analysis.get("h2h") or {},
             side=side,
         )
-        has_reliable_h2h = h2h_side_hit_rate is not None and int(h2h_games_count or 0) >= MIN_PARLAY_H2H_GAMES_FOR_RANKING
-        if is_playoffs_mode:
-            if h2h_side_hit_rate is None or int(h2h_games_count or 0) <= 0:
-                if strict_playoff_rules:
-                    return None
-                ranking_hit_rate = float(side_hit_rate)
-                ranking_source = "recent"
-            else:
-                ranking_hit_rate = float(h2h_side_hit_rate)
-                ranking_source = "h2h"
-        else:
-            ranking_hit_rate = h2h_side_hit_rate if has_reliable_h2h else side_hit_rate
-            ranking_source = "h2h" if has_reliable_h2h else "recent"
+        ranking_context = build_parlay_ranking_context(
+            season_type=scoring_season_type,
+            side=side,
+            stat=stat,
+            side_hit_rate=float(side_hit_rate),
+            games_count=int(analysis.get("games_count") or 0),
+            h2h_games_count=int(h2h_games_count or 0),
+            h2h_side_hit_rate=float(h2h_side_hit_rate) if h2h_side_hit_rate is not None else None,
+            model_probability=model_prob,
+            fair_probability=fair_prob,
+            edge_pct=edge_pct,
+            ev_decimal=ev_decimal_adjusted,
+            confidence_score=confidence_score_value,
+            engine_ranking_score=confidence_engine.get("ranking_score"),
+            line=line,
+            average=avg,
+        )
+        ranking_hit_rate = float(ranking_context.get("ranking_hit_rate") or side_hit_rate)
+        ranking_source = str(ranking_context.get("ranking_source") or "recent")
 
         scored_games_count = int(analysis.get("games_count") or 0)
         side_hit_count = max(0, min(scored_games_count, int(round((float(side_hit_rate) / 100.0) * scored_games_count))))
@@ -8518,6 +8836,11 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             "hit_rate": round(side_hit_rate, 1),
             "ranking_hit_rate": round(ranking_hit_rate, 1),
             "ranking_source": ranking_source,
+            "ranking_sort_score": ranking_context.get("ranking_sort_score"),
+            "ranking_blend_score": ranking_context.get("ranking_blend_score"),
+            "ranking_profile": ranking_context.get("ranking_profile") or {},
+            "playoff_strategy_tips": ranking_context.get("playoff_strategy_tips") or [],
+            "h2h_weight_pct": ranking_context.get("h2h_weight_pct"),
             "h2h_games_count": h2h_games_count,
             "h2h_hit_count": h2h_side_hit_count,
             "h2h_hit_rate": round(h2h_side_hit_rate, 1) if h2h_side_hit_rate is not None else None,
@@ -8601,11 +8924,13 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
         )
         playoff_relaxed_fallback_applied = bool(scored)
 
-    # Primary rank: opponent-specific H2H side hit rate.
-    # Fallback: regular side hit rate when no H2H sample exists.
+    # Primary rank: playoff blend in postseason, H2H/recent side hit rate otherwise.
+    # The playoff blend caps tiny H2H samples so a new series does not overfit one game.
     scored.sort(
         key=lambda x: (
-            x.get("ranking_hit_rate", x.get("hit_rate", 0)),
+            x.get("ranking_sort_score", x.get("ranking_hit_rate", x.get("hit_rate", 0))),
+            x.get("calibrated_edge_pct", x.get("edge", 0)),
+            x.get("model_probability", 0),
             x.get("h2h_games_count", 0),
             x.get("ranking_score", x["confidence_score"]),
             x["odds"],
@@ -9378,19 +9703,25 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             h2h_games_count = int(base_h2h_games_count or 0)
             h2h_side_hit_count = int(base_h2h_side_hit_count or 0)
             h2h_side_hit_rate = float(base_h2h_side_hit_rate) if base_h2h_side_hit_rate is not None else None
-        has_reliable_h2h = h2h_side_hit_rate is not None and int(h2h_games_count or 0) >= MIN_PARLAY_H2H_GAMES_FOR_RANKING
-        if is_playoffs_mode:
-            if h2h_side_hit_rate is None or int(h2h_games_count or 0) <= 0:
-                if strict_playoff_rules:
-                    return None
-                ranking_hit_rate = float(side_hit_rate)
-                ranking_source = "recent"
-            else:
-                ranking_hit_rate = float(h2h_side_hit_rate)
-                ranking_source = "h2h"
-        else:
-            ranking_hit_rate = h2h_side_hit_rate if has_reliable_h2h else side_hit_rate
-            ranking_source = "h2h" if has_reliable_h2h else "recent"
+        ranking_context = build_parlay_ranking_context(
+            season_type=scoring_season_type,
+            side=side,
+            stat=stat,
+            side_hit_rate=float(side_hit_rate),
+            games_count=int(active_games_count or 0),
+            h2h_games_count=int(h2h_games_count or 0),
+            h2h_side_hit_rate=float(h2h_side_hit_rate) if h2h_side_hit_rate is not None else None,
+            model_probability=model_prob,
+            fair_probability=fair_prob,
+            edge_pct=_computed_edge,
+            ev_decimal=_computed_ev,
+            confidence_score=confidence_score_value,
+            engine_ranking_score=confidence_engine.get("ranking_score"),
+            line=line,
+            average=avg,
+        )
+        ranking_hit_rate = float(ranking_context.get("ranking_hit_rate") or side_hit_rate)
+        ranking_source = str(ranking_context.get("ranking_source") or "recent")
 
         return {
             "player_name": result.get("player_name") or "",
@@ -9407,6 +9738,11 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             "hit_rate": round(side_hit_rate, 1),
             "ranking_hit_rate": round(ranking_hit_rate, 1),
             "ranking_source": ranking_source,
+            "ranking_sort_score": ranking_context.get("ranking_sort_score"),
+            "ranking_blend_score": ranking_context.get("ranking_blend_score"),
+            "ranking_profile": ranking_context.get("ranking_profile") or {},
+            "playoff_strategy_tips": ranking_context.get("playoff_strategy_tips") or [],
+            "h2h_weight_pct": ranking_context.get("h2h_weight_pct"),
             "h2h_games_count": h2h_games_count,
             "h2h_hit_count": h2h_side_hit_count,
             "h2h_hit_rate": round(h2h_side_hit_rate, 1) if h2h_side_hit_rate is not None else None,
@@ -9502,7 +9838,9 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
 
     scored.sort(
         key=lambda x: (
-            x.get("ranking_hit_rate", x.get("hit_rate", 0)),
+            x.get("ranking_sort_score", x.get("ranking_hit_rate", x.get("hit_rate", 0))),
+            x.get("calibrated_edge_pct", x.get("edge", 0)),
+            x.get("model_probability", 0),
             x.get("h2h_games_count", 0),
             x.get("ranking_score", x["confidence_score"]),
             x["odds"],
@@ -9592,6 +9930,7 @@ def todays_games(game_date: str | None = None) -> dict[str, Any]:
     resolved_date = requested_date
     rows = fetch_scoreboard_games(requested_date)
     fallback_used = False
+    live_scoreboard: dict[str, Any] | None = None
 
     if not rows:
         base_date = datetime.strptime(requested_date, "%Y-%m-%d").date()
@@ -9606,6 +9945,28 @@ def todays_games(game_date: str | None = None) -> dict[str, Any]:
                 resolved_date = probe_date
                 fallback_used = True
                 break
+
+    if not rows:
+        live_scoreboard = _fetch_nba_live_scoreboard()
+        live_scoreboard_payload = (live_scoreboard or {}).get("scoreboard") or {}
+        live_scoreboard_date = str(live_scoreboard_payload.get("gameDate") or "").strip()
+        live_games = [game for game in (live_scoreboard_payload.get("games") or []) if isinstance(game, dict)]
+        if live_games and (not game_date or live_scoreboard_date == requested_date):
+            rows = []
+            resolved_date = live_scoreboard_date or resolved_date
+            fallback_used = True
+            for live_game in live_games:
+                live_home = (live_game or {}).get("homeTeam") or {}
+                live_away = (live_game or {}).get("awayTeam") or {}
+                rows.append({
+                    "GAME_ID": str((live_game or {}).get("gameId") or "").strip(),
+                    "GAME_DATE_EST": resolved_date,
+                    "HOME_TEAM_ID": safe_int_score(live_home.get("teamId"), 0),
+                    "VISITOR_TEAM_ID": safe_int_score(live_away.get("teamId"), 0),
+                    "GAME_STATUS_TEXT": str((live_game or {}).get("gameStatusText") or "").strip(),
+                    "PTS_HOME": safe_int_score(live_home.get("score"), 0),
+                    "PTS_AWAY": safe_int_score(live_away.get("score"), 0),
+                })
 
     report_payload = get_cached_injury_report_payload_fast()
     injury_rows_by_team: dict[str, list[dict[str, Any]]] = {}
@@ -9624,18 +9985,250 @@ def todays_games(game_date: str | None = None) -> dict[str, Any]:
             for team_name in involved_teams
         }
     games: list[dict[str, Any]] = []
+    live_scoreboard = live_scoreboard or _fetch_nba_live_scoreboard()
+    live_games_by_id: dict[str, dict[str, Any]] = {}
+    live_scoreboard_date = str(((live_scoreboard or {}).get("scoreboard") or {}).get("gameDate") or "").strip()
+    if live_scoreboard_date == str(resolved_date):
+        for live_game in (((live_scoreboard or {}).get("scoreboard") or {}).get("games") or []):
+            live_game_id = str((live_game or {}).get("gameId") or "").strip()
+            if live_game_id:
+                live_games_by_id[live_game_id] = live_game
+    needs_schedule_context = any(
+        not str(row.get("GAME_STATUS_TEXT") or "").strip()
+        or str(row.get("GAME_ID") or "").strip()[:3] in {"001", "004", "005"}
+        for row in rows
+    )
+    schedule_payload = _fetch_nba_schedule_league() if needs_schedule_context else None
+    schedule_games_by_id: dict[str, dict[str, Any]] = {}
+    schedule_games_by_matchup: dict[str, dict[str, Any]] = {}
+    for date_group in (((schedule_payload or {}).get("leagueSchedule") or {}).get("gameDates") or []):
+        schedule_date = str((date_group or {}).get("gameDate") or (date_group or {}).get("gameDateEst") or "").strip()
+        for schedule_game in ((date_group or {}).get("games") or []):
+            if not isinstance(schedule_game, dict):
+                continue
+            schedule_game_id = str(schedule_game.get("gameId") or "").strip()
+            if schedule_game_id:
+                schedule_games_by_id[schedule_game_id] = schedule_game
+            schedule_home = schedule_game.get("homeTeam") or {}
+            schedule_away = schedule_game.get("awayTeam") or {}
+            schedule_home_id = safe_int_score(schedule_home.get("teamId"), 0)
+            schedule_away_id = safe_int_score(schedule_away.get("teamId"), 0)
+            if schedule_date and schedule_home_id and schedule_away_id:
+                schedule_games_by_matchup[f"{schedule_date}|{schedule_away_id}@{schedule_home_id}"] = schedule_game
+
+    def _team_record_from_live(live_team: dict[str, Any] | None) -> str:
+        live_team = live_team or {}
+        wins = live_team.get("wins")
+        losses = live_team.get("losses")
+        if wins in (None, "") or losses in (None, ""):
+            return ""
+        try:
+            return f"{int(wins)}-{int(losses)}"
+        except Exception:
+            return ""
+
+    def _team_record_for_team(team_id: int, *games_to_scan: dict[str, Any] | None) -> str:
+        for game_to_scan in games_to_scan:
+            for team_key in ("homeTeam", "awayTeam"):
+                team_payload = (game_to_scan or {}).get(team_key) or {}
+                if safe_int_score(team_payload.get("teamId"), 0) == team_id:
+                    record = _team_record_from_live(team_payload)
+                    if record:
+                        return record
+        return ""
+
+    def _team_seed_for_team(team_id: int, *games_to_scan: dict[str, Any] | None) -> Any:
+        for game_to_scan in games_to_scan:
+            for team_key in ("homeTeam", "awayTeam"):
+                team_payload = (game_to_scan or {}).get(team_key) or {}
+                if safe_int_score(team_payload.get("teamId"), 0) == team_id and team_payload.get("seed") is not None:
+                    return team_payload.get("seed")
+        return None
+
+    def _format_live_tipoff_pht(live_game: dict[str, Any] | None) -> str:
+        raw_utc = str((live_game or {}).get("gameTimeUTC") or (live_game or {}).get("gameDateTimeUTC") or "").strip()
+        if not raw_utc:
+            return ""
+        try:
+            parsed = datetime.fromisoformat(raw_utc.replace("Z", "+00:00"))
+            pht_dt = parsed.astimezone(APP_ZONEINFO)
+            hh = pht_dt.strftime("%I").lstrip("0") or "0"
+            return f"{hh}:{pht_dt.strftime('%M')} {pht_dt.strftime('%p').lower()} PHT"
+        except Exception:
+            return ""
+
+    def _infer_scoreboard_season_type(
+        row: dict[str, Any],
+        live_game: dict[str, Any] | None,
+        schedule_game: dict[str, Any] | None,
+    ) -> str:
+        game_id_prefix = str(row.get("GAME_ID") or (live_game or {}).get("gameId") or (schedule_game or {}).get("gameId") or "")[:3]
+        live_label = " ".join(
+            str((live_game or {}).get(key) or (schedule_game or {}).get(key) or "")
+            for key in ("gameLabel", "gameSubLabel", "seriesText", "poRoundDesc")
+        ).lower()
+        if game_id_prefix == "004" or "round" in live_label or "series" in live_label:
+            return SEASON_TYPE_PLAYOFFS
+        if game_id_prefix == "005" or "play-in" in live_label:
+            return "Play-In"
+        if game_id_prefix == "001" or "preseason" in live_label:
+            return "Preseason"
+        return SEASON_TYPE_REGULAR
+
+    def _live_game_number(live_game: dict[str, Any] | None) -> int | None:
+        raw = str(
+            (live_game or {}).get("seriesGameNumber")
+            or (live_game or {}).get("gameSubLabel")
+            or (live_game or {}).get("gameLabel")
+            or ""
+        ).strip()
+        match = re.search(r"\bGame\s*(\d+)\b", raw, flags=re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            value = int(match.group(1))
+            return value if 1 <= value <= 7 else None
+        except Exception:
+            return None
+
+    def _infer_playoff_game_number_from_game_id(game_id: Any) -> int | None:
+        raw = str(game_id or "").strip()
+        if len(raw) < 4 or raw[:3] != "004":
+            return None
+        try:
+            value = int(raw[-1])
+            return value if 1 <= value <= 7 else None
+        except Exception:
+            return None
+
+    def _previous_schedule_series_game(game_id: Any) -> dict[str, Any] | None:
+        raw = str(game_id or "").strip()
+        current_game_number = _infer_playoff_game_number_from_game_id(raw)
+        if not current_game_number or len(raw) < 4:
+            return None
+        prefix = raw[:-1]
+        candidates: list[tuple[int, dict[str, Any]]] = []
+        for candidate_id, candidate_game in schedule_games_by_id.items():
+            if not candidate_id.startswith(prefix) or candidate_id == raw:
+                continue
+            candidate_game_number = _infer_playoff_game_number_from_game_id(candidate_id)
+            if candidate_game_number is None or candidate_game_number >= current_game_number:
+                continue
+            candidates.append((candidate_game_number, candidate_game))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+
+    def _series_text_from_team_records(
+        away_abbreviation: str,
+        home_abbreviation: str,
+        away_record: str,
+        home_record: str,
+    ) -> str:
+        def _wins(record: str) -> int | None:
+            match = re.match(r"^\s*(\d+)\s*-\s*\d+\s*$", str(record or ""))
+            if not match:
+                return None
+            try:
+                return int(match.group(1))
+            except Exception:
+                return None
+
+        away_wins = _wins(away_record)
+        home_wins = _wins(home_record)
+        if away_wins is None or home_wins is None:
+            return ""
+        if away_wins == home_wins:
+            return f"Series tied {away_wins}-{home_wins}"
+        if home_wins > away_wins:
+            leader = home_abbreviation or "Home"
+            return f"{leader} leads {home_wins}-{away_wins}"
+        leader = away_abbreviation or "Away"
+        return f"{leader} leads {away_wins}-{home_wins}"
 
     for row in rows:
         home_team_id = int(row.get("HOME_TEAM_ID") or 0)
         away_team_id = int(row.get("VISITOR_TEAM_ID") or 0)
         home_team = TEAM_LOOKUP.get(home_team_id, {})
         away_team = TEAM_LOOKUP.get(away_team_id, {})
-        game_status = str(row.get("GAME_STATUS_TEXT") or "").strip()
+        game_id = str(row.get("GAME_ID") or "").strip()
+        live_game = live_games_by_id.get(game_id)
+        schedule_game = schedule_games_by_id.get(game_id) or schedule_games_by_matchup.get(f"{resolved_date}|{away_team_id}@{home_team_id}")
+        previous_series_game = _previous_schedule_series_game(game_id) if not schedule_game else None
+        live_home = (live_game or {}).get("homeTeam") or {}
+        live_away = (live_game or {}).get("awayTeam") or {}
+        schedule_home = (schedule_game or {}).get("homeTeam") or {}
+        schedule_away = (schedule_game or {}).get("awayTeam") or {}
+        context_game = live_game or schedule_game or {}
+        series_context_game = live_game or schedule_game or previous_series_game or {}
+        game_status = str(
+            (live_game or {}).get("gameStatusText")
+            or row.get("GAME_STATUS_TEXT")
+            or (schedule_game or {}).get("gameStatusText")
+            or ""
+        ).strip()
         status_text_display = convert_game_status_text_to_pht(game_status, resolved_date)
-        home_score = safe_int_score(row.get("PTS_HOME"), 0)
-        away_score = safe_int_score(row.get("PTS_AWAY"), 0)
+        if status_text_display == "TBD":
+            status_text_display = _format_live_tipoff_pht(context_game) or status_text_display
+        live_status_code = safe_int_score((live_game or {}).get("gameStatus"), (schedule_game or {}).get("gameStatus"), 0)
+        if live_status_code == 3:
+            status_category = "final"
+        elif live_status_code == 2:
+            status_category = "live"
+        elif live_status_code == 1:
+            status_category = "scheduled"
+        else:
+            status_category = "final" if "Final" in game_status else ("live" if "Q" in game_status or "Halftime" in game_status else "scheduled")
+        if status_text_display == "TBD" and status_category == "scheduled":
+            status_text_display = "Scheduled"
+        home_score = safe_int_score(live_home.get("score"), schedule_home.get("score"), row.get("PTS_HOME"), 0)
+        away_score = safe_int_score(live_away.get("score"), schedule_away.get("score"), row.get("PTS_AWAY"), 0)
         home_summary = build_team_availability_summary(str(home_team.get("full_name") or ""), report_payload, game_date=resolved_date)
         away_summary = build_team_availability_summary(str(away_team.get("full_name") or ""), report_payload, game_date=resolved_date)
+        series_text, scoreboard_game_number = _extract_series_context_from_scoreboard_row(row)
+        live_game_number = _live_game_number(live_game)
+        schedule_game_number = _live_game_number(schedule_game)
+        series_text = str(
+            (live_game or {}).get("seriesText")
+            or (schedule_game or {}).get("seriesText")
+            or series_text
+            or (previous_series_game or {}).get("seriesText")
+            or ""
+        ).strip()
+        playoff_game_number = live_game_number or schedule_game_number or scoreboard_game_number or _infer_playoff_game_number_from_game_id(game_id)
+        scoreboard_season_type = _infer_scoreboard_season_type(row, live_game, series_context_game)
+        competition_label = str((live_game or {}).get("gameLabel") or (schedule_game or {}).get("gameLabel") or (previous_series_game or {}).get("gameLabel") or "").strip()
+        game_sub_label = str((live_game or {}).get("gameSubLabel") or (schedule_game or {}).get("gameSubLabel") or "").strip()
+        if not game_sub_label and scoreboard_season_type == SEASON_TYPE_PLAYOFFS and playoff_game_number:
+            game_sub_label = f"Game {playoff_game_number}"
+        playoff_round = str((live_game or {}).get("poRoundDesc") or (schedule_game or {}).get("poRoundDesc") or (previous_series_game or {}).get("poRoundDesc") or "").strip()
+        series_conference = str((live_game or {}).get("seriesConference") or (schedule_game or {}).get("seriesConference") or (previous_series_game or {}).get("seriesConference") or "").strip()
+        away_record = _team_record_for_team(away_team_id, live_game, schedule_game, previous_series_game)
+        home_record = _team_record_for_team(home_team_id, live_game, schedule_game, previous_series_game)
+        if scoreboard_season_type == SEASON_TYPE_PLAYOFFS and not series_text:
+            series_text = _series_text_from_team_records(
+                str(away_team.get("abbreviation") or ""),
+                str(home_team.get("abbreviation") or ""),
+                away_record,
+                home_record,
+            )
+        standings_summary = ""
+        if scoreboard_season_type == SEASON_TYPE_PLAYOFFS:
+            standings_summary = series_text or "Series standing unavailable"
+        elif away_record or home_record:
+            standings_summary = " | ".join(
+                part for part in (
+                    f"{away_team.get('abbreviation', '')} {away_record}".strip(),
+                    f"{home_team.get('abbreviation', '')} {home_record}".strip(),
+                )
+                if part
+            )
+        series_is_over = scoreboard_season_type == SEASON_TYPE_PLAYOFFS and bool(
+            re.search(r"\bwins\s+4\s*-\s*\d\b", series_text, flags=re.IGNORECASE)
+        )
+        if series_is_over and status_category == "scheduled" and status_text_display in {"TBD", "Scheduled"}:
+            status_text_display = "Series over"
 
         def _inj_players(team_full_name: str) -> list[dict[str, Any]]:
             seen_keys: set[str] = set()
@@ -9674,13 +10267,24 @@ def todays_games(game_date: str | None = None) -> dict[str, Any]:
             "game_id": str(row.get("GAME_ID") or "").strip(),
             "game_date": resolved_date,
             "status_text": status_text_display,
-            "status_category": "final" if "Final" in game_status else ("live" if "Q" in game_status or "Halftime" in game_status else "scheduled"),
+            "status_category": status_category,
             "game_label": f"{away_team.get('abbreviation', '')} @ {home_team.get('abbreviation', '')}",
+            "season_type": scoreboard_season_type,
+            "competition_label": competition_label,
+            "game_sub_label": game_sub_label,
+            "series_text": series_text,
+            "series_summary": series_text,
+            "series_conference": series_conference,
+            "playoff_round": playoff_round,
+            "playoff_game_number": playoff_game_number,
+            "standings_summary": standings_summary,
             "home": {
                 "team_id": home_team_id,
                 "full_name": str(home_team.get("full_name") or "").strip(),
                 "abbreviation": str(home_team.get("abbreviation") or "").strip(),
                 "score": home_score,
+                "record": home_record,
+                "seed": _team_seed_for_team(home_team_id, live_game, schedule_game, previous_series_game),
                 "availability": home_summary,
                 "injury_players": _inj_players(str(home_team.get("full_name") or "")),
             },
@@ -9689,6 +10293,8 @@ def todays_games(game_date: str | None = None) -> dict[str, Any]:
                 "full_name": str(away_team.get("full_name") or "").strip(),
                 "abbreviation": str(away_team.get("abbreviation") or "").strip(),
                 "score": away_score,
+                "record": away_record,
+                "seed": _team_seed_for_team(away_team_id, live_game, schedule_game, previous_series_game),
                 "availability": away_summary,
                 "injury_players": _inj_players(str(away_team.get("full_name") or "")),
             },
@@ -9712,6 +10318,8 @@ _LIVE_BOX_CACHE_TTL = 30  # seconds
 # NBA CDN live scoreboard  much faster than ScoreboardV2
 _LIVE_SCOREBOARD_CACHE: dict[str, Any] = {}
 _LIVE_SCOREBOARD_TTL = 20  # seconds
+_NBA_SCHEDULE_CACHE: dict[str, Any] = {}
+_NBA_SCHEDULE_TTL = 1800  # seconds
 
 _NBA_CDN_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -9738,6 +10346,31 @@ def _fetch_nba_live_scoreboard() -> dict[str, Any] | None:
         return data
     except Exception:
         return None
+
+
+def _fetch_nba_schedule_league() -> dict[str, Any] | None:
+    """Fetch NBA CDN season schedule for exact game-id playoff metadata."""
+    cached = _NBA_SCHEDULE_CACHE.get("data")
+    if cached and time.time() - _NBA_SCHEDULE_CACHE.get("ts", 0) < _NBA_SCHEDULE_TTL:
+        return cached
+    urls = (
+        "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json",
+        "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2_1.json",
+    )
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=10, headers=_NBA_CDN_HEADERS)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            if not isinstance((data or {}).get("leagueSchedule"), dict):
+                continue
+            _NBA_SCHEDULE_CACHE["data"] = data
+            _NBA_SCHEDULE_CACHE["ts"] = time.time()
+            return data
+        except Exception:
+            continue
+    return None
 
 
 def _fetch_live_boxscore(game_id: str) -> dict[str, Any] | None:
