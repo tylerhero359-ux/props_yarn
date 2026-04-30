@@ -165,7 +165,7 @@ POSTGRES_BACKFILL_HASHES_ENABLED = os.getenv("NBA_POSTGRES_BACKFILL_HASHES_ENABL
 POSTGRES_BACKFILL_HASHES_LIMIT = max(100, int(os.getenv("NBA_POSTGRES_BACKFILL_HASHES_LIMIT", "5000")))
 MARKET_SCAN_CACHE_TTL_SECONDS = max(0, int(os.getenv("NBA_MARKET_SCAN_CACHE_TTL_SECONDS", "900")))
 PARLAY_BUILDER_CACHE_TTL_SECONDS = max(0, int(os.getenv("NBA_PARLAY_BUILDER_CACHE_TTL_SECONDS", "900")))
-MARKET_SCAN_MAX_ROWS = max(1, int(os.getenv("NBA_MARKET_SCAN_MAX_ROWS", os.getenv("NBA_BULK_ANALYSIS_MAX_ROWS", "100"))))
+MARKET_SCAN_MAX_ROWS = max(1, int(os.getenv("NBA_MARKET_SCAN_MAX_ROWS", "500")))
 PROP_ANALYSIS_MAX_LAST_N = max(1, int(os.getenv("NBA_PROP_ANALYSIS_MAX_LAST_N", "82")))
 PARLAY_BUILDER_MAX_BATCH_SIZE = max(1, int(os.getenv("NBA_PARLAY_BUILDER_MAX_BATCH_SIZE", "6")))
 ODDS_API_MAX_RETRIES = max(0, int(os.getenv("NBA_ODDS_API_MAX_RETRIES", "2")))
@@ -8202,15 +8202,145 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
     return payload_out
 
 
+def _offset_market_scan_row_numbers(items: list[dict[str, Any]] | None, row_offset: int) -> list[dict[str, Any]]:
+    adjusted: list[dict[str, Any]] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        next_item = copy.deepcopy(item)
+        try:
+            row_number = int(next_item.get("row") or 0)
+        except (TypeError, ValueError):
+            row_number = 0
+        if row_number > 0:
+            next_item["row"] = row_number + row_offset
+        adjusted.append(next_item)
+    return adjusted
+
+
+def _sort_market_scan_results(results: list[dict[str, Any]]) -> None:
+    results.sort(
+        key=lambda item: (
+            item.get("best_bet", {}).get("ranking_score") if item.get("best_bet", {}).get("ranking_score") is not None else float("-inf"),
+            item.get("best_bet", {}).get("ev") if item.get("best_bet", {}).get("ev") is not None else float("-inf"),
+            item.get("best_bet", {}).get("edge_pct")
+            if item.get("best_bet", {}).get("edge_pct") is not None
+            else item.get("best_bet", {}).get("edge")
+            if item.get("best_bet", {}).get("edge") is not None
+            else float("-inf"),
+            item.get("analysis", {}).get("hit_rate") if item.get("analysis", {}).get("hit_rate") is not None else float("-inf"),
+            item.get("best_bet", {}).get("confidence_score", 0),
+            -1 * int(item.get("availability", {}).get("sort_rank", 3) or 3),
+        ),
+        reverse=True,
+    )
+
+
+def _market_scan_request(payload: dict[str, Any], progress_cb=None) -> dict[str, Any]:
+    rows = payload.get("rows") or []
+    if not isinstance(rows, list) or len(rows) <= int(MARKET_SCAN_CORE_SERVICE.max_rows):
+        return _market_scan_core(payload, progress_cb)
+
+    batch_size = max(1, int(MARKET_SCAN_CORE_SERVICE.max_rows))
+    total_batches = int(math.ceil(len(rows) / batch_size))
+    merged_results: list[dict[str, Any]] = []
+    merged_errors: list[dict[str, Any]] = []
+    merged_base: dict[str, Any] = {
+        "season": str(payload.get("season") or current_nba_season()),
+        "season_type": normalize_requested_season_type(payload.get("season_type")),
+        "last_n": payload.get("last_n"),
+        "injury_aware": bool(payload.get("injury_aware")),
+        "template": "player_name,stat,line,over_odds,under_odds",
+    }
+
+    for batch_index, batch_start in enumerate(range(0, len(rows), batch_size), start=1):
+        batch_rows = rows[batch_start : batch_start + batch_size]
+
+        def batch_progress(update: dict[str, Any]) -> None:
+            if not progress_cb:
+                return
+            batch_update = dict(update or {})
+            original_stage = str(batch_update.get("stage") or "")
+            if original_stage == "done":
+                batch_update["stage"] = "batch_done"
+            batch_update.update(
+                {
+                    "batch": batch_index,
+                    "batches": total_batches,
+                    "batch_rows": len(batch_rows),
+                    "total_rows": len(rows),
+                }
+            )
+            progress_cb(batch_update)
+
+        _emit_progress(
+            progress_cb,
+            "batch_start",
+            batch=batch_index,
+            batches=total_batches,
+            batch_rows=len(batch_rows),
+            total_rows=len(rows),
+        )
+        batch_payload = {**payload, "rows": batch_rows}
+        batch_result = _market_scan_core(batch_payload, batch_progress)
+        if batch_index == 1 and isinstance(batch_result, dict):
+            merged_base.update({k: v for k, v in batch_result.items() if k not in {"results", "errors"}})
+        merged_results.extend(_offset_market_scan_row_numbers(batch_result.get("results") if isinstance(batch_result, dict) else [], batch_start))
+        merged_errors.extend(_offset_market_scan_row_numbers(batch_result.get("errors") if isinstance(batch_result, dict) else [], batch_start))
+
+    _sort_market_scan_results(merged_results)
+    merged_errors.sort(key=lambda item: int(item.get("row") or 0))
+    payload_out = {
+        **merged_base,
+        "results": merged_results,
+        "errors": merged_errors,
+        "rows_submitted": len(rows),
+        "batches_scanned": total_batches,
+        "batch_size": batch_size,
+    }
+    _submit_pg_write(_pg_write_market_scan_run, payload_out, _request_hash("market_scan", payload))
+    _emit_progress(progress_cb, "done", results=len(merged_results), errors=len(merged_errors), batches=total_batches)
+    return payload_out
+
+
+def _build_parlay_odds_source_payload(orig_row: dict[str, Any], side: str, odds: float) -> dict[str, Any]:
+    side_key = "under" if str(side or "").upper() == "UNDER" else "over"
+    best_odds = safe_float_or_none(orig_row.get(f"best_{side_key}_odds"))
+    selected_odds = safe_float_or_none(odds)
+    selected_bookmaker = str(orig_row.get("bookmaker_title") or orig_row.get("bookmaker_key") or "N/A")
+    best_bookmaker = str(orig_row.get(f"best_{side_key}_bookmaker") or selected_bookmaker)
+    if best_odds is None:
+        best_odds = selected_odds
+    is_best_available = bool(
+        best_odds is not None
+        and selected_odds is not None
+        and abs(float(best_odds) - float(selected_odds)) <= 1e-9
+    )
+    return {
+        "bookmaker": selected_bookmaker,
+        "bookmaker_key": orig_row.get("bookmaker_key"),
+        "odds_source": selected_bookmaker,
+        "odds_source_type": "selected_bookmaker",
+        "odds_last_update": orig_row.get("market_last_update"),
+        "odds_market_key": orig_row.get("market_key") or "",
+        "odds_side": side_key.upper(),
+        "odds_is_best_available": is_best_available,
+        "best_available_odds": best_odds,
+        "best_available_bookmaker": best_bookmaker,
+        "books_count": orig_row.get("books_count") or 1,
+        "hold_percent": orig_row.get("hold_percent"),
+    }
+
+
 @app.post("/api/market-scan")
 def market_scan(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     enforce_heavy_rate_limit(request, "market_scan")
-    return MARKET_SCAN_SERVICE.run_sync(_market_scan_core, payload)
+    return MARKET_SCAN_SERVICE.run_sync(_market_scan_request, payload)
 
 @app.post("/api/market-scan/async")
 def market_scan_async(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     enforce_heavy_rate_limit(request, "market_scan_async")
-    return MARKET_SCAN_SERVICE.run_async(_market_scan_core, payload)
+    return MARKET_SCAN_SERVICE.run_async(_market_scan_request, payload)
 
 @app.get("/api/jobs/{job_id}")
 def async_job_status(job_id: str) -> dict[str, Any]:
@@ -8220,7 +8350,7 @@ def async_job_status(job_id: str) -> dict[str, Any]:
 @app.post("/api/market-scan/stream")
 def market_scan_stream(request: Request, payload: dict[str, Any] = Body(...)) -> StreamingResponse:
     enforce_heavy_rate_limit(request, "market_scan_stream")
-    return _stream_with_progress(_market_scan_core, payload)
+    return _stream_with_progress(_market_scan_request, payload)
 
 
 @app.post("/api/odds/events")
@@ -8833,6 +8963,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             "line": line,
             "side": side,
             "odds": odds,
+            **_build_parlay_odds_source_payload(orig_row, side, odds),
             "hit_rate": round(side_hit_rate, 1),
             "ranking_hit_rate": round(ranking_hit_rate, 1),
             "ranking_source": ranking_source,
@@ -9735,6 +9866,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             "opponent_team_id": opponent_info.get("opponent_team_id"),
             "opponent_abbreviation": str(opponent_info.get("opponent_abbreviation") or ""),
             "stat": stat, "line": line, "side": side, "odds": odds,
+            **_build_parlay_odds_source_payload(orig_row, side, odds),
             "hit_rate": round(side_hit_rate, 1),
             "ranking_hit_rate": round(ranking_hit_rate, 1),
             "ranking_source": ranking_source,

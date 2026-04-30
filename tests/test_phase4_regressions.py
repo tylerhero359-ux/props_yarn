@@ -173,6 +173,45 @@ class Phase4RegressionTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertIn("Maximum 2 market rows", str(ctx.exception.detail))
 
+    def test_market_scan_route_batches_oversized_payloads(self) -> None:
+        calls: list[int] = []
+
+        def fake_core(payload, progress_cb=None):
+            calls.append(len(payload.get("rows") or []))
+            call_index = len(calls)
+            if progress_cb:
+                progress_cb({"stage": "done", "results": 1, "errors": 0})
+            return {
+                "season": "2025-26",
+                "season_type": "Regular Season",
+                "last_n": 10,
+                "injury_aware": False,
+                "template": "player_name,stat,line,over_odds,under_odds",
+                "results": [
+                    {
+                        "row": 1,
+                        "best_bet": {"ranking_score": 100 - call_index, "ev": 1.0, "edge": 1.0, "confidence_score": 50},
+                        "analysis": {"hit_rate": 50},
+                        "availability": {"sort_rank": 1},
+                    }
+                ],
+                "errors": [{"row": 2, "reason": "bad row"}] if call_index == 2 else [],
+            }
+
+        rows = [{"player_name": f"Player {idx}", "stat": "PTS", "line": 10.5, "over_odds": 1.91, "under_odds": 1.91} for idx in range(5)]
+        with (
+            patch.object(main.MARKET_SCAN_CORE_SERVICE, "max_rows", 2),
+            patch.object(main, "_market_scan_core", side_effect=fake_core),
+            patch.object(main, "_submit_pg_write", return_value=None),
+        ):
+            payload = main._market_scan_request({"rows": rows, "last_n": 10, "season_type": "Regular Season"})
+
+        self.assertEqual(calls, [2, 2, 1])
+        self.assertEqual(payload["rows_submitted"], 5)
+        self.assertEqual(payload["batches_scanned"], 3)
+        self.assertEqual([item["row"] for item in payload["results"]], [1, 3, 5])
+        self.assertEqual(payload["errors"][0]["row"], 4)
+
     def test_market_scan_rejects_invalid_decimal_odds(self) -> None:
         service = main.MarketScanCoreService(
             current_nba_season=lambda: "2025-26",

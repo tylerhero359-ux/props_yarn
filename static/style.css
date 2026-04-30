@@ -935,6 +935,23 @@ body.light-theme .search-results {
   margin: 6px 0;
 }
 
+.market-empty-error-list {
+  width: min(100%, 760px);
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+  text-align: left;
+}
+
+.market-empty-error-list small {
+  display: block;
+  padding: 8px 10px;
+  border: 1px solid rgba(248, 113, 113, 0.22);
+  border-radius: 10px;
+  background: rgba(248, 113, 113, 0.08);
+  color: var(--ds-color-text-secondary);
+}
+
 .empty-icon {
   font-size: 28px;
   width: 40px;
@@ -4765,6 +4782,24 @@ body.light-theme .action-banner-inner {
   letter-spacing: -0.02em;
   line-height: 1;
 }
+.parlay-ticket-odds-source,
+.parlay-odds-source {
+  display: block;
+  max-width: 220px;
+  color: var(--ds-color-text-muted);
+  font-size: 0.68rem;
+  line-height: 1.25;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+}
+.parlay-ticket-odds-source {
+  text-align: right;
+}
+.parlay-odds-source.best {
+  color: var(--ds-color-good);
+}
 .parlay-legs-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
@@ -4835,6 +4870,22 @@ body.light-theme .action-banner-inner {
   display: flex;
   flex-direction: column;
   gap: 1px;
+}
+.parlay-leg-odds-item,
+.parlay-odds-cell {
+  min-width: 110px;
+}
+.parlay-odds-cell {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  white-space: normal;
+  overflow: visible;
+}
+.parlay-odds-cell strong {
+  display: block;
+  font-size: 0.86rem;
+  line-height: 1.15;
 }
 .parlay-leg-stat-item .slabel { font-size: 0.68rem; color: var(--ds-color-text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
 .parlay-leg-stat-item .sval  { font-size: 0.88rem; font-weight: 700; color: var(--ds-color-text-primary); }
@@ -4985,8 +5036,21 @@ body.light-theme .action-banner-inner {
   font-weight: 700;
 }
 
-/* ── Injury column (col 10): allow wrapping ── */
+/* ── Odds column (col 10): show source below price ── */
 .parlay-all-props-table tbody td:nth-child(10) {
+  white-space: normal;
+  vertical-align: middle;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.parlay-all-props-table tbody td:nth-child(10) .parlay-odds-source {
+  max-width: none;
+  font-size: 0.66rem;
+}
+
+/* ── Injury column (col 11): allow wrapping ── */
+.parlay-all-props-table tbody td:nth-child(11) {
   white-space: normal;
   vertical-align: middle;
 }

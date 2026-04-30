@@ -393,6 +393,7 @@ const THEME_KEY = 'nba-props-theme';
 const SIDEBAR_COLLAPSED_KEY = 'nba-props-sidebar-collapsed';
 const MARKET_RESULTS_KEY = 'nba-props-latest-market-results';
 const MARKET_EXPERT_FILTERS_KEY = 'nba-props-market-expert-filters';
+const MARKET_SCAN_REQUEST_ROW_LIMIT = 100;
 const ODDS_API_KEY_STORAGE = 'nba-props-odds-api-key';
 const ODDS_API_SETTINGS_STORAGE = 'nba-props-odds-api-settings';
 const INJURY_DEBUG_STORAGE = 'nba-props-injury-debug';
@@ -3691,7 +3692,11 @@ function getFinderLabel(hitRate) {
 
 function runMarketResultsEnhancements(payload) {
   if (window.nbaUiEnhancements && typeof window.nbaUiEnhancements.market === 'function') {
-    window.nbaUiEnhancements.market(payload);
+    try {
+      window.nbaUiEnhancements.market(payload);
+    } catch (error) {
+      console.warn('Market UI enhancement failed:', error);
+    }
   }
 }
 
@@ -4849,7 +4854,12 @@ async function importOddsPropsAndScan() {
       home_team: row.home_team,
       away_team: row.away_team,
     }));
-    await runMarketScan(scanRows.length ? scanRows : null);
+    const scanPayload = await runMarketScan(scanRows.length ? scanRows : null);
+    if (scanPayload) {
+      const resultCount = Array.isArray(scanPayload.results) ? scanPayload.results.length : 0;
+      const errorCount = Array.isArray(scanPayload.errors) ? scanPayload.errors.length : 0;
+      setOddsApiStatus(`Imported ${csvRows.length}, rendered ${resultCount}${errorCount ? ` (${errorCount} issue${errorCount === 1 ? '' : 's'})` : ''}`, resultCount ? 'good' : 'bad');
+    }
   } catch (error) {
     console.error(error);
     setOddsApiStatus('Import failed', 'bad');
@@ -4874,6 +4884,32 @@ function renderMarketEmpty(message = 'Paste your board using the template, then 
     <div class="empty-icon">${getEmptyIconSvg('spark')}</div>
     <strong>No market scan yet.</strong>
     <span>${escapeHtml(message)}</span>
+  `;
+}
+
+function renderMarketNoResults(payload, message = 'No rows produced a usable result. Check names and try again.') {
+  const errors = Array.isArray(payload?.errors) ? payload.errors : [];
+  marketMeta.textContent = errors.length
+    ? `0 props rendered  ${errors.length} scanner row issue${errors.length === 1 ? '' : 's'}`
+    : 'No usable scanner results returned.';
+  marketResults.className = 'bet-finder-state empty-state-panel compact';
+  const visibleErrors = errors.slice(0, 8);
+  const extraCount = Math.max(0, errors.length - visibleErrors.length);
+  marketResults.innerHTML = `
+    <div class="empty-icon">${getEmptyIconSvg('spark')}</div>
+    <strong>No usable market results.</strong>
+    <span>${escapeHtml(message)}</span>
+    ${visibleErrors.length ? `
+      <div class="market-empty-error-list">
+        ${visibleErrors.map(error => {
+    const rowLabel = error?.row ? `Row ${error.row}` : 'Row';
+    const playerLabel = error?.player_name ? ` - ${error.player_name}` : '';
+    const reason = error?.reason || error?.detail || 'Scanner could not analyze this row.';
+    return `<small><strong>${escapeHtml(rowLabel + playerLabel)}</strong>: ${escapeHtml(reason)}</small>`;
+  }).join('')}
+        ${extraCount ? `<small>+${extraCount} more issue${extraCount === 1 ? '' : 's'}</small>` : ''}
+      </div>
+    ` : ''}
   `;
 }
 
@@ -5472,10 +5508,11 @@ function populateMarketInjuryCells(results) {
 }
 
 function renderMarketResults(payload) {
-  currentMarketResultsPayload = payload;
+  const scanPayload = payload && typeof payload === 'object' ? payload : {};
+  currentMarketResultsPayload = scanPayload;
   const sortKey = currentMarketSort || 'best_ev';
   const filterKey = currentMarketFilter || 'all';
-  const rawResults = payload.results || [];
+  const rawResults = Array.isArray(scanPayload.results) ? scanPayload.results : [];
   let fullResults = [...filterMarketRows(rawResults, filterKey)]
     .filter(item => passesExpertFilters(item))
     .filter(item => passesAdvancedMarketFilters(item))
@@ -5490,7 +5527,7 @@ function renderMarketResults(payload) {
         tone: 'warning'
       });
     } else {
-      renderMarketEmpty('No rows produced a usable result. Check names and try again.');
+      renderMarketNoResults(scanPayload);
       return;
     }
   }
@@ -5506,7 +5543,9 @@ function renderMarketResults(payload) {
   const pageEnd = Math.min(totalResults, pageStart + MARKET_PAGE_SIZE);
   const results = fullResults.slice(pageStart, pageEnd);
 
-  marketMeta.textContent = `${totalResults} props scanned  ${getMarketSortLabel(sortKey)}  ${getMarketFilterLabel(filterKey)}  ${getExpertFilterSummary()}  Page ${currentMarketPage}/${totalPages}`;
+  const errorCount = Array.isArray(scanPayload.errors) ? scanPayload.errors.length : 0;
+  const errorSuffix = errorCount ? `  ${errorCount} row issue${errorCount === 1 ? '' : 's'}` : '';
+  marketMeta.textContent = `${totalResults} props scanned  ${getMarketSortLabel(sortKey)}  ${getMarketFilterLabel(filterKey)}  ${getExpertFilterSummary()}  Page ${currentMarketPage}/${totalPages}${errorSuffix}`;
 
   const resultKeySet = new Set(fullResults.map(getMarketItemKey));
   currentMarketInspectKeys = currentMarketInspectKeys.filter(key => resultKeySet.has(key));
@@ -5686,7 +5725,7 @@ function renderMarketResults(payload) {
                     <span>Edge <strong class="${(item.best_bet.edge || 0) >= 0 ? 'hit-value' : 'miss-value'}">${item.best_bet.edge ?? '--'}%</strong></span>
                     <span>Model <strong>${item.best_bet.model_probability ?? '--'}%</strong></span>
                     <span>Implied <strong>${item.best_bet.implied_probability ?? '--'}%</strong></span>
-                    <span>Last ${payload.last_n} <strong>${Number.isFinite(sideSample.sideHitCount) ? sideSample.sideHitCount : '--'}/${item.analysis.games_count ?? '--'}</strong></span>
+                    <span>Last ${scanPayload.last_n} <strong>${Number.isFinite(sideSample.sideHitCount) ? sideSample.sideHitCount : '--'}/${item.analysis.games_count ?? '--'}</strong></span>
                     <span>Avg <strong>${item.analysis.average}</strong></span>
                   </div>
                 </td>
@@ -5755,7 +5794,7 @@ function renderMarketResults(payload) {
       toggleMarketSort(header.dataset.sortKey || 'best_ev');
       currentMarketPage = 1;
       if (marketSortSelect) marketSortSelect.value = currentMarketSort;
-      renderMarketResults(currentMarketResultsPayload || payload);
+      renderMarketResults(currentMarketResultsPayload || scanPayload);
     });
   });
 
@@ -5766,12 +5805,12 @@ function renderMarketResults(payload) {
       const action = btn.dataset.pageAction;
       if (action === 'prev') currentMarketPage = Math.max(1, currentMarketPage - 1);
       if (action === 'next') currentMarketPage += 1;
-      renderMarketResults(currentMarketResultsPayload || payload);
+      renderMarketResults(currentMarketResultsPayload || scanPayload);
     });
   });
 
   populateMarketInjuryCells(results);
-  runMarketResultsEnhancements(payload);
+  runMarketResultsEnhancements(scanPayload);
 }
 
 async function streamNdjson(url, payload, onMessage) {
@@ -5864,6 +5903,68 @@ async function runAsyncJob(endpoint, payload, onTick, timeoutMs = 180000, pollMs
   }
 }
 
+async function fetchMarketScanPayload(inputPayload, updateProgress) {
+  let payload = null;
+  try {
+    const streamResult = await streamNdjson('/api/market-scan/stream', inputPayload, updateProgress);
+    if (streamResult?.type === 'error') {
+      const error = new Error(streamResult.message || 'Market scan failed.');
+      error.skipAsyncFallback = true;
+      throw error;
+    }
+    payload = streamResult?.payload || null;
+  } catch (streamError) {
+    if (streamError?.skipAsyncFallback) throw streamError;
+    payload = await runAsyncJob('/api/market-scan/async', inputPayload, (status) => {
+      if (!status || status.type !== 'market_scan') return;
+      const label = status.status === 'running' ? 'Scanning market...' : 'Queued scan...';
+      setStatus(label);
+      showGlobalProgress({
+        key: 'market-scan',
+        title: 'Market Scanner',
+        detail: label,
+        percent: status.status === 'running' ? 65 : 20,
+      });
+    });
+  }
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('Market scan finished without a result payload.');
+  }
+  return payload;
+}
+
+function offsetMarketScanRows(items, rowOffset) {
+  return (Array.isArray(items) ? items : []).map(item => {
+    const next = { ...item };
+    const rowNumber = Number(next.row);
+    if (Number.isFinite(rowNumber) && rowNumber > 0) {
+      next.row = rowNumber + rowOffset;
+    }
+    return next;
+  });
+}
+
+function mergeMarketScanPayloads(batchPayloads, basePayload, totalRows) {
+  const firstPayload = batchPayloads[0]?.payload || {};
+  const merged = {
+    ...firstPayload,
+    season: firstPayload.season || basePayload.season,
+    season_type: firstPayload.season_type || basePayload.season_type,
+    last_n: firstPayload.last_n ?? basePayload.last_n,
+    injury_aware: firstPayload.injury_aware ?? basePayload.injury_aware,
+    template: firstPayload.template || 'player_name,stat,line,over_odds,under_odds',
+    results: [],
+    errors: [],
+    rows_submitted: totalRows,
+    batches_scanned: batchPayloads.length,
+  };
+  batchPayloads.forEach(({ payload, rowOffset }) => {
+    merged.results.push(...offsetMarketScanRows(payload?.results, rowOffset));
+    merged.errors.push(...offsetMarketScanRows(payload?.errors, rowOffset));
+  });
+  return merged;
+}
+
 
 async function runMarketScan(rowsOverride = null) {
   switchView('market');
@@ -5873,6 +5974,11 @@ async function runMarketScan(rowsOverride = null) {
   } catch (error) {
     alert(error.message);
     return;
+  }
+  if (!rows.length) {
+    renderMarketNoResults({}, 'Please provide at least one market row.');
+    setStatus('Ready');
+    return null;
   }
 
   setStatus('Scanning market');
@@ -5889,20 +5995,36 @@ async function runMarketScan(rowsOverride = null) {
       (marketInjuryAwareTop && marketInjuryAwareTop.checked) ||
       (marketInjuryAware && marketInjuryAware.checked)
     );
-    const inputPayload = {
-      rows,
+    const basePayload = {
       last_n: Number(gamesSelect.value),
       season: seasonInput.value.trim() || undefined,
       season_type: getSelectedSeasonType(),
       injury_aware: injuryAwareEnabled
     };
-    const progressLabel = (msg) => {
+    const rowBatches = [];
+    for (let start = 0; start < rows.length; start += MARKET_SCAN_REQUEST_ROW_LIMIT) {
+      rowBatches.push({
+        rows: rows.slice(start, start + MARKET_SCAN_REQUEST_ROW_LIMIT),
+        rowOffset: start,
+      });
+    }
+    const batchCount = rowBatches.length;
+    if (batchCount > 1) {
+      marketMeta.textContent = `Large board detected: scanning ${rows.length} rows in ${batchCount} batches of ${MARKET_SCAN_REQUEST_ROW_LIMIT}.`;
+      showAppToast({
+        title: 'Large board detected',
+        detail: `Scanning ${rows.length} rows in ${batchCount} backend-safe batches.`,
+        tone: 'info'
+      });
+    }
+    const progressLabel = (msg, batchRows = rows) => {
       switch (msg.stage) {
-        case 'start': return `Scanning ${msg.total_rows || rows.length} rows...`;
+        case 'start': return `Scanning ${msg.total_rows || batchRows.length} rows...`;
         case 'prepared': return `Prepared ${msg.prepared || 0} rows`;
         case 'analysis_start': return `Analyzing ${msg.total || 0} props...`;
         case 'analysis_progress': return `Analyzing ${msg.done || 0}/${msg.total || 0}`;
         case 'analysis_done': return `Analysis complete (${msg.analyzed || 0})`;
+        case 'scoring_start': return `Scoring ${msg.total || 0} props...`;
         case 'scoring_progress': return `Scoring ${msg.done || 0}/${msg.total || 0}`;
         case 'done': return `Scan complete (${msg.results || 0} results)`;
         default: return 'Scanning market';
@@ -5919,6 +6041,7 @@ async function runMarketScan(rowsOverride = null) {
         return 35 + Math.round((done / total) * 40);
       }
       if (stage === 'analysis_done') return 78;
+      if (stage === 'scoring_start') return 80;
       if (stage === 'scoring_progress') {
         const done = Number(msg?.done || 0);
         const total = Math.max(1, Number(msg?.total || 1));
@@ -5927,35 +6050,33 @@ async function runMarketScan(rowsOverride = null) {
       if (stage === 'done') return 100;
       return 12;
     };
-    const updateProgress = (msg) => {
+    const makeBatchProgress = (batchIndex, batchRows) => (msg) => {
       if (msg?.type !== 'progress') return;
-      const label = progressLabel(msg);
+      const coreLabel = progressLabel(msg, batchRows);
+      const label = batchCount > 1 ? `Batch ${batchIndex + 1}/${batchCount}: ${coreLabel}` : coreLabel;
+      const rawPercent = progressPercent(msg);
+      const percent = batchCount > 1
+        ? Math.min(99, Math.round(((batchIndex + (rawPercent / 100)) / batchCount) * 100))
+        : rawPercent;
       setStatus(label);
       showGlobalProgress({
         key: 'market-scan',
         title: 'Market Scanner',
         detail: label,
-        percent: progressPercent(msg),
+        percent,
       });
     };
-    let payload = null;
-    try {
-      const streamResult = await streamNdjson('/api/market-scan/stream', inputPayload, updateProgress);
-      if (streamResult?.type === 'error') throw new Error(streamResult.message || 'Market scan failed.');
-      payload = streamResult?.payload || null;
-    } catch (streamError) {
-      payload = await runAsyncJob('/api/market-scan/async', inputPayload, (status) => {
-        if (!status || status.type !== 'market_scan') return;
-        const label = status.status === 'running' ? 'Scanning market...' : 'Queued scan...';
-        setStatus(label);
-        showGlobalProgress({
-          key: 'market-scan',
-          title: 'Market Scanner',
-          detail: label,
-          percent: status.status === 'running' ? 65 : 20,
-        });
-      });
+
+    const batchPayloads = [];
+    for (let batchIndex = 0; batchIndex < rowBatches.length; batchIndex += 1) {
+      const batch = rowBatches[batchIndex];
+      const batchPayload = await fetchMarketScanPayload(
+        { ...basePayload, rows: batch.rows },
+        makeBatchProgress(batchIndex, batch.rows)
+      );
+      batchPayloads.push({ payload: batchPayload, rowOffset: batch.rowOffset });
     }
+    const payload = mergeMarketScanPayloads(batchPayloads, basePayload, rows.length);
     currentMarketPage = 1;
     renderMarketResults(payload);
     enrichMarketResultsWithGameContext(payload)
@@ -5974,11 +6095,13 @@ async function runMarketScan(rowsOverride = null) {
       clearGlobalProgress();
       if (networkActivityMap.size === 0 && activeWorkCount === 0) hideActionBanner(true);
     }, 1100);
+    return payload;
   } catch (error) {
     console.error(error);
     renderMarketEmpty(error.message || 'Market scan failed.');
     setStatus('Error');
     clearGlobalProgress();
+    return null;
   } finally {
     marketScanBtn.disabled = false;
   }
@@ -8234,7 +8357,7 @@ function clearAnalysisForNewSelection() {
 function saveLatestMarketResults(payload) {
   const snapshot = {
     updated_at: new Date().toISOString(),
-    results: (payload.results || []).slice(0, 12)
+    results: (Array.isArray(payload?.results) ? payload.results : []).slice(0, 12)
   };
   localStorage.setItem(MARKET_RESULTS_KEY, JSON.stringify(snapshot));
 }
@@ -9547,6 +9670,38 @@ function enhanceBetFinderSparklines(payload) {
   //  Helpers 
   function escHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
   function fmtOdds(v) { return v != null ? Number(v).toFixed(2) : '--'; }
+  function fmtParlayBookmakerLabel(value) {
+    const raw = String(value || '').trim();
+    if (!raw || raw.toLowerCase() === 'n/a') return 'Book unavailable';
+    return raw.replace(/_/g, ' ').replace(/\b\w/g, function (ch) { return ch.toUpperCase(); });
+  }
+  function getParlayOddsSourceLabel(prop) {
+    const source = prop?.odds_source || prop?.bookmaker || prop?.best_available_bookmaker || '';
+    return fmtParlayBookmakerLabel(source);
+  }
+  function getParlayBestOddsLabel(prop) {
+    const selectedOdds = Number(prop?.odds);
+    const bestOdds = Number(prop?.best_available_odds);
+    const bestBook = fmtParlayBookmakerLabel(prop?.best_available_bookmaker || prop?.odds_source || prop?.bookmaker);
+    if (!Number.isFinite(bestOdds) || !Number.isFinite(selectedOdds)) return '';
+    if (Math.abs(bestOdds - selectedOdds) > 0.005) {
+      return 'Best ' + (prop?.side || 'side') + ': ' + fmtOdds(bestOdds) + ' at ' + bestBook;
+    }
+    return 'Best available at source';
+  }
+  function renderParlayOddsSource(prop) {
+    const source = getParlayOddsSourceLabel(prop);
+    const best = getParlayBestOddsLabel(prop);
+    return '<small class="parlay-odds-source">Source: ' + escHtml(source) + '</small>' +
+      (best ? '<small class="parlay-odds-source best">' + escHtml(best) + '</small>' : '');
+  }
+  function getParlayTicketOddsSourceSummary(parlay) {
+    const sources = Array.from(new Set((parlay || []).map(getParlayOddsSourceLabel).filter(Boolean)));
+    if (!sources.length) return 'Leg odds source unavailable';
+    const visibleSources = sources.slice(0, 3).join(', ');
+    const extra = Math.max(0, sources.length - 3);
+    return 'Leg odds from The Odds API: ' + visibleSources + (extra ? ' +' + extra + ' more' : '');
+  }
   function show(el, v) { if (el) el.style.display = v ? '' : 'none'; }
   function setStatus(msg, err) {
     if (!parlayStatusMeta) return;
@@ -9942,6 +10097,17 @@ function enhanceBetFinderSparklines(payload) {
     const legsSpan = parlayTicket.querySelector('#parlayTicketLegs');
     if (legsSpan && legsSpan.tagName === 'SPAN') legsSpan.textContent = legs;
     if (parlayTicketOdds) parlayTicketOdds.textContent = parlayOdds != null ? fmtOdds(parlayOdds) + 'x' : '--';
+    const oddsBlock = parlayTicketOdds ? parlayTicketOdds.closest('.parlay-ticket-odds-block') : null;
+    if (oddsBlock) {
+      let sourceEl = oddsBlock.querySelector('#parlayTicketOddsSource');
+      if (!sourceEl) {
+        sourceEl = document.createElement('small');
+        sourceEl.id = 'parlayTicketOddsSource';
+        sourceEl.className = 'parlay-ticket-odds-source';
+        oddsBlock.appendChild(sourceEl);
+      }
+      sourceEl.textContent = getParlayTicketOddsSourceSummary(parlay);
+    }
     const grid = parlayTicket.querySelector('.parlay-legs-grid');
     if (!grid) return;
     grid.innerHTML = parlay.map(function (leg, i) {
@@ -10019,7 +10185,7 @@ function enhanceBetFinderSparklines(payload) {
         '<div class="parlay-leg-stat-item"><span class="slabel">Hit %</span><span class="sval">' + leg.hit_rate + '%</span></div>' +
         '<div class="parlay-leg-stat-item"><span class="slabel">Avg</span><span class="sval">' + (leg.average || '--') + '</span></div>' +
         '<div class="parlay-leg-stat-item"><span class="slabel">Games</span><span class="sval">' + (leg.games_count || '--') + '</span></div>' +
-        '<div class="parlay-leg-stat-item"><span class="slabel">Odds</span><span class="sval">' + fmtOdds(leg.odds) + '</span></div>' +
+        '<div class="parlay-leg-stat-item parlay-leg-odds-item"><span class="slabel">Odds</span><span class="sval">' + fmtOdds(leg.odds) + '</span>' + renderParlayOddsSource(leg) + '</div>' +
         '</div>' +
         '<div class="parlay-leg-hit-bar"><div class="parlay-leg-hit-fill" style="width:' + fp + '%"></div></div>' +
         detailHtml +
@@ -10076,7 +10242,7 @@ function enhanceBetFinderSparklines(payload) {
         '<td>' + (p.average || '--') + '</td><td>' + (p.games_count || '--') + '</td>' +
         '<td>' + confText + '</td>' +
         '<td><div class="parlay-row-micro"><span>EV <strong>' + formatEvPercent(p.ev) + '%</strong></span><span>Edge <strong>' + (p.edge ?? '--') + '%</strong></span><span>Sample <strong>' + (p.hit_count || 0) + '/' + (p.games_count || 0) + '</strong></span></div></td>' +
-        '<td>' + fmtOdds(p.odds) + '</td>' +
+        '<td><div class="parlay-odds-cell"><strong>' + fmtOdds(p.odds) + '</strong>' + renderParlayOddsSource(p) + '</div></td>' +
         '<td><div class="parlay-inj-cell">' + renderInjuryCell(p) + '</div></td>' +
         '<td><div class="parlay-action-cell"><button class="parlay-track-btn" data-track-idx="' + idx + '">+ Track</button></div></td>' +
         '</tr>';
