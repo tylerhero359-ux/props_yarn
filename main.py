@@ -1459,7 +1459,7 @@ STAT_MAP = {
 }
 VALIDATED_BOX_SCORE_COLUMNS = ("PTS", "REB", "AST", "FG3M", "STL", "BLK", "FGA", "FG3A", "FTA")
 GAME_LOG_CACHE_SCHEMA_VERSION = "validated_boxscore_v1"
-ANALYSIS_CACHE_SCHEMA_VERSION = "validated_analysis_v2"  # v2: last_n removed from cache key; filtered_pool stored alongside payload
+ANALYSIS_CACHE_SCHEMA_VERSION = "validated_analysis_v3"  # v3: position fallback added for matchup context
 POSITION_LABELS = {
     "G": "Guards",
     "F": "Forwards",
@@ -1703,6 +1703,7 @@ def _build_analysis_cache_key(
         bool(debug),
         report_label,
         report_url,
+        _backtest_calibration_signature(),
     )
 HYBRID_GAME_LOG_SOFT_TTL_SECONDS = max(300, int(os.getenv("NBA_HYBRID_GAME_LOG_SOFT_TTL_SECONDS", "3600")))
 HYBRID_GAME_LOG_MAX_STALE_SECONDS = max(HYBRID_GAME_LOG_SOFT_TTL_SECONDS, int(os.getenv("NBA_HYBRID_GAME_LOG_MAX_STALE_SECONDS", "43200")))
@@ -2797,7 +2798,10 @@ def build_prop_analysis_payload(
     profile_row = None
     player_info_meta = {"source": "unused", "seconds_ago": None, "refresh_queued": False}
     resolved_team_id = team_id
-    resolved_position = player_position
+    resolved_position = extract_player_position_text(
+        {"position": player_position},
+        player,
+    )
 
     if resolved_team_id is None or not resolved_position:
         if HYBRID_ANALYZER_ENABLED:
@@ -2812,7 +2816,14 @@ def build_prop_analysis_payload(
                 raw_team_id = profile_row.get("TEAM_ID")
                 resolved_team_id = int(raw_team_id) if raw_team_id not in (None, "") else None
             if not resolved_position:
-                resolved_position = str(profile_row.get("POSITION", "")).strip()
+                resolved_position = extract_player_position_text(profile_row)
+
+    if not resolved_position:
+        resolved_position = resolve_player_position_from_roster(
+            player_id=player_id,
+            team_id=resolved_team_id,
+            season=season,
+        )
 
     position_code, position_label = resolve_primary_position(resolved_position)
 
@@ -2923,11 +2934,17 @@ def build_prop_analysis_payload(
     market_probs = fair_implied_probabilities(over_odds, under_odds)
     implied_over = market_probs.get("over")
     implied_under = market_probs.get("under")
-    model_over, model_under = apply_market_probability_penalty(
+    market_adjusted_model_over, market_adjusted_model_under = apply_market_probability_penalty(
         model_over,
         model_under,
         implied_over=implied_over,
         implied_under=implied_under,
+    )
+    model_over, model_under, backtest_probability_calibration = apply_backtest_probability_calibration(
+        market_adjusted_model_over,
+        market_adjusted_model_under,
+        stat=stat,
+        source="analyzer",
     )
     model_recommended_side = "OVER" if model_over >= model_under else "UNDER"
     recommended_side = forced_side_normalized or model_recommended_side
@@ -2943,7 +2960,7 @@ def build_prop_analysis_payload(
         fair_probability=chosen_fair_prob,
         odds=safe_float_or_none(_chosen_odds_raw),
     )["ev"]
-    confidence_engine = build_confidence_engine(
+    base_confidence_engine = build_confidence_engine(
         side=recommended_side,
         hit_rate=float(side_hit_rate),
         games_count=int(len(values)),
@@ -2960,6 +2977,19 @@ def build_prop_analysis_payload(
         average=average,
         season_type=season_type,
         playoff_game_number=int((next_game or {}).get("playoff_game_number") or 0) or None,
+    )
+    market_confidence_engine = apply_market_confidence_adjustment(
+        base_confidence_engine,
+        side=recommended_side,
+        over_probability=implied_over,
+        under_probability=implied_under,
+        odds=safe_float_or_none(_chosen_odds_raw),
+    )
+    confidence_engine = apply_backtest_ranking_adjustment(
+        market_confidence_engine,
+        stat=stat,
+        side=recommended_side,
+        source="analyzer",
     )
     h2h_games_count, h2h_side_hit_count, h2h_side_hit_rate = resolve_side_h2h_metrics(
         games=games,
@@ -2984,17 +3014,19 @@ def build_prop_analysis_payload(
         line=line,
         average=average,
     )
-    confidence_engine = {
-        **confidence_engine,
-        "ranking_source": ranking_context.get("ranking_source"),
-        "ranking_sort_score": ranking_context.get("ranking_sort_score"),
-        "ranking_blend_score": ranking_context.get("ranking_blend_score"),
-        "ranking_profile": ranking_context.get("ranking_profile") or {},
-        "playoff_strategy_tips": ranking_context.get("playoff_strategy_tips") or [],
-        "h2h_weight_pct": ranking_context.get("h2h_weight_pct"),
-        "model_probability": round(side_model_prob * 100.0, 1),
-        "implied_probability": round(chosen_fair_prob * 100.0, 1),
-    }
+    confidence_engine = build_confidence_contract(
+        confidence_engine,
+        source="analyzer",
+        side=recommended_side,
+        base_engine=base_confidence_engine,
+        market_engine=market_confidence_engine,
+        ranking_context=ranking_context,
+        model_probability=side_model_prob,
+        implied_probability=chosen_fair_prob,
+        edge_pct=chosen_edge_pct,
+        ev_decimal=chosen_ev,
+        probability_calibration=backtest_probability_calibration,
+    )
 
     traffic_tone = "yellow"
     traffic_label = "Caution"
@@ -3084,6 +3116,10 @@ def build_prop_analysis_payload(
         "edge_pct": chosen_edge_pct,
         "ev": chosen_ev,
         "edge_definition": EDGE_DEFINITION_MODEL_FAIR,
+        "model_probability": round(side_model_prob * 100.0, 1),
+        "model_probability_raw": round((market_adjusted_model_under if recommended_side == "UNDER" else market_adjusted_model_over) * 100.0, 1),
+        "model_probability_calibrated": round(side_model_prob * 100.0, 1),
+        "probability_calibration": backtest_probability_calibration,
         "fair_probability": round(chosen_fair_prob * 100.0, 1),
         "traffic_light": {
             "label": traffic_label,
@@ -3426,6 +3462,15 @@ CONFIDENCE_TIER_MEDIUM_MIN = 62
 BACKTEST_RANKING_MIN_SAMPLES = 8
 BACKTEST_RANKING_BASE_MIN_SAMPLES = 12
 BACKTEST_RANKING_MAX_ADJUSTMENT = 6.0
+BACKTEST_PROBABILITY_MIN_SAMPLES = 8
+BACKTEST_PROBABILITY_BASE_MIN_SAMPLES = 12
+BACKTEST_PROBABILITY_MAX_DELTA = 0.045
+BACKTEST_SOURCE_RANKING_MIN_SAMPLES = 5
+BACKTEST_SOURCE_RANKING_BASE_MIN_SAMPLES = 8
+BACKTEST_SOURCE_PROBABILITY_MIN_SAMPLES = 5
+BACKTEST_SOURCE_PROBABILITY_BASE_MIN_SAMPLES = 8
+BACKTEST_CALIBRATION_RECENT_HALF_LIFE_DAYS = 10.0
+BACKTEST_CALIBRATION_RECENCY_FLOOR = 0.35
 BACKTEST_RANKING_CACHE_TTL_SECONDS = 120
 _BACKTEST_RANKING_CACHE_LOCK = Lock()
 _BACKTEST_RANKING_CACHE: dict[str, Any] = {"timestamp": 0.0, "metrics": {}}
@@ -3435,6 +3480,150 @@ def _invalidate_backtest_ranking_cache() -> None:
     with _BACKTEST_RANKING_CACHE_LOCK:
         _BACKTEST_RANKING_CACHE["timestamp"] = 0.0
         _BACKTEST_RANKING_CACHE["metrics"] = {}
+
+
+def _coerce_logged_backtest_model_probability(entry: dict[str, Any]) -> float | None:
+    candidates = [
+        entry.get("model_prob"),
+        entry.get("model_probability"),
+    ]
+    contract = entry.get("confidence_contract")
+    if isinstance(contract, dict):
+        candidates.append(contract.get("model_probability"))
+    confidence = entry.get("confidence")
+    if isinstance(confidence, dict):
+        candidates.append(confidence.get("model_probability"))
+
+    for value in candidates:
+        prob = safe_float_or_none(value)
+        if prob is None:
+            continue
+        if abs(prob) > 1.0:
+            prob /= 100.0
+        if 0.02 <= prob <= 0.98:
+            return float(prob)
+    return None
+
+
+def _backtest_calibration_entry_weight(entry: dict[str, Any], now: datetime | None = None) -> float:
+    entry_dt = _backtest_normalize_datetime(_backtest_entry_datetime(entry))
+    if not entry_dt:
+        return 1.0
+
+    now_dt = _backtest_normalize_datetime(now) or _backtest_utc_now()
+    age_days = max(0.0, (now_dt - entry_dt).total_seconds() / 86400.0)
+    if age_days <= 1.0:
+        return 1.0
+
+    decay = 0.5 ** (age_days / BACKTEST_CALIBRATION_RECENT_HALF_LIFE_DAYS)
+    return round(max(BACKTEST_CALIBRATION_RECENCY_FLOOR, min(1.0, decay)), 4)
+
+
+def normalize_backtest_calibration_source(raw_source: Any) -> str:
+    raw = str(raw_source or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not raw:
+        return ""
+    raw = re.sub(r"[^a-z0-9_]+", "_", raw).strip("_")
+    aliases = {
+        "market": "market_scanner",
+        "market_scan": "market_scanner",
+        "market_scanner": "market_scanner",
+        "scanner": "market_scanner",
+        "parlay": "parlay_builder",
+        "parlay_builder": "parlay_builder",
+        "parlay_builder_injury_aware": "injury_aware",
+        "injury_aware": "injury_aware",
+        "injury_aware_parlay": "injury_aware",
+        "player_analyzer": "analyzer",
+        "analyzer": "analyzer",
+        "manual": "manual",
+    }
+    if raw in aliases:
+        return aliases[raw]
+    if raw.startswith("market_scanner") or raw.startswith("market_scan"):
+        return "market_scanner"
+    if raw.startswith("parlay_builder_injury") or raw.startswith("injury_aware"):
+        return "injury_aware"
+    if raw.startswith("parlay_builder") or raw.startswith("parlay"):
+        return "parlay_builder"
+    if raw.startswith("analyzer") or raw.startswith("player_analyzer"):
+        return "analyzer"
+    if raw.startswith("manual"):
+        return "manual"
+    return raw[:48]
+
+
+def _backtest_entry_calibration_source(entry: dict[str, Any]) -> str:
+    candidates: list[Any] = [entry.get("source")]
+    contract = entry.get("confidence_contract")
+    if isinstance(contract, dict):
+        candidates.append(contract.get("source"))
+    confidence = entry.get("confidence")
+    if isinstance(confidence, dict):
+        candidates.append(confidence.get("source"))
+    for candidate in candidates:
+        source = normalize_backtest_calibration_source(candidate)
+        if source:
+            return source
+    return ""
+
+
+def _new_backtest_metric_bucket() -> dict[str, float]:
+    return {
+        "count": 0.0,
+        "raw_count": 0.0,
+        "hits": 0.0,
+        "profit": 0.0,
+        "prob_sum": 0.0,
+        "prob_count": 0.0,
+        "prob_weight": 0.0,
+    }
+
+
+def _add_backtest_metric_result(
+    bucket: dict[str, float],
+    *,
+    result: str,
+    profit: float,
+    weight: float,
+    logged_model_prob: float | None,
+) -> None:
+    bucket["count"] += weight
+    bucket["raw_count"] += 1.0
+    bucket["hits"] += weight if result == "hit" else 0.0
+    bucket["profit"] += float(profit) * weight
+    if logged_model_prob is not None:
+        bucket["prob_sum"] += float(logged_model_prob) * weight
+        bucket["prob_count"] += 1.0
+        bucket["prob_weight"] += weight
+
+
+def _annotate_calibration_global_fallback(
+    fallback_meta: dict[str, Any],
+    *,
+    requested_source: str,
+    source_meta: dict[str, Any],
+) -> dict[str, Any]:
+    annotated = copy.deepcopy(fallback_meta or {})
+    annotated["source"] = requested_source
+    annotated["source_requested"] = requested_source
+    annotated["fallback_source"] = "global"
+    annotated["calibration_scope"] = "global_fallback"
+    annotated["fallback_reason"] = str((source_meta or {}).get("reason") or "")
+    annotated["source_base_count"] = (source_meta or {}).get("base_count")
+    annotated["source_segment_count"] = (source_meta or {}).get("segment_count")
+    return annotated
+
+
+def _attach_global_calibration_probe(
+    source_meta: dict[str, Any],
+    global_meta: dict[str, Any],
+) -> dict[str, Any]:
+    meta = copy.deepcopy(source_meta or {})
+    meta["global_reason"] = (global_meta or {}).get("reason")
+    meta["global_base_count"] = (global_meta or {}).get("base_count")
+    meta["global_segment_count"] = (global_meta or {}).get("segment_count")
+    return meta
 
 
 def _apply_confidence_recalibration(
@@ -3500,8 +3689,11 @@ def _compute_backtest_ranking_metrics() -> dict[str, Any]:
     with _BACKTEST_LOCK:
         entries = [copy.deepcopy(entry) for entry in _BACKTEST_LOG]
 
+    now_dt = _backtest_utc_now()
     stat_totals: dict[str, dict[str, float]] = {}
     stat_side_totals: dict[tuple[str, str], dict[str, float]] = {}
+    source_stat_totals: dict[tuple[str, str], dict[str, float]] = {}
+    source_stat_side_totals: dict[tuple[str, str, str], dict[str, float]] = {}
     for entry in entries:
         result = str(entry.get("result") or "").strip().lower()
         if result not in {"hit", "miss"}:
@@ -3510,22 +3702,47 @@ def _compute_backtest_ranking_metrics() -> dict[str, Any]:
         side = str(entry.get("side") or "").strip().upper()
         if not stat or side not in {"OVER", "UNDER"}:
             continue
+        weight = _backtest_calibration_entry_weight(entry, now_dt)
         odds = safe_float_or_none(entry.get("odds"))
         profit = (float(odds) - 1.0) if (result == "hit" and odds and float(odds) > 1.0) else (1.0 if result == "hit" else -1.0)
+        logged_model_prob = _coerce_logged_backtest_model_probability(entry)
+        source_key = _backtest_entry_calibration_source(entry)
 
-        stat_bucket = stat_totals.setdefault(stat, {"count": 0.0, "hits": 0.0, "profit": 0.0})
-        stat_bucket["count"] += 1.0
-        stat_bucket["hits"] += 1.0 if result == "hit" else 0.0
-        stat_bucket["profit"] += float(profit)
-
-        side_bucket = stat_side_totals.setdefault((stat, side), {"count": 0.0, "hits": 0.0, "profit": 0.0})
-        side_bucket["count"] += 1.0
-        side_bucket["hits"] += 1.0 if result == "hit" else 0.0
-        side_bucket["profit"] += float(profit)
+        _add_backtest_metric_result(
+            stat_totals.setdefault(stat, _new_backtest_metric_bucket()),
+            result=result,
+            profit=float(profit),
+            weight=weight,
+            logged_model_prob=logged_model_prob,
+        )
+        _add_backtest_metric_result(
+            stat_side_totals.setdefault((stat, side), _new_backtest_metric_bucket()),
+            result=result,
+            profit=float(profit),
+            weight=weight,
+            logged_model_prob=logged_model_prob,
+        )
+        if source_key:
+            _add_backtest_metric_result(
+                source_stat_totals.setdefault((source_key, stat), _new_backtest_metric_bucket()),
+                result=result,
+                profit=float(profit),
+                weight=weight,
+                logged_model_prob=logged_model_prob,
+            )
+            _add_backtest_metric_result(
+                source_stat_side_totals.setdefault((source_key, stat, side), _new_backtest_metric_bucket()),
+                result=result,
+                profit=float(profit),
+                weight=weight,
+                logged_model_prob=logged_model_prob,
+            )
 
     metrics = {
         "stat_totals": stat_totals,
         "stat_side_totals": stat_side_totals,
+        "source_stat_totals": source_stat_totals,
+        "source_stat_side_totals": source_stat_side_totals,
     }
     with _BACKTEST_RANKING_CACHE_LOCK:
         _BACKTEST_RANKING_CACHE["timestamp"] = now_ts
@@ -3533,51 +3750,282 @@ def _compute_backtest_ranking_metrics() -> dict[str, Any]:
     return metrics
 
 
-def get_backtest_ranking_adjustment(stat: str | None, side: str | None) -> tuple[float, dict[str, Any]]:
+def get_backtest_ranking_adjustment(
+    stat: str | None,
+    side: str | None,
+    source: str | None = None,
+) -> tuple[float, dict[str, Any]]:
     stat_key = str(stat or "").strip().upper()
     side_key = str(side or "").strip().upper()
+    source_key = normalize_backtest_calibration_source(source)
     if not stat_key or side_key not in {"OVER", "UNDER"}:
-        return 0.0, {"reason": "missing_inputs"}
+        return 0.0, {"reason": "missing_inputs", "source": source_key}
 
     metrics = _compute_backtest_ranking_metrics()
-    stat_totals = metrics.get("stat_totals") or {}
-    stat_side_totals = metrics.get("stat_side_totals") or {}
-    base = stat_totals.get(stat_key) or {}
-    segment = stat_side_totals.get((stat_key, side_key)) or {}
-    base_count = int(base.get("count") or 0)
-    segment_count = int(segment.get("count") or 0)
-    if base_count < BACKTEST_RANKING_BASE_MIN_SAMPLES:
-        return 0.0, {"reason": "insufficient_base", "base_count": base_count, "segment_count": segment_count}
-    if segment_count < BACKTEST_RANKING_MIN_SAMPLES:
-        return 0.0, {"reason": "insufficient_segment", "base_count": base_count, "segment_count": segment_count}
+    if source_key:
+        stat_totals = metrics.get("source_stat_totals") or {}
+        stat_side_totals = metrics.get("source_stat_side_totals") or {}
+        base = stat_totals.get((source_key, stat_key)) or {}
+        segment = stat_side_totals.get((source_key, stat_key, side_key)) or {}
+    else:
+        stat_totals = metrics.get("stat_totals") or {}
+        stat_side_totals = metrics.get("stat_side_totals") or {}
+        base = stat_totals.get(stat_key) or {}
+        segment = stat_side_totals.get((stat_key, side_key)) or {}
+    base_count = float(base.get("count") or 0.0)
+    segment_count = float(segment.get("count") or 0.0)
+    base_raw_count = int(base.get("raw_count") or base_count or 0)
+    segment_raw_count = int(segment.get("raw_count") or segment_count or 0)
+    base_min_samples = BACKTEST_SOURCE_RANKING_BASE_MIN_SAMPLES if source_key else BACKTEST_RANKING_BASE_MIN_SAMPLES
+    segment_min_samples = BACKTEST_SOURCE_RANKING_MIN_SAMPLES if source_key else BACKTEST_RANKING_MIN_SAMPLES
+    calibration_scope = "source" if source_key else "global"
+    if base_raw_count < base_min_samples:
+        meta = {
+            "reason": "insufficient_source_base" if source_key else "insufficient_base",
+            "source": source_key,
+            "calibration_scope": calibration_scope,
+            "base_count": base_raw_count,
+            "segment_count": segment_raw_count,
+        }
+        if source_key:
+            global_adjustment, global_meta = get_backtest_ranking_adjustment(stat_key, side_key)
+            if str(global_meta.get("reason") or "") in {"applied", "neutral"}:
+                return global_adjustment, _annotate_calibration_global_fallback(global_meta, requested_source=source_key, source_meta=meta)
+            meta = _attach_global_calibration_probe(meta, global_meta)
+        return 0.0, meta
+    if segment_raw_count < segment_min_samples:
+        meta = {
+            "reason": "insufficient_source_segment" if source_key else "insufficient_segment",
+            "source": source_key,
+            "calibration_scope": calibration_scope,
+            "base_count": base_raw_count,
+            "segment_count": segment_raw_count,
+        }
+        if source_key:
+            global_adjustment, global_meta = get_backtest_ranking_adjustment(stat_key, side_key)
+            if str(global_meta.get("reason") or "") in {"applied", "neutral"}:
+                return global_adjustment, _annotate_calibration_global_fallback(global_meta, requested_source=source_key, source_meta=meta)
+            meta = _attach_global_calibration_probe(meta, global_meta)
+        return 0.0, meta
 
-    base_hit_rate = (float(base.get("hits") or 0.0) / float(base_count)) * 100.0 if base_count > 0 else 0.0
-    segment_hit_rate = (float(segment.get("hits") or 0.0) / float(segment_count)) * 100.0 if segment_count > 0 else 0.0
-    base_roi = float(base.get("profit") or 0.0) / float(base_count) if base_count > 0 else 0.0
-    segment_roi = float(segment.get("profit") or 0.0) / float(segment_count) if segment_count > 0 else 0.0
+    base_hit_rate = (float(base.get("hits") or 0.0) / base_count) * 100.0 if base_count > 0 else 0.0
+    segment_hit_rate = (float(segment.get("hits") or 0.0) / segment_count) * 100.0 if segment_count > 0 else 0.0
+    base_roi = float(base.get("profit") or 0.0) / base_count if base_count > 0 else 0.0
+    segment_roi = float(segment.get("profit") or 0.0) / segment_count if segment_count > 0 else 0.0
 
     hit_rate_delta = segment_hit_rate - base_hit_rate
     roi_delta_pct = (segment_roi - base_roi) * 100.0
-    sample_strength = max(0.2, min(1.0, float(segment_count) / 40.0))
+    sample_strength = max(0.2, min(1.0, segment_count / 40.0))
     raw_adjustment = ((hit_rate_delta * 0.22) + (roi_delta_pct * 0.18)) * sample_strength
     adjustment = max(-BACKTEST_RANKING_MAX_ADJUSTMENT, min(BACKTEST_RANKING_MAX_ADJUSTMENT, raw_adjustment))
 
     if abs(adjustment) < 0.15:
         return 0.0, {
             "reason": "neutral",
-            "base_count": base_count,
-            "segment_count": segment_count,
+            "source": source_key,
+            "calibration_scope": calibration_scope,
+            "base_count": base_raw_count,
+            "segment_count": segment_raw_count,
+            "base_effective_count": round(base_count, 2),
+            "segment_effective_count": round(segment_count, 2),
             "hit_rate_delta": round(hit_rate_delta, 2),
             "roi_delta_pct": round(roi_delta_pct, 2),
         }
 
     return round(adjustment, 1), {
         "reason": "applied",
-        "base_count": base_count,
-        "segment_count": segment_count,
+        "source": source_key,
+        "calibration_scope": calibration_scope,
+        "base_count": base_raw_count,
+        "segment_count": segment_raw_count,
+        "base_effective_count": round(base_count, 2),
+        "segment_effective_count": round(segment_count, 2),
         "hit_rate_delta": round(hit_rate_delta, 2),
         "roi_delta_pct": round(roi_delta_pct, 2),
     }
+
+
+def get_backtest_probability_adjustment(
+    stat: str | None,
+    side: str | None,
+    source: str | None = None,
+) -> tuple[float, dict[str, Any]]:
+    stat_key = str(stat or "").strip().upper()
+    side_key = str(side or "").strip().upper()
+    source_key = normalize_backtest_calibration_source(source)
+    if not stat_key or side_key not in {"OVER", "UNDER"}:
+        return 0.0, {"reason": "missing_inputs", "source": source_key}
+
+    metrics = _compute_backtest_ranking_metrics()
+    if source_key:
+        stat_totals = metrics.get("source_stat_totals") or {}
+        stat_side_totals = metrics.get("source_stat_side_totals") or {}
+        base = stat_totals.get((source_key, stat_key)) or {}
+        segment = stat_side_totals.get((source_key, stat_key, side_key)) or {}
+    else:
+        stat_totals = metrics.get("stat_totals") or {}
+        stat_side_totals = metrics.get("stat_side_totals") or {}
+        base = stat_totals.get(stat_key) or {}
+        segment = stat_side_totals.get((stat_key, side_key)) or {}
+    base_count = float(base.get("count") or 0.0)
+    segment_count = float(segment.get("count") or 0.0)
+    base_raw_count = int(base.get("raw_count") or base_count or 0)
+    segment_raw_count = int(segment.get("raw_count") or segment_count or 0)
+    base_min_samples = BACKTEST_SOURCE_PROBABILITY_BASE_MIN_SAMPLES if source_key else BACKTEST_PROBABILITY_BASE_MIN_SAMPLES
+    segment_min_samples = BACKTEST_SOURCE_PROBABILITY_MIN_SAMPLES if source_key else BACKTEST_PROBABILITY_MIN_SAMPLES
+    calibration_scope = "source" if source_key else "global"
+    if base_raw_count < base_min_samples:
+        meta = {
+            "reason": "insufficient_source_base" if source_key else "insufficient_base",
+            "source": source_key,
+            "calibration_scope": calibration_scope,
+            "base_count": base_raw_count,
+            "segment_count": segment_raw_count,
+        }
+        if source_key:
+            global_delta, global_meta = get_backtest_probability_adjustment(stat_key, side_key)
+            if str(global_meta.get("reason") or "") in {"applied", "neutral"}:
+                return global_delta, _annotate_calibration_global_fallback(global_meta, requested_source=source_key, source_meta=meta)
+            meta = _attach_global_calibration_probe(meta, global_meta)
+        return 0.0, meta
+    if segment_raw_count < segment_min_samples:
+        meta = {
+            "reason": "insufficient_source_segment" if source_key else "insufficient_segment",
+            "source": source_key,
+            "calibration_scope": calibration_scope,
+            "base_count": base_raw_count,
+            "segment_count": segment_raw_count,
+        }
+        if source_key:
+            global_delta, global_meta = get_backtest_probability_adjustment(stat_key, side_key)
+            if str(global_meta.get("reason") or "") in {"applied", "neutral"}:
+                return global_delta, _annotate_calibration_global_fallback(global_meta, requested_source=source_key, source_meta=meta)
+            meta = _attach_global_calibration_probe(meta, global_meta)
+        return 0.0, meta
+
+    base_hit_rate = (float(base.get("hits") or 0.0) / base_count) if base_count > 0 else 0.5
+    segment_hit_rate = (float(segment.get("hits") or 0.0) / segment_count) if segment_count > 0 else 0.5
+    base_roi = float(base.get("profit") or 0.0) / base_count if base_count > 0 else 0.0
+    segment_roi = float(segment.get("profit") or 0.0) / segment_count if segment_count > 0 else 0.0
+
+    prob_count = int(segment.get("prob_count") or 0)
+    prob_weight = float(segment.get("prob_weight") or prob_count or 0.0)
+    if prob_count >= max(4, min(segment_min_samples, 6)) and prob_weight > 0:
+        expected_hit_rate = float(segment.get("prob_sum") or 0.0) / prob_weight
+        expectation_source = "logged_model_probability"
+    else:
+        expected_hit_rate = base_hit_rate
+        expectation_source = "stat_baseline"
+
+    calibration_gap = segment_hit_rate - expected_hit_rate
+    roi_delta = segment_roi - base_roi
+    sample_strength = max(0.2, min(1.0, segment_count / 50.0))
+    raw_delta = ((calibration_gap * 0.45) + (roi_delta * 0.055)) * sample_strength
+    delta = max(-BACKTEST_PROBABILITY_MAX_DELTA, min(BACKTEST_PROBABILITY_MAX_DELTA, raw_delta))
+
+    meta = {
+        "reason": "applied" if abs(delta) >= 0.0025 else "neutral",
+        "source": source_key,
+        "calibration_scope": calibration_scope,
+        "base_count": base_raw_count,
+        "segment_count": segment_raw_count,
+        "base_effective_count": round(base_count, 2),
+        "segment_effective_count": round(segment_count, 2),
+        "prob_count": prob_count,
+        "prob_effective_count": round(prob_weight, 2),
+        "expectation_source": expectation_source,
+        "actual_hit_rate_pct": round(segment_hit_rate * 100.0, 2),
+        "expected_hit_rate_pct": round(expected_hit_rate * 100.0, 2),
+        "base_hit_rate_pct": round(base_hit_rate * 100.0, 2),
+        "calibration_gap_pct": round(calibration_gap * 100.0, 2),
+        "roi_delta_pct": round(roi_delta * 100.0, 2),
+        "sample_strength": round(sample_strength, 3),
+        "delta_pct": round(delta * 100.0, 2),
+    }
+    if abs(delta) < 0.0025:
+        return 0.0, meta
+    return round(delta, 4), meta
+
+
+def apply_backtest_probability_calibration(
+    model_over: float,
+    model_under: float,
+    *,
+    stat: str | None,
+    source: str | None = None,
+) -> tuple[float, float, dict[str, Any]]:
+    source_key = normalize_backtest_calibration_source(source)
+    over_delta, over_meta = get_backtest_probability_adjustment(stat, "OVER", source=source_key)
+    under_delta, under_meta = get_backtest_probability_adjustment(stat, "UNDER", source=source_key)
+    original_over = clamp(float(model_over), 0.02, 0.98)
+    original_under = clamp(float(model_under), 0.02, 0.98)
+
+    adjusted_over = clamp(original_over + float(over_delta), 0.02, 0.98)
+    adjusted_under = clamp(original_under + float(under_delta), 0.02, 0.98)
+    total = adjusted_over + adjusted_under
+    if total <= 0:
+        final_over, final_under = original_over, original_under
+    else:
+        final_over = clamp(adjusted_over / total, 0.02, 0.98)
+        final_under = clamp(1.0 - final_over, 0.02, 0.98)
+
+    applied = abs(final_over - original_over) >= 0.0005 or abs(final_under - original_under) >= 0.0005
+    over_scope = str((over_meta or {}).get("calibration_scope") or "")
+    under_scope = str((under_meta or {}).get("calibration_scope") or "")
+    calibration_scope = over_scope if over_scope and over_scope == under_scope else (over_scope or under_scope or ("source" if source_key else "global"))
+    meta = {
+        "applied": applied,
+        "stat": str(stat or "").strip().upper(),
+        "source": source_key,
+        "calibration_scope": calibration_scope,
+        "over": over_meta,
+        "under": under_meta,
+        "raw_over_delta_pct": round(float(over_delta) * 100.0, 2),
+        "raw_under_delta_pct": round(float(under_delta) * 100.0, 2),
+        "over_delta_pct": round((final_over - original_over) * 100.0, 2),
+        "under_delta_pct": round((final_under - original_under) * 100.0, 2),
+        "before": {
+            "over_probability": round(original_over, 4),
+            "under_probability": round(original_under, 4),
+        },
+        "after": {
+            "over_probability": round(final_over, 4),
+            "under_probability": round(final_under, 4),
+        },
+    }
+    return round(final_over, 4), round(final_under, 4), meta
+
+
+def _backtest_calibration_signature() -> str:
+    metrics = _compute_backtest_ranking_metrics()
+    stat_totals = metrics.get("stat_totals") or {}
+    stat_side_totals = metrics.get("stat_side_totals") or {}
+    source_stat_totals = metrics.get("source_stat_totals") or {}
+    source_stat_side_totals = metrics.get("source_stat_side_totals") or {}
+    serializable_side_totals = {
+        f"{str(key[0])}:{str(key[1])}": value
+        for key, value in stat_side_totals.items()
+        if isinstance(key, tuple) and len(key) == 2
+    }
+    serializable_source_stat_totals = {
+        f"{str(key[0])}:{str(key[1])}": value
+        for key, value in source_stat_totals.items()
+        if isinstance(key, tuple) and len(key) == 2
+    }
+    serializable_source_side_totals = {
+        f"{str(key[0])}:{str(key[1])}:{str(key[2])}": value
+        for key, value in source_stat_side_totals.items()
+        if isinstance(key, tuple) and len(key) == 3
+    }
+    return _payload_hash(
+        {
+            "schema": "backtest_probability_v3_source_scoped",
+            "stat_totals": stat_totals,
+            "stat_side_totals": serializable_side_totals,
+            "source_stat_totals": serializable_source_stat_totals,
+            "source_stat_side_totals": serializable_source_side_totals,
+        }
+    )[:16]
 
 
 def apply_backtest_ranking_adjustment(
@@ -3585,10 +4033,14 @@ def apply_backtest_ranking_adjustment(
     *,
     stat: str | None,
     side: str | None,
+    source: str | None = None,
 ) -> dict[str, Any]:
     adjusted = copy.deepcopy(confidence_engine or {})
     base_ranking_score = int(adjusted.get("ranking_score") if adjusted.get("ranking_score") is not None else adjusted.get("score") or 0)
-    adjustment, meta = get_backtest_ranking_adjustment(stat, side)
+    source_key = normalize_backtest_calibration_source(source)
+    adjustment, meta = get_backtest_ranking_adjustment(stat, side, source=source_key)
+    if source_key and isinstance(meta, dict):
+        meta["source"] = source_key
     adjusted["backtest_ranking_adjustment"] = adjustment
     adjusted["backtest_ranking_meta"] = meta
     if abs(adjustment) < 0.1:
@@ -3608,6 +4060,107 @@ def apply_backtest_ranking_adjustment(
         tags.append(tag_text)
     adjusted["tags"] = tags[:6]
     return adjusted
+
+
+def build_backtest_calibration_diagnostics(
+    *,
+    stat: str | None,
+    side: str | None,
+    probability_calibration: dict[str, Any] | None,
+    ranking_meta: dict[str, Any] | None = None,
+    ranking_adjustment: Any = None,
+) -> dict[str, Any]:
+    side_key = str(side or "").strip().upper()
+    stat_key = str(stat or "").strip().upper()
+    probability_calibration = probability_calibration or {}
+    side_meta_key = side_key.lower()
+    side_meta = probability_calibration.get(side_meta_key) if isinstance(probability_calibration, dict) else {}
+    if not isinstance(side_meta, dict):
+        side_meta = {}
+    ranking_meta = ranking_meta if isinstance(ranking_meta, dict) else {}
+    raw_delta_key = f"raw_{side_meta_key}_delta_pct"
+    final_delta_key = f"{side_meta_key}_delta_pct"
+    raw_probability_delta = safe_float_or_none(probability_calibration.get(raw_delta_key))
+    final_probability_delta = safe_float_or_none(probability_calibration.get(final_delta_key))
+    side_probability_delta = safe_float_or_none(side_meta.get("delta_pct"))
+
+    if raw_probability_delta is None:
+        raw_probability_delta = side_probability_delta
+    if final_probability_delta is None:
+        final_probability_delta = raw_probability_delta
+
+    rank_adjustment = safe_float_or_none(ranking_adjustment)
+    if rank_adjustment is None:
+        rank_adjustment = 0.0
+
+    source_key = normalize_backtest_calibration_source(
+        probability_calibration.get("source")
+        or side_meta.get("source")
+        or ranking_meta.get("source")
+    )
+    calibration_scope = str(
+        side_meta.get("calibration_scope")
+        or ranking_meta.get("calibration_scope")
+        or probability_calibration.get("calibration_scope")
+        or ("source" if source_key else "global")
+    )
+    probability_reason = str(side_meta.get("reason") or "unavailable")
+    ranking_reason = str(ranking_meta.get("reason") or "unavailable")
+    probability_applied = probability_reason == "applied" or abs(float(final_probability_delta or 0.0)) >= 0.05
+    ranking_applied = ranking_reason == "applied" or abs(float(rank_adjustment or 0.0)) >= 0.1
+
+    return {
+        "schema": "calibration_diagnostics_v1",
+        "stat": stat_key,
+        "side": side_key,
+        "source": source_key,
+        "calibration_scope": calibration_scope,
+        "applied": bool(probability_calibration.get("applied") or probability_applied or ranking_applied),
+        "probability": {
+            "reason": probability_reason,
+            "source": source_key,
+            "calibration_scope": calibration_scope,
+            "fallback_source": str(side_meta.get("fallback_source") or ""),
+            "fallback_reason": str(side_meta.get("fallback_reason") or ""),
+            "source_base_count": safe_float_or_none(side_meta.get("source_base_count")),
+            "source_segment_count": safe_float_or_none(side_meta.get("source_segment_count")),
+            "global_base_count": safe_float_or_none(side_meta.get("global_base_count")),
+            "global_segment_count": safe_float_or_none(side_meta.get("global_segment_count")),
+            "expectation_source": str(side_meta.get("expectation_source") or ""),
+            "actual_hit_rate_pct": safe_float_or_none(side_meta.get("actual_hit_rate_pct")),
+            "expected_hit_rate_pct": safe_float_or_none(side_meta.get("expected_hit_rate_pct")),
+            "base_hit_rate_pct": safe_float_or_none(side_meta.get("base_hit_rate_pct")),
+            "calibration_gap_pct": safe_float_or_none(side_meta.get("calibration_gap_pct")),
+            "roi_delta_pct": safe_float_or_none(side_meta.get("roi_delta_pct")),
+            "raw_delta_pct": raw_probability_delta,
+            "final_delta_pct": final_probability_delta,
+            "sample_strength": safe_float_or_none(side_meta.get("sample_strength")),
+            "base_count": safe_float_or_none(side_meta.get("base_count")),
+            "segment_count": safe_float_or_none(side_meta.get("segment_count")),
+            "base_effective_count": safe_float_or_none(side_meta.get("base_effective_count")),
+            "segment_effective_count": safe_float_or_none(side_meta.get("segment_effective_count")),
+            "prob_count": safe_float_or_none(side_meta.get("prob_count")),
+            "prob_effective_count": safe_float_or_none(side_meta.get("prob_effective_count")),
+        },
+        "ranking": {
+            "reason": ranking_reason,
+            "source": source_key,
+            "calibration_scope": calibration_scope,
+            "fallback_source": str(ranking_meta.get("fallback_source") or ""),
+            "fallback_reason": str(ranking_meta.get("fallback_reason") or ""),
+            "source_base_count": safe_float_or_none(ranking_meta.get("source_base_count")),
+            "source_segment_count": safe_float_or_none(ranking_meta.get("source_segment_count")),
+            "global_base_count": safe_float_or_none(ranking_meta.get("global_base_count")),
+            "global_segment_count": safe_float_or_none(ranking_meta.get("global_segment_count")),
+            "adjustment": rank_adjustment,
+            "hit_rate_delta": safe_float_or_none(ranking_meta.get("hit_rate_delta")),
+            "roi_delta_pct": safe_float_or_none(ranking_meta.get("roi_delta_pct")),
+            "base_count": safe_float_or_none(ranking_meta.get("base_count")),
+            "segment_count": safe_float_or_none(ranking_meta.get("segment_count")),
+            "base_effective_count": safe_float_or_none(ranking_meta.get("base_effective_count")),
+            "segment_effective_count": safe_float_or_none(ranking_meta.get("segment_effective_count")),
+        },
+    }
 
 
 def build_confidence_engine(
@@ -3915,6 +4468,124 @@ def apply_market_confidence_adjustment(
         adjusted["summary"] = f"{summary}  {note}".strip(" ")
     return adjusted
 
+
+CONFIDENCE_CONTRACT_VERSION = "confidence_v1"
+
+
+def _confidence_score_or_none(value: Any) -> int | None:
+    try:
+        return int(max(0, min(99, round(float(value)))))
+    except (TypeError, ValueError):
+        return None
+
+
+def _confidence_pct_or_none(value: Any) -> float | None:
+    raw_value = safe_float_or_none(value)
+    if raw_value is None:
+        return None
+    pct_value = raw_value * 100.0 if abs(raw_value) <= 1.0 else raw_value
+    return round(pct_value, 1)
+
+
+def build_confidence_contract(
+    confidence_engine: dict[str, Any],
+    *,
+    source: str,
+    side: str,
+    base_engine: dict[str, Any] | None = None,
+    market_engine: dict[str, Any] | None = None,
+    ranking_context: dict[str, Any] | None = None,
+    model_probability: Any = None,
+    implied_probability: Any = None,
+    edge_pct: Any = None,
+    ev_decimal: Any = None,
+    probability_calibration: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    engine = copy.deepcopy(confidence_engine or {})
+    base_engine = base_engine or engine
+    market_engine = market_engine or engine
+    ranking_context = ranking_context or {}
+
+    display_score = _confidence_score_or_none(engine.get("score"))
+    if display_score is None:
+        display_score = _confidence_score_or_none(base_engine.get("score")) or 0
+
+    base_score = _confidence_score_or_none(base_engine.get("score"))
+    if base_score is None:
+        base_score = display_score
+
+    market_adjusted_score = _confidence_score_or_none(market_engine.get("score"))
+    if market_adjusted_score is None:
+        market_adjusted_score = display_score
+
+    ranking_score = _confidence_score_or_none(engine.get("ranking_score"))
+    if ranking_score is None:
+        ranking_score = display_score
+
+    market_penalty = safe_float_or_none(engine.get("market_penalty"))
+    market_side = engine.get("market_side")
+    market_adjusted = market_side is not None or (market_penalty is not None and abs(market_penalty) > 0)
+
+    contract = {
+        **engine,
+        "contract_version": CONFIDENCE_CONTRACT_VERSION,
+        "source": str(source or ""),
+        "side": str(side or "").upper(),
+        "score": display_score,
+        "confidence_score": display_score,
+        "display_score": display_score,
+        "base_score": base_score,
+        "base_confidence_score": base_score,
+        "market_adjusted_score": market_adjusted_score,
+        "market_adjusted_confidence_score": market_adjusted_score,
+        "ranking_score": ranking_score,
+        "ranking_adjusted_score": ranking_score,
+        "score_source": "market_adjusted" if market_adjusted else "base",
+        "market_adjusted": market_adjusted,
+        "model_probability": _confidence_pct_or_none(model_probability if model_probability is not None else engine.get("model_probability")),
+        "implied_probability": _confidence_pct_or_none(implied_probability if implied_probability is not None else engine.get("implied_probability")),
+        "edge_pct": round(float(edge_pct), 1) if edge_pct is not None else engine.get("edge_pct"),
+        "ev": round(float(ev_decimal), 4) if ev_decimal is not None else engine.get("ev"),
+        "probability_calibration": copy.deepcopy(probability_calibration if probability_calibration is not None else engine.get("probability_calibration") or {}),
+        "calibration_diagnostics": build_backtest_calibration_diagnostics(
+            stat=engine.get("stat"),
+            side=side,
+            probability_calibration=probability_calibration if probability_calibration is not None else engine.get("probability_calibration") or {},
+            ranking_meta=engine.get("backtest_ranking_meta"),
+            ranking_adjustment=engine.get("backtest_ranking_adjustment"),
+        ),
+        "ranking_source": ranking_context.get("ranking_source", engine.get("ranking_source")),
+        "ranking_sort_score": ranking_context.get("ranking_sort_score", engine.get("ranking_sort_score")),
+        "ranking_blend_score": ranking_context.get("ranking_blend_score", engine.get("ranking_blend_score")),
+        "ranking_profile": ranking_context.get("ranking_profile", engine.get("ranking_profile") or {}) or {},
+        "playoff_strategy_tips": ranking_context.get("playoff_strategy_tips", engine.get("playoff_strategy_tips") or []) or [],
+        "h2h_weight_pct": ranking_context.get("h2h_weight_pct", engine.get("h2h_weight_pct")),
+    }
+    return contract
+
+
+def confidence_contract_flat_fields(contract: dict[str, Any]) -> dict[str, Any]:
+    confidence = contract or {}
+    return {
+        "confidence": confidence.get("grade"),
+        "confidence_score": confidence.get("display_score", confidence.get("score")),
+        "confidence_tone": confidence.get("tone"),
+        "confidence_tier": confidence.get("tier"),
+        "confidence_summary": confidence.get("summary"),
+        "confidence_tags": confidence.get("tags") or [],
+        "confidence_components": confidence.get("components") or {},
+        "confidence_contract": copy.deepcopy(confidence),
+        "base_confidence_score": confidence.get("base_confidence_score"),
+        "market_adjusted_confidence_score": confidence.get("market_adjusted_confidence_score"),
+        "ranking_score": confidence.get("ranking_score"),
+        "calibration_diagnostics": copy.deepcopy(confidence.get("calibration_diagnostics") or {}),
+        "market_side": confidence.get("market_side"),
+        "market_disagrees": confidence.get("market_disagrees"),
+        "market_penalty": confidence.get("market_penalty"),
+        "market_support_pct": confidence.get("market_support_pct"),
+    }
+
+
 def apply_market_probability_penalty(
     model_over: float,
     model_under: float,
@@ -4105,6 +4776,7 @@ def build_shared_market_pricing_snapshot(
     variance: dict[str, Any] | None = None,
     games_count: int = 0,
     h2h_games_count: int | None = None,
+    calibration_source: str | None = None,
 ) -> dict[str, Any]:
     fair_inputs = resolve_market_fair_inputs(market_row, over_odds, under_odds)
     model_over, model_under = estimate_model_probabilities(
@@ -4132,16 +4804,24 @@ def build_shared_market_pricing_snapshot(
         h2h_games_count=h2h_games_count,
         market_hold=safe_float_or_none(fair_inputs.get("hold")),
     )
-    calibrated_over, calibrated_under = calibrate_two_way_probabilities(
+    market_calibrated_over, market_calibrated_under = calibrate_two_way_probabilities(
         raw_over,
         raw_under,
         fair_over=fair_inputs.get("fair_over"),
         fair_under=fair_inputs.get("fair_under"),
         shrink_strength=float(reliability["shrink_strength"]),
     )
+    calibrated_over, calibrated_under, backtest_probability_calibration = apply_backtest_probability_calibration(
+        market_calibrated_over,
+        market_calibrated_under,
+        stat=str(stat),
+        source=calibration_source,
+    )
 
     raw_over_metrics = compute_side_pricing_metrics(raw_over, float(fair_inputs["fair_over"]), over_odds)
     raw_under_metrics = compute_side_pricing_metrics(raw_under, float(fair_inputs["fair_under"]), under_odds)
+    market_calibrated_over_metrics = compute_side_pricing_metrics(market_calibrated_over, float(fair_inputs["fair_over"]), over_odds)
+    market_calibrated_under_metrics = compute_side_pricing_metrics(market_calibrated_under, float(fair_inputs["fair_under"]), under_odds)
     calibrated_over_metrics = compute_side_pricing_metrics(calibrated_over, float(fair_inputs["fair_over"]), over_odds)
     calibrated_under_metrics = compute_side_pricing_metrics(calibrated_under, float(fair_inputs["fair_under"]), under_odds)
     adjusted_over_ev = risk_adjust_ev(calibrated_over_metrics["ev"], float(reliability["reliability"]))
@@ -4157,6 +4837,14 @@ def build_shared_market_pricing_snapshot(
             "over_ev": raw_over_metrics["ev"],
             "under_ev": raw_under_metrics["ev"],
         },
+        "market_calibrated": {
+            "over_probability": market_calibrated_over,
+            "under_probability": market_calibrated_under,
+            "over_edge_pct": market_calibrated_over_metrics["edge_pct"],
+            "under_edge_pct": market_calibrated_under_metrics["edge_pct"],
+            "over_ev": market_calibrated_over_metrics["ev"],
+            "under_ev": market_calibrated_under_metrics["ev"],
+        },
         "calibrated": {
             "over_probability": calibrated_over,
             "under_probability": calibrated_under,
@@ -4170,6 +4858,7 @@ def build_shared_market_pricing_snapshot(
             "under_ev": adjusted_under_ev,
         },
         "reliability": reliability,
+        "backtest": backtest_probability_calibration,
     }
 
 def _build_parlay_reason_fragments(prop: dict[str, Any]) -> list[str]:
@@ -4316,6 +5005,10 @@ def resolve_side_h2h_metrics(
 MIN_PARLAY_H2H_GAMES_FOR_RANKING = 2
 MIN_PARLAY_PLAYOFF_H2H_GAMES_FOR_PRIMARY = 4
 MAX_PARLAY_PLAYOFF_H2H_WEIGHT = 0.35
+PARLAY_DIVERSIFICATION_MAX_PLAYER_LEGS = 1
+PARLAY_DIVERSIFICATION_MAX_GAME_LEGS = 1
+PARLAY_DIVERSIFICATION_MAX_TEAM_LEGS = 2
+PARLAY_DIVERSIFICATION_MAX_COMBO_LEGS = 1
 
 
 def playoff_h2h_weight_for_sample(games_count: int | None) -> float:
@@ -4497,38 +5190,388 @@ def build_parlay_ranking_context(
     }
 
 
+def _parlay_prop_player_key(prop: dict[str, Any]) -> str:
+    player_id = str(prop.get("player_id") or "").strip()
+    if player_id:
+        return f"id:{player_id}"
+    player_name = str(prop.get("player_name") or prop.get("player") or "").strip().lower()
+    return f"name:{player_name}" if player_name else ""
+
+
+def _parlay_prop_game_key(prop: dict[str, Any]) -> str:
+    event_id = str(prop.get("event_id") or "").strip()
+    if event_id:
+        return f"event:{event_id}"
+    game_label = str(prop.get("game_label") or "").strip().lower()
+    if game_label:
+        return f"label:{game_label}"
+    teams = sorted(
+        str(value or "").strip().lower()
+        for value in [prop.get("home_team"), prop.get("away_team")]
+        if str(value or "").strip()
+    )
+    return f"teams:{'|'.join(teams)}" if teams else ""
+
+
+def _parlay_prop_team_key(prop: dict[str, Any]) -> str:
+    team_id = str(prop.get("team_id") or "").strip()
+    if team_id:
+        return f"id:{team_id}"
+    team_abbr = str(prop.get("team_abbreviation") or prop.get("team") or "").strip().upper()
+    if team_abbr:
+        return f"abbr:{team_abbr}"
+    team_name = str(prop.get("team_name") or "").strip().lower()
+    return f"name:{team_name}" if team_name else ""
+
+
+def _parlay_prop_stat_exposures(prop: dict[str, Any]) -> set[str]:
+    stat = str(prop.get("stat") or "").strip().upper()
+    exposure_map = {
+        "PTS": {"points"},
+        "REB": {"rebounds"},
+        "AST": {"assists"},
+        "PR": {"points", "rebounds", "combo"},
+        "PA": {"points", "assists", "combo"},
+        "RA": {"rebounds", "assists", "combo"},
+        "PRA": {"points", "rebounds", "assists", "combo"},
+        "3PM": {"shooting"},
+        "STL": {"stocks"},
+        "BLK": {"stocks"},
+    }
+    return set(exposure_map.get(stat) or {stat.lower() or "other"})
+
+
+def _parlay_stat_family_limit(legs: int) -> int:
+    return 1 if int(legs or 0) <= 3 else 2
+
+
 def annotate_parlay_selection(scored: list[dict[str, Any]], legs: int) -> list[dict[str, Any]]:
     parlay_legs: list[dict[str, Any]] = []
-    seen_player_ids: set[int] = set()
-    seen_event_ids: set[str] = set()
+    seen_player_keys: set[str] = set()
+    selected_game_counts: dict[str, int] = {}
+    selected_team_counts: dict[str, int] = {}
+    selected_stat_exposures: dict[str, int] = {}
+    selected_combo_count = 0
+    stat_family_limit = _parlay_stat_family_limit(legs)
 
     for idx, prop in enumerate(scored, start=1):
-        pid = prop.get("player_id")
-        eid = str(prop.get("event_id") or "")
         prop["board_rank"] = idx
         prop["selection_reason_parts"] = _build_parlay_reason_fragments(prop)
         prop["selection_reason"] = ""
         prop["selection_status"] = "not_selected"
+        prop["diversification"] = {
+            "player_key": _parlay_prop_player_key(prop),
+            "game_key": _parlay_prop_game_key(prop),
+            "team_key": _parlay_prop_team_key(prop),
+            "stat_exposures": sorted(_parlay_prop_stat_exposures(prop)),
+            "relaxed": False,
+        }
 
-        if len(parlay_legs) >= legs:
-            prop["selection_reason"] = f"Ranked below the final cutoff for this {legs}-leg ticket."
-            continue
-        if pid in seen_player_ids:
-            prop["selection_reason"] = "Skipped because a higher-ranked prop from the same player was already selected."
-            continue
-        if eid and eid in seen_event_ids:
-            prop["selection_reason"] = "Skipped because the ticket avoids same-game parlays."
-            continue
+    def blocker_for(prop: dict[str, Any], *, relaxed: bool = False) -> str:
+        player_key = _parlay_prop_player_key(prop)
+        game_key = _parlay_prop_game_key(prop)
+        team_key = _parlay_prop_team_key(prop)
+        stat_exposures = _parlay_prop_stat_exposures(prop)
 
-        seen_player_ids.add(pid)
-        if eid:
-            seen_event_ids.add(eid)
+        if player_key and player_key in seen_player_keys:
+            return "same_player"
+        if game_key and selected_game_counts.get(game_key, 0) >= PARLAY_DIVERSIFICATION_MAX_GAME_LEGS:
+            return "same_game"
+        if not relaxed:
+            if team_key and selected_team_counts.get(team_key, 0) >= PARLAY_DIVERSIFICATION_MAX_TEAM_LEGS:
+                return "team_cluster"
+            if "combo" in stat_exposures and selected_combo_count >= PARLAY_DIVERSIFICATION_MAX_COMBO_LEGS:
+                return "combo_cluster"
+            crowded_exposures = [
+                exposure
+                for exposure in stat_exposures
+                if exposure != "combo" and selected_stat_exposures.get(exposure, 0) >= stat_family_limit
+            ]
+            if crowded_exposures:
+                return "stat_family_cluster"
+        return ""
+
+    def select_prop(prop: dict[str, Any], *, relaxed: bool = False) -> None:
+        nonlocal selected_combo_count
+        player_key = _parlay_prop_player_key(prop)
+        game_key = _parlay_prop_game_key(prop)
+        team_key = _parlay_prop_team_key(prop)
+        stat_exposures = _parlay_prop_stat_exposures(prop)
+        if player_key:
+            seen_player_keys.add(player_key)
+        if game_key:
+            selected_game_counts[game_key] = selected_game_counts.get(game_key, 0) + 1
+        if team_key:
+            selected_team_counts[team_key] = selected_team_counts.get(team_key, 0) + 1
+        for exposure in stat_exposures:
+            selected_stat_exposures[exposure] = selected_stat_exposures.get(exposure, 0) + 1
+        if "combo" in stat_exposures:
+            selected_combo_count += 1
         prop["selection_status"] = "selected"
-        why = prop.get("selection_reason_parts") or []
+        prop["diversification"] = {
+            **dict(prop.get("diversification") or {}),
+            "relaxed": relaxed,
+            "team_count": selected_team_counts.get(team_key, 0) if team_key else 0,
+            "game_count": selected_game_counts.get(game_key, 0) if game_key else 0,
+            "stat_family_limit": stat_family_limit,
+        }
+        why = list(prop.get("selection_reason_parts") or [])
+        if relaxed:
+            why.insert(0, "diversification relaxed to fill the ticket")
+        else:
+            why.insert(0, "diversified ticket fit")
         prop["selection_reason"] = "Selected for " + "; ".join(why[:3]) + "." if why else "Selected as one of the strongest board fits."
         parlay_legs.append(prop)
 
+    def skip_reason(blocker: str) -> str:
+        if blocker == "same_player":
+            return "Skipped because a higher-ranked prop from the same player was already selected."
+        if blocker == "same_game":
+            return "Skipped because the ticket avoids same-game parlays."
+        if blocker == "team_cluster":
+            return "Skipped to avoid clustering too many legs on one team."
+        if blocker == "combo_cluster":
+            return "Skipped to keep combo props from dominating the ticket."
+        if blocker == "stat_family_cluster":
+            return "Skipped to diversify stat exposure across the ticket."
+        return f"Ranked below the final cutoff for this {legs}-leg ticket."
+
+    for prop in scored:
+        if len(parlay_legs) >= legs:
+            break
+        blocker = blocker_for(prop, relaxed=False)
+        if blocker:
+            prop["selection_reason"] = skip_reason(blocker)
+            prop["diversification"] = {**dict(prop.get("diversification") or {}), "blocker": blocker}
+            continue
+        select_prop(prop, relaxed=False)
+
+    if len(parlay_legs) < legs:
+        for prop in scored:
+            if len(parlay_legs) >= legs:
+                break
+            if prop.get("selection_status") == "selected":
+                continue
+            blocker = blocker_for(prop, relaxed=True)
+            if blocker:
+                prop["selection_reason"] = skip_reason(blocker)
+                prop["diversification"] = {**dict(prop.get("diversification") or {}), "blocker": blocker}
+                continue
+            select_prop(prop, relaxed=True)
+
+    for prop in scored:
+        if prop.get("selection_status") == "selected":
+            continue
+        if not prop.get("selection_reason"):
+            prop["selection_reason"] = skip_reason(str((prop.get("diversification") or {}).get("blocker") or ""))
+
     return parlay_legs
+
+
+def _parlay_leg_probability(leg: dict[str, Any]) -> float:
+    for key in ("model_probability_calibrated", "model_probability", "hit_rate"):
+        prob = safe_float_or_none(leg.get(key))
+        if prob is None:
+            continue
+        if abs(prob) > 1.0:
+            prob /= 100.0
+        return clamp(float(prob), 0.02, 0.98)
+    return 0.5
+
+
+def _parlay_leg_calibration_delta_pct(leg: dict[str, Any]) -> float:
+    diagnostics = leg.get("calibration_diagnostics")
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    probability = diagnostics.get("probability")
+    if not isinstance(probability, dict):
+        probability = {}
+    side_key = str(leg.get("side") or "").strip().lower()
+    calibration = leg.get("backtest_probability_calibration")
+    if not isinstance(calibration, dict):
+        contract = leg.get("confidence_contract")
+        calibration = (contract or {}).get("probability_calibration") if isinstance(contract, dict) else {}
+    if not isinstance(calibration, dict):
+        calibration = {}
+    side_calibration = calibration.get(side_key) if side_key in {"over", "under"} else {}
+    if not isinstance(side_calibration, dict):
+        side_calibration = {}
+
+    candidates = [
+        probability.get("final_delta_pct"),
+        probability.get("raw_delta_pct"),
+        calibration.get(f"{side_key}_delta_pct") if side_key else None,
+        side_calibration.get("delta_pct"),
+    ]
+    for candidate in candidates:
+        delta = safe_float_or_none(candidate)
+        if delta is not None:
+            return float(delta)
+    return 0.0
+
+
+def build_parlay_risk_meter(
+    parlay_legs: list[dict[str, Any]] | None,
+    all_props: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    legs = [leg for leg in (parlay_legs or []) if isinstance(leg, dict)]
+    leg_count = len(legs)
+    if leg_count <= 0:
+        return {
+            "schema": "parlay_risk_meter_v1",
+            "risk_score": 0,
+            "tier": "No slip",
+            "tone": "neutral",
+            "summary": "No parlay legs selected.",
+            "combined_model_probability": None,
+            "factors": [],
+            "details": {"legs": 0, "available_props": len(all_props or [])},
+        }
+
+    game_counts: dict[str, int] = {}
+    team_counts: dict[str, int] = {}
+    stat_counts: dict[str, int] = {}
+    combo_count = 0
+    risky_count = 0
+    unavailable_count = 0
+    market_disagree_count = 0
+    low_sample_count = 0
+    tiny_sample_count = 0
+    long_odds_count = 0
+    volatile_count = 0
+    calibration_deltas: list[float] = []
+    combined_probability = 1.0
+    parlay_odds = 1.0
+
+    for leg in legs:
+        game_key = _parlay_prop_game_key(leg)
+        team_key = _parlay_prop_team_key(leg)
+        if game_key:
+            game_counts[game_key] = game_counts.get(game_key, 0) + 1
+        if team_key:
+            team_counts[team_key] = team_counts.get(team_key, 0) + 1
+
+        exposures = _parlay_prop_stat_exposures(leg)
+        for exposure in exposures:
+            stat_counts[exposure] = stat_counts.get(exposure, 0) + 1
+        if "combo" in exposures:
+            combo_count += 1
+        if exposures.intersection({"shooting", "stocks"}):
+            volatile_count += 1
+
+        availability = leg.get("availability") if isinstance(leg.get("availability"), dict) else {}
+        if availability.get("is_unavailable"):
+            unavailable_count += 1
+        elif availability.get("is_risky"):
+            risky_count += 1
+
+        if bool(leg.get("market_disagrees")):
+            market_disagree_count += 1
+
+        games_count = int(safe_float_or_none(leg.get("games_count")) or 0)
+        if games_count < 8:
+            low_sample_count += 1
+        if games_count < 4:
+            tiny_sample_count += 1
+
+        odds = safe_float_or_none(leg.get("odds"))
+        if odds and odds > 1.0:
+            parlay_odds *= float(odds)
+            if odds >= 2.35:
+                long_odds_count += 1
+
+        combined_probability *= _parlay_leg_probability(leg)
+        calibration_deltas.append(_parlay_leg_calibration_delta_pct(leg))
+
+    duplicate_game_legs = sum(max(0, count - 1) for count in game_counts.values())
+    max_team_count = max(team_counts.values(), default=0)
+    max_stat_count = max((count for key, count in stat_counts.items() if key != "combo"), default=0)
+    stat_family_limit = _parlay_stat_family_limit(leg_count)
+    average_calibration_delta = sum(calibration_deltas) / len(calibration_deltas) if calibration_deltas else 0.0
+    negative_calibration_count = sum(1 for delta in calibration_deltas if delta <= -0.5)
+
+    score = 6.0 + max(0, leg_count - 2) * 4.0
+    score += duplicate_game_legs * 22.0
+    score += max(0, max_team_count - 2) * 12.0 + (3.0 if max_team_count == 2 and leg_count >= 4 else 0.0)
+    score += max(0, max_stat_count - stat_family_limit) * 12.0
+    score += max(0, combo_count - 1) * 10.0 + (3.0 if combo_count == 1 and leg_count >= 4 else 0.0)
+    score += risky_count * 9.0 + unavailable_count * 30.0
+    score += market_disagree_count * 6.0
+    score += low_sample_count * 5.0 + tiny_sample_count * 4.0
+    score += long_odds_count * 5.0
+    score += volatile_count * 4.0
+    if parlay_odds >= 12.0:
+        score += 8.0
+    elif parlay_odds >= 8.0:
+        score += 4.0
+    if combined_probability < 0.12:
+        score += 12.0
+    elif combined_probability < 0.20:
+        score += 6.0
+    if average_calibration_delta < -0.25:
+        score += min(16.0, abs(average_calibration_delta) * 3.5) + (negative_calibration_count * 2.0)
+    elif average_calibration_delta > 0.75:
+        score -= min(6.0, average_calibration_delta * 1.5)
+
+    risk_score = int(round(clamp(score, 0.0, 100.0)))
+    if risk_score >= 68:
+        tier, tone = "High risk", "bad"
+        summary = "Risk is elevated; trim or shuffle one flagged leg before trusting the slip."
+    elif risk_score >= 42:
+        tier, tone = "Medium risk", "warning"
+        summary = "Some concentration, sample, or price risk is active on this ticket."
+    else:
+        tier, tone = "Low risk", "good"
+        summary = "The slip is reasonably balanced across source, stats, and pricing flags."
+
+    def factor(label: str, value: str, impact: float) -> dict[str, Any]:
+        if impact >= 12:
+            factor_tone = "bad"
+        elif impact > 0:
+            factor_tone = "warning"
+        elif impact < 0:
+            factor_tone = "good"
+        else:
+            factor_tone = "good"
+        return {"label": label, "value": value, "impact": round(float(impact), 1), "tone": factor_tone}
+
+    factors = [
+        factor("Game overlap", f"{duplicate_game_legs} extra" if duplicate_game_legs else "clear", duplicate_game_legs * 22.0),
+        factor("Team cluster", f"max {max_team_count}" if max_team_count else "clear", max(0, max_team_count - 2) * 12.0),
+        factor("Stat exposure", f"max {max_stat_count}/{stat_family_limit}", max(0, max_stat_count - stat_family_limit) * 12.0),
+        factor("Combo legs", str(combo_count), max(0, combo_count - 1) * 10.0),
+        factor("Status risk", str(risky_count + unavailable_count), risky_count * 9.0 + unavailable_count * 30.0),
+        factor("Market disagreement", str(market_disagree_count), market_disagree_count * 6.0),
+        factor("Small samples", str(low_sample_count), low_sample_count * 5.0 + tiny_sample_count * 4.0),
+        factor("Volatile props", str(volatile_count), volatile_count * 4.0),
+        factor("Calibration", f"{average_calibration_delta:+.1f}pp", -3.0 if average_calibration_delta > 0.75 else max(0.0, abs(min(0.0, average_calibration_delta)) * 3.5)),
+        factor("Model hit chance", f"{combined_probability * 100.0:.1f}%", 12.0 if combined_probability < 0.12 else (6.0 if combined_probability < 0.20 else 0.0)),
+    ]
+
+    return {
+        "schema": "parlay_risk_meter_v1",
+        "risk_score": risk_score,
+        "tier": tier,
+        "tone": tone,
+        "summary": summary,
+        "combined_model_probability": round(combined_probability, 4),
+        "combined_odds": round(parlay_odds, 2) if parlay_odds > 1.0 else None,
+        "factors": factors,
+        "details": {
+            "legs": leg_count,
+            "available_props": len(all_props or []),
+            "same_game_extra_legs": duplicate_game_legs,
+            "max_team_count": max_team_count,
+            "max_stat_exposure": max_stat_count,
+            "stat_family_limit": stat_family_limit,
+            "combo_count": combo_count,
+            "status_risk_count": risky_count + unavailable_count,
+            "market_disagree_count": market_disagree_count,
+            "low_sample_count": low_sample_count,
+            "volatile_count": volatile_count,
+            "average_calibration_delta_pct": round(average_calibration_delta, 2),
+        },
+    }
 
 
 def throttle_request() -> None:
@@ -6048,6 +7091,52 @@ def get_stat_label_for_copy(stat: str) -> str:
     return labels.get(stat, stat)
 
 
+PLAYER_POSITION_FIELD_NAMES = {
+    "POSITION",
+    "PLAYER_POSITION",
+    "POS",
+    "POSITION_GROUP",
+    "POSITION_GROUP_LABEL",
+    "POSITION_ABBREVIATION",
+    "PLAYER_POSITION_ABBREVIATION",
+    "ROSTER_POSITION",
+}
+
+
+def extract_player_position_text(*sources: dict[str, Any] | None) -> str:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key, value in source.items():
+            normalized_key = str(key or "").upper().strip()
+            if normalized_key not in PLAYER_POSITION_FIELD_NAMES:
+                continue
+            position_text = str(value or "").strip()
+            if resolve_primary_position(position_text)[0]:
+                return position_text
+    return ""
+
+
+def resolve_player_position_from_roster(player_id: int, team_id: int | None, season: str) -> str:
+    if not player_id or not team_id:
+        return ""
+    try:
+        roster_rows = fetch_team_roster(team_id=int(team_id), season=season)
+    except Exception:
+        return ""
+    for row in roster_rows or []:
+        try:
+            row_player_id = int(row.get("PLAYER_ID") or row.get("PERSON_ID") or 0)
+        except (TypeError, ValueError):
+            row_player_id = 0
+        if row_player_id != int(player_id):
+            continue
+        position_text = extract_player_position_text(row)
+        if position_text:
+            return position_text
+    return ""
+
+
 def resolve_primary_position(raw_position: str | None) -> tuple[str | None, str | None]:
     if not raw_position:
         return None, None
@@ -7456,7 +8545,11 @@ def _apply_parlay_event_context_to_bulk_row(
 
 
 def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, Any]:
-    prepared_payload = MARKET_SCAN_CORE_SERVICE.prepare_request(payload)
+    payload_for_cache = {
+        **payload,
+        "_backtest_calibration_signature": _backtest_calibration_signature(),
+    }
+    prepared_payload = MARKET_SCAN_CORE_SERVICE.prepare_request(payload_for_cache)
     cached_run = prepared_payload["cached_run"]
     if cached_run:
         return cached_run
@@ -7638,6 +8731,12 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
         matchup_pass1 = analysis_pass1.get("matchup") or {}
         vs_position_pass1 = matchup_pass1.get("vs_position") or {}
         matchup_delta_pass1 = vs_position_pass1.get("delta_pct") if isinstance(vs_position_pass1, dict) else None
+        environment_pass1 = enrich_environment_with_market_context(
+            analysis_pass1.get("environment") or {},
+            bulk_row,
+            player_team_name=(analysis_pass1.get("player") or {}).get("team_name") or team_text,
+            player_team_abbreviation=(analysis_pass1.get("player") or {}).get("team_abbreviation") or "",
+        )
         pricing_pass1 = build_shared_market_pricing_snapshot(
             market_row=bulk_row,
             over_odds=over_odds,
@@ -7649,10 +8748,11 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
             matchup_delta_pct=float(matchup_delta_pass1) if matchup_delta_pass1 is not None else None,
             opportunity=analysis_pass1.get("opportunity") or {},
             team_context=analysis_pass1.get("team_context") or {},
-            environment=analysis_pass1.get("environment") or {},
+            environment=environment_pass1,
             variance=analysis_pass1.get("variance") or {},
             games_count=int(analysis_pass1.get("games_count") or 0),
             h2h_games_count=int((analysis_pass1.get("h2h") or {}).get("games_count") or 0),
+            calibration_source="market_scanner",
         )
         model_over_pass1 = float(pricing_pass1["raw"]["over_probability"])
         model_under_pass1 = float(pricing_pass1["raw"]["under_probability"])
@@ -7731,6 +8831,7 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
             "matchup_delta_pct": matchup_delta_pass1,
             "calibration_reliability": float(pricing_pass1["reliability"]["reliability"]),
             "calibration_shrink": float(pricing_pass1["reliability"]["shrink_strength"]),
+            "backtest_probability_calibration": copy.deepcopy(pricing_pass1.get("backtest") or {}),
         }
         pass1_ranked.append((pre_rank_score, index))
 
@@ -7871,6 +8972,12 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
             next_game = matchup.get("next_game") or {}
             vs_position = matchup.get("vs_position") or {}
             availability = analysis.get("availability") or {}
+            enriched_environment = enrich_environment_with_market_context(
+                analysis.get("environment") or {},
+                bulk_row,
+                player_team_name=(analysis.get("player") or {}).get("team_name") or team_text,
+                player_team_abbreviation=(analysis.get("player") or {}).get("team_abbreviation") or "",
+            )
             cached_pass1_metrics = pass1_metrics_by_row.get(index)
             if cached_pass1_metrics and not injury_boost:
                 matchup_delta_pct = cached_pass1_metrics.get("matchup_delta_pct")
@@ -7901,6 +9008,7 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
                 calibrated_under = float(cached_pass1_metrics.get("calibrated_under") or model_under)
                 calibration_reliability = float(cached_pass1_metrics.get("calibration_reliability") or 0.5)
                 calibration_shrink = float(cached_pass1_metrics.get("calibration_shrink") or 0.0)
+                backtest_probability_calibration = copy.deepcopy(cached_pass1_metrics.get("backtest_probability_calibration") or {})
             else:
                 matchup_delta_pct = vs_position.get("delta_pct") if isinstance(vs_position, dict) else None
                 pricing_snapshot = build_shared_market_pricing_snapshot(
@@ -7914,10 +9022,11 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
                     matchup_delta_pct=float(matchup_delta_pct) if matchup_delta_pct is not None else None,
                     opportunity=analysis.get("opportunity") or {},
                     team_context=analysis.get("team_context") or {},
-                    environment=analysis.get("environment") or {},
+                    environment=enriched_environment,
                     variance=analysis.get("variance") or {},
                     games_count=int(analysis.get("games_count") or 0),
                     h2h_games_count=int((analysis.get("h2h") or {}).get("games_count") or 0),
+                    calibration_source="market_scanner",
                 )
                 implied_over = pricing_snapshot["market"].get("implied_over")
                 implied_under = pricing_snapshot["market"].get("implied_under")
@@ -7937,6 +9046,7 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
                 under_ev = float(pricing_snapshot["adjusted"]["under_ev"])
                 calibration_reliability = float(pricing_snapshot["reliability"]["reliability"])
                 calibration_shrink = float(pricing_snapshot["reliability"]["shrink_strength"])
+                backtest_probability_calibration = copy.deepcopy(pricing_snapshot.get("backtest") or {})
 
                 if under_ev_calibrated > over_ev_calibrated:
                     best_side = "UNDER"
@@ -7960,7 +9070,7 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
                     market_odds = over_odds
 
             confidence_hit_rate = side_hit_rate_from_over_hit_rate(analysis.get("hit_rate"), best_side)
-            confidence_engine = build_confidence_engine(
+            base_confidence_engine = build_confidence_engine(
                 side=best_side,
                 hit_rate=float(confidence_hit_rate),
                 games_count=int(analysis["games_count"]),
@@ -7970,7 +9080,7 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
                 availability=availability,
                 opportunity=analysis.get("opportunity") or {},
                 team_context=analysis.get("team_context") or {},
-                environment=analysis.get("environment") or {},
+                environment=enriched_environment,
                 stat=str(bulk_row["stat"]),
                 player_position=analysis.get("player", {}).get("position") or '',
                 line=float(bulk_row["line"]),
@@ -7978,10 +9088,30 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
                 season_type=analysis.get("season_type"),
                 playoff_game_number=int(((analysis.get("matchup") or {}).get("next_game") or {}).get("playoff_game_number") or 0) or None,
             )
+            market_confidence_engine = apply_market_confidence_adjustment(
+                base_confidence_engine,
+                side=best_side,
+                over_probability=fair_over,
+                under_probability=fair_under,
+                odds=market_odds,
+            )
             confidence_engine = apply_backtest_ranking_adjustment(
-                confidence_engine,
+                market_confidence_engine,
                 stat=str(bulk_row["stat"]),
                 side=best_side,
+                source="market_scanner",
+            )
+            confidence_engine = build_confidence_contract(
+                confidence_engine,
+                source="market_scan",
+                side=best_side,
+                base_engine=base_confidence_engine,
+                market_engine=market_confidence_engine,
+                model_probability=best_model,
+                implied_probability=best_implied,
+                edge_pct=best_edge_pct,
+                ev_decimal=best_ev,
+                probability_calibration=backtest_probability_calibration,
             )
 
             display_side = best_side
@@ -8008,6 +9138,9 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
 
             result_payload = {
                 "row": index,
+                "event_id": bulk_row.get("event_id") or "",
+                "home_team": bulk_row.get("home_team") or "",
+                "away_team": bulk_row.get("away_team") or "",
                 "player": {
                     "id": analysis["player"]["id"],
                     "full_name": analysis["player"]["full_name"],
@@ -8056,7 +9189,7 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
                     "h2h": analysis.get("h2h") or {},
                     "opportunity": analysis.get("opportunity") or {},
                     "team_context": analysis.get("team_context") or {},
-                    "environment": analysis.get("environment") or {},
+                    "environment": enriched_environment,
                     "interpretation": analysis.get("interpretation") or {},
                 },
                 "model": {
@@ -8100,18 +9233,8 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
                     "odds": market_odds,
                     "calibration_reliability": round(calibration_reliability * 100, 1),
                     "calibration_shrink": round(calibration_shrink * 100, 1),
-                    "confidence": confidence_engine["grade"],
-                    "confidence_score": confidence_engine["score"],
-                    "confidence_summary": confidence_engine["summary"],
-                    "confidence_tone": confidence_engine["tone"],
-                    "confidence_tier": confidence_engine.get("tier"),
-                    "confidence_tags": confidence_engine.get("tags") or [],
-                    "confidence_components": confidence_engine.get("components") or {},
-                    "market_side": confidence_engine.get("market_side"),
-                    "market_disagrees": confidence_engine.get("market_disagrees"),
-                    "market_penalty": confidence_engine.get("market_penalty"),
-                    "market_support_pct": confidence_engine.get("market_support_pct"),
-                    "ranking_score": confidence_engine.get("ranking_score"),
+                    "backtest_probability_calibration": copy.deepcopy(backtest_probability_calibration),
+                    **confidence_contract_flat_fields(confidence_engine),
                     "playable": not availability.get("is_unavailable", False),
                     "user_read": analysis.get("interpretation", {}).get("market_takeaway") or confidence_engine["summary"],
                 },
@@ -8120,6 +9243,7 @@ def _market_scan_core(payload: dict[str, Any], progress_cb=None) -> dict[str, An
                     "next_game": next_game,
                     "vs_position": vs_position,
                 },
+                "environment": enriched_environment,
                 "injury_boost": injury_boost,
                 "base_hit_rate": round(base_hit_rate, 1),
                 "injury_filter_player_ids": injury_filter_player_ids,
@@ -8499,6 +9623,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
         "batch_size": batch_size,
         "bookmakers": requested_bookmakers,
         "markets": list(ODDS_PARLAY_MARKETS),
+        "_backtest_calibration_signature": _backtest_calibration_signature(),
     }
     request_hash_value = _request_hash("parlay_builder", canonical_request_payload)
     bypass_cache = bool(payload.get("bypass_cache")) or season_type == SEASON_TYPE_PLAYOFFS
@@ -8819,6 +9944,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             variance=analysis.get("variance") or {},
             games_count=int(analysis.get("games_count") or 0),
             h2h_games_count=int((analysis.get("h2h") or {}).get("games_count") or 0),
+            calibration_source="parlay_builder",
         )
         fair_over_prob = pricing_snapshot["market"].get("fair_over")
         fair_under_prob = pricing_snapshot["market"].get("fair_under")
@@ -8826,6 +9952,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
         model_under = float(pricing_snapshot["raw"]["under_probability"])
         calibrated_over = float(pricing_snapshot["calibrated"]["over_probability"])
         calibrated_under = float(pricing_snapshot["calibrated"]["under_probability"])
+        backtest_probability_calibration = copy.deepcopy(pricing_snapshot.get("backtest") or {})
 
         if side == "OVER":
             model_prob = calibrated_over
@@ -8855,7 +9982,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             player_team_name=(analysis.get("player") or {}).get("team_name") or "",
             player_team_abbreviation=(analysis.get("player") or {}).get("team_abbreviation") or "",
         )
-        confidence_engine = build_confidence_engine(
+        base_confidence_engine = build_confidence_engine(
             side=side,
             hit_rate=float(side_hit_rate),
             games_count=int(analysis.get("games_count") or 0),
@@ -8873,17 +10000,18 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             season_type=analysis.get("season_type"),
             playoff_game_number=int((next_game_info or {}).get("playoff_game_number") or 0) or None,
         )
-        confidence_engine = apply_market_confidence_adjustment(
-            confidence_engine,
+        market_confidence_engine = apply_market_confidence_adjustment(
+            base_confidence_engine,
             side=side,
             over_probability=fair_over_prob,
             under_probability=fair_under_prob,
             odds=odds,
         )
         confidence_engine = apply_backtest_ranking_adjustment(
-            confidence_engine,
+            market_confidence_engine,
             stat=stat,
             side=side,
+            source="parlay_builder",
         )
 
         scoring_season_type = str(analysis.get("season_type") or season_type or "")
@@ -8942,6 +10070,19 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
         )
         ranking_hit_rate = float(ranking_context.get("ranking_hit_rate") or side_hit_rate)
         ranking_source = str(ranking_context.get("ranking_source") or "recent")
+        confidence_engine = build_confidence_contract(
+            confidence_engine,
+            source="parlay_builder",
+            side=side,
+            base_engine=base_confidence_engine,
+            market_engine=market_confidence_engine,
+            ranking_context=ranking_context,
+            model_probability=model_prob,
+            implied_probability=fair_prob,
+            edge_pct=edge_pct,
+            ev_decimal=ev_decimal_adjusted,
+            probability_calibration=backtest_probability_calibration,
+        )
 
         scored_games_count = int(analysis.get("games_count") or 0)
         side_hit_count = max(0, min(scored_games_count, int(round((float(side_hit_rate) / 100.0) * scored_games_count))))
@@ -9002,16 +10143,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             "availability": copy.deepcopy(availability),
             "matchup": matchup_payload,
             "environment": copy.deepcopy(enriched_environment),
-            "confidence": confidence_engine.get("grade"),
-            "confidence_score": confidence_score_value,
-            "confidence_tone": confidence_engine.get("tone"),
-            "confidence_tier": confidence_engine.get("tier"),
-            "confidence_summary": confidence_engine.get("summary"),
-            "confidence_tags": confidence_engine.get("tags") or [],
-            "market_side": confidence_engine.get("market_side"),
-            "market_disagrees": confidence_engine.get("market_disagrees"),
-            "market_penalty": confidence_engine.get("market_penalty"),
-            "ranking_score": confidence_engine.get("ranking_score"),
+            **confidence_contract_flat_fields(confidence_engine),
             "edge_pct": edge_pct,
             "edge_definition": EDGE_DEFINITION_MODEL_FAIR,
             "edge": edge_pct,
@@ -9022,6 +10154,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
             "calibrated_ev": calibrated_ev_decimal,
             "calibration_reliability": round(float(pricing_snapshot["reliability"]["reliability"]) * 100.0, 1),
             "calibration_shrink": round(float(pricing_snapshot["reliability"]["shrink_strength"]) * 100.0, 1),
+            "backtest_probability_calibration": copy.deepcopy(backtest_probability_calibration),
             "event_id": orig_row.get("event_id") or "",
             "game_label": orig_row.get("game_label") or "",
             "home_team": orig_row.get("home_team") or "",
@@ -9079,6 +10212,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
         for leg in parlay_legs:
             parlay_odds *= leg["odds"]
         parlay_odds = round(parlay_odds, 2)
+    risk_meter = build_parlay_risk_meter(parlay_legs, scored)
 
     all_errors = scrape_errors + analysis_errors
 
@@ -9095,6 +10229,7 @@ def _parlay_builder_core(payload: dict[str, Any], progress_cb=None) -> dict[str,
         "legs": legs,
         "parlay": parlay_legs,
         "parlay_odds": parlay_odds,
+        "risk_meter": risk_meter,
         "all_props_scored": scored,
         "events_scraped": len(events),
         "props_found": len(all_import_rows),
@@ -9231,6 +10366,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         "batch_size": batch_size,
         "bookmakers": requested_bookmakers,
         "markets": list(ODDS_PARLAY_MARKETS),
+        "_backtest_calibration_signature": _backtest_calibration_signature(),
     }
     request_hash_value = _request_hash("parlay_builder_injury_aware", canonical_request_payload)
     bypass_cache = bool(payload.get("bypass_cache")) or season_type == SEASON_TYPE_PLAYOFFS
@@ -9732,6 +10868,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             variance=analysis.get("variance") or {},
             games_count=int(active_games_count or 0),
             h2h_games_count=int((active_h2h_payload or {}).get("games_count") or 0),
+            calibration_source="injury_aware",
         )
         fair_over_prob = pricing_snapshot["market"].get("fair_over")
         fair_under_prob = pricing_snapshot["market"].get("fair_under")
@@ -9739,6 +10876,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         model_under = float(pricing_snapshot["raw"]["under_probability"])
         calibrated_over = float(pricing_snapshot["calibrated"]["over_probability"])
         calibrated_under = float(pricing_snapshot["calibrated"]["under_probability"])
+        backtest_probability_calibration = copy.deepcopy(pricing_snapshot.get("backtest") or {})
         if side == "OVER":
             model_prob = calibrated_over
             fair_prob = float(fair_over_prob or 0.5)
@@ -9765,7 +10903,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             player_team_name=team_name,
             player_team_abbreviation=player_info.get("team_abbreviation") or "",
         )
-        confidence_engine = build_confidence_engine(
+        base_confidence_engine = build_confidence_engine(
             side=side, hit_rate=float(side_hit_rate), games_count=int(active_games_count or 0),
             edge=_computed_edge,
             ev=_computed_ev,
@@ -9777,17 +10915,18 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             season_type=analysis.get("season_type"),
             playoff_game_number=int((next_game_info or {}).get("playoff_game_number") or 0) or None,
         )
-        confidence_engine = apply_market_confidence_adjustment(
-            confidence_engine,
+        market_confidence_engine = apply_market_confidence_adjustment(
+            base_confidence_engine,
             side=side,
             over_probability=fair_over_prob,
             under_probability=fair_under_prob,
             odds=odds,
         )
         confidence_engine = apply_backtest_ranking_adjustment(
-            confidence_engine,
+            market_confidence_engine,
             stat=stat,
             side=side,
+            source="injury_aware",
         )
 
         scoring_season_type = str(analysis.get("season_type") or season_type or "")
@@ -9853,6 +10992,19 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         )
         ranking_hit_rate = float(ranking_context.get("ranking_hit_rate") or side_hit_rate)
         ranking_source = str(ranking_context.get("ranking_source") or "recent")
+        confidence_engine = build_confidence_contract(
+            confidence_engine,
+            source="parlay_builder_injury_aware",
+            side=side,
+            base_engine=base_confidence_engine,
+            market_engine=market_confidence_engine,
+            ranking_context=ranking_context,
+            model_probability=model_prob,
+            implied_probability=fair_prob,
+            edge_pct=_computed_edge,
+            ev_decimal=_computed_ev,
+            probability_calibration=backtest_probability_calibration,
+        )
 
         return {
             "player_name": result.get("player_name") or "",
@@ -9909,6 +11061,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             "calibrated_ev": calibrated_ev,
             "calibration_reliability": round(float(pricing_snapshot["reliability"]["reliability"]) * 100.0, 1),
             "calibration_shrink": round(float(pricing_snapshot["reliability"]["shrink_strength"]) * 100.0, 1),
+            "backtest_probability_calibration": copy.deepcopy(backtest_probability_calibration),
             "last_n": last_n,
             "bookmaker": orig_row.get("bookmaker_title") or "N/A",
             "market_key": orig_row.get("market_key") or "",
@@ -9916,16 +11069,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
             "availability": copy.deepcopy(availability),
             "matchup": matchup_payload,
             "environment": copy.deepcopy(enriched_environment),
-            "confidence": confidence_engine.get("grade"),
-            "confidence_score": confidence_score_value,
-            "confidence_tone": confidence_engine.get("tone"),
-            "confidence_tier": confidence_engine.get("tier"),
-            "confidence_summary": confidence_engine.get("summary"),
-            "confidence_tags": confidence_engine.get("tags") or [],
-            "market_side": confidence_engine.get("market_side"),
-            "market_disagrees": confidence_engine.get("market_disagrees"),
-            "market_penalty": confidence_engine.get("market_penalty"),
-            "ranking_score": confidence_engine.get("ranking_score"),
+            **confidence_contract_flat_fields(confidence_engine),
             "event_id": orig_row.get("event_id") or "",
             "game_label": orig_row.get("game_label") or "",
             "home_team": orig_row.get("home_team") or "",
@@ -9989,6 +11133,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         for leg in parlay_legs:
             parlay_odds *= leg["odds"]
         parlay_odds = round(parlay_odds, 2)
+    risk_meter = build_parlay_risk_meter(parlay_legs, scored)
 
     # Build injury summary for display
     all_team_names: set[str] = {p.get("team_name", "") for p in scored if p.get("team_name")}
@@ -10022,6 +11167,7 @@ def _parlay_builder_injury_aware_core(payload: dict[str, Any], progress_cb=None)
         "legs": legs,
         "parlay": parlay_legs,
         "parlay_odds": parlay_odds,
+        "risk_meter": risk_meter,
         "all_props_scored": scored,
         "events_scraped": len(events),
         "props_found": len(all_import_rows),
@@ -10999,12 +12145,14 @@ def _build_bulk_prop_item(
         else:
             local_cache.setdefault(cache_key, copy.deepcopy(analysis))
 
+    resolved_player_position = str((analysis.get("player") or {}).get("position") or player_position or "").strip()
+
     return {
         "row": row_index,
         "player_id": resolved_player_id,
         "player_name": analysis.get("player", {}).get("full_name") or player_name,
         "team_id": resolved_team_id,
-        "player_position": player_position,
+        "player_position": resolved_player_position,
         "override_opponent_id": override_opponent_id,
         "event_id": row.get("event_id") or "",
         "game_label": row.get("game_label") or "",
@@ -11218,30 +12366,9 @@ def _load_backtest_log() -> None:
         with _BACKTEST_LOCK:
             _BACKTEST_LOG.clear()
             for raw in entries:
-                if not isinstance(raw, dict):
+                entry = _normalize_backtest_entry(raw)
+                if not entry:
                     continue
-                normalized_tier = _normalize_backtest_confidence_tier(raw.get("confidence_tier"), raw.get("confidence_score"))
-                normalized_score = _normalize_backtest_confidence_score(raw.get("confidence_score"), normalized_tier)
-                entry = {
-                    "id": str(raw.get("id") or _backtest_new_id()),
-                    "player": str(raw.get("player") or ""),
-                    "stat": str(raw.get("stat") or ""),
-                    "line": float(raw.get("line") or 0),
-                    "side": str(raw.get("side") or ""),
-                    "confidence_score": normalized_score,
-                    "confidence_tier": normalized_tier,
-                    "model_prob": float(raw.get("model_prob") or 0.5),
-                    "odds": raw.get("odds"),
-                    "result": str(raw.get("result") or "pending"),
-                    "actual_value": raw.get("actual_value"),
-                    "logged_at": str(raw.get("logged_at") or ""),
-                    "resolved_at": raw.get("resolved_at"),
-                    "event_date": str(raw.get("event_date") or ""),
-                    "source": str(raw.get("source") or ""),
-                    "market_side": str(raw.get("market_side") or ""),
-                    "market_disagrees": bool(raw.get("market_disagrees")) if raw.get("market_disagrees") is not None else False,
-                    "notes": str(raw.get("notes") or ""),
-                }
                 _BACKTEST_LOG.append(entry)
 
     load_json_snapshot(
@@ -11489,6 +12616,138 @@ def _normalize_backtest_confidence_score(raw_score: Any, fallback_tier: str) -> 
     return 54
 
 
+def _extract_confidence_contract(source: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(source, dict):
+        return {}
+    contract = source.get("confidence_contract")
+    if isinstance(contract, dict):
+        return copy.deepcopy(contract)
+    confidence = source.get("confidence")
+    if isinstance(confidence, dict) and (
+        confidence.get("contract_version")
+        or confidence.get("display_score") is not None
+        or confidence.get("score") is not None
+    ):
+        return copy.deepcopy(confidence)
+    return {}
+
+
+def _normalize_backtest_model_prob(raw_value: Any, confidence_contract: dict[str, Any] | None = None) -> float:
+    value = safe_float_or_none(raw_value)
+    if value is None and isinstance(confidence_contract, dict):
+        value = safe_float_or_none(confidence_contract.get("model_probability"))
+    if value is None:
+        value = 0.5
+    if value > 1.0:
+        value /= 100.0
+    return max(0.0, min(1.0, float(value)))
+
+
+def _first_confidence_score(*values: Any) -> int | None:
+    for value in values:
+        score = _confidence_score_or_none(value)
+        if score is not None:
+            return score
+    return None
+
+
+def _backtest_bool(raw_value: Any, default: bool = False) -> bool:
+    if raw_value is None:
+        return default
+    if isinstance(raw_value, bool):
+        return raw_value
+    text = str(raw_value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return bool(raw_value)
+
+
+def _backtest_optional_int(raw_value: Any) -> int | None:
+    if raw_value in (None, "", "null"):
+        return None
+    try:
+        return int(raw_value)
+    except Exception:
+        return None
+
+
+def _normalize_backtest_entry(raw: Any) -> dict[str, Any] | None:
+    """Normalize core backtest fields while preserving grading metadata."""
+    if not isinstance(raw, dict):
+        return None
+
+    entry = copy.deepcopy(raw)
+    confidence_contract = _extract_confidence_contract(raw)
+    confidence_score_input = raw.get("confidence_score")
+    if confidence_score_input in (None, "", "null"):
+        confidence_score_input = _first_confidence_score(
+            confidence_contract.get("display_score"),
+            confidence_contract.get("confidence_score"),
+            confidence_contract.get("score"),
+        )
+    confidence_tier_input = (
+        raw.get("confidence_tier")
+        or confidence_contract.get("tier")
+        or confidence_contract.get("grade")
+    )
+    normalized_tier = _normalize_backtest_confidence_tier(confidence_tier_input, confidence_score_input)
+    normalized_score = _normalize_backtest_confidence_score(confidence_score_input, normalized_tier)
+
+    actual_value = safe_float_or_none(raw.get("actual_value"))
+    line_value = safe_float_or_none(raw.get("line"))
+
+    entry.update(
+        {
+            "id": str(raw.get("id") or _backtest_new_id()),
+            "player": str(raw.get("player") or raw.get("player_name") or ""),
+            "player_id": _backtest_optional_int(raw.get("player_id")),
+            "stat": str(raw.get("stat") or "").strip().upper(),
+            "line": float(line_value if line_value is not None else 0.0),
+            "side": str(raw.get("side") or "").strip().upper(),
+            "confidence_score": normalized_score,
+            "confidence_tier": normalized_tier,
+            "model_prob": _normalize_backtest_model_prob(raw.get("model_prob"), confidence_contract),
+            "odds": raw.get("odds"),
+            "result": str(raw.get("result") or "pending").strip().lower(),
+            "actual_value": actual_value,
+            "logged_at": str(raw.get("logged_at") or ""),
+            "resolved_at": raw.get("resolved_at"),
+            "event_date": str(raw.get("event_date") or ""),
+            "season": str(raw.get("season") or ""),
+            "season_type": str(raw.get("season_type") or ""),
+            "event_id": str(raw.get("event_id") or ""),
+            "game_label": str(raw.get("game_label") or ""),
+            "opponent_abbreviation": str(raw.get("opponent_abbreviation") or ""),
+            "batch_id": str(raw.get("batch_id") or ""),
+            "parlay_prop_key": str(raw.get("parlay_prop_key") or ""),
+            "source": str(raw.get("source") or ""),
+            "market_side": str(raw.get("market_side") or ""),
+            "market_disagrees": _backtest_bool(raw.get("market_disagrees"), False),
+            "notes": str(raw.get("notes") or ""),
+            "resolved_game_date": str(raw.get("resolved_game_date") or ""),
+            "resolved_matchup": str(raw.get("resolved_matchup") or ""),
+            "auto_grade_run_id": str(raw.get("auto_grade_run_id") or ""),
+            "auto_graded_at": str(raw.get("auto_graded_at") or ""),
+        }
+    )
+
+    if confidence_contract:
+        entry["confidence_contract"] = confidence_contract
+
+    for key in ("base_confidence_score", "market_adjusted_confidence_score", "ranking_score"):
+        score = _first_confidence_score(raw.get(key), confidence_contract.get(key))
+        if score is not None:
+            entry[key] = score
+        elif key in entry and entry[key] in ("", "null"):
+            entry[key] = None
+    entry["confidence_score_source"] = str(
+        raw.get("confidence_score_source") or confidence_contract.get("score_source") or ""
+    )
+    return entry
+
+
 def _merge_backtest_entries(raw_entries: list[Any]) -> tuple[int, int, int, list[dict[str, Any]]]:
     added = 0
     updated = 0
@@ -11532,31 +12791,22 @@ def _merge_backtest_entries(raw_entries: list[Any]) -> tuple[int, int, int, list
             logged_at = str(raw.get("logged_at") or _utc_iso_z()).strip()
             incoming_id = str(raw.get("id") or _backtest_new_id()).strip()
             dedupe_key = (player.lower(), stat, line, side, logged_at)
-            actual_raw = raw.get("actual_value")
-            try:
-                actual_value = float(actual_raw) if actual_raw not in (None, "", "null") else None
-            except Exception:
-                actual_value = None
-            entry = {
-                "id": incoming_id,
-                "player": player,
-                "stat": stat,
-                "line": line,
-                "side": side,
-                "confidence_score": normalized_score,
-                "confidence_tier": normalized_tier,
-                "model_prob": float(raw.get("model_prob") or 0.5),
-                "odds": raw.get("odds"),
-                "result": str(raw.get("result") or "pending"),
-                "actual_value": actual_value,
-                "logged_at": logged_at,
-                "resolved_at": raw.get("resolved_at"),
-                "event_date": str(raw.get("event_date") or ""),
-                "source": str(raw.get("source") or ""),
-                "market_side": str(raw.get("market_side") or ""),
-                "market_disagrees": bool(raw.get("market_disagrees")) if raw.get("market_disagrees") is not None else False,
-                "notes": str(raw.get("notes") or ""),
-            }
+            entry = _normalize_backtest_entry(
+                {
+                    **raw,
+                    "id": incoming_id,
+                    "player": player,
+                    "stat": stat,
+                    "line": line,
+                    "side": side,
+                    "confidence_score": normalized_score,
+                    "confidence_tier": normalized_tier,
+                    "logged_at": logged_at,
+                }
+            )
+            if not entry:
+                skipped += 1
+                continue
 
             existing_by_id = existing_entries_by_id.get(incoming_id)
             if isinstance(existing_by_id, dict):
@@ -11751,11 +13001,16 @@ def _build_backtest_csv(entries: list[dict[str, Any]]) -> str:
     headers = [
         "id",
         "player",
+        "player_id",
         "stat",
         "line",
         "side",
         "confidence_tier",
         "confidence_score",
+        "confidence_score_source",
+        "base_confidence_score",
+        "market_adjusted_confidence_score",
+        "ranking_score",
         "model_prob",
         "odds",
         "result",
@@ -11763,10 +13018,21 @@ def _build_backtest_csv(entries: list[dict[str, Any]]) -> str:
         "logged_at",
         "resolved_at",
         "event_date",
+        "season",
+        "season_type",
+        "event_id",
+        "game_label",
+        "opponent_abbreviation",
+        "batch_id",
+        "parlay_prop_key",
         "source",
         "market_side",
         "market_disagrees",
         "notes",
+        "resolved_game_date",
+        "resolved_matchup",
+        "auto_grade_run_id",
+        "auto_graded_at",
     ]
     buffer = io.StringIO()
     writer = csv.DictWriter(buffer, fieldnames=headers)
@@ -12004,20 +13270,53 @@ def _backtest_parlay_filter_thresholds(mode: str) -> tuple[int, int]:
     return 72, 5
 
 
+BACKTEST_LOG_MAX_DECIMAL_ODDS = 1.79
+
+
+def _resolve_backtest_prop_odds(prop: dict[str, Any], side: str | None = None) -> float | None:
+    if not isinstance(prop, dict):
+        return None
+    side_key = str(side or prop.get("side") or "").strip().lower()
+    if side_key not in {"over", "under"}:
+        side_key = "under" if "under" in side_key else "over"
+    market = prop.get("market") if isinstance(prop.get("market"), dict) else {}
+    best_bet = prop.get("best_bet") if isinstance(prop.get("best_bet"), dict) else {}
+    candidates = [
+        prop.get("odds"),
+        prop.get("decimal_odds"),
+        prop.get("selected_odds"),
+        best_bet.get("odds"),
+        best_bet.get("best_odds"),
+        best_bet.get("best_available_odds"),
+        prop.get(f"best_{side_key}_odds"),
+        prop.get(f"{side_key}_odds"),
+        prop.get(f"market_{side_key}_odds"),
+        market.get(f"best_{side_key}_odds"),
+        market.get(f"{side_key}_odds"),
+        prop.get("best_available_odds"),
+    ]
+    for candidate in candidates:
+        value = safe_float_or_none(candidate)
+        if value is not None and value > 1.0:
+            return round(float(value), 4)
+    return None
+
+
 def _backtest_parlay_prop_passes_action_filter(prop: dict[str, Any], mode: str) -> bool:
     if not isinstance(prop, dict):
         return False
     normalized = str(mode or "action").strip().lower()
+    odds = _resolve_backtest_prop_odds(prop)
+    odds_in_range = odds is not None and odds <= BACKTEST_LOG_MAX_DECIMAL_ODDS
     if normalized == "selected":
-        return str(prop.get("selection_status") or "").strip().lower() == "selected"
+        return str(prop.get("selection_status") or "").strip().lower() == "selected" and odds_in_range
     min_score, min_games = _backtest_parlay_filter_thresholds(normalized)
     try:
         score = int(float(prop.get("confidence_score") or 0))
     except Exception:
         score = 0
     games_count = int(prop.get("games_count") or 0)
-    odds = float(prop.get("odds") or 0.0)
-    return score >= min_score and games_count >= min_games and odds >= 1.40
+    return score >= min_score and games_count >= min_games and odds_in_range
 
 
 def _backtest_parlay_event_date(prop: dict[str, Any]) -> str:
@@ -12235,8 +13534,21 @@ def backtest_log_prediction(payload: dict = Body(...)) -> dict[str, Any]:
     Log a prediction before a game.
     Body: { player, stat, line, side, confidence_score, confidence_tier, model_prob, odds? }
     """
-    normalized_tier = _normalize_backtest_confidence_tier(payload.get("confidence_tier"), payload.get("confidence_score"))
-    normalized_score = _normalize_backtest_confidence_score(payload.get("confidence_score"), normalized_tier)
+    confidence_contract = _extract_confidence_contract(payload)
+    confidence_score_input = payload.get("confidence_score")
+    if confidence_score_input in (None, "", "null"):
+        confidence_score_input = _first_confidence_score(
+            confidence_contract.get("display_score"),
+            confidence_contract.get("confidence_score"),
+            confidence_contract.get("score"),
+        )
+    confidence_tier_input = (
+        payload.get("confidence_tier")
+        or confidence_contract.get("tier")
+        or confidence_contract.get("grade")
+    )
+    normalized_tier = _normalize_backtest_confidence_tier(confidence_tier_input, confidence_score_input)
+    normalized_score = _normalize_backtest_confidence_score(confidence_score_input, normalized_tier)
     player_id_raw = payload.get("player_id")
     try:
         player_id = int(player_id_raw) if player_id_raw not in (None, "", "null") else None
@@ -12251,8 +13563,25 @@ def backtest_log_prediction(payload: dict = Body(...)) -> dict[str, Any]:
         "side": str(payload.get("side") or ""),
         "confidence_score": normalized_score,
         "confidence_tier": normalized_tier,
-        "model_prob": float(payload.get("model_prob") or 0.5),
-        "odds": payload.get("odds"),  # decimal odds, optional
+        "confidence_contract": confidence_contract,
+        "base_confidence_score": _first_confidence_score(
+            payload.get("base_confidence_score"),
+            confidence_contract.get("base_confidence_score"),
+            confidence_contract.get("base_score"),
+        ),
+        "market_adjusted_confidence_score": _first_confidence_score(
+            payload.get("market_adjusted_confidence_score"),
+            confidence_contract.get("market_adjusted_confidence_score"),
+            confidence_contract.get("market_adjusted_score"),
+        ),
+        "ranking_score": _first_confidence_score(
+            payload.get("ranking_score"),
+            confidence_contract.get("ranking_score"),
+            confidence_contract.get("ranking_adjusted_score"),
+        ),
+        "confidence_score_source": str(payload.get("confidence_score_source") or confidence_contract.get("score_source") or ""),
+        "model_prob": _normalize_backtest_model_prob(payload.get("model_prob"), confidence_contract),
+        "odds": _resolve_backtest_prop_odds(payload),  # decimal odds, optional
         "result": "pending",
         "actual_value": None,
         "logged_at": _utc_iso_z(),
@@ -12265,9 +13594,13 @@ def backtest_log_prediction(payload: dict = Body(...)) -> dict[str, Any]:
         "opponent_abbreviation": str(payload.get("opponent_abbreviation") or ""),
         "batch_id": str(payload.get("batch_id") or ""),
         "parlay_prop_key": str(payload.get("parlay_prop_key") or ""),
-        "source": str(payload.get("source") or ""),
-        "market_side": str(payload.get("market_side") or ""),
-        "market_disagrees": bool(payload.get("market_disagrees")) if payload.get("market_disagrees") is not None else False,
+        "source": str(payload.get("source") or confidence_contract.get("source") or ""),
+        "market_side": str(payload.get("market_side") or confidence_contract.get("market_side") or ""),
+        "market_disagrees": (
+            bool(payload.get("market_disagrees"))
+            if payload.get("market_disagrees") is not None
+            else bool(confidence_contract.get("market_disagrees"))
+        ),
         "notes": str(payload.get("notes") or ""),
     }
     with _BACKTEST_LOCK:
@@ -12323,13 +13656,15 @@ def backtest_log_parlay_batch(payload: dict = Body(...)) -> dict[str, Any]:
     now_iso = _utc_iso_z()
 
     with _BACKTEST_LOCK:
-        existing_prop_keys = {
-            str(entry.get("parlay_prop_key") or "").strip()
+        existing_prop_entries = {
+            str(entry.get("parlay_prop_key") or "").strip(): entry
             for entry in _BACKTEST_LOG
             if isinstance(entry, dict) and str(entry.get("parlay_prop_key") or "").strip()
         }
+        existing_prop_keys = set(existing_prop_entries)
 
     logged_entries: list[dict[str, Any]] = []
+    updated_odds_entries: list[dict[str, Any]] = []
     skipped_invalid = 0
     skipped_filter = 0
     skipped_duplicate = 0
@@ -12347,30 +13682,50 @@ def backtest_log_parlay_batch(payload: dict = Body(...)) -> dict[str, Any]:
         if not player_name or not stat or side not in {"OVER", "UNDER"}:
             skipped_invalid += 1
             continue
+        resolved_odds = _resolve_backtest_prop_odds(raw_prop, side)
+        if resolved_odds is None:
+            skipped_invalid += 1
+            continue
         try:
             line = float(raw_prop.get("line"))
         except Exception:
             skipped_invalid += 1
             continue
-        try:
-            model_prob = float(raw_prop.get("model_probability") or 50.0) / 100.0
-        except Exception:
-            model_prob = 0.5
+        confidence_contract = _extract_confidence_contract(raw_prop)
+        raw_model_prob = raw_prop.get("model_prob")
+        if raw_model_prob in (None, "", "null"):
+            raw_model_prob = raw_prop.get("model_probability")
+        model_prob = _normalize_backtest_model_prob(raw_model_prob, confidence_contract)
         event_date = _backtest_parlay_event_date(raw_prop)
         event_dt = parse_game_date_any(event_date)
         season = season_input or _nba_season_for_datetime(event_dt)
         season_type = normalize_requested_season_type(raw_prop.get("season_type") or season_type_input)
         unique_key = _backtest_parlay_unique_key(raw_prop, event_date)
         if unique_key in existing_prop_keys:
+            existing_entry = existing_prop_entries.get(unique_key)
+            existing_odds = safe_float_or_none(existing_entry.get("odds")) if isinstance(existing_entry, dict) else None
+            if isinstance(existing_entry, dict) and (existing_odds is None or existing_odds <= 1.0):
+                with _BACKTEST_LOCK:
+                    existing_entry["odds"] = resolved_odds
+                    updated_odds_entries.append(copy.deepcopy(existing_entry))
             skipped_duplicate += 1
             continue
         existing_prop_keys.add(unique_key)
 
-        confidence_score = _normalize_backtest_confidence_score(
-            raw_prop.get("confidence_score"),
-            _normalize_backtest_confidence_tier(raw_prop.get("confidence_tier"), raw_prop.get("confidence_score")),
+        confidence_score_input = raw_prop.get("confidence_score")
+        if confidence_score_input in (None, "", "null"):
+            confidence_score_input = _first_confidence_score(
+                confidence_contract.get("display_score"),
+                confidence_contract.get("confidence_score"),
+                confidence_contract.get("score"),
+            )
+        confidence_tier_input = (
+            raw_prop.get("confidence_tier")
+            or confidence_contract.get("tier")
+            or confidence_contract.get("grade")
         )
-        confidence_tier = _normalize_backtest_confidence_tier(raw_prop.get("confidence_tier"), confidence_score)
+        confidence_tier = _normalize_backtest_confidence_tier(confidence_tier_input, confidence_score_input)
+        confidence_score = _normalize_backtest_confidence_score(confidence_score_input, confidence_tier)
         try:
             player_id = int(raw_prop.get("player_id")) if raw_prop.get("player_id") not in (None, "", "null") else None
         except Exception:
@@ -12385,8 +13740,25 @@ def backtest_log_parlay_batch(payload: dict = Body(...)) -> dict[str, Any]:
             "side": side,
             "confidence_score": confidence_score,
             "confidence_tier": confidence_tier,
-            "model_prob": max(0.0, min(1.0, model_prob)),
-            "odds": raw_prop.get("odds"),
+            "confidence_contract": confidence_contract,
+            "base_confidence_score": _first_confidence_score(
+                raw_prop.get("base_confidence_score"),
+                confidence_contract.get("base_confidence_score"),
+                confidence_contract.get("base_score"),
+            ),
+            "market_adjusted_confidence_score": _first_confidence_score(
+                raw_prop.get("market_adjusted_confidence_score"),
+                confidence_contract.get("market_adjusted_confidence_score"),
+                confidence_contract.get("market_adjusted_score"),
+            ),
+            "ranking_score": _first_confidence_score(
+                raw_prop.get("ranking_score"),
+                confidence_contract.get("ranking_score"),
+                confidence_contract.get("ranking_adjusted_score"),
+            ),
+            "confidence_score_source": str(raw_prop.get("confidence_score_source") or confidence_contract.get("score_source") or ""),
+            "model_prob": model_prob,
+            "odds": resolved_odds,
             "result": "pending",
             "actual_value": None,
             "logged_at": now_iso,
@@ -12400,23 +13772,32 @@ def backtest_log_parlay_batch(payload: dict = Body(...)) -> dict[str, Any]:
             "batch_id": batch_id,
             "parlay_prop_key": unique_key,
             "source": source_label,
-            "market_side": str(raw_prop.get("market_side") or ""),
-            "market_disagrees": bool(raw_prop.get("market_disagrees")) if raw_prop.get("market_disagrees") is not None else False,
+            "market_side": str(raw_prop.get("market_side") or confidence_contract.get("market_side") or ""),
+            "market_disagrees": (
+                bool(raw_prop.get("market_disagrees"))
+                if raw_prop.get("market_disagrees") is not None
+                else bool(confidence_contract.get("market_disagrees"))
+            ),
             "notes": str(raw_prop.get("selection_reason") or ""),
         }
         logged_entries.append(entry)
 
-    if logged_entries:
+    if logged_entries or updated_odds_entries:
         with _BACKTEST_LOCK:
-            _BACKTEST_LOG.extend(logged_entries)
+            if logged_entries:
+                _BACKTEST_LOG.extend(logged_entries)
             _save_backtest_log()
+    if logged_entries:
         _require_pg_backtest_write(_pg_write_backtest_entries, logged_entries)
+    if updated_odds_entries:
+        _require_pg_backtest_write(_pg_write_backtest_entries, updated_odds_entries)
 
     return {
         "ok": True,
         "batch_id": batch_id,
         "filter_mode": filter_mode,
         "logged": len(logged_entries),
+        "updated_odds": len(updated_odds_entries),
         "skipped_filter": skipped_filter,
         "skipped_invalid": skipped_invalid,
         "skipped_duplicate": skipped_duplicate,
@@ -12719,7 +14100,6 @@ def backtest_get_log(
     """Return the backtest log with server-side filtering and pagination."""
     with _BACKTEST_LOCK:
         all_entries = [copy.deepcopy(entry) for entry in _BACKTEST_LOG]
-    stats = _compute_backtest_stats(all_entries)
     filtered_entries = _filter_backtest_entries(
         all_entries,
         search=search,
@@ -12730,6 +14110,7 @@ def backtest_get_log(
         date_range=date_range,
         view_mode=view_mode,
     )
+    stats = _compute_backtest_stats(filtered_entries)
     total_filtered = len(filtered_entries)
     page_entries = filtered_entries[offset: offset + limit]
     grouped_entries = _backtest_group_entries(page_entries, group_by=group_by)
@@ -13387,36 +14768,41 @@ def odds_game_context(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     regions = str(payload.get("regions") or "us").strip()
     odds_format = str(payload.get("odds_format") or "decimal").strip()
     requested_bookmakers = parse_requested_bookmakers(payload.get("bookmakers") or payload.get("bookmaker") or ODDS_DEFAULT_BOOKMAKERS)
+    event_id = str(payload.get("event_id") or "").strip()
     team_name = str(payload.get("team_name") or "").strip()
     opponent_name = str(payload.get("opponent_name") or "").strip()
     team_abbreviation = str(payload.get("team_abbreviation") or "").strip()
     opponent_abbreviation = str(payload.get("opponent_abbreviation") or "").strip()
+    home_team = str(payload.get("home_team") or "").strip()
+    away_team = str(payload.get("away_team") or "").strip()
 
-    events_result = odds_api_fetch(
-        f"/sports/{sport}/events",
-        api_key,
-        {"dateFormat": "iso"},
-    )
-    events = events_result.get("data") or []
-    matched_event = next(
-        (
-            event for event in events
-            if _event_matches_teams(
-                event,
-                team_name=team_name,
-                opponent_name=opponent_name,
-                team_abbreviation=team_abbreviation,
-                opponent_abbreviation=opponent_abbreviation,
-            )
-        ),
-        None,
-    )
-    if not matched_event:
-        return {"ok": False, "context": {}, "environment": {}, "quota": events_result.get("quota"), "message": "No matching odds event found."}
-
-    event_id = str(matched_event.get("id") or "").strip()
+    events_result: dict[str, Any] = {"quota": None}
+    matched_event: dict[str, Any] = {"id": event_id, "home_team": home_team, "away_team": away_team} if event_id else {}
     if not event_id:
-        return {"ok": False, "context": {}, "environment": {}, "quota": events_result.get("quota"), "message": "Matched odds event is missing an id."}
+        events_result = odds_api_fetch(
+            f"/sports/{sport}/events",
+            api_key,
+            {"dateFormat": "iso"},
+        )
+        events = events_result.get("data") or []
+        matched_event = next(
+            (
+                event for event in events
+                if _event_matches_teams(
+                    event,
+                    team_name=team_name,
+                    opponent_name=opponent_name,
+                    team_abbreviation=team_abbreviation,
+                    opponent_abbreviation=opponent_abbreviation,
+                )
+            ),
+            {},
+        )
+        if not matched_event:
+            return {"ok": False, "context": {}, "environment": {}, "quota": events_result.get("quota"), "message": "No matching odds event found."}
+        event_id = str(matched_event.get("id") or "").strip()
+        if not event_id:
+            return {"ok": False, "context": {}, "environment": {}, "quota": events_result.get("quota"), "message": "Matched odds event is missing an id."}
 
     odds_result = odds_api_fetch(
         f"/sports/{sport}/events/{event_id}/odds",

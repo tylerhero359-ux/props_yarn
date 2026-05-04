@@ -3372,3 +3372,146 @@
   }
 }
 
+/* Market Scanner ranked prop slips: keep cards readable, never newspaper-narrow. */
+.ds-market .market-results-shell.market-balanced .market-slips-grid {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 520px), 1fr)) !important;
+  gap: 18px !important;
+  align-items: start;
+}
+
+.ds-market .market-results-shell.market-balanced .market-slip-card:first-child {
+  grid-column: 1 / -1;
+}
+
+.ds-market .market-results-shell.market-balanced .market-slip-card {
+  min-width: 0;
+  padding: 18px !important;
+  border-radius: 18px !important;
+  gap: 14px !important;
+}
+
+.ds-market .market-results-shell.market-balanced .market-slip-head {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px !important;
+  padding: 0 !important;
+}
+
+.ds-market .market-results-shell.market-balanced .market-slip-body,
+.ds-market .market-results-shell.market-balanced .market-slip-footer {
+  padding: 0 !important;
+}
+
+.ds-market .market-results-shell.market-balanced .market-slip-player,
+.ds-market .market-results-shell.market-balanced .market-slip-player > div,
+.ds-market .market-results-shell.market-balanced .market-slip-statusline,
+.ds-market .market-results-shell.market-balanced .market-slip-summary,
+.ds-market .market-results-shell.market-balanced .market-slip-subtext,
+.ds-market .market-results-shell.market-balanced .market-micro-summary,
+.ds-market .market-results-shell.market-balanced .market-slip-angle-row {
+  min-width: 0;
+}
+
+.ds-market .market-results-shell.market-balanced .market-slip-player {
+  align-items: flex-start;
+  padding-right: 0 !important;
+}
+
+.ds-market .market-results-shell.market-balanced .market-slip-player img {
+  flex: 0 0 50px;
+  width: 50px !important;
+  height: 50px !important;
+  border-radius: 14px !important;
+}
+
+.ds-market .market-results-shell.market-balanced .market-slip-player strong {
+  max-width: 100%;
+  font-size: 1.08rem !important;
+  line-height: 1.12;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+}
+
+.ds-market .market-results-shell.market-balanced .market-slip-player span,
+.ds-market .market-results-shell.market-balanced .market-slip-player small,
+.ds-market .market-results-shell.market-balanced .market-slip-summary {
+  white-space: normal !important;
+  overflow-wrap: anywhere;
+}
+
+.ds-market .market-results-shell.market-balanced .market-slip-rank {
+  position: static !important;
+  min-width: 34px !important;
+  width: auto !important;
+  height: 28px !important;
+  padding: 0 10px !important;
+  border-radius: 999px !important;
+  font-size: 0.72rem !important;
+}
+
+.ds-market .market-results-shell.market-balanced .market-slip-line strong {
+  font-size: clamp(1.2rem, 1.6vw, 1.42rem) !important;
+  letter-spacing: 0;
+}
+
+.ds-market .market-results-shell.market-balanced .market-slip-side,
+.ds-market .market-results-shell.market-balanced .market-slip-confidence,
+.ds-market .market-results-shell.market-balanced .market-slip-pill,
+.ds-market .market-results-shell.market-balanced .market-micro-pill,
+.ds-market .market-results-shell.market-balanced .market-angle-badge,
+.ds-market .market-results-shell.market-balanced .finder-chip {
+  max-width: 100%;
+  white-space: normal;
+  text-align: left;
+  line-height: 1.25;
+}
+
+.ds-market .market-results-shell.market-balanced .market-micro-pill {
+  padding: 6px 8px;
+  border-radius: 10px;
+}
+
+.ds-market .market-results-shell.market-balanced .market-slip-summary {
+  max-width: none !important;
+  line-height: 1.5;
+}
+
+.ds-market .market-results-shell.market-balanced .market-slip-stats {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)) !important;
+  gap: 10px !important;
+}
+
+.ds-market .market-results-shell.market-balanced .market-slip-stat {
+  min-width: 0;
+  padding: 11px !important;
+  border-radius: 14px !important;
+}
+
+.ds-market .market-results-shell.market-balanced .market-slip-stat strong,
+.ds-market .market-results-shell.market-balanced .market-slip-stat small {
+  overflow-wrap: anywhere;
+}
+
+.ds-market .market-results-shell.market-balanced .market-slip-footer,
+.ds-market .market-results-shell.market-balanced .market-slip-action-row {
+  align-items: stretch;
+}
+
+.ds-market .market-results-shell.market-balanced .market-matchup-cell {
+  width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 760px) {
+  .ds-market .market-results-shell.market-balanced .market-slip-head,
+  .ds-market .market-results-shell.market-balanced .market-slip-line,
+  .ds-market .market-results-shell.market-balanced .market-slip-footer {
+    grid-template-columns: 1fr;
+  }
+
+  .ds-market .market-results-shell.market-balanced .market-slip-stats {
+    grid-template-columns: 1fr !important;
+  }
+}
+

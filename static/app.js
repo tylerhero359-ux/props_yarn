@@ -320,6 +320,9 @@ const marketTextarea = document.getElementById('marketTextarea');
 const marketTemplateBtn = document.getElementById('marketTemplateBtn');
 const marketClearBtn = document.getElementById('marketClearBtn');
 const marketScanBtn = document.getElementById('marketScanBtn');
+const marketBacktestFilterSelect = document.getElementById('marketBacktestFilterSelect');
+const marketLogBacktestBtn = document.getElementById('marketLogBacktestBtn');
+const marketUndoBacktestBtn = document.getElementById('marketUndoBacktestBtn');
 const marketResults = document.getElementById('marketResults');
 const marketMeta = document.getElementById('marketMeta');
 const marketSortSelect = document.getElementById('marketSortSelect');
@@ -394,6 +397,7 @@ const SIDEBAR_COLLAPSED_KEY = 'nba-props-sidebar-collapsed';
 const MARKET_RESULTS_KEY = 'nba-props-latest-market-results';
 const MARKET_EXPERT_FILTERS_KEY = 'nba-props-market-expert-filters';
 const MARKET_SCAN_REQUEST_ROW_LIMIT = 100;
+const BACKTEST_LOG_MAX_DECIMAL_ODDS = 1.79;
 const ODDS_API_KEY_STORAGE = 'nba-props-odds-api-key';
 const ODDS_API_SETTINGS_STORAGE = 'nba-props-odds-api-settings';
 const INJURY_DEBUG_STORAGE = 'nba-props-injury-debug';
@@ -578,11 +582,13 @@ let overviewBoardTab = 'top';
 let currentGameLogPayload = null;
 let activeGameLogView = 'recent';
 let currentMarketResultsPayload = null;
+let currentBetFinderResultsPayload = null;
 let currentMarketSort = localStorage.getItem('nba-props-market-sort') || 'best_ev';
 let currentMarketSortDirection = localStorage.getItem('nba-props-market-sort-direction') || 'desc';
 let currentMarketFilter = localStorage.getItem('nba-props-market-filter') || 'all';
 const MARKET_PAGE_SIZE = 12;
 let currentMarketPage = 1;
+let lastMarketBacktestBatchId = '';
 let currentExpertFilters = loadStoredExpertFilters();
 const currentExpertSettings = { min_minutes: 22, min_fga: 10, min_h2h_games: 2, min_h2h_hit_rate: 60 };
 let currentMarketInspectKey = '';
@@ -3649,6 +3655,7 @@ function bindSlateTeamButtons(root) {
 }
 
 function renderBetFinderEmpty(message = 'Choose a team, set your prop line, then click Bet Finder.') {
+  currentBetFinderResultsPayload = null;
   betFinderResults.className = 'bet-finder-state empty-state-panel compact';
   betFinderResults.innerHTML = `
     <div class="empty-icon">${getEmptyIconSvg('trend')}</div>
@@ -3683,7 +3690,7 @@ function getFinderTone(hitRate) {
   return 'neutral';
 }
 
-function getFinderLabel(hitRate) {
+function getFallbackFinderLabel(hitRate) {
   if (hitRate >= 80) return 'Elite';
   if (hitRate >= 70) return 'Strong';
   if (hitRate >= 60) return 'Playable';
@@ -3714,9 +3721,11 @@ function runAnalyzerSummaryEnhancements(payload) {
 
 /*  Mini sparkline SVG  */
 function renderBetFinderResults(payload) {
+  currentBetFinderResultsPayload = payload || null;
   const results = payload.results || [];
 
   if (!results.length) {
+    currentBetFinderResultsPayload = payload || null;
     renderBetFinderEmpty('No players on this roster met the sample requirement for the current prop line.');
     return;
   }
@@ -3746,10 +3755,19 @@ function renderBetFinderResults(payload) {
     const sideGuess = String(item.side || (item.average >= payload.line ? 'OVER' : 'UNDER')).toUpperCase();
     const sideClass = sideGuess.toLowerCase();
     const rankChip = renderPlayoffRankingChipHtml(item);
-    const confidence = item.confidence || {};
-    const confidenceText = confidence.grade ? `${confidence.grade} ${confidence.score || ''}`.trim() : getFinderLabel(displayHitRate);
+    const backendConfidenceScore = getBackendConfidenceScore(item);
+    const backendConfidenceGrade = getBackendConfidenceGrade(item);
+    const backendConfidenceTier = getBackendConfidenceTier(item, backendConfidenceScore);
+    const confidenceText = backendConfidenceGrade
+      ? `${backendConfidenceGrade}${backendConfidenceScore !== null ? ` ${backendConfidenceScore}` : ''}`.trim()
+      : getFallbackFinderLabel(displayHitRate);
+    const confidenceBadgeText = backendConfidenceGrade
+      ? `${backendConfidenceGrade}${backendConfidenceScore !== null ? ` ${backendConfidenceScore}` : ''}${backendConfidenceTier ? ` ${backendConfidenceTier}` : ''}`.trim()
+      : getFallbackFinderLabel(displayHitRate);
+    const confidenceBadgeTone = backendConfidenceGrade ? getConfidenceTone(backendConfidenceGrade) : tone;
     return `
       <button class="finder-card sportsbook-tile ${tone}" type="button"
+        data-result-idx="${index}"
         data-id="${item.player.id}"
         data-name="${escapeHtml(item.player.full_name)}"
         data-team-id="${item.player.team_id}"
@@ -3805,7 +3823,7 @@ function renderBetFinderResults(payload) {
           </div>
         </div>
         <div class="finder-ticket-footer">
-          <span class="finder-badge ${tone}">${getFinderLabel(displayHitRate)}</span>
+          <span class="finder-badge ${confidenceBadgeTone}">${escapeHtml(confidenceBadgeText)}</span>
           <span class="finder-odds-pill">Tap to open analyzer</span>
         </div>
       </button>
@@ -4509,8 +4527,14 @@ function getGameContextRequestData(source) {
   const teamAbbreviation = String(player.team_abbreviation || nextGame.player_team_abbreviation || '').trim();
   const opponentName = String(nextGame.opponent_name || player.opponent_name || source?.player?.opponent_name || '').trim();
   const opponentAbbreviation = String(nextGame.opponent_abbreviation || player.opponent || source?.player?.opponent || '').trim();
-  if (!teamName || (!opponentName && !opponentAbbreviation)) return null;
+  const eventId = String(source?.event_id || source?.market?.event_id || source?.analysis?.event_id || '').trim();
+  const homeTeam = String(source?.home_team || source?.market?.home_team || source?.analysis?.home_team || '').trim();
+  const awayTeam = String(source?.away_team || source?.market?.away_team || source?.analysis?.away_team || '').trim();
+  if (!teamName || (!eventId && !opponentName && !opponentAbbreviation)) return null;
   return {
+    event_id: eventId,
+    home_team: homeTeam,
+    away_team: awayTeam,
     team_name: teamName,
     team_abbreviation: teamAbbreviation,
     opponent_name: opponentName,
@@ -4538,7 +4562,9 @@ async function fetchAnalyzerGameContext(source) {
   const requestData = getGameContextRequestData(source);
   if (!requestData) return null;
 
-  const existingEnvironment = source?.environment && typeof source.environment === 'object' ? source.environment : {};
+  const existingEnvironment = source?.environment && typeof source.environment === 'object'
+    ? source.environment
+    : (source?.analysis?.environment && typeof source.analysis.environment === 'object' ? source.analysis.environment : {});
   const hasExistingMarketContext =
     Number.isFinite(Number(existingEnvironment.market_team_total)) ||
     Number.isFinite(Number(existingEnvironment.market_game_total)) ||
@@ -4878,6 +4904,7 @@ function getConfidenceTone(confidence) {
 }
 
 function renderMarketEmpty(message = 'Paste your board using the template, then click Analyze Board.') {
+  currentMarketResultsPayload = null;
   marketMeta.textContent = 'Paste rows using the template below. Team and opponent are detected automatically from the player.';
   marketResults.className = 'bet-finder-state empty-state-panel compact';
   marketResults.innerHTML = `
@@ -4885,9 +4912,11 @@ function renderMarketEmpty(message = 'Paste your board using the template, then 
     <strong>No market scan yet.</strong>
     <span>${escapeHtml(message)}</span>
   `;
+  refreshMarketBacktestActionButtons();
 }
 
 function renderMarketNoResults(payload, message = 'No rows produced a usable result. Check names and try again.') {
+  currentMarketResultsPayload = null;
   const errors = Array.isArray(payload?.errors) ? payload.errors : [];
   marketMeta.textContent = errors.length
     ? `0 props rendered  ${errors.length} scanner row issue${errors.length === 1 ? '' : 's'}`
@@ -4911,6 +4940,7 @@ function renderMarketNoResults(payload, message = 'No rows produced a usable res
       </div>
     ` : ''}
   `;
+  refreshMarketBacktestActionButtons();
 }
 
 async function focusMarketPlayer(item, options = {}) {
@@ -4935,7 +4965,7 @@ async function focusMarketPlayer(item, options = {}) {
     team_abbreviation: item.player.team_abbreviation || '',
     team_name: item.player.team_name || '',
     team_id: item.player.team_id || null,
-    position: item.player.position || '',
+    position: item.player.position || analysis.player?.position || '',
     jersey: item.player.jersey || '',
     availability: analysis.availability || item.availability || null,
     matchup: analysis.matchup || item.matchup || null,
@@ -4955,8 +4985,11 @@ async function focusMarketPlayer(item, options = {}) {
         id: item.player.id,
         full_name: item.player.full_name,
         team_id: item.player.team_id || null,
-        position: item.player.position || '',
+        position: item.player.position || analysis.player?.position || '',
       }),
+      event_id: item.event_id || analysis.event_id || '',
+      home_team: item.home_team || analysis.home_team || '',
+      away_team: item.away_team || analysis.away_team || '',
       stat: item.market.stat,
       line: item.market.line,
       availability: analysis.availability || item.availability || null,
@@ -4988,6 +5021,23 @@ async function focusMarketPlayer(item, options = {}) {
     renderTable(displayPayload);
     setStatus('Ready');
 
+    const hasHydratedMarketContext =
+      Number.isFinite(Number(displayPayload.environment?.market_team_total)) ||
+      Number.isFinite(Number(displayPayload.environment?.market_game_total)) ||
+      Number.isFinite(Number(displayPayload.environment?.market_spread));
+    if (!hasHydratedMarketContext) {
+      fetchAnalyzerGameContext(hydratedPayload)
+        .then(result => {
+          if (!result?.environment) return;
+          const mergedEnvironment = { ...(displayPayload.environment || {}), ...(result.environment || {}) };
+          hydratedPayload.environment = mergedEnvironment;
+          displayPayload.environment = mergedEnvironment;
+          selectedPlayer = { ...selectedPlayer, environment: mergedEnvironment };
+          renderSummary(displayPayload);
+        })
+        .catch(error => console.warn('Market context hydration failed:', error));
+    }
+
     // Silently refresh in background to get latest data (next game, injury status, etc.)
     if (!options?.skipRefresh) {
       analyzePlayerProp({ preserveScroll: true, forceRefresh: true }).catch(err => {
@@ -5015,13 +5065,14 @@ async function focusMarketPlayerEnhanced(item) {
     return;
   }
   const marketLastN = analysis?.last_n || currentMarketResultsPayload?.last_n || null;
+  const resolvedPlayerPosition = item.player.position || analysis?.player?.position || analysis?.player?.position_group || analysis?.player?.position_group_label || '';
   const hydrated = await hydrateAnalyzerFromPropSelection({
     player_id: item.player.id,
     player_name: item.player.full_name,
     team_id: item.player.team_id || null,
     team_name: item.player.team_name || '',
     team_abbreviation: item.player.team_abbreviation || item.player.team || '',
-    player_position: item.player.position || '',
+    player_position: resolvedPlayerPosition,
     player_jersey: item.player.jersey || '',
     opponent_team_id: analysis?.matchup?.next_game?.opponent_team_id || item?.matchup?.next_game?.opponent_team_id || null,
     opponent_abbreviation: analysis?.matchup?.next_game?.opponent_abbreviation || item.player.opponent || '',
@@ -5348,6 +5399,7 @@ function renderMarketInspectTray() {
             <strong>Rank ${escapeHtml(details.rankingScore)}</strong>
             <small>${escapeHtml(Number(details.marketPenalty) > 0 ? `Market penalty ${details.marketPenalty}` : 'No market disagreement penalty')}</small>
           </div>
+          ${renderCalibrationDiagnostics(item.best_bet, escapeHtml)}
           <div class="market-inspect-block">
             <span class="small-label">Availability</span>
             <strong>${escapeHtml(details.availability.status || 'Unknown')}</strong>
@@ -5477,6 +5529,231 @@ function renderCalibrationChips(source, escFn = escapeHtml) {
   return `<div class="cal-chip-row">${chips.join('')}</div>`;
 }
 
+function signedCalibrationValue(value, suffix = '') {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return '--';
+  return `${num > 0 ? '+' : ''}${num.toFixed(Math.abs(num) >= 10 ? 0 : 1)}${suffix}`;
+}
+
+function formatCalibrationSourceLabel(source) {
+  const key = String(source || '').trim().toLowerCase();
+  if (!key) return '';
+  if (key === 'market_scanner' || key === 'market_scan') return 'Market scanner';
+  if (key === 'parlay_builder') return 'Parlay builder';
+  if (key === 'injury_aware' || key === 'parlay_builder_injury_aware') return 'Injury-aware parlay';
+  if (key === 'analyzer') return 'Analyzer';
+  return key.split('_').filter(Boolean).map(part => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
+}
+
+function formatCalibrationScopeLabel(source, scope) {
+  const sourceLabel = formatCalibrationSourceLabel(source);
+  const scopeKey = String(scope || '').trim().toLowerCase();
+  if (scopeKey === 'global_fallback') {
+    return sourceLabel ? `${sourceLabel} -> global fallback` : 'Global fallback';
+  }
+  if (scopeKey === 'source') return sourceLabel ? `${sourceLabel} only` : 'Source only';
+  if (scopeKey === 'global') return 'Global backtest';
+  return sourceLabel;
+}
+
+function resolveCalibrationDiagnostics(source) {
+  if (!source || typeof source !== 'object') return null;
+  const contract = source.confidence_contract && typeof source.confidence_contract === 'object'
+    ? source.confidence_contract
+    : {};
+  const direct = source.calibration_diagnostics && typeof source.calibration_diagnostics === 'object'
+    ? source.calibration_diagnostics
+    : null;
+  if (direct && (direct.probability || direct.ranking)) return direct;
+
+  const calibration = source.backtest_probability_calibration || contract.probability_calibration || {};
+  const side = String(source.side || contract.side || '').toUpperCase();
+  const stat = String(source.stat || contract.stat || '').toUpperCase();
+  const sideKey = side === 'UNDER' ? 'under' : 'over';
+  const probability = calibration && typeof calibration === 'object' && calibration[sideKey] && typeof calibration[sideKey] === 'object'
+    ? calibration[sideKey]
+    : {};
+  const ranking = contract.backtest_ranking_meta && typeof contract.backtest_ranking_meta === 'object'
+    ? contract.backtest_ranking_meta
+    : {};
+  const finalDelta = Number(calibration?.[`${sideKey}_delta_pct`] ?? probability.delta_pct);
+  const rankAdjustment = Number(contract.backtest_ranking_adjustment ?? source.backtest_ranking_adjustment ?? 0);
+  if (!Object.keys(probability).length && !Object.keys(ranking).length && !Number.isFinite(finalDelta) && !Number.isFinite(rankAdjustment)) {
+    return null;
+  }
+  return {
+    stat,
+    side,
+    source: direct?.source || calibration?.source || probability.source || ranking.source || '',
+    calibration_scope: direct?.calibration_scope || calibration?.calibration_scope || probability.calibration_scope || ranking.calibration_scope || '',
+    applied: Boolean(calibration?.applied || Math.abs(finalDelta || 0) >= 0.05 || Math.abs(rankAdjustment || 0) >= 0.1),
+    probability: {
+      ...probability,
+      final_delta_pct: Number.isFinite(finalDelta) ? finalDelta : probability.delta_pct,
+    },
+    ranking: {
+      ...ranking,
+      adjustment: Number.isFinite(rankAdjustment) ? rankAdjustment : 0,
+    },
+  };
+}
+
+function renderCalibrationDiagnostics(source, escFn = escapeHtml, options = {}) {
+  const diagnostics = resolveCalibrationDiagnostics(source);
+  if (!diagnostics) return '';
+  const probability = diagnostics.probability || {};
+  const ranking = diagnostics.ranking || {};
+  const finalDelta = Number(probability.final_delta_pct ?? probability.raw_delta_pct ?? probability.delta_pct);
+  const rankAdjustment = Number(ranking.adjustment || 0);
+  const probabilityReason = String(probability.reason || '').replace(/_/g, ' ');
+  const rankingReason = String(ranking.reason || '').replace(/_/g, ' ');
+  const actual = Number(probability.actual_hit_rate_pct);
+  const expected = Number(probability.expected_hit_rate_pct);
+  const rawSample = Number(probability.segment_count);
+  const effectiveSample = Number(probability.segment_effective_count);
+  const gap = Number(probability.calibration_gap_pct);
+  const rankDelta = Number(ranking.hit_rate_delta);
+  const roiDelta = Number(ranking.roi_delta_pct);
+  const statSide = [diagnostics.stat, diagnostics.side].filter(Boolean).join(' ');
+  const scope = diagnostics.calibration_scope || probability.calibration_scope || ranking.calibration_scope;
+  const sourceLabel = formatCalibrationScopeLabel(diagnostics.source || probability.source || ranking.source, scope);
+  const pendingSample = !diagnostics.applied
+    && String(probability.reason || ranking.reason || '').toLowerCase().startsWith('insufficient')
+    && (!Number.isFinite(finalDelta) || Math.abs(finalDelta) < 0.05);
+  const moveLabel = pendingSample ? 'Pending' : signedCalibrationValue(finalDelta, 'pp');
+  const appliedText = diagnostics.applied ? 'Applied' : 'Observed';
+  const compact = Boolean(options.compact);
+
+  const sampleText = Number.isFinite(rawSample)
+    ? `${rawSample.toFixed(0)} raw${Number.isFinite(effectiveSample) ? ` / ${effectiveSample.toFixed(1)} weighted` : ''}`
+    : 'sample pending';
+  const actualText = Number.isFinite(actual) && Number.isFinite(expected)
+    ? `${actual.toFixed(1)}% actual vs ${expected.toFixed(1)}% expected`
+    : 'not enough probability sample yet';
+
+  const rows = [
+    ['Source', sourceLabel],
+    ['Reason', probabilityReason || rankingReason],
+    ['Sample', sampleText],
+    ['Hit read', actualText],
+    ['Model move', moveLabel],
+    ['Gap', signedCalibrationValue(gap, 'pp')],
+    ['Rank move', signedCalibrationValue(rankAdjustment)],
+    ['Rank hit delta', signedCalibrationValue(rankDelta, 'pp')],
+    ['ROI delta', signedCalibrationValue(roiDelta, 'pp')],
+  ].filter(row => row[1] && row[1] !== '--' && row[1] !== '--pp');
+
+  return `
+    <details class="cal-diagnostic-panel ${compact ? 'compact' : ''}">
+      <summary>
+        <span>${escFn(appliedText)} calibration${statSide ? ` · ${escFn(statSide)}` : ''}</span>
+        <strong>${escFn(moveLabel)}</strong>
+      </summary>
+      <div class="cal-diagnostic-grid">
+        ${rows.map(row => `<span><b>${escFn(row[0])}</b>${escFn(row[1])}</span>`).join('')}
+      </div>
+    </details>`;
+}
+
+function getDiversificationPlayerKey(prop) {
+  const playerId = prop?.player_id ?? prop?.player?.id;
+  if (playerId !== undefined && playerId !== null && String(playerId).trim()) return `id:${String(playerId).trim()}`;
+  const name = String(prop?.player_name || prop?.player?.full_name || '').trim().toLowerCase();
+  return name ? `name:${name}` : '';
+}
+
+function getDiversificationGameKey(prop) {
+  const eventId = String(prop?.event_id || '').trim();
+  if (eventId) return `event:${eventId}`;
+  const label = String(prop?.game_label || '').trim().toLowerCase();
+  if (label) return `label:${label}`;
+  const teams = [prop?.home_team, prop?.away_team].map(v => String(v || '').trim().toLowerCase()).filter(Boolean).sort();
+  return teams.length ? `teams:${teams.join('|')}` : '';
+}
+
+function getDiversificationTeamKey(prop) {
+  const teamId = prop?.team_id ?? prop?.player?.team_id;
+  if (teamId !== undefined && teamId !== null && String(teamId).trim()) return `id:${String(teamId).trim()}`;
+  const abbr = String(prop?.team_abbreviation || prop?.player?.team_abbreviation || prop?.player?.team || '').trim().toUpperCase();
+  if (abbr) return `abbr:${abbr}`;
+  const name = String(prop?.team_name || prop?.player?.team_name || '').trim().toLowerCase();
+  return name ? `name:${name}` : '';
+}
+
+function getDiversificationStatExposures(prop) {
+  const stat = String(prop?.stat || prop?.market?.stat || '').trim().toUpperCase();
+  const map = {
+    PTS: ['points'],
+    REB: ['rebounds'],
+    AST: ['assists'],
+    PR: ['points', 'rebounds', 'combo'],
+    PA: ['points', 'assists', 'combo'],
+    RA: ['rebounds', 'assists', 'combo'],
+    PRA: ['points', 'rebounds', 'assists', 'combo'],
+    '3PM': ['shooting'],
+    STL: ['stocks'],
+    BLK: ['stocks'],
+  };
+  return map[stat] || [stat.toLowerCase() || 'other'];
+}
+
+function pickDiversifiedProps(props, limit, options = {}) {
+  const source = Array.isArray(props) ? props : [];
+  const maxPlayer = Number.isFinite(Number(options.maxPlayer)) ? Number(options.maxPlayer) : 1;
+  const maxGame = Number.isFinite(Number(options.maxGame)) ? Number(options.maxGame) : 1;
+  const maxTeam = Number.isFinite(Number(options.maxTeam)) ? Number(options.maxTeam) : 2;
+  const maxCombo = Number.isFinite(Number(options.maxCombo)) ? Number(options.maxCombo) : 1;
+  const maxStatFamily = Number.isFinite(Number(options.maxStatFamily)) ? Number(options.maxStatFamily) : (Number(limit) <= 3 ? 1 : 2);
+  const allowRelaxedFill = options.allowRelaxedFill !== false;
+  const selected = [];
+  const playerCounts = new Map();
+  const gameCounts = new Map();
+  const teamCounts = new Map();
+  const statCounts = new Map();
+  let comboCount = 0;
+
+  function canTake(prop, relaxed = false) {
+    const playerKey = getDiversificationPlayerKey(prop);
+    const gameKey = getDiversificationGameKey(prop);
+    const teamKey = getDiversificationTeamKey(prop);
+    const exposures = getDiversificationStatExposures(prop);
+    if (playerKey && (playerCounts.get(playerKey) || 0) >= maxPlayer) return false;
+    if (gameKey && (gameCounts.get(gameKey) || 0) >= maxGame) return false;
+    if (!relaxed) {
+      if (teamKey && (teamCounts.get(teamKey) || 0) >= maxTeam) return false;
+      if (exposures.includes('combo') && comboCount >= maxCombo) return false;
+      if (exposures.some(exposure => exposure !== 'combo' && (statCounts.get(exposure) || 0) >= maxStatFamily)) return false;
+    }
+    return true;
+  }
+
+  function take(prop) {
+    const playerKey = getDiversificationPlayerKey(prop);
+    const gameKey = getDiversificationGameKey(prop);
+    const teamKey = getDiversificationTeamKey(prop);
+    const exposures = getDiversificationStatExposures(prop);
+    if (playerKey) playerCounts.set(playerKey, (playerCounts.get(playerKey) || 0) + 1);
+    if (gameKey) gameCounts.set(gameKey, (gameCounts.get(gameKey) || 0) + 1);
+    if (teamKey) teamCounts.set(teamKey, (teamCounts.get(teamKey) || 0) + 1);
+    exposures.forEach(exposure => statCounts.set(exposure, (statCounts.get(exposure) || 0) + 1));
+    if (exposures.includes('combo')) comboCount += 1;
+    selected.push(prop);
+  }
+
+  for (const prop of source) {
+    if (selected.length >= limit) break;
+    if (canTake(prop, false)) take(prop);
+  }
+  if (allowRelaxedFill && selected.length < limit) {
+    for (const prop of source) {
+      if (selected.length >= limit) break;
+      if (selected.includes(prop)) continue;
+      if (canTake(prop, true)) take(prop);
+    }
+  }
+  return selected;
+}
+
 function populateMarketInjuryCells(results) {
   const teamNameByIndex = new Map();
   results.forEach((item, index) => {
@@ -5505,6 +5782,173 @@ function populateMarketInjuryCells(results) {
       })
       .catch(() => { });
   });
+}
+
+function marketNumber(value, fallback = null) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
+function resolveBacktestLogPropOdds(prop, sideOverride = '') {
+  if (!prop || typeof prop !== 'object') return null;
+  const rawSide = String(sideOverride || prop.side || prop.best_bet?.side || prop.best_bet?.display_side || '').toUpperCase();
+  const sideKey = rawSide.includes('UNDER') ? 'under' : 'over';
+  const market = prop.market && typeof prop.market === 'object' ? prop.market : {};
+  const bestBet = prop.best_bet && typeof prop.best_bet === 'object' ? prop.best_bet : {};
+  const candidates = [
+    prop.odds,
+    prop.decimal_odds,
+    prop.selected_odds,
+    bestBet.odds,
+    bestBet.best_odds,
+    bestBet.best_available_odds,
+    prop[`best_${sideKey}_odds`],
+    prop[`${sideKey}_odds`],
+    prop[`market_${sideKey}_odds`],
+    market[`best_${sideKey}_odds`],
+    market[`${sideKey}_odds`],
+    prop.best_available_odds,
+  ];
+  for (const candidate of candidates) {
+    const odds = marketNumber(candidate, null);
+    if (odds !== null && odds > 1) return odds;
+  }
+  return null;
+}
+
+function hydrateBacktestLogPropOdds(prop) {
+  if (!prop || typeof prop !== 'object') return prop;
+  const odds = resolveBacktestLogPropOdds(prop);
+  return odds === null ? prop : { ...prop, odds };
+}
+
+function normalizeMarketBetSide(item) {
+  const rawSide = String(item?.best_bet?.side || item?.best_bet?.display_side || item?.side || '').toUpperCase();
+  return rawSide.includes('UNDER') ? 'UNDER' : 'OVER';
+}
+
+function getMarketRankedResults(payload = currentMarketResultsPayload, allowRawFallback = true) {
+  const scanPayload = payload && typeof payload === 'object' ? payload : {};
+  const rawResults = Array.isArray(scanPayload.results) ? scanPayload.results : [];
+  const sortKey = currentMarketSort || 'best_ev';
+  const filterKey = currentMarketFilter || 'all';
+  let rankedResults = [...filterMarketRows(rawResults, filterKey)]
+    .filter(item => passesExpertFilters(item))
+    .filter(item => passesAdvancedMarketFilters(item))
+    .sort((a, b) => compareMarketRows(a, b, sortKey, currentMarketSortDirection));
+  if (!rankedResults.length && allowRawFallback && rawResults.length) {
+    rankedResults = [...rawResults].sort((a, b) => compareMarketRows(a, b, sortKey, currentMarketSortDirection));
+  }
+  return rankedResults;
+}
+
+function buildMarketBacktestProp(item, { selected = false } = {}) {
+  const bestBet = item?.best_bet || {};
+  const market = item?.market || {};
+  const analysis = item?.analysis || {};
+  const player = item?.player || {};
+  const matchup = analysis?.matchup || item?.matchup || {};
+  const nextGame = matchup?.next_game || {};
+  const side = normalizeMarketBetSide(item);
+  const odds = resolveBacktestLogPropOdds(item, side);
+  const confidenceContract = getBackendConfidenceContract(bestBet) || getBackendConfidenceContract(item) || null;
+  const confidenceScore = getBackendConfidenceScore(bestBet)
+    ?? getBackendConfidenceScore(item)
+    ?? parseBackendConfidenceScore(bestBet.ranking_score)
+    ?? 0;
+  const confidenceTier = getBackendConfidenceTier(bestBet, confidenceScore)
+    || getBackendConfidenceTier(item, confidenceScore)
+    || String(bestBet.confidence || '');
+  const modelProbability = marketNumber(
+    bestBet.model_probability_calibrated ?? bestBet.model_probability ?? bestBet.model_prob,
+    null
+  );
+  return {
+    player_name: player.full_name || item?.player_name || '',
+    player_id: player.id || item?.player_id || '',
+    stat: String(market.stat || item?.stat || '').toUpperCase(),
+    line: marketNumber(market.line ?? item?.line, 0),
+    side,
+    odds: odds ?? 0,
+    over_odds: marketNumber(market.over_odds, null),
+    under_odds: marketNumber(market.under_odds, null),
+    best_over_odds: marketNumber(market.best_over_odds, null),
+    best_under_odds: marketNumber(market.best_under_odds, null),
+    best_available_odds: odds ?? null,
+    confidence_score: confidenceScore,
+    confidence_tier: confidenceTier,
+    confidence: confidenceContract || bestBet,
+    confidence_contract: confidenceContract || bestBet,
+    base_confidence_score: marketNumber(bestBet.base_confidence_score ?? bestBet.base_score, null),
+    market_adjusted_confidence_score: marketNumber(
+      bestBet.market_adjusted_confidence_score ?? bestBet.market_adjusted_score,
+      null
+    ),
+    ranking_score: marketNumber(bestBet.ranking_score ?? bestBet.ranking_adjusted_score, null),
+    confidence_score_source: bestBet.score_source || bestBet.confidence_score_source || '',
+    model_prob: modelProbability,
+    games_count: marketNumber(analysis.games_count, 0),
+    event_date: String(nextGame.game_date || item?.event_date || ''),
+    season_type: analysis.season_type || getSelectedSeasonType(),
+    event_id: String(item?.event_id || nextGame.event_id || ''),
+    game_label: String(item?.game_label || nextGame.matchup_label || ''),
+    opponent_abbreviation: String(player.opponent || nextGame.opponent_abbreviation || ''),
+    selection_status: selected ? 'selected' : '',
+    source: 'market_scanner',
+    market_side: String(bestBet.market_side || ''),
+    market_disagrees: Boolean(bestBet.market_disagrees),
+    selection_reason: String(bestBet.user_read || bestBet.confidence_summary || ''),
+  };
+}
+
+function getMarketBacktestPropsForLog(payload = currentMarketResultsPayload) {
+  const rankedResults = getMarketRankedResults(payload, true);
+  const selectedKeys = new Set(rankedResults.slice(0, 6).map(getMarketItemKey));
+  return rankedResults.map(item => buildMarketBacktestProp(item, {
+    selected: selectedKeys.has(getMarketItemKey(item)),
+  }));
+}
+
+function getMarketBacktestThresholds(mode) {
+  const normalized = String(mode || 'action').trim().toLowerCase();
+  if (normalized === 'broad') return { minScore: 60, minGames: 4 };
+  if (normalized === 'playoff_high') return { minScore: 75, minGames: 0 };
+  return { minScore: 72, minGames: 5 };
+}
+
+function passesMarketBacktestMode(prop, mode) {
+  if (!prop || typeof prop !== 'object') return false;
+  const normalized = String(mode || 'action').trim().toLowerCase();
+  const odds = resolveBacktestLogPropOdds(prop);
+  const oddsInRange = odds !== null && odds <= BACKTEST_LOG_MAX_DECIMAL_ODDS;
+  if (normalized === 'selected') {
+    return String(prop.selection_status || '').trim().toLowerCase() === 'selected' && oddsInRange;
+  }
+  const thresholds = getMarketBacktestThresholds(normalized);
+  return Number(prop.confidence_score || 0) >= thresholds.minScore
+    && Number(prop.games_count || 0) >= thresholds.minGames
+    && oddsInRange;
+}
+
+function getMarketBacktestModeEmptyMessage(mode) {
+  const normalized = String(mode || 'action').trim().toLowerCase();
+  if (normalized === 'selected') return `No ranked slip props with odds <= ${BACKTEST_LOG_MAX_DECIMAL_ODDS.toFixed(2)} are available to log yet.`;
+  if (normalized === 'playoff_high') return `No props met Playoff High+ thresholds (score >= 75, odds <= ${BACKTEST_LOG_MAX_DECIMAL_ODDS.toFixed(2)}).`;
+  if (normalized === 'broad') return `No props met Broad thresholds (score >= 60, games >= 4, odds <= ${BACKTEST_LOG_MAX_DECIMAL_ODDS.toFixed(2)}).`;
+  return `No props met Actionable thresholds (score >= 72, games >= 5, odds <= ${BACKTEST_LOG_MAX_DECIMAL_ODDS.toFixed(2)}).`;
+}
+
+function refreshMarketBacktestActionButtons() {
+  const props = getMarketBacktestPropsForLog();
+  const filterMode = String(marketBacktestFilterSelect?.value || 'action').toLowerCase();
+  const matchingProps = props.filter(prop => passesMarketBacktestMode(prop, filterMode));
+  if (marketLogBacktestBtn) {
+    marketLogBacktestBtn.disabled = !props.length || !matchingProps.length;
+  }
+  if (marketUndoBacktestBtn) {
+    marketUndoBacktestBtn.style.display = lastMarketBacktestBatchId ? '' : 'none';
+    marketUndoBacktestBtn.disabled = !lastMarketBacktestBatchId;
+  }
 }
 
 function renderMarketResults(payload) {
@@ -5554,7 +5998,14 @@ function renderMarketResults(payload) {
   }
   renderMarketInspectTray();
 
-  const featured = results.slice(0, 6);
+  const featured = pickDiversifiedProps(fullResults, Math.min(6, fullResults.length), {
+    maxPlayer: 1,
+    maxGame: 2,
+    maxTeam: 2,
+    maxCombo: 2,
+    maxStatFamily: 2,
+    allowRelaxedFill: true,
+  });
   marketResults.className = 'market-results-shell market-balanced';
   marketResults.innerHTML = `
     <div class="market-slips-header">
@@ -5562,7 +6013,7 @@ function renderMarketResults(payload) {
         <h3>Ranked prop slips</h3>
         <p>The highest-value board looks are surfaced as sportsbook-style tiles before the full table.</p>
       </div>
-      <span class="spotlight-pill neutral">Top ${featured.length} featured</span>
+      <span class="spotlight-pill neutral">Top ${featured.length} overall</span>
     </div>
     <div class="market-slips-grid">
       ${featured.map((item, index) => {
@@ -5594,6 +6045,7 @@ function renderMarketResults(payload) {
       marketOddsAvailable,
     });
     const compactSummary = String(item.best_bet.user_read || item.best_bet.confidence_summary || 'Confidence summary unavailable.');
+    const evidence = buildMarketPredictionEvidence(item);
     return `
           <article class="market-slip-card market-balanced-card ${isInspected ? 'is-inspected' : ''}" data-index="${index}" data-item-key="${escapeHtml(itemKey)}">
             <div class="market-slip-head">
@@ -5626,7 +6078,9 @@ function renderMarketResults(payload) {
                 <span class="market-micro-pill market-h2h-chip ${sideSample.h2hGames > 0 ? 'has-h2h' : 'no-h2h'}">H2H <strong>${sideSample.h2hGames > 0 ? `${Number.isFinite(sideSample.h2hSideHitCount) ? sideSample.h2hSideHitCount : '--'}/${sideSample.h2hGames} (${Number.isFinite(sideSample.h2hSideHitRate) ? sideSample.h2hSideHitRate.toFixed(1) : '--'}%)` : 'No sample'}</strong></span>
               </div>
               ${renderCalibrationChips(item.best_bet)}
+              ${renderCalibrationDiagnostics(item.best_bet, escapeHtml, { compact: true })}
               <p class="market-slip-summary">${escapeHtml(item.best_bet.user_read || item.best_bet.confidence_summary || 'Confidence summary unavailable.')}</p>
+              ${renderPredictionEvidencePanel({ points: evidence.points, stats: evidence.stats })}
               ${renderTrustDiagnostics(trustDiagnostics, true)}
               <div class="market-slip-stats">
                 <div class="market-slip-stat">
@@ -5692,6 +6146,7 @@ function renderMarketResults(payload) {
     const contextAngles = expertAngles.slice(0, 2);
     const sideSample = getMarketSideSampleMetrics(item);
     const compactSummary = String(item.best_bet.user_read || item.best_bet.confidence_summary || 'Confidence summary unavailable.');
+    const evidence = buildMarketPredictionEvidence(item);
     return `
               <tr class="market-row" data-index="${index}" data-item-key="${escapeHtml(getMarketItemKey(item))}">
                 <td>
@@ -5710,6 +6165,7 @@ function renderMarketResults(payload) {
                     <span class="finder-badge ${tone}">${item.best_bet.display_side || item.best_bet.side}  ${item.best_bet.confidence}${item.best_bet.confidence_score ? ` ${item.best_bet.confidence_score}` : ''}</span>
                     <small>Rank score ${item.best_bet.ranking_score ?? item.best_bet.confidence_score ?? '--'}${Number(item.best_bet.market_penalty || 0) > 0 ? `  market penalty ${Number(item.best_bet.market_penalty).toFixed(1)}` : ''}</small>
                     <small class="market-row-summary">${escapeHtml(compactSummary)}</small>
+                    ${renderPredictionEvidenceCompact(evidence.points)}
                   </div>
                   <div class="market-row-micro">
                     <span>EV <strong>${formatEvPercent(item.best_bet.ev)}%</strong></span>
@@ -5718,6 +6174,7 @@ function renderMarketResults(payload) {
                     <span class="market-h2h-chip ${sideSample.h2hGames > 0 ? 'has-h2h' : 'no-h2h'}">H2H <strong>${sideSample.h2hGames > 0 ? `${Number.isFinite(sideSample.h2hSideHitCount) ? sideSample.h2hSideHitCount : '--'}/${sideSample.h2hGames} (${Number.isFinite(sideSample.h2hSideHitRate) ? sideSample.h2hSideHitRate.toFixed(1) : '--'}%)` : 'No sample'}</strong></span>
                   </div>
                   ${renderCalibrationChips(item.best_bet)}
+                  ${renderCalibrationDiagnostics(item.best_bet, escapeHtml, { compact: true })}
                 </td>
                 <td>
                   <div class="market-metrics-cell">
@@ -5768,9 +6225,11 @@ function renderMarketResults(payload) {
   currentMarketInspectKey = '';
   currentMarketInspectKeys = [];
 
+  const marketItemByKey = new Map(fullResults.map(item => [getMarketItemKey(item), item]));
   marketResults.querySelectorAll('.market-row, .market-slip-card').forEach(row => {
     row.addEventListener('click', async () => {
-      const item = results[Number(row.dataset.index)];
+      const itemKey = row.dataset.itemKey || '';
+      const item = marketItemByKey.get(itemKey) || results[Number(row.dataset.index)];
       if (!item) return;
       try {
         setStatus('Loading market pick');
@@ -5809,6 +6268,7 @@ function renderMarketResults(payload) {
     });
   });
 
+  refreshMarketBacktestActionButtons();
   populateMarketInjuryCells(results);
   runMarketResultsEnhancements(scanPayload);
 }
@@ -5976,11 +6436,14 @@ async function runMarketScan(rowsOverride = null) {
     return;
   }
   if (!rows.length) {
+    lastMarketBacktestBatchId = '';
     renderMarketNoResults({}, 'Please provide at least one market row.');
     setStatus('Ready');
     return null;
   }
 
+  lastMarketBacktestBatchId = '';
+  refreshMarketBacktestActionButtons();
   setStatus('Scanning market');
   showGlobalProgress({
     key: 'market-scan',
@@ -6104,6 +6567,92 @@ async function runMarketScan(rowsOverride = null) {
     return null;
   } finally {
     marketScanBtn.disabled = false;
+  }
+}
+
+async function logMarketBacktestBatch(modeOverride) {
+  const propsForLog = getMarketBacktestPropsForLog();
+  if (!propsForLog.length) {
+    setStatus('Run Market Scanner first so there are scored props to log.', true);
+    return;
+  }
+  const filterMode = String(modeOverride || marketBacktestFilterSelect?.value || 'action').toLowerCase();
+  const matchingModeProps = propsForLog.filter(prop => passesMarketBacktestMode(prop, filterMode));
+  if (!matchingModeProps.length) {
+    setStatus(getMarketBacktestModeEmptyMessage(filterMode), true);
+    showAppToast('No Market Scanner props match the selected log filter.', 'info');
+    return;
+  }
+  const season = (typeof seasonInput !== 'undefined' && seasonInput && seasonInput.value) ? seasonInput.value.trim() : '';
+  const seasonType = getSelectedSeasonType();
+  const originalLabel = marketLogBacktestBtn ? marketLogBacktestBtn.textContent : '';
+  if (marketLogBacktestBtn) {
+    marketLogBacktestBtn.disabled = true;
+    marketLogBacktestBtn.textContent = 'Logging...';
+  }
+  try {
+    const payload = await apiFetch('/api/backtest/parlay/log-batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        props: propsForLog,
+        filter_mode: filterMode,
+        season: season || undefined,
+        season_type: seasonType,
+        source: 'market_scanner',
+      }),
+    }, 20000);
+    if (!payload || payload.ok === false) throw new Error(payload?.error || 'Could not log Market Scanner batch.');
+    lastMarketBacktestBatchId = String(payload.batch_id || '').trim();
+    const logged = Number(payload.logged || 0);
+    const skipped = Number(payload.skipped_filter || 0) + Number(payload.skipped_duplicate || 0) + Number(payload.skipped_invalid || 0);
+    const updatedOdds = Number(payload.updated_odds || 0);
+    if (logged === 0 && Number(payload.skipped_filter || 0) > 0) {
+      setStatus('Backend skipped every Market Scanner prop for the selected filter.', true);
+    }
+    showAppToast(`Market Scanner backtest log: ${logged} added${updatedOdds ? `, ${updatedOdds} odds updated` : ''}${skipped ? `, ${skipped} skipped` : ''}.`, (logged > 0 || updatedOdds > 0) ? 'success' : 'info');
+  } catch (err) {
+    setStatus('Market Scanner backtest log failed: ' + (err?.message || 'Unknown error'), true);
+  } finally {
+    if (marketLogBacktestBtn) {
+      marketLogBacktestBtn.disabled = false;
+      marketLogBacktestBtn.textContent = originalLabel;
+    }
+    refreshMarketBacktestActionButtons();
+  }
+}
+
+async function undoMarketBacktestBatch() {
+  if (!lastMarketBacktestBatchId) {
+    setStatus('No recent Market Scanner backtest batch to undo.', true);
+    return;
+  }
+  const originalLabel = marketUndoBacktestBtn ? marketUndoBacktestBtn.textContent : '';
+  if (marketUndoBacktestBtn) {
+    marketUndoBacktestBtn.disabled = true;
+    marketUndoBacktestBtn.textContent = 'Undoing...';
+  }
+  try {
+    const payload = await apiFetch('/api/backtest/parlay/undo-batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        batch_id: lastMarketBacktestBatchId,
+        source_prefix: 'market_scanner',
+        only_pending: true,
+      }),
+    }, 30000);
+    if (!payload || payload.ok === false) throw new Error(payload?.error || 'Undo failed.');
+    const deleted = Number(payload.deleted || 0);
+    showAppToast(`Undo complete: ${deleted} pending Market Scanner prop${deleted === 1 ? '' : 's'} removed.`, deleted > 0 ? 'success' : 'info');
+    lastMarketBacktestBatchId = '';
+  } catch (err) {
+    setStatus('Market Scanner undo failed: ' + (err?.message || 'Unknown error'), true);
+  } finally {
+    if (marketUndoBacktestBtn) {
+      marketUndoBacktestBtn.textContent = originalLabel;
+    }
+    refreshMarketBacktestActionButtons();
   }
 }
 
@@ -6317,8 +6866,19 @@ if (parlaySeasonTypeSelect) {
 }
 clearRecentBtn.addEventListener('click', () => clearRecentPlayersState({ resetCurrent: true }));
 marketTemplateBtn.addEventListener('click', () => { marketTextarea.value = getMarketTemplate(); });
-marketClearBtn.addEventListener('click', () => { marketTextarea.value = ''; renderMarketEmpty(); });
+marketClearBtn.addEventListener('click', () => {
+  marketTextarea.value = '';
+  lastMarketBacktestBatchId = '';
+  renderMarketEmpty();
+});
 marketScanBtn.addEventListener('click', runMarketScan);
+marketLogBacktestBtn?.addEventListener('click', () => {
+  const selectedMode = String(marketBacktestFilterSelect?.value || 'action');
+  logMarketBacktestBatch(selectedMode);
+});
+marketBacktestFilterSelect?.addEventListener('change', refreshMarketBacktestActionButtons);
+marketUndoBacktestBtn?.addEventListener('click', undoMarketBacktestBatch);
+refreshMarketBacktestActionButtons();
 oddsLoadEventsBtn?.addEventListener('click', loadOddsEvents);
 oddsImportScanBtn?.addEventListener('click', importOddsPropsAndScan);
 
@@ -8466,6 +9026,118 @@ function getMarketSideSampleMetrics(item) {
   return { side, gamesCount, sideHitCount, sideHitRate, h2hGames, h2hSideHitCount, h2hSideHitRate };
 }
 
+function formatPredictionNumber(value, digits = 1, fallback = '--') {
+  const num = Number(value);
+  return Number.isFinite(num) ? num.toFixed(digits) : fallback;
+}
+
+function formatPredictionPercent(value, digits = 1, fallback = '--') {
+  const num = Number(value);
+  return Number.isFinite(num) ? `${num.toFixed(digits)}%` : fallback;
+}
+
+function formatPredictionOdds(value, fallback = '--') {
+  const num = Number(value);
+  return Number.isFinite(num) && num > 1 ? num.toFixed(2) : fallback;
+}
+
+function renderPredictionEvidencePanel({ title = 'Why this pick', points = [], stats = [], escFn = escapeHtml } = {}) {
+  const cleanPoints = (Array.isArray(points) ? points : []).filter(Boolean).slice(0, 3);
+  const cleanStats = (Array.isArray(stats) ? stats : []).filter(item => item && item.label).slice(0, 4);
+  if (!cleanPoints.length && !cleanStats.length) return '';
+  return `
+    <section class="prediction-evidence-card grid gap-3 rounded-2xl border border-white/10 bg-white/5 p-4">
+      <div class="prediction-evidence-head flex items-center justify-between gap-3">
+        <span>${escFn(title)}</span>
+        <small>Pick profile</small>
+      </div>
+      ${cleanPoints.length ? `
+        <ul class="prediction-evidence-list">
+          ${cleanPoints.map(point => `<li>${escFn(point)}</li>`).join('')}
+        </ul>
+      ` : ''}
+      ${cleanStats.length ? `
+        <div class="prediction-stat-strip grid gap-2">
+          ${cleanStats.map(stat => `
+            <div class="prediction-stat-cell">
+              <span>${escFn(stat.label)}</span>
+              <strong>${escFn(String(stat.value ?? '--'))}</strong>
+              ${stat.note ? `<small>${escFn(stat.note)}</small>` : ''}
+            </div>
+          `).join('')}
+        </div>
+      ` : ''}
+    </section>
+  `;
+}
+
+function renderPredictionEvidenceCompact(points = [], escFn = escapeHtml) {
+  const cleanPoints = (Array.isArray(points) ? points : []).filter(Boolean).slice(0, 2);
+  if (!cleanPoints.length) return '';
+  return `
+    <div class="prediction-evidence-compact">
+      <span>Why</span>
+      <p>${cleanPoints.map(point => escFn(point)).join(' ')}</p>
+    </div>
+  `;
+}
+
+function buildMarketPredictionEvidence(item) {
+  const bestBet = item?.best_bet || {};
+  const analysis = item?.analysis || {};
+  const sideSample = getMarketSideSampleMetrics(item);
+  const sideLabel = sideSample.side || normalizeMarketBetSide(item);
+  const points = [];
+  const ev = Number(bestBet.ev);
+  const edge = Number(bestBet.edge);
+  if (Number.isFinite(ev) || Number.isFinite(edge)) {
+    points.push(`Price edge: ${Number.isFinite(ev) ? `${formatEvPercent(ev)}% EV` : 'EV --'}${Number.isFinite(edge) ? `, ${edge.toFixed(1)}% model edge` : ''}.`);
+  }
+  if (Number.isFinite(sideSample.sideHitCount) && Number.isFinite(sideSample.gamesCount) && sideSample.gamesCount > 0) {
+    points.push(`Recent ${sideLabel}: ${sideSample.sideHitCount}/${sideSample.gamesCount} hits (${formatPredictionPercent(sideSample.sideHitRate)}).`);
+  }
+  if (sideSample.h2hGames > 0 && Number.isFinite(sideSample.h2hSideHitCount)) {
+    const opponent = item?.player?.opponent || item?.matchup?.next_game?.opponent_abbreviation || 'opponent';
+    points.push(`H2H vs ${opponent}: ${sideSample.h2hSideHitCount}/${sideSample.h2hGames} on this side.`);
+  }
+  const opportunity = analysis.opportunity || {};
+  if (Number.isFinite(Number(opportunity.minutes_last5)) || Number.isFinite(Number(opportunity.fga_last5))) {
+    points.push(`Role check: ${formatPredictionNumber(opportunity.minutes_last5, 1)} MIN, ${formatPredictionNumber(opportunity.fga_last5, 1)} FGA lately.`);
+  }
+  if (bestBet.user_read || bestBet.confidence_summary) {
+    points.push(String(bestBet.user_read || bestBet.confidence_summary));
+  }
+  const odds = resolveBacktestLogPropOdds(item, sideLabel);
+  const stats = [
+    { label: 'Avg', value: formatPredictionNumber(analysis.average, 1), note: `Line ${formatPredictionNumber(item?.market?.line, 1)}` },
+    { label: 'Recent', value: Number.isFinite(sideSample.sideHitCount) ? `${sideSample.sideHitCount}/${sideSample.gamesCount}` : '--', note: `${sideLabel} sample` },
+    { label: 'H2H', value: sideSample.h2hGames > 0 && Number.isFinite(sideSample.h2hSideHitCount) ? `${sideSample.h2hSideHitCount}/${sideSample.h2hGames}` : '--', note: item?.player?.opponent || 'Opponent' },
+    { label: 'Odds', value: formatPredictionOdds(odds), note: 'Decimal' },
+  ];
+  return { points, stats };
+}
+
+function buildParlayPredictionEvidence(leg) {
+  const points = [];
+  if (Array.isArray(leg?.selection_reason_parts)) {
+    leg.selection_reason_parts.slice(0, 3).forEach(part => {
+      if (part) points.push(String(part));
+    });
+  }
+  if (!points.length && leg?.selection_reason) points.push(String(leg.selection_reason));
+  if (leg?.confidence_summary) points.push(String(leg.confidence_summary));
+  if (Number.isFinite(Number(leg?.edge)) || Number.isFinite(Number(leg?.ev))) {
+    points.push(`Market math: ${Number.isFinite(Number(leg.ev)) ? `${formatEvPercent(leg.ev)}% EV` : 'EV --'}${Number.isFinite(Number(leg.edge)) ? `, ${Number(leg.edge).toFixed(1)}% edge` : ''}.`);
+  }
+  const stats = [
+    { label: 'Hit %', value: formatPredictionPercent(leg?.hit_rate, 1), note: `${leg?.hit_count ?? '--'}/${leg?.games_count ?? '--'} sample` },
+    { label: 'Avg', value: formatPredictionNumber(leg?.average, 1), note: `Line ${formatPredictionNumber(leg?.line, 1)}` },
+    { label: 'H2H', value: Number(leg?.h2h_games_count || 0) > 0 ? `${leg?.h2h_hit_count ?? '--'}/${leg?.h2h_games_count}` : '--', note: leg?.opponent_abbreviation || 'Opponent' },
+    { label: 'Odds', value: formatPredictionOdds(resolveBacktestLogPropOdds(leg)), note: 'Decimal' },
+  ];
+  return { points, stats };
+}
+
 function getMarketSortValue(item, sortKey) {
   const ev = Number(item?.best_bet?.ev ?? Number.NEGATIVE_INFINITY);
   const edge = Number(item?.best_bet?.edge ?? Number.NEGATIVE_INFINITY);
@@ -8954,13 +9626,73 @@ function renderEmptyFilterStatesUpgrade() {
   if (chart) { chart.destroy(); chart = null; }
 }
 
-function computeConfidenceGrade(hitRate, edge, gamesCount) {
+// Last-resort display fallback only. Backend confidence contracts are the source of truth.
+function computeFallbackConfidenceGrade(hitRate, edge, gamesCount) {
   const safeEdge = Number.isFinite(edge) ? edge : 0;
   const score = (hitRate * 0.5) + (Math.max(0, safeEdge) * 1.5) + Math.min(gamesCount, 15);
   if (score >= 62) return 'A';
   if (score >= 50) return 'B';
   if (score >= 38) return 'C';
   return 'D';
+}
+function parseBackendConfidenceScore(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? Math.max(0, Math.min(100, Math.round(num))) : null;
+}
+function getBackendConfidenceContract(source) {
+  if (!source || typeof source !== 'object') return null;
+  const candidates = [
+    source.confidence_contract,
+    source.confidenceContract,
+    source.confidence,
+    source.best_bet?.confidence_contract,
+    source.best_bet?.confidenceContract,
+    source.best_bet?.confidence,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== 'object') continue;
+    if (
+      candidate.contract_version ||
+      candidate.display_score !== undefined ||
+      candidate.confidence_score !== undefined ||
+      candidate.score !== undefined
+    ) {
+      return candidate;
+    }
+  }
+  return null;
+}
+function getBackendConfidenceScore(source) {
+  const contract = getBackendConfidenceContract(source);
+  const fromContract = parseBackendConfidenceScore(
+    contract?.display_score ?? contract?.confidence_score ?? contract?.score
+  );
+  if (fromContract !== null) return fromContract;
+  return parseBackendConfidenceScore(
+    source?.confidence_score ??
+    source?.display_score ??
+    source?.score ??
+    source?.best_bet?.confidence_score
+  );
+}
+function getBackendConfidenceTier(source, fallbackScore = null) {
+  const contract = getBackendConfidenceContract(source);
+  const tier = contract?.tier || source?.confidence_tier || source?.best_bet?.confidence_tier;
+  if (tier) return String(tier);
+  const score = parseBackendConfidenceScore(fallbackScore);
+  if (score !== null) {
+    if (score >= 86) return 'Elite';
+    if (score >= 72) return 'High';
+    if (score >= 56) return 'Medium';
+    return 'Low';
+  }
+  return '';
+}
+function getBackendConfidenceGrade(source, fallbackGrade = '') {
+  const contract = getBackendConfidenceContract(source);
+  const directGrade = typeof source?.confidence === 'string' ? source.confidence : '';
+  const bestBetGrade = typeof source?.best_bet?.confidence === 'string' ? source.best_bet.confidence : '';
+  return String(contract?.grade || directGrade || bestBetGrade || fallbackGrade || '').trim();
 }
 function gradeLabel(grade) {
   return { A: 'Elite', B: 'Strong', C: 'Playable', D: 'Thin' }[grade] || '--';
@@ -9020,17 +9752,21 @@ function renderSummary(payload) {
   const vsPosition = payload.matchup?.vs_position;
   const h2h = payload.h2h || {};
   const environment = payload.environment || {};
-  const grade = computeConfidenceGrade(
+  const fallbackGrade = computeFallbackConfidenceGrade(
     Number(sideHitRate || 0),
     (leanSide === 'UNDER' ? (Number(payload.line || 0) - Number(payload.average || 0)) : (Number(payload.average || 0) - Number(payload.line || 0))),
     payload.games_count || 0
   );
+  const backendConfidenceScore = getBackendConfidenceScore(payload);
+  const grade = getBackendConfidenceGrade(payload, fallbackGrade) || fallbackGrade;
+  const gradeTier = getBackendConfidenceTier(payload, backendConfidenceScore) || gradeLabel(grade);
+  const gradeText = `${grade}${backendConfidenceScore !== null ? ` ${backendConfidenceScore}` : ''}: ${gradeTier}`;
 
   chartTitle.textContent = `${payload.player.full_name}  ${getStatLabel(payload.stat)}`;
 
   // Running hit-rate subtitle with grade + streak
   const hitRatePct = Number(sideHitRate || 0).toFixed(1);
-  let subtitleText = `${hitRatePct}% ${leanSide.toLowerCase()} hit rate (${sideHitCount || 0}/${payload.games_count || 0})  Grade ${grade}: ${gradeLabel(grade)}`;
+  let subtitleText = `${hitRatePct}% ${leanSide.toLowerCase()} hit rate (${sideHitCount || 0}/${payload.games_count || 0})  Grade ${gradeText}`;
   if (streak > 1) subtitleText += `   ${streak} straight`;
   if (nextGame) subtitleText += `  vs ${nextGame.matchup_label}`;
   chartSubtitle.textContent = subtitleText;
@@ -9046,7 +9782,7 @@ function renderSummary(payload) {
   chartChips.innerHTML = `
     <span class="chart-chip">Avg ${Number(payload.average || 0).toFixed(1)}</span>
     <span class="chart-chip">${sideHitCount || 0}/${payload.games_count || 0} ${h2hLabel}</span>
-    <span class="chart-chip grade-chip grade-${grade.toLowerCase()}">${grade} ${gradeLabel(grade)}</span>
+    <span class="chart-chip grade-chip grade-${String(grade).toLowerCase()}">${grade}${backendConfidenceScore !== null ? ` ${backendConfidenceScore}` : ''} ${escapeHtml(gradeTier)}</span>
     <span class="chart-chip">Season ${escapeHtml(payload.season || '')}</span>
     <span class="chart-chip">Streak ${streak}</span>
     ${splitHtml}
@@ -9347,7 +10083,10 @@ function enhanceBetFinderSparklines(payload) {
     const item = results[idx];
     if (!item) return;
     const values = (item.games || []).map(function (g) { return Number(g.value || 0); });
-    const grade = computeConfidenceGrade(item.hit_rate, item.avg_edge || 0, item.games_count || 0);
+    const fallbackGrade = computeFallbackConfidenceGrade(item.hit_rate, item.avg_edge || 0, item.games_count || 0);
+    const backendScore = getBackendConfidenceScore(item);
+    const grade = getBackendConfidenceGrade(item, fallbackGrade) || fallbackGrade;
+    const tier = getBackendConfidenceTier(item, backendScore) || gradeLabel(grade);
     const footer = card.querySelector('.finder-ticket-footer') || card.querySelector('.finder-footer');
     if (values.length >= 2 && footer && !card.querySelector('.finder-sparkline')) {
       const svg = buildSparklineSvg(values, payload.line);
@@ -9359,8 +10098,8 @@ function enhanceBetFinderSparklines(payload) {
     const chipRow = card.querySelector('.finder-chip-row');
     if (chipRow && !chipRow.querySelector('.grade-chip')) {
       const gradeEl = document.createElement('span');
-      gradeEl.className = 'finder-chip grade-chip grade-' + grade.toLowerCase();
-      gradeEl.textContent = grade + '  ' + gradeLabel(grade);
+      gradeEl.className = 'finder-chip grade-chip grade-' + String(grade).toLowerCase();
+      gradeEl.textContent = backendScore !== null ? `${grade} ${backendScore}  ${tier}` : `${grade}  ${tier}`;
       chipRow.appendChild(gradeEl);
     }
   });
@@ -9753,14 +10492,17 @@ function enhanceBetFinderSparklines(payload) {
   function passesParlayBacktestMode(prop, mode) {
     if (!prop || typeof prop !== 'object') return false;
     const normalized = String(mode || 'action').trim().toLowerCase();
+    const odds = resolveBacktestLogPropOdds(prop);
+    const oddsInRange = odds !== null && odds <= BACKTEST_LOG_MAX_DECIMAL_ODDS;
     if (normalized === 'selected') {
-      return String(prop.selection_status || '').trim().toLowerCase() === 'selected';
+      return String(prop.selection_status || '').trim().toLowerCase() === 'selected' && oddsInRange;
     }
     const thresholds = getParlayBacktestThresholds(normalized);
     const score = Number(prop.confidence_score || 0);
     const gamesCount = Number(prop.games_count || 0);
-    const odds = Number(prop.odds || 0);
-    return score >= thresholds.minScore && gamesCount >= thresholds.minGames && odds >= 1.4;
+    return score >= thresholds.minScore
+      && gamesCount >= thresholds.minGames
+      && oddsInRange;
   }
   function getParlayPropsPassingMode(props, mode) {
     return (Array.isArray(props) ? props : []).filter(function (prop) { return passesParlayBacktestMode(prop, mode); });
@@ -9940,36 +10682,112 @@ function enhanceBetFinderSparklines(payload) {
 
   //  Pick top N legs from cached props 
   function pickLegs(props, n) {
-    const legs = [], seenPlayers = new Set(), seenEvents = new Set();
-    for (const p of props) {
-      if (legs.length >= n) break;
-      const pid = Number(p.player_id);
-      const eid = p.event_id || '';
-      if (seenPlayers.has(pid)) continue;
-      if (eid && seenEvents.has(eid)) continue; // no same-game parlay
-      seenPlayers.add(pid);
-      if (eid) seenEvents.add(eid);
-      legs.push(p);
-    }
-    return legs;
+    return pickDiversifiedProps(props, n, {
+      maxPlayer: 1,
+      maxGame: 1,
+      maxTeam: 2,
+      maxCombo: 1,
+      maxStatFamily: n <= 3 ? 1 : 2,
+      allowRelaxedFill: true,
+    });
+  }
+  function getParlayLegKey(leg) {
+    if (!leg || typeof leg !== 'object') return '';
+    return [
+      String(leg.player_id || ''),
+      String(leg.event_id || ''),
+      String(leg.stat || ''),
+      String(leg.line || ''),
+      String(leg.side || ''),
+    ].join(':');
+  }
+  function sameParlayLeg(a, b) {
+    const keyA = getParlayLegKey(a);
+    const keyB = getParlayLegKey(b);
+    return Boolean(keyA && keyB && keyA === keyB);
   }
   function getParlayLegSignature(legs) {
     const list = Array.isArray(legs) ? legs : [];
-    return list.map(function (leg) {
-      return [
-        String(leg?.player_id || ''),
-        String(leg?.event_id || ''),
-        String(leg?.stat || ''),
-        String(leg?.line || ''),
-        String(leg?.side || ''),
-      ].join(':');
-    }).join('|');
+    return list.map(getParlayLegKey).join('|');
   }
   function pickLegsForOffset(offset, n) {
     const filteredProps = filterParlayPropsByOdds(cachedScoredProps || []);
     const displayProps = rotateParlayProps(filteredProps, offset);
     const legs = pickLegs(displayProps, n);
     return { filteredProps, displayProps, legs };
+  }
+  function buildSingleShuffleState(fixedLegs) {
+    const state = {
+      playerCounts: new Map(),
+      gameCounts: new Map(),
+      teamCounts: new Map(),
+      statCounts: new Map(),
+      comboCount: 0,
+    };
+    (Array.isArray(fixedLegs) ? fixedLegs : []).forEach(function (leg) {
+      const playerKey = getDiversificationPlayerKey(leg);
+      const gameKey = getDiversificationGameKey(leg);
+      const teamKey = getDiversificationTeamKey(leg);
+      const exposures = getDiversificationStatExposures(leg);
+      if (playerKey) state.playerCounts.set(playerKey, (state.playerCounts.get(playerKey) || 0) + 1);
+      if (gameKey) state.gameCounts.set(gameKey, (state.gameCounts.get(gameKey) || 0) + 1);
+      if (teamKey) state.teamCounts.set(teamKey, (state.teamCounts.get(teamKey) || 0) + 1);
+      exposures.forEach(function (exposure) {
+        state.statCounts.set(exposure, (state.statCounts.get(exposure) || 0) + 1);
+      });
+      if (exposures.includes('combo')) state.comboCount += 1;
+    });
+    return state;
+  }
+  function canSingleShuffleTake(candidate, fixedLegs, n, relaxed) {
+    if (!candidate || fixedLegs.some(function (leg) { return sameParlayLeg(leg, candidate); })) return false;
+    const state = buildSingleShuffleState(fixedLegs);
+    const playerKey = getDiversificationPlayerKey(candidate);
+    const gameKey = getDiversificationGameKey(candidate);
+    const teamKey = getDiversificationTeamKey(candidate);
+    const exposures = getDiversificationStatExposures(candidate);
+    const statFamilyLimit = n <= 3 ? 1 : 2;
+    if (playerKey && (state.playerCounts.get(playerKey) || 0) >= 1) return false;
+    if (gameKey && (state.gameCounts.get(gameKey) || 0) >= 1) return false;
+    if (!relaxed) {
+      if (teamKey && (state.teamCounts.get(teamKey) || 0) >= 2) return false;
+      if (exposures.includes('combo') && state.comboCount >= 1) return false;
+      if (exposures.some(function (exposure) {
+        return exposure !== 'combo' && (state.statCounts.get(exposure) || 0) >= statFamilyLimit;
+      })) return false;
+    }
+    return true;
+  }
+  function findSingleLegReplacement(currentLeg, fixedLegs, candidatePool, n) {
+    const pool = Array.isArray(candidatePool) ? candidatePool : [];
+    const currentKey = getParlayLegKey(currentLeg);
+    const currentIndex = pool.findIndex(function (item) { return getParlayLegKey(item) === currentKey; });
+    const ordered = currentIndex >= 0
+      ? pool.slice(currentIndex + 1).concat(pool.slice(0, currentIndex))
+      : pool.slice();
+    const strict = ordered.find(function (candidate) {
+      return getParlayLegKey(candidate) !== currentKey && canSingleShuffleTake(candidate, fixedLegs, n, false);
+    });
+    if (strict) return strict;
+    return ordered.find(function (candidate) {
+      return getParlayLegKey(candidate) !== currentKey && canSingleShuffleTake(candidate, fixedLegs, n, true);
+    }) || null;
+  }
+  function syncCurrentParlaySelection(displayProps, legs) {
+    const selectedKeys = new Set((Array.isArray(legs) ? legs : []).map(getParlayLegKey).filter(Boolean));
+    (Array.isArray(displayProps) ? displayProps : []).forEach(function (prop) {
+      const isSelected = selectedKeys.has(getParlayLegKey(prop));
+      const wasSelected = String(prop.selection_status || '').toLowerCase() === 'selected';
+      if (isSelected) {
+        prop.selection_status = 'selected';
+        prop.selection_reason = prop.selection_reason && String(prop.selection_reason).toLowerCase().startsWith('selected')
+          ? prop.selection_reason
+          : 'Selected on the current shuffled ticket.';
+      } else if (wasSelected) {
+        prop.selection_status = 'not_selected';
+        prop.selection_reason = 'Not on the current shuffled ticket.';
+      }
+    });
   }
   function calcOdds(legs) {
     if (!legs.length) return null;
@@ -10089,9 +10907,205 @@ function enhanceBetFinderSparklines(payload) {
       '</div>';
   }
 
+  function parlayRiskNumber(value, fallback) {
+    const num = Number(value);
+    return Number.isFinite(num) ? num : fallback;
+  }
+
+  function getParlayLegProbability(leg) {
+    const raw = [leg?.model_probability_calibrated, leg?.model_probability, leg?.hit_rate]
+      .map(value => parlayRiskNumber(value, NaN))
+      .find(value => Number.isFinite(value));
+    if (!Number.isFinite(raw)) return 0.5;
+    const prob = Math.abs(raw) > 1 ? raw / 100 : raw;
+    return Math.max(0.02, Math.min(0.98, prob));
+  }
+
+  function getParlayCalibrationDeltaPct(leg) {
+    const diagnostics = leg?.calibration_diagnostics && typeof leg.calibration_diagnostics === 'object'
+      ? leg.calibration_diagnostics
+      : {};
+    const probability = diagnostics.probability && typeof diagnostics.probability === 'object'
+      ? diagnostics.probability
+      : {};
+    const sideKey = String(leg?.side || '').toLowerCase();
+    const calibration = leg?.backtest_probability_calibration && typeof leg.backtest_probability_calibration === 'object'
+      ? leg.backtest_probability_calibration
+      : {};
+    const sideCalibration = calibration[sideKey] && typeof calibration[sideKey] === 'object'
+      ? calibration[sideKey]
+      : {};
+    const candidates = [
+      probability.final_delta_pct,
+      probability.raw_delta_pct,
+      calibration[sideKey + '_delta_pct'],
+      sideCalibration.delta_pct,
+    ];
+    for (const candidate of candidates) {
+      const num = Number(candidate);
+      if (Number.isFinite(num)) return num;
+    }
+    return 0;
+  }
+
+  function countMapMax(map) {
+    let max = 0;
+    map.forEach(value => { max = Math.max(max, value || 0); });
+    return max;
+  }
+
+  function buildClientParlayRiskMeter(legs) {
+    const list = Array.isArray(legs) ? legs.filter(Boolean) : [];
+    const legCount = list.length;
+    if (!legCount) return null;
+    const gameCounts = new Map();
+    const teamCounts = new Map();
+    const statCounts = new Map();
+    let comboCount = 0;
+    let statusRiskCount = 0;
+    let marketDisagreeCount = 0;
+    let lowSampleCount = 0;
+    let tinySampleCount = 0;
+    let longOddsCount = 0;
+    let volatileCount = 0;
+    let parlayOdds = 1;
+    let combinedProbability = 1;
+    const calibrationDeltas = [];
+
+    list.forEach(function (leg) {
+      const gameKey = getDiversificationGameKey(leg);
+      const teamKey = getDiversificationTeamKey(leg);
+      if (gameKey) gameCounts.set(gameKey, (gameCounts.get(gameKey) || 0) + 1);
+      if (teamKey) teamCounts.set(teamKey, (teamCounts.get(teamKey) || 0) + 1);
+      const exposures = getDiversificationStatExposures(leg);
+      exposures.forEach(function (exposure) {
+        statCounts.set(exposure, (statCounts.get(exposure) || 0) + 1);
+      });
+      if (exposures.includes('combo')) comboCount += 1;
+      if (exposures.includes('shooting') || exposures.includes('stocks')) volatileCount += 1;
+      const availability = leg.availability && typeof leg.availability === 'object' ? leg.availability : {};
+      if (availability.is_risky || availability.is_unavailable) statusRiskCount += 1;
+      if (leg.market_disagrees) marketDisagreeCount += 1;
+      const games = parlayRiskNumber(leg.games_count, 0);
+      if (games < 8) lowSampleCount += 1;
+      if (games < 4) tinySampleCount += 1;
+      const odds = parlayRiskNumber(leg.odds, 0);
+      if (odds > 1) {
+        parlayOdds *= odds;
+        if (odds >= 2.35) longOddsCount += 1;
+      }
+      combinedProbability *= getParlayLegProbability(leg);
+      calibrationDeltas.push(getParlayCalibrationDeltaPct(leg));
+    });
+
+    let sameGameExtra = 0;
+    gameCounts.forEach(count => { sameGameExtra += Math.max(0, count - 1); });
+    const maxTeamCount = countMapMax(teamCounts);
+    let maxStatExposure = 0;
+    statCounts.forEach(function (count, key) {
+      if (key !== 'combo') maxStatExposure = Math.max(maxStatExposure, count || 0);
+    });
+    const statFamilyLimit = legCount <= 3 ? 1 : 2;
+    const avgCalibration = calibrationDeltas.length
+      ? calibrationDeltas.reduce((sum, value) => sum + value, 0) / calibrationDeltas.length
+      : 0;
+
+    let score = 6 + Math.max(0, legCount - 2) * 4;
+    score += sameGameExtra * 22;
+    score += Math.max(0, maxTeamCount - 2) * 12 + (maxTeamCount === 2 && legCount >= 4 ? 3 : 0);
+    score += Math.max(0, maxStatExposure - statFamilyLimit) * 12;
+    score += Math.max(0, comboCount - 1) * 10 + (comboCount === 1 && legCount >= 4 ? 3 : 0);
+    score += statusRiskCount * 9;
+    score += marketDisagreeCount * 6;
+    score += lowSampleCount * 5 + tinySampleCount * 4;
+    score += longOddsCount * 5;
+    score += volatileCount * 4;
+    score += parlayOdds >= 12 ? 8 : (parlayOdds >= 8 ? 4 : 0);
+    score += combinedProbability < 0.12 ? 12 : (combinedProbability < 0.20 ? 6 : 0);
+    if (avgCalibration < -0.25) score += Math.min(16, Math.abs(avgCalibration) * 3.5);
+    if (avgCalibration > 0.75) score -= Math.min(6, avgCalibration * 1.5);
+    const riskScore = Math.max(0, Math.min(100, Math.round(score)));
+    const tone = riskScore >= 68 ? 'bad' : (riskScore >= 42 ? 'warning' : 'good');
+    const tier = riskScore >= 68 ? 'High risk' : (riskScore >= 42 ? 'Medium risk' : 'Low risk');
+    const summary = riskScore >= 68
+      ? 'Shuffle a flagged leg before trusting this ticket.'
+      : (riskScore >= 42 ? 'Some concentration or sample risk is active.' : 'Balanced across the main risk checks.');
+    const factor = function (label, value, impact) {
+      return {
+        label,
+        value,
+        impact,
+        tone: impact >= 12 ? 'bad' : (impact > 0 ? 'warning' : (impact < 0 ? 'good' : 'good')),
+      };
+    };
+
+    return {
+      risk_score: riskScore,
+      tier,
+      tone,
+      summary,
+      combined_model_probability: combinedProbability,
+      factors: [
+        factor('Game overlap', sameGameExtra ? sameGameExtra + ' extra' : 'clear', sameGameExtra * 22),
+        factor('Team cluster', maxTeamCount ? 'max ' + maxTeamCount : 'clear', Math.max(0, maxTeamCount - 2) * 12),
+        factor('Stat exposure', 'max ' + maxStatExposure + '/' + statFamilyLimit, Math.max(0, maxStatExposure - statFamilyLimit) * 12),
+        factor('Combo legs', String(comboCount), Math.max(0, comboCount - 1) * 10),
+        factor('Status risk', String(statusRiskCount), statusRiskCount * 9),
+        factor('Market disagree', String(marketDisagreeCount), marketDisagreeCount * 6),
+        factor('Small samples', String(lowSampleCount), lowSampleCount * 5 + tinySampleCount * 4),
+        factor('Volatile props', String(volatileCount), volatileCount * 4),
+        factor('Calibration', (avgCalibration > 0 ? '+' : '') + avgCalibration.toFixed(1) + 'pp', avgCalibration > 0.75 ? -3 : Math.max(0, Math.abs(Math.min(0, avgCalibration)) * 3.5)),
+        factor('Model hit chance', (combinedProbability * 100).toFixed(1) + '%', combinedProbability < 0.12 ? 12 : (combinedProbability < 0.20 ? 6 : 0)),
+      ],
+    };
+  }
+
+  function renderParlayRiskMeter(riskMeter) {
+    if (!parlayTicket) return;
+    const grid = parlayTicket.querySelector('.parlay-legs-grid');
+    let panel = parlayTicket.querySelector('#parlayRiskMeter');
+    if (!riskMeter) {
+      if (panel) panel.remove();
+      return;
+    }
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = 'parlayRiskMeter';
+      panel.className = 'parlay-risk-meter';
+      if (grid) parlayTicket.insertBefore(panel, grid);
+      else parlayTicket.appendChild(panel);
+    }
+    const score = parlayRiskNumber(riskMeter.risk_score, 0);
+    const factors = Array.isArray(riskMeter.factors) ? riskMeter.factors : [];
+    const toneClass = ['good', 'warning', 'bad', 'neutral'].includes(String(riskMeter.tone || 'neutral'))
+      ? String(riskMeter.tone || 'neutral')
+      : 'neutral';
+    panel.className = 'parlay-risk-meter ' + toneClass;
+    panel.innerHTML =
+      '<div class="parlay-risk-head">' +
+        '<div><span class="small-label">Parlay risk meter</span><strong>' + escHtml(riskMeter.tier || 'Risk') + '</strong></div>' +
+        '<div class="parlay-risk-score"><span>' + Math.round(score) + '</span><small>/100</small></div>' +
+      '</div>' +
+      '<div class="parlay-risk-track"><span style="width:' + Math.max(0, Math.min(100, score)) + '%"></span></div>' +
+      '<p class="parlay-risk-summary">' + escHtml(riskMeter.summary || '') + '</p>' +
+      '<div class="parlay-risk-factors">' +
+        factors.slice(0, 10).map(function (factor) {
+          const factorTone = ['good', 'warning', 'bad', 'neutral'].includes(String(factor.tone || 'neutral'))
+            ? String(factor.tone || 'neutral')
+            : 'neutral';
+          return '<span class="parlay-risk-chip ' + factorTone + '">' +
+            '<b>' + escHtml(factor.label || '') + '</b>' +
+            '<em>' + escHtml(String(factor.value ?? '')) + '</em>' +
+          '</span>';
+        }).join('') +
+      '</div>';
+  }
+
   //  Render ticket 
   function renderTicket(parlay, legs, parlayOdds) {
     if (!parlay || !parlay.length) return;
+    window._lastParlayLegs = parlay;
+    lastParlayLegSignature = getParlayLegSignature(parlay);
     show(parlayTicketShell, true);
     show(parlayTicket, true);
     const legsSpan = parlayTicket.querySelector('#parlayTicketLegs');
@@ -10108,6 +11122,7 @@ function enhanceBetFinderSparklines(payload) {
       }
       sourceEl.textContent = getParlayTicketOddsSourceSummary(parlay);
     }
+    renderParlayRiskMeter(buildClientParlayRiskMeter(parlay));
     const grid = parlayTicket.querySelector('.parlay-legs-grid');
     if (!grid) return;
     grid.innerHTML = parlay.map(function (leg, i) {
@@ -10116,6 +11131,7 @@ function enhanceBetFinderSparklines(payload) {
       const tone = getConfidenceTone(leg.confidence);
       const tags = Array.isArray(leg.confidence_tags) ? leg.confidence_tags.slice(0, 2) : [];
       const reasonParts = Array.isArray(leg.selection_reason_parts) ? leg.selection_reason_parts.slice(0, 3) : [];
+      const evidence = buildParlayPredictionEvidence(leg);
       const trustDiagnostics = buildTrustDiagnostics({
         availability: leg.availability || null,
         environment: leg.environment || {},
@@ -10151,12 +11167,14 @@ function enhanceBetFinderSparklines(payload) {
         reasonHtml +
         renderDecisionLensHtml(decisionLens, 'compact') +
         renderParlayRankingProfile(leg) +
+        renderCalibrationDiagnostics(leg, escHtml) +
         renderParlayH2HDebug(leg) +
         '<div class="parlay-leg-analyze-hint" style="font-size:0.72rem;color:var(--muted);margin-top:6px;text-align:center">' + escHtml(leg.confidence_summary || 'Click to analyze ') + '</div>' +
         '</div>' +
         '</details>';
       return '<div class="parlay-leg-card" data-leg-idx="' + i + '" title="Analyze ' + escHtml(leg.player_name) + '" style="cursor:pointer">' +
         '<span class="parlay-leg-rank">#' + (i + 1) + '</span>' +
+        '<button class="parlay-single-shuffle-btn" type="button" data-shuffle-leg-idx="' + i + '" title="Shuffle only this leg">Shuffle</button>' +
         '<div class="parlay-leg-player">' + escHtml(leg.player_name) + '</div>' +
         '<div class="parlay-leg-market">' +
         '<span class="parlay-leg-stat">' + escHtml(leg.stat) + '</span>' +
@@ -10171,6 +11189,8 @@ function enhanceBetFinderSparklines(payload) {
         tags.map(function (tag) { return '<span class="finder-chip">' + escHtml(tag) + '</span>'; }).join('') +
         '</div>' +
         renderCalibrationChips(leg, escHtml) +
+        renderCalibrationDiagnostics(leg, escHtml, { compact: true }) +
+        renderPredictionEvidencePanel({ points: evidence.points, stats: evidence.stats, escFn: escHtml }) +
         (
           leg.injury_filter_player_names && leg.injury_filter_player_names.length
             ? '<div class="parlay-leg-inj-context">w/o ' + leg.injury_filter_player_names.map(escHtml).join(', ') + '</div>'
@@ -10206,6 +11226,13 @@ function enhanceBetFinderSparklines(payload) {
         } catch (err) { console.warn('Parlay ticket leg nav failed:', err); }
       });
     });
+    grid.querySelectorAll('.parlay-single-shuffle-btn[data-shuffle-leg-idx]').forEach(function (btn) {
+      btn.addEventListener('click', function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        shuffleSingleParlayLeg(Number(btn.dataset.shuffleLegIdx));
+      });
+    });
     if (window.nbaUiEnhancements && typeof window.nbaUiEnhancements.refresh === 'function') {
       window.nbaUiEnhancements.refresh();
     }
@@ -10214,6 +11241,7 @@ function enhanceBetFinderSparklines(payload) {
   //  Render all props table (clickable  analyzer) 
   function renderAllProps(all, selectedIds) {
     if (!all || !all.length) return;
+    window._lastParlayScoredProps = all;
     show(parlayAllPropsWrap, true);
     if (parlayPropCount) parlayPropCount.textContent = all.length + ' props -- click any row to analyze';
     if (parlayAllPropsTitle) {
@@ -10230,7 +11258,7 @@ function enhanceBetFinderSparklines(payload) {
       const tone = getConfidenceTone(p.confidence);
       const statusLabel = p.selection_status === 'selected' ? 'Why selected' : 'Why not selected';
       const reasonText = p.selection_reason || '';
-      const confText = p.confidence ? ('<div class="parlay-conf-cell"><span class="finder-badge ' + tone + '">' + escHtml(p.confidence) + ' ' + escHtml(String(p.confidence_score || '')) + '</span><small>' + escHtml(p.confidence_summary || '') + '</small><div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">' + getParlayRankingChip(p) + '</div>' + renderCalibrationChips(p, escHtml) + (reasonText ? '<small class="parlay-selection-note"><strong>' + escHtml(statusLabel) + ':</strong> ' + escHtml(reasonText) + '</small>' : '') + '</div>') : '<span style="opacity:0.35">--</span>';
+      const confText = p.confidence ? ('<div class="parlay-conf-cell"><span class="finder-badge ' + tone + '">' + escHtml(p.confidence) + ' ' + escHtml(String(p.confidence_score || '')) + '</span><small>' + escHtml(p.confidence_summary || '') + '</small><div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">' + getParlayRankingChip(p) + '</div>' + renderCalibrationChips(p, escHtml) + renderCalibrationDiagnostics(p, escHtml, { compact: true }) + (reasonText ? '<small class="parlay-selection-note"><strong>' + escHtml(statusLabel) + ':</strong> ' + escHtml(reasonText) + '</small>' : '') + '</div>') : '<span style="opacity:0.35">--</span>';
       return '<tr class="' + (isSel ? 'parlay-selected-row' : '') + '" data-prop-idx="' + idx + '" data-player-id="' + (p.player_id || '') + '" data-player-name="' + escHtml(p.player_name || '') + '" data-stat="' + escHtml(p.stat || '') + '" data-line="' + (p.line || 0) + '" data-side="' + escHtml(p.side || 'OVER') + '" title="Analyze ' + escHtml(p.player_name) + '">' +
         '<td><span style="display:flex;align-items:center;gap:8px"><img src="' + imgSrc + '" style="width:26px;height:26px;border-radius:50%;object-fit:cover;object-position:top" onerror="this.hidden=true">' +
         '<span style="display:flex;flex-direction:column;gap:2px">' +
@@ -10277,6 +11305,45 @@ function enhanceBetFinderSparklines(payload) {
     }
   }
 
+  function shuffleSingleParlayLeg(legIndex) {
+    if (!cachedScoredProps || !cachedScoredProps.length) {
+      setStatus('No cached data. Run Scrape & Build first.', true);
+      return;
+    }
+    const currentLegs = Array.isArray(window._lastParlayLegs) ? window._lastParlayLegs.slice() : [];
+    const n = parseInt(parlayLegsSelect.value) || currentLegs.length || 3;
+    const index = Number(legIndex);
+    if (!Number.isInteger(index) || index < 0 || index >= currentLegs.length) {
+      setStatus('Could not find that parlay leg to shuffle.', true);
+      return;
+    }
+    const filteredProps = filterParlayPropsByOdds(cachedScoredProps || []);
+    const displayProps = rotateParlayProps(filteredProps, parlayReshuffleOffset);
+    if (displayProps.length <= currentLegs.length) {
+      setStatus('No alternate ranked slip available for current filters.', true);
+      return;
+    }
+    const currentLeg = currentLegs[index];
+    const fixedLegs = currentLegs.filter(function (_leg, idx) { return idx !== index; });
+    const replacement = findSingleLegReplacement(currentLeg, fixedLegs, displayProps, n);
+    if (!replacement) {
+      setStatus('No replacement found that keeps the ticket diversified.', true);
+      return;
+    }
+    const nextLegs = currentLegs.slice();
+    nextLegs[index] = replacement;
+    syncCurrentParlaySelection(displayProps, nextLegs);
+    const odds = calcOdds(nextLegs);
+    renderPlayoffFallbackNotice(cachedPlayoffFallbackApplied);
+    renderParlayStrategyPanel(displayProps);
+    renderTicket(nextLegs, n, odds);
+    renderAllProps(displayProps, nextLegs.map(function (leg) { return leg.player_id; }));
+    const oldLabel = currentLeg ? (currentLeg.player_name + ' ' + currentLeg.stat) : 'leg';
+    const newLabel = replacement ? (replacement.player_name + ' ' + replacement.stat) : 'new leg';
+    setStatus('Shuffled one leg: ' + oldLabel + ' -> ' + newLabel + ' -- no credits used', false);
+    refreshParlayBacktestActionButtons();
+  }
+
   //  Rebuild from cache (zero API calls) 
   function rebuildFromCache() {
     if (!cachedScoredProps || !cachedScoredProps.length) return;
@@ -10303,6 +11370,7 @@ function enhanceBetFinderSparklines(payload) {
     renderPlayoffFallbackNotice(cachedPlayoffFallbackApplied);
     renderParlayStrategyPanel(displayProps);
     const legs = layout.legs;
+    syncCurrentParlaySelection(displayProps, legs);
     lastParlayLegSignature = getParlayLegSignature(legs);
     const odds = calcOdds(legs);
     renderTicket(legs, n, odds);
@@ -10539,6 +11607,8 @@ function enhanceBetFinderSparklines(payload) {
       }
 
       cachedScoredProps = data.all_props_scored || [];
+      window._lastParlayScoredProps = cachedScoredProps;
+      window._lastParlayLegs = data.parlay || [];
       cachedQuotaLog = data.quota_log || [];
       cachedPlayoffFallbackApplied = Boolean(data.playoff_relaxed_fallback_applied);
       cachedScrapeMeta = { evCount: data.events_scraped || 0, propCount: data.props_found || 0, analyzed: data.props_analyzed || 0, scrapedAt: Date.now() };
@@ -10707,7 +11777,7 @@ function enhanceBetFinderSparklines(payload) {
       setStatus('Build a parlay first so there are scored props to log.', true);
       return;
     }
-    const propsForLog = filterParlayPropsByOdds(cachedScoredProps);
+    const propsForLog = filterParlayPropsByOdds((cachedScoredProps || []).map(hydrateBacktestLogPropOdds));
     if (!propsForLog.length) {
       setStatus('No props match the current odds filter. Adjust min/max odds before logging.', true);
       return;
@@ -10716,13 +11786,13 @@ function enhanceBetFinderSparklines(payload) {
     const matchingModeProps = getParlayPropsPassingMode(propsForLog, filterMode);
     if (!matchingModeProps.length) {
       if (filterMode === 'selected') {
-        setStatus('No selected-leg props available in the current filtered board.', true);
+        setStatus(`No selected-leg props with odds <= ${BACKTEST_LOG_MAX_DECIMAL_ODDS.toFixed(2)} are available in the current filtered board.`, true);
       } else if (filterMode === 'playoff_high') {
-        setStatus('No props met Playoff High+ thresholds (score >= 75, odds >= 1.40).', true);
+        setStatus(`No props met Playoff High+ thresholds (score >= 75, odds <= ${BACKTEST_LOG_MAX_DECIMAL_ODDS.toFixed(2)}).`, true);
       } else if (filterMode === 'broad') {
-        setStatus('No props met Broad thresholds (score >= 60, games >= 4, odds >= 1.40).', true);
+        setStatus(`No props met Broad thresholds (score >= 60, games >= 4, odds <= ${BACKTEST_LOG_MAX_DECIMAL_ODDS.toFixed(2)}).`, true);
       } else {
-        setStatus('No props met Actionable thresholds (score >= 72, games >= 5, odds >= 1.40).', true);
+        setStatus(`No props met Actionable thresholds (score >= 72, games >= 5, odds <= ${BACKTEST_LOG_MAX_DECIMAL_ODDS.toFixed(2)}).`, true);
       }
       showAppToast('No props match the selected log filter.', 'info');
       return;
@@ -10752,10 +11822,11 @@ function enhanceBetFinderSparklines(payload) {
       refreshParlayBacktestActionButtons();
       const logged = Number(payload.logged || 0);
       const skipped = Number(payload.skipped_filter || 0) + Number(payload.skipped_duplicate || 0) + Number(payload.skipped_invalid || 0);
+      const updatedOdds = Number(payload.updated_odds || 0);
       if (logged === 0 && Number(payload.skipped_filter || 0) > 0) {
         setStatus('Backend skipped every prop for the selected filter. This usually means stale client code or changed server rules.', true);
       }
-      showAppToast(`Backtest batch logged: ${logged} added${skipped ? `, ${skipped} skipped` : ''}.`, logged > 0 ? 'success' : 'info');
+      showAppToast(`Backtest batch logged: ${logged} added${updatedOdds ? `, ${updatedOdds} odds updated` : ''}${skipped ? `, ${skipped} skipped` : ''}.`, (logged > 0 || updatedOdds > 0) ? 'success' : 'info');
     } catch (err) {
       setStatus('Backtest log failed: ' + (err?.message || 'Unknown error'), true);
     } finally {
@@ -11610,7 +12681,8 @@ function enhanceBetFinderSparklines(payload) {
     return Math.max(min, Math.min(max, n));
   }
 
-  function computeConfidenceScoreFromParts(parts = {}) {
+  // Last-resort slip/tracker fallback only. Prefer backend-provided confidence_score.
+  function computeFallbackConfidenceScoreFromParts(parts = {}) {
     const hitRate = parsePercentLike(parts.hit_rate);
     const ev = parsePercentLike(parts.ev);
     const edge = parsePercentLike(parts.edge);
@@ -11725,7 +12797,10 @@ function enhanceBetFinderSparklines(payload) {
   }
 
   function buildSlipProp(input = {}) {
-    const confidenceScore = safeNumber(input.confidenceScore, null) ?? computeConfidenceScoreFromParts(input.metrics || input);
+    const confidenceContract = input.confidenceContract || getBackendConfidenceContract(input);
+    const confidenceScore = getBackendConfidenceScore(input)
+      ?? safeNumber(input.confidenceScore, null)
+      ?? computeFallbackConfidenceScoreFromParts(input.metrics || input);
     const bucket = getConfidenceBucket(confidenceScore);
     const odds = safeNumber(input.odds, 1.91) || 1.91;
     return {
@@ -11739,6 +12814,10 @@ function enhanceBetFinderSparklines(payload) {
       odds,
       source: input.source || 'manual',
       confidenceScore,
+      confidenceContract,
+      baseConfidenceScore: safeNumber(input.baseConfidenceScore ?? confidenceContract?.base_confidence_score ?? confidenceContract?.base_score, null),
+      marketAdjustedConfidenceScore: safeNumber(input.marketAdjustedConfidenceScore ?? confidenceContract?.market_adjusted_confidence_score ?? confidenceContract?.market_adjusted_score, null),
+      rankingScore: safeNumber(input.rankingScore ?? confidenceContract?.ranking_score ?? confidenceContract?.ranking_adjusted_score, null),
       confidenceLabel: bucket.label,
       tone: bucket.tone,
       insightChips: Array.isArray(input.insightChips) ? input.insightChips.slice(0, 4) : [],
@@ -11939,7 +13018,8 @@ function enhanceBetFinderSparklines(payload) {
         availability_status: payload.availability?.status,
         recommended_side: side
       });
-      const confidenceScore = computeConfidenceScoreFromParts({
+      const confidenceContract = getBackendConfidenceContract(payload);
+      const confidenceScore = getBackendConfidenceScore(payload) ?? computeFallbackConfidenceScoreFromParts({
         hit_rate: payload.hit_rate,
         games_count: payload.games_count,
         h2h_hit_rate: h2hMetrics.hitRate,
@@ -11956,6 +13036,7 @@ function enhanceBetFinderSparklines(payload) {
         odds: 1.91,
         source: 'Analyzer',
         confidenceScore,
+        confidenceContract,
         insightChips
       });
       refreshSlipButtons();
@@ -12028,6 +13109,7 @@ function enhanceBetFinderSparklines(payload) {
       || safeNumber(item?.best_bet?.odds, null)
       || (side.includes('UNDER') ? safeNumber(item?.market?.under_odds, 1.91) : safeNumber(item?.market?.over_odds, 1.91))
       || 1.91;
+    const confidenceContract = getBackendConfidenceContract(item?.best_bet || item);
     return {
       player_id: item?.player?.id,
       player_name: item?.player?.full_name,
@@ -12037,7 +13119,7 @@ function enhanceBetFinderSparklines(payload) {
       side,
       odds,
       source: 'Scanner',
-      confidenceScore: safeNumber(item?.best_bet?.confidence_score, null) || computeConfidenceScoreFromParts({
+      confidenceScore: getBackendConfidenceScore(item?.best_bet || item) ?? computeFallbackConfidenceScoreFromParts({
         hit_rate: item?.analysis?.hit_rate,
         edge: item?.best_bet?.edge,
         ev: item?.best_bet?.ev,
@@ -12046,6 +13128,7 @@ function enhanceBetFinderSparklines(payload) {
         h2h_games: item?.analysis?.h2h?.games_count,
         minutes_last5: item?.analysis?.opportunity?.minutes_last5
       }),
+      confidenceContract,
       insightChips: makeInsightChips({
         hit_rate: item?.analysis?.hit_rate,
         edge: item?.best_bet?.edge,
@@ -12068,13 +13151,15 @@ function enhanceBetFinderSparklines(payload) {
   function enhanceMarketUI() {
     const root = document.getElementById('marketResults');
     if (!root || !currentMarketResultsPayload?.results?.length) return;
-    const results = [...filterMarketRows(currentMarketResultsPayload.results || [], currentMarketFilter || 'all')]
-      .filter(item => passesExpertFilters(item))
-      .filter(item => passesAdvancedMarketFilters(item))
-      .sort((a, b) => compareMarketRows(a, b, currentMarketSort || 'best_ev', currentMarketSortDirection));
+    const results = getMarketRankedResults(currentMarketResultsPayload, true);
+    const itemByKey = new Map(results.map(item => [getMarketItemKey(item), item]));
+    const resolveRenderedMarketItem = (node, fallbackIndex) => {
+      const key = node?.dataset?.itemKey || '';
+      return itemByKey.get(key) || results[fallbackIndex];
+    };
 
     root.querySelectorAll('.market-slip-card').forEach((card, index) => {
-      const item = results[index];
+      const item = resolveRenderedMarketItem(card, index);
       if (!item || card.querySelector('.market-slip-cta-row')) return;
       const prop = buildMarketSlipPropFromItem(item);
       const cta = document.createElement('div');
@@ -12093,7 +13178,7 @@ function enhanceBetFinderSparklines(payload) {
     });
 
     root.querySelectorAll('.market-row').forEach((row, index) => {
-      const item = results[index];
+      const item = resolveRenderedMarketItem(row, index);
       if (!item || row.querySelector('.market-inline-actions')) return;
       const prop = buildMarketSlipPropFromItem(item);
       const cell = document.createElement('div');
@@ -12113,12 +13198,15 @@ function enhanceBetFinderSparklines(payload) {
     });
   }
 
-  function enhanceBetFinderUI() {
+  function enhanceBetFinderUI(payload = null) {
     const root = document.getElementById('betFinderResults');
     if (!root || !root.querySelectorAll('.finder-card').length) return;
     const cards = root.querySelectorAll('.finder-card');
+    const payloadForScores = payload || currentBetFinderResultsPayload || null;
+    const results = Array.isArray(payloadForScores?.results) ? payloadForScores.results : [];
     cards.forEach(card => {
       if (card.querySelector('.finder-slip-row')) return;
+      const item = results[Number(card.dataset.resultIdx || -1)] || null;
       const hitChip = card.querySelector('.finder-chip');
       const hitRate = hitChip ? parsePercentLike(hitChip.textContent) : 0;
       const lineText = card.querySelector('.market-slip-subtext')?.textContent || '';
@@ -12126,7 +13214,9 @@ function enhanceBetFinderSparklines(payload) {
       const line = lineMatch ? Number(lineMatch[1]) : safeNumber(lineInput?.value, 0) || 0;
       const stat = selectedStat || 'PTS';
       const side = card.querySelector('.finder-side-pill')?.textContent?.trim()?.toUpperCase() || 'OVER';
-      const confidenceScore = computeConfidenceScoreFromParts({ hit_rate: hitRate, games_count: Number((card.querySelectorAll('.finder-chip')[1]?.textContent || '0/0').split('/')[1] || 0) });
+      const confidenceContract = getBackendConfidenceContract(item);
+      const confidenceScore = getBackendConfidenceScore(item)
+        ?? computeFallbackConfidenceScoreFromParts({ hit_rate: hitRate, games_count: Number((card.querySelectorAll('.finder-chip')[1]?.textContent || '0/0').split('/')[1] || 0) });
       const insightChips = makeInsightChips({ hit_rate: hitRate, line, recommended_side: side, average: safeNumber(card.querySelector('.finder-ticket-stat strong')?.textContent, 0) });
       const prop = {
         player_id: card.dataset.id,
@@ -12138,6 +13228,7 @@ function enhanceBetFinderSparklines(payload) {
         odds: 1.91,
         source: 'Bet Finder',
         confidenceScore,
+        confidenceContract,
         insightChips
       };
       const row = document.createElement('div');
@@ -12160,13 +13251,27 @@ function enhanceBetFinderSparklines(payload) {
     const ticketGrid = document.querySelector('#parlayTicket .parlay-legs-grid');
     ticketGrid?.querySelectorAll('.parlay-leg-card').forEach(card => {
       if (card.querySelector('.parlay-slip-row')) return;
-      const player = card.querySelector('.parlay-leg-player')?.textContent?.trim() || 'Unknown Player';
-      const stat = card.querySelector('.parlay-leg-stat')?.textContent?.trim() || 'PTS';
-      const line = safeNumber(card.querySelector('.parlay-leg-line')?.textContent, 0) || 0;
-      const side = card.querySelector('.parlay-leg-side')?.textContent?.trim()?.toUpperCase() || 'OVER';
+      const leg = (window._lastParlayLegs || [])[Number(card.dataset.legIdx || -1)] || null;
+      const player = leg?.player_name || card.querySelector('.parlay-leg-player')?.textContent?.trim() || 'Unknown Player';
+      const stat = leg?.stat || card.querySelector('.parlay-leg-stat')?.textContent?.trim() || 'PTS';
+      const line = safeNumber(leg?.line ?? card.querySelector('.parlay-leg-line')?.textContent, 0) || 0;
+      const side = String(leg?.side || card.querySelector('.parlay-leg-side')?.textContent?.trim() || 'OVER').toUpperCase();
       const hitRateText = card.querySelector('.parlay-leg-stat-item .sval')?.textContent || '0';
-      const confidenceScore = computeConfidenceScoreFromParts({ hit_rate: parsePercentLike(hitRateText), line });
-      const prop = { player_name: player, stat, line, side, odds: 1.91, source: 'Parlay Builder', confidenceScore, insightChips: makeInsightChips({ hit_rate: parsePercentLike(hitRateText), line, recommended_side: side }) };
+      const confidenceContract = getBackendConfidenceContract(leg);
+      const confidenceScore = getBackendConfidenceScore(leg)
+        ?? computeFallbackConfidenceScoreFromParts({ hit_rate: parsePercentLike(hitRateText), line });
+      const prop = {
+        player_name: player,
+        player_id: leg?.player_id || null,
+        stat,
+        line,
+        side,
+        odds: safeNumber(leg?.odds, 1.91) || 1.91,
+        source: 'Parlay Builder',
+        confidenceScore,
+        confidenceContract,
+        insightChips: makeInsightChips({ hit_rate: leg?.hit_rate ?? parsePercentLike(hitRateText), line, recommended_side: side })
+      };
       const row = document.createElement('div');
       row.className = 'parlay-slip-row';
       row.innerHTML = `<button class="secondary-btn compact-slip-btn" type="button">${loadSlipProps().some(x => x.key === getSlipKey(prop)) ? 'In Slip' : 'Add to Slip'}</button>`;
@@ -12181,13 +13286,26 @@ function enhanceBetFinderSparklines(payload) {
 
     document.querySelectorAll('#parlayAllPropsBody tr[data-prop-idx]').forEach(row => {
       if (row.querySelector('.parlay-slip-inline')) return;
-      const player = row.dataset.playerName || row.children[0]?.querySelector('span > span')?.textContent?.trim() || 'Unknown Player';
-      const playerId = row.dataset.playerId ? Number(row.dataset.playerId) : null;
-      const stat = row.dataset.stat || row.children[1]?.textContent?.trim() || 'PTS';
-      const line = safeNumber(row.dataset.line || row.children[2]?.textContent, 0) || 0;
-      const side = (row.dataset.side || row.children[3]?.textContent?.trim() || 'OVER').toUpperCase();
-      const confidenceScore = computeConfidenceScoreFromParts({ hit_rate: parsePercentLike(row.children[4]?.textContent), line });
-      const prop = { player_name: player, player_id: playerId, stat, line, side, odds: 1.91, source: 'Parlay Board', confidenceScore };
+      const backendProp = (window._lastParlayScoredProps || [])[Number(row.dataset.propIdx || -1)] || null;
+      const player = backendProp?.player_name || row.dataset.playerName || row.children[0]?.querySelector('span > span')?.textContent?.trim() || 'Unknown Player';
+      const playerId = backendProp?.player_id || (row.dataset.playerId ? Number(row.dataset.playerId) : null);
+      const stat = backendProp?.stat || row.dataset.stat || row.children[1]?.textContent?.trim() || 'PTS';
+      const line = safeNumber(backendProp?.line ?? row.dataset.line ?? row.children[2]?.textContent, 0) || 0;
+      const side = String(backendProp?.side || row.dataset.side || row.children[3]?.textContent?.trim() || 'OVER').toUpperCase();
+      const confidenceContract = getBackendConfidenceContract(backendProp);
+      const confidenceScore = getBackendConfidenceScore(backendProp)
+        ?? computeFallbackConfidenceScoreFromParts({ hit_rate: parsePercentLike(row.children[4]?.textContent), line });
+      const prop = {
+        player_name: player,
+        player_id: playerId,
+        stat,
+        line,
+        side,
+        odds: safeNumber(backendProp?.odds, 1.91) || 1.91,
+        source: 'Parlay Board',
+        confidenceScore,
+        confidenceContract
+      };
       const cell = document.createElement('div');
       cell.className = 'parlay-slip-inline';
       cell.innerHTML = `<button class="parlay-slip-btn" type="button">${loadSlipProps().some(x => x.key === getSlipKey(prop)) ? ' Slip' : '+ Slip'}</button>`;
@@ -12212,7 +13330,8 @@ function enhanceBetFinderSparklines(payload) {
       const line = lineMatch ? Number(lineMatch[1]) : 0;
       const side = card.querySelector('.tracker-side-pill')?.textContent?.trim()?.toUpperCase() || 'OVER';
       const currentVal = safeNumber(card.querySelector('.tracker-current-val')?.textContent, 0) || 0;
-      const confidenceScore = computeConfidenceScoreFromParts({ average: currentVal, line, recommended_side: side, hit_rate: currentVal >= line ? 65 : 45 });
+      // Tracker cards do not originate from a backend-scored payload, so this is a manual fallback.
+      const confidenceScore = computeFallbackConfidenceScoreFromParts({ average: currentVal, line, recommended_side: side, hit_rate: currentVal >= line ? 65 : 45 });
       const insightChips = makeInsightChips({ average: currentVal, line, recommended_side: side });
       const meta = document.createElement('div');
       meta.className = 'tracker-slip-row';
@@ -12242,7 +13361,7 @@ function enhanceBetFinderSparklines(payload) {
     }
     const side = String(payload?.recommended_side || (parsePercentLike(payload?.hit_rate) >= 50 ? 'OVER' : 'UNDER')).toUpperCase();
     const h2hMetrics = getSideAwareH2HMetrics(payload?.h2h || {}, side);
-    const confidenceScore = computeConfidenceScoreFromParts({
+    const confidenceScore = getBackendConfidenceScore(payload) ?? computeFallbackConfidenceScoreFromParts({
       hit_rate: payload?.hit_rate,
       games_count: payload?.games_count,
       h2h_hit_rate: h2hMetrics.hitRate,
@@ -12303,7 +13422,7 @@ function enhanceBetFinderSparklines(payload) {
       animateSvgLineDraw(marketResults);
     },
     betFinder(payload) {
-      enhanceBetFinderUI();
+      enhanceBetFinderUI(payload);
       renderSlipDrawer();
       animateResultContainer(betFinderResults, 'betfinder');
       registerScrollReveals(betFinderResults);
@@ -12465,6 +13584,29 @@ function enhanceBetFinderSparklines(payload) {
     btLogError.style.display = msg ? '' : 'none';
   }
 
+  function readBacktestConfidenceContract() {
+    const raw = btLogBtn?.dataset?.prefilledConfidenceContract || '';
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function clearBacktestPrefillDataset() {
+    if (!btLogBtn) return;
+    [
+      'prefilledConfidenceScore',
+      'prefilledConfidenceContract',
+      'prefilledModelProb',
+      'prefilledSource',
+      'prefilledMarketSide',
+      'prefilledMarketDisagrees',
+    ].forEach(key => { btLogBtn.dataset[key] = ''; });
+  }
+
   function normalizeBacktestTier(rawTier, rawScore) {
     const tier = String(rawTier || '').trim().toLowerCase();
     if (tier === 'elite' || tier === 'a') return 'Elite';
@@ -12503,6 +13645,11 @@ function enhanceBetFinderSparklines(payload) {
   function formatBacktestPercent(value) {
     if (value === null || value === undefined || Number.isNaN(Number(value))) return '--';
     return `${Number(value).toFixed(1)}%`;
+  }
+
+  function formatBacktestOdds(value) {
+    const odds = Number(value);
+    return Number.isFinite(odds) && odds > 1 ? odds.toFixed(2) : '--';
   }
 
   function populateBacktestFilterOptions() {
@@ -12701,7 +13848,7 @@ function enhanceBetFinderSparklines(payload) {
       el.querySelector('strong').textContent = main;
       el.querySelector('small').textContent = sub;
     };
-    setChip('btStatTotal', stats.total, `${stats.pending} pending`);
+    setChip('btStatTotal', stats.logged_total || (stats.total + stats.pending), `${stats.total} resolved`);
     setChip('btStatWin', `${stats.win_rate}%`, `${stats.hits}/${stats.hits + stats.misses} resolved`);
     const roiSign = stats.roi_pct > 0 ? '+' : '';
     setChip('btStatROI', `${roiSign}${stats.roi_pct}%`, 'vs -110 odds');
@@ -12764,6 +13911,7 @@ function enhanceBetFinderSparklines(payload) {
       const resultIcon = isPending ? '\u2026' : isHit ? '\u2713' : '\u2715';
       const resultLabel = isPending ? 'Pending' : isHit ? 'Hit' : 'Miss';
       const dateStr = e.logged_at ? new Date(e.logged_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : '--';
+      const oddsStr = formatBacktestOdds(e.odds);
 
       return `<tr data-bt-id="${esc(e.id)}" style="border-bottom:1px solid rgba(255,255,255,0.05)">
         <td style="padding:7px 8px;font-weight:600;font-size:12px">${esc(e.player)}</td>
@@ -12772,6 +13920,7 @@ function enhanceBetFinderSparklines(payload) {
         <td style="padding:7px 6px">
           <span style="font-size:10px;font-weight:700;padding:2px 7px;border-radius:10px;background:${e.side === 'OVER' ? 'rgba(74,222,128,0.15)' : 'rgba(248,113,113,0.15)'};color:${e.side === 'OVER' ? 'var(--good)' : 'var(--bad)'}">${esc(e.side)}</span>
         </td>
+        <td style="padding:7px 6px;font-size:11px;font-weight:700">${esc(oddsStr)}</td>
         <td style="padding:7px 6px;font-size:11px;color:${tierColor(e.confidence_tier)}">${esc(e.confidence_tier || '--')}</td>
         <td style="padding:7px 6px;font-size:11px;color:${resultColor};font-weight:700">${resultIcon} ${resultLabel}${e.actual_value !== null && e.actual_value !== undefined ? ` (${Number(e.actual_value).toFixed(1)})` : ''}</td>
         <td style="padding:7px 6px;font-size:11px;opacity:0.5">${dateStr}</td>
@@ -12797,6 +13946,7 @@ function enhanceBetFinderSparklines(payload) {
               <th style="padding:5px 6px;text-align:left;font-weight:600">Stat</th>
               <th style="padding:5px 6px;text-align:left;font-weight:600">Line</th>
               <th style="padding:5px 6px;text-align:left;font-weight:600">Side</th>
+              <th style="padding:5px 6px;text-align:left;font-weight:600">Odds</th>
               <th style="padding:5px 6px;text-align:left;font-weight:600">Tier</th>
               <th style="padding:5px 6px;text-align:left;font-weight:600">Result</th>
               <th style="padding:5px 6px;text-align:left;font-weight:600">Date</th>
@@ -12947,7 +14097,7 @@ function enhanceBetFinderSparklines(payload) {
   }
 
   function buildBacktestCsv(entries) {
-    const headers = ['id', 'player', 'stat', 'line', 'side', 'confidence_tier', 'confidence_score', 'model_prob', 'odds', 'result', 'actual_value', 'logged_at', 'resolved_at', 'event_date', 'source', 'market_side', 'market_disagrees', 'notes'];
+    const headers = ['id', 'player', 'player_id', 'stat', 'line', 'side', 'confidence_tier', 'confidence_score', 'confidence_score_source', 'base_confidence_score', 'market_adjusted_confidence_score', 'ranking_score', 'model_prob', 'odds', 'result', 'actual_value', 'logged_at', 'resolved_at', 'event_date', 'season', 'season_type', 'event_id', 'game_label', 'opponent_abbreviation', 'batch_id', 'parlay_prop_key', 'source', 'market_side', 'market_disagrees', 'notes', 'resolved_game_date', 'resolved_matchup', 'auto_grade_run_id', 'auto_graded_at'];
     const escCsv = value => {
       const s = String(value ?? '');
       return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
@@ -12965,6 +14115,14 @@ function enhanceBetFinderSparklines(payload) {
     const prefilledScore = Number(btLogBtn?.dataset?.prefilledConfidenceScore || NaN);
     const tier = normalizeBacktestTier(tierRaw, prefilledScore);
     const odds = btOddsInput ? parseFloat(btOddsInput.value) : 1.91;
+    const confidenceContract = readBacktestConfidenceContract();
+    const prefilledModelProb = Number(btLogBtn?.dataset?.prefilledModelProb || NaN);
+    const contractModelProbRaw = Number(confidenceContract?.model_probability ?? NaN);
+    const modelProbRaw = Number.isFinite(prefilledModelProb) ? prefilledModelProb : contractModelProbRaw;
+    const modelProb = Number.isFinite(modelProbRaw)
+      ? Math.max(0, Math.min(1, Math.abs(modelProbRaw) <= 1 ? modelProbRaw : modelProbRaw / 100))
+      : 0.55;
+    const marketDisagreesRaw = String(btLogBtn?.dataset?.prefilledMarketDisagrees || '').toLowerCase();
 
     if (!player) { showBtError('Enter a player name.'); return; }
     if (isNaN(line) || line <= 0) { showBtError('Enter a valid line.'); return; }
@@ -12984,9 +14142,16 @@ function enhanceBetFinderSparklines(payload) {
           player, stat, line, side,
           confidence_tier: tier,
           confidence_score: Number.isFinite(prefilledScore) ? prefilledScore : scoreFromBacktestTier(tier),
-          model_prob: 0.55,
+          confidence_contract: confidenceContract || undefined,
+          base_confidence_score: parseBackendConfidenceScore(confidenceContract?.base_confidence_score ?? confidenceContract?.base_score) ?? undefined,
+          market_adjusted_confidence_score: parseBackendConfidenceScore(confidenceContract?.market_adjusted_confidence_score ?? confidenceContract?.market_adjusted_score) ?? undefined,
+          ranking_score: parseBackendConfidenceScore(confidenceContract?.ranking_score ?? confidenceContract?.ranking_adjusted_score) ?? undefined,
+          confidence_score_source: confidenceContract?.score_source || undefined,
+          model_prob: modelProb,
           odds: isNaN(odds) ? 1.91 : odds,
-          source: 'manual',
+          source: btLogBtn?.dataset?.prefilledSource || 'manual',
+          market_side: btLogBtn?.dataset?.prefilledMarketSide || confidenceContract?.market_side || '',
+          market_disagrees: marketDisagreesRaw ? marketDisagreesRaw === 'true' : Boolean(confidenceContract?.market_disagrees),
         }),
       });
       clearTimeout(timer);
@@ -12994,7 +14159,7 @@ function enhanceBetFinderSparklines(payload) {
       if (btPlayerInput) btPlayerInput.value = '';
       if (btLineInput) btLineInput.value = '';
       if (btOddsInput) btOddsInput.value = '';
-      if (btLogBtn) btLogBtn.dataset.prefilledConfidenceScore = '';
+      clearBacktestPrefillDataset();
       btSelectedPlayerName = '';
       closeBtDropdown();
       await loadAndRender();
@@ -13014,8 +14179,16 @@ function enhanceBetFinderSparklines(payload) {
       const playerName = payload.player?.full_name || '';
       const stat = payload.stat || 'PTS';
       const side = payload.recommended_side || 'OVER';
-      const score = Number(payload.confidence?.score ?? payload.confidence_score ?? payload.best_bet?.confidence_score ?? NaN);
-      const tier = normalizeBacktestTier(payload.confidence?.tier || payload.confidence_tier || payload.best_bet?.confidence_tier, score);
+      const confidenceContract = getBackendConfidenceContract(payload);
+      const score = getBackendConfidenceScore(payload);
+      const tier = normalizeBacktestTier(
+        getBackendConfidenceTier(payload, score) || payload.confidence_tier || payload.best_bet?.confidence_tier,
+        score ?? NaN
+      );
+      const modelProbRaw = Number(confidenceContract?.model_probability ?? payload.model_probability ?? payload.best_bet?.model_probability ?? NaN);
+      const modelProb = Number.isFinite(modelProbRaw)
+        ? Math.max(0, Math.min(1, Math.abs(modelProbRaw) <= 1 ? modelProbRaw : modelProbRaw / 100))
+        : NaN;
 
       if (btPlayerInput) btPlayerInput.value = playerName;
       if (btStatSelect) btStatSelect.value = stat;
@@ -13023,6 +14196,13 @@ function enhanceBetFinderSparklines(payload) {
       if (btLineInput) btLineInput.value = payload.line || '';
       if (btTierSelect) btTierSelect.value = tier;
       if (btLogBtn) btLogBtn.dataset.prefilledConfidenceScore = Number.isFinite(score) ? String(score) : '';
+      if (btLogBtn) {
+        btLogBtn.dataset.prefilledConfidenceContract = confidenceContract ? JSON.stringify(confidenceContract) : '';
+        btLogBtn.dataset.prefilledModelProb = Number.isFinite(modelProb) ? String(modelProb) : '';
+        btLogBtn.dataset.prefilledSource = confidenceContract?.source || payload.source || 'Analyzer';
+        btLogBtn.dataset.prefilledMarketSide = confidenceContract?.market_side || payload.market_side || '';
+        btLogBtn.dataset.prefilledMarketDisagrees = String(Boolean(confidenceContract?.market_disagrees ?? payload.market_disagrees));
+      }
       btSelectedPlayerName = playerName;
 
       // Scroll to backtest section smoothly
@@ -13053,10 +14233,21 @@ function enhanceBetFinderSparklines(payload) {
         if (!payload || payload.ok === false) throw new Error(payload?.error || 'Auto-grade failed.');
         const graded = Number(payload.graded || 0);
         const checked = Number(payload.checked || 0);
+        const skippedNoPlayer = Number(payload.skipped_no_player || 0);
+        const skippedNoGame = Number(payload.skipped_no_game || 0);
+        const skippedNotFinished = Number(payload.skipped_not_finished || 0);
+        const skipParts = [];
+        if (skippedNoPlayer) skipParts.push(`${skippedNoPlayer} missing player`);
+        if (skippedNoGame) skipParts.push(`${skippedNoGame} no game match`);
+        if (skippedNotFinished) skipParts.push(`${skippedNotFinished} not final`);
+        const skipDetail = skipParts.length ? ` (${skipParts.join(', ')})` : '';
         lastBacktestAutoGradeRunId = graded > 0 ? String(payload.run_id || '').trim() : '';
         refreshBacktestAutoGradeUndoButton();
         showBtError('');
-        showAppToast(`Auto-grade complete: ${graded}/${checked} resolved.`, graded > 0 ? 'success' : 'info', {
+        if (checked > 0 && graded === 0 && skipDetail) {
+          showBtError(`Auto-grade checked ${checked} props but did not resolve any${skipDetail}.`);
+        }
+        showAppToast(`Auto-grade complete: ${graded}/${checked} resolved${skipDetail}.`, graded > 0 ? 'success' : 'info', {
           undoLabel: graded > 0 ? 'Undo' : '',
           onUndo: graded > 0 ? async () => {
             try {
@@ -13285,11 +14476,16 @@ function enhanceBetFinderSparklines(payload) {
         const entries = parseBacktestCsv(text).map(row => ({
           id: row.id,
           player: row.player,
+          player_id: row.player_id ? Number(row.player_id) : null,
           stat: row.stat,
           line: Number(row.line || 0),
           side: String(row.side || '').toUpperCase(),
           confidence_tier: row.confidence_tier,
           confidence_score: Number(row.confidence_score || 0),
+          confidence_score_source: row.confidence_score_source,
+          base_confidence_score: row.base_confidence_score ? Number(row.base_confidence_score) : null,
+          market_adjusted_confidence_score: row.market_adjusted_confidence_score ? Number(row.market_adjusted_confidence_score) : null,
+          ranking_score: row.ranking_score ? Number(row.ranking_score) : null,
           model_prob: Number(row.model_prob || 0.5),
           odds: row.odds ? Number(row.odds) : null,
           result: row.result || 'pending',
@@ -13297,10 +14493,21 @@ function enhanceBetFinderSparklines(payload) {
           logged_at: row.logged_at,
           resolved_at: row.resolved_at,
           event_date: row.event_date,
+          season: row.season,
+          season_type: row.season_type,
+          event_id: row.event_id,
+          game_label: row.game_label,
+          opponent_abbreviation: row.opponent_abbreviation,
+          batch_id: row.batch_id,
+          parlay_prop_key: row.parlay_prop_key,
           source: row.source || 'csv-import',
           market_side: row.market_side,
           market_disagrees: String(row.market_disagrees || '').toLowerCase() === 'true',
           notes: row.notes || '',
+          resolved_game_date: row.resolved_game_date,
+          resolved_matchup: row.resolved_matchup,
+          auto_grade_run_id: row.auto_grade_run_id,
+          auto_graded_at: row.auto_graded_at,
         })).filter(entry => entry.player && entry.stat && entry.side);
         if (!entries.length) throw new Error('No usable rows found in that CSV.');
         const payload = await apiFetch('/api/backtest/import', {

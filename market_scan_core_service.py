@@ -183,8 +183,12 @@ class MarketScanCoreService:
                 "stat": stat,
                 "line": line,
                 "team_id": team_id or (player_team_id if player_team_id else None),
-                "player_position": None,
+                "player_position": row.get("player_position") or row.get("position") or None,
                 "override_opponent_id": int(opponent["id"]) if opponent and int(opponent.get("id") or 0) != (team_id or player_team_id) else None,
+                "event_id": row.get("event_id") or "",
+                "game_label": input_game_label,
+                "home_team": home_team_text,
+                "away_team": away_team_text,
                 "over_fair_prob": row.get("over_fair_prob"),
                 "under_fair_prob": row.get("under_fair_prob"),
                 "consensus_over_fair_prob": row.get("consensus_over_fair_prob"),
@@ -197,6 +201,14 @@ class MarketScanCoreService:
                 "best_under_bookmaker": row.get("best_under_bookmaker"),
                 "market_implied_line": row.get("market_implied_line"),
                 "bookmaker_title": row.get("bookmaker_title"),
+                "bookmaker_key": row.get("bookmaker_key"),
+                "market_key": row.get("market_key"),
+                "market_last_update": row.get("market_last_update"),
+                "market_game_total": row.get("market_game_total"),
+                "market_home_spread": row.get("market_home_spread"),
+                "market_away_spread": row.get("market_away_spread"),
+                "market_home_implied_total": row.get("market_home_implied_total"),
+                "market_away_implied_total": row.get("market_away_implied_total"),
             }
             prepared_rows.append((index, bulk_row, over_odds, under_odds, team_text, opponent_text, team, opponent, team_id, input_game_label))
 

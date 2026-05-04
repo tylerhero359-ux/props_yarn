@@ -1061,6 +1061,23 @@ Nikola Jokic,REB,12.5,2.00,1.73" spellcheck="false"></textarea>
 <button class="text-btn" id="marketClearBtn" type="button">Clear</button>
 <button class="primary-btn" id="marketScanBtn" type="button">Analyze Board</button>
 </div>
+<div class="market-action-row market-backtest-action-row">
+<label class="field-inline">
+<span class="small-label">Log filter</span>
+<select class="market-api-input" id="marketBacktestFilterSelect">
+<option selected="" value="action">Actionable (High+, odds <= 1.79)</option>
+<option value="selected">Top ranked slips only (odds <= 1.79)</option>
+<option value="playoff_high">Playoff High+ (75+, odds <= 1.79)</option>
+<option value="broad">Broad (Medium+, odds <= 1.79)</option>
+</select>
+</label>
+<button class="secondary-btn" id="marketLogBacktestBtn" title="Log filtered Market Scanner props to Backtest as pending entries" type="button">
+Log Props to Backtest
+</button>
+<button class="text-btn" id="marketUndoBacktestBtn" style="display:none" title="Undo the most recent Market Scanner backtest log" type="button">
+Undo Last Log
+</button>
+</div>
 </div>
 <div class="market-guide market-guide-card card rounded-[28px] border border-white/10">
 <p class="section-kicker">How to fill it</p>
@@ -1212,10 +1229,10 @@ Re-scrape
 <label class="field-inline">
 <span class="small-label">Log filter</span>
 <select class="market-api-input" id="parlayBacktestFilterSelect">
-<option selected="" value="action">Actionable (High+)</option>
-<option value="playoff_high">Playoff High+ (75+, odds 1.40+)</option>
-<option value="selected">Selected legs only</option>
-<option value="broad">Broad (Medium+)</option>
+<option selected="" value="action">Actionable (High+, odds <= 1.79)</option>
+<option value="playoff_high">Playoff High+ (75+, odds <= 1.79)</option>
+<option value="selected">Selected legs only (odds <= 1.79)</option>
+<option value="broad">Broad (Medium+, odds <= 1.79)</option>
 </select>
 </label>
 <button class="secondary-btn parlay-build-btn" id="parlayLogBacktestBtn" title="Log filtered props to Backtest as pending entries" type="button">

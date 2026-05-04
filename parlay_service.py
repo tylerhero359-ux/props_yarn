@@ -39,7 +39,7 @@ class ParlayService:
                 "stat": row["stat"],
                 "line": row["line"],
                 "team_id": None,
-                "player_position": None,
+                "player_position": row.get("player_position") or row.get("position") or None,
                 "event_id": event_id,
                 "game_label": str(row.get("game_label") or "").strip(),
                 "home_team": home_team,
